@@ -654,6 +654,32 @@ def inertial_langevin(V_init, ebt, V_query, max_steps=500):
 
 **Экономия:** при K=5 шагов explore и 10–15 шагов cruise — сокращение backward passes примерно в 3 раза.
 
+### 8.4 Inertial Navigation как гиперпараметр инференса
+
+> **Ревью-заметка (v1.1):** Inertial Navigation не должна быть скрытой оптимизацией — она является полноценным гиперпараметром, влияющим на качество рассуждений.
+
+**Принцип:** модель лучше всего работает в условиях инференса, знакомых ей по обучению. Если EBT тренировалась только на траекториях с полным градиентом, а при инференсе мы включаем cruise-фазы — энергетический ландшафт может вести себя непредсказуемо на "инерционных" участках траектории.
+
+**Решение:** `cruise_ratio` — явный гиперпараметр, определяющий долю cruise-шагов в Langevin loop.
+
+**Пресеты режимов инференса:**
+
+| Пресет | max_steps | cruise_ratio | Описание |
+|--------|-----------|-------------|----------|
+| `fast` | 10 | 0.7 | Минимум вычислений, агрессивная инерция |
+| `balanced` | 50 | 0.5 | Баланс точности и скорости |
+| `deep` | 200 | 0.2 | Высокая точность, мало инерции |
+| `extra_deep` | 500 | 0.0 | Чистый Langevin, без cruise |
+
+**Train-time awareness:** при обучении EBT каждый батч обрабатывается с **случайным** `cruise_ratio`, чтобы модель видела траектории, порождённые разными стратегиями навигации:
+
+```python
+# В training loop (после базового обучения EBT на статических парах):
+cruise_ratio = random.choice([0.0, 0.0, 0.3, 0.5])  # bias к полному градиенту
+trajectory = langevin.refine(V_init, V_query, cruise_ratio=cruise_ratio)
+# EBT обучается оценивать точки на траекториях разного типа
+```
+
 ---
 
 ## 9. Механизм контекста и памяти диалога
@@ -666,17 +692,58 @@ def inertial_langevin(V_init, ebt, V_query, max_steps=500):
 
 ### 9.2 Архитектура кэша
 
+> **Ревью-заметка (v1.1):** Исходная схема предполагала 1:1 (один query — один answer). В реальном диалоге на один вопрос может быть несколько ответов (уточнения, дополнения, корректировки). Архитектура обновлена для поддержки multi-answer слотов.
+
 ```
 Context Cache (в 1024d SONAR-пространстве):
-┌─────────────────────────────────────────────┐
-│  Slot 1: V_q1 (1024d) │ V_a1 (1024d)       │
-│  Slot 2: V_q2 (1024d) │ V_a2 (1024d)       │
-│  ...                                         │
-│  Slot N: V_qN (1024d) │ V_aN (1024d)        │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Slot 1: V_q1 (1024d) │ [V_a1_1, V_a1_2] (1024d each)     │  turn_id=0
+│  Slot 2: V_q2 (1024d) │ [V_a2_1]          (1024d)          │  turn_id=1
+│  ...                                                         │
+│  Slot N: V_qN (1024d) │ [V_aN_1, ..., V_aN_M] (1024d each) │  turn_id=N
+└──────────────────────────────────────────────────────────────┘
 
-Размер: 2 × 1024 × 4 bytes = 8 КБ на один обмен
-1000 обменов = 8 МБ (ничтожно)
+Размер: (1 + avg_answers) × 1024 × 4 bytes ≈ 12 КБ на один обмен (при avg 2 ответа)
+1000 обменов = 12 МБ (ничтожно)
+```
+
+**Ключевое свойство:** при сериализации в последовательность для attention сохраняется хронологический порядок и структура (query/answer type embeddings), чтобы attention мог восстановить, что к чему относится:
+
+```python
+@dataclass
+class CacheSlot:
+    query_vector: Tensor          # [1024]
+    answer_vectors: list[Tensor]  # каждый [1024], может быть несколько
+    turn_id: int                  # порядок в диалоге
+    timestamp: float
+
+class ContextCache:
+    def __init__(self, max_slots=1000):
+        self.slots: list[CacheSlot] = []
+
+    def add(self, V_query, V_answer, turn_id):
+        """Добавляет ответ. Если query уже есть — append к существующему слоту."""
+        for slot in self.slots:
+            if torch.cosine_similarity(slot.query_vector, V_query, dim=0) > 0.98:
+                slot.answer_vectors.append(V_answer)
+                return
+        self.slots.append(CacheSlot(V_query, [V_answer], turn_id, time.time()))
+
+    def to_sequence(self, slots: list[CacheSlot]) -> tuple[Tensor, Tensor]:
+        """
+        Разворачивает слоты в упорядоченную последовательность.
+        Returns:
+            vectors: [seq_len, 1024]
+            type_ids: [seq_len] — 0 для query, 1 для answer
+        """
+        vectors, type_ids = [], []
+        for slot in sorted(slots, key=lambda s: s.turn_id):
+            vectors.append(slot.query_vector)
+            type_ids.append(0)
+            for ans in slot.answer_vectors:
+                vectors.append(ans)
+                type_ids.append(1)
+        return torch.stack(vectors), torch.tensor(type_ids)
 ```
 
 ### 9.3 Где ловить вектор для кэша
@@ -695,42 +762,95 @@ Context Cache (в 1024d SONAR-пространстве):
 def get_context(V_query_new, cache, top_k=5):
     """
     Находит top-K наиболее релевантных прошлых обменов.
-    Возвращает список пар (V_query, V_answer).
+    Возвращает слоты отсортированные хронологически (по turn_id).
     """
-    if len(cache) == 0:
+    if len(cache.slots) == 0:
         return []
 
-    all_queries = torch.stack([slot.V_query for slot in cache])
-    # Cosine similarity в SONAR-пространстве уже семантически осмысленна
+    all_queries = torch.stack([slot.query_vector for slot in cache.slots])
     similarities = F.cosine_similarity(
         V_query_new.unsqueeze(0), all_queries, dim=-1
     )
-    top_indices = torch.topk(similarities, min(top_k, len(cache))).indices
+    top_indices = torch.topk(similarities, min(top_k, len(cache.slots))).indices
 
-    context = []
-    for idx in top_indices:
-        context.append(cache[idx].V_query)
-        context.append(cache[idx].V_answer)
+    selected_slots = [cache.slots[idx] for idx in top_indices]
+    # Сортируем по turn_id для хронологического порядка
+    selected_slots.sort(key=lambda s: s.turn_id)
 
-    return context  # [V_q_rel1, V_a_rel1, V_q_rel2, V_a_rel2, ...]
+    return selected_slots
 ```
 
 ### 9.5 Подача контекста в Predictor
 
-Predictor получает на вход не просто V_query, а конкатенацию/агрегацию контекста:
+> **Ревью-заметка (v1.1):** Выбран Вариант 2 (Attention-based агрегация) с элементами MHLA (Multi-Head Latent Attention) из DeepSeek. Вариант 1 (конкатенация + MLP) не масштабируется при переменном числе контекстных векторов и не сохраняет структуру диалога.
+
+**Выбранная архитектура: MHLA-inspired Context Aggregator**
+
+Ключевая идея заимствована у DeepSeek MHLA: вместо полного attention на все контекстные вектора, сначала **сжимаем KV через learned compression** в меньшее число "слотов", потом делаем attention по слотам. У нас это проще, чем у DeepSeek, потому что вектора уже в компактном 1024d (нет раздутых KV-кэшей на тысячи токенов).
 
 ```python
-# Вариант 1: Конкатенация + MLP
-context_vectors = get_context(V_query, cache, top_k=5)  # 10 векторов
-V_context = torch.cat([V_query] + context_vectors, dim=-1)  # 1024 * 11 = 11264d
-V_init = predictor_with_context(V_context)  # Linear(11264, 1024) + MLP
+class ContextAggregator(nn.Module):
+    """
+    MHLA-inspired attention агрегация контекста.
 
-# Вариант 2: Attention-based агрегация (лучше)
-# Маленький трансформер (2 слоя) обрабатывает последовательность
-context_seq = torch.stack([V_query] + context_vectors)  # [11, 1024]
-V_aggregated = context_transformer(context_seq)  # [1, 1024] (CLS output)
-V_init = predictor(V_aggregated)
+    Преимущества перед простой конкатенацией:
+    1. Масштабируется на произвольное число контекстных векторов
+    2. Type embeddings (query=0, answer=1) сохраняют структуру диалога
+    3. KV-compression позволяет обрабатывать длинные истории без квадратичного роста
+    """
+    def __init__(self, dim=1024, n_heads=8, n_layers=2, n_compress_slots=16):
+        super().__init__()
+        # Type embedding: query=0, answer=1
+        self.type_embedding = nn.Embedding(2, dim)
+
+        # KV compression (MHLA-inspired):
+        # Learned query-slots сжимают произвольно длинную историю
+        # в фиксированное число n_compress_slots векторов
+        self.compress_slots = nn.Parameter(torch.randn(1, n_compress_slots, dim))
+        self.kv_compressor = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=n_heads, batch_first=True
+        )
+
+        # Main attention: current query attends to compressed context
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=n_heads, dim_feedforward=dim * 2,
+            dropout=0.1, activation='gelu', batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def forward(self, V_query, context_vectors, type_ids):
+        """
+        V_query: [batch, 1024] — текущий запрос
+        context_vectors: [batch, seq_len, 1024] — контекст из кэша
+        type_ids: [batch, seq_len] — 0 для query, 1 для answer
+
+        Returns: [batch, 1024] — агрегированный контекст для Predictor
+        """
+        # 1. Добавить type embeddings
+        ctx = context_vectors + self.type_embedding(type_ids)
+
+        # 2. KV compression: сжимаем контекст в n_compress_slots векторов
+        batch_size = ctx.size(0)
+        slots = self.compress_slots.expand(batch_size, -1, -1)
+        compressed, _ = self.kv_compressor(
+            query=slots, key=ctx, value=ctx
+        )  # [batch, n_compress_slots, 1024]
+
+        # 3. Prepend current query, apply transformer
+        full_seq = torch.cat([V_query.unsqueeze(1), compressed], dim=1)
+        out = self.transformer(full_seq)
+
+        # 4. Вытаскиваем позицию query (индекс 0)
+        return out[:, 0, :]  # [batch, 1024]
 ```
+
+**Сравнение с альтернативами:**
+
+| Подход | Плюсы | Минусы |
+|--------|-------|--------|
+| Конкатенация + MLP | Просто | Фиксированная длина, не масштабируется |
+| Vanilla Transformer | Гибко | O(N²) при длинной истории |
+| **MHLA-inspired (выбрано)** | O(N × S) где S — число слотов, масштабируемо | Чуть сложнее в реализации |
 
 ### 9.6 Преимущества перед LLM-подходом
 
