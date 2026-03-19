@@ -6,11 +6,15 @@
 **Статус:** Концептуальное проектирование → Proof of Concept
 
 > **Changelog v1.2 (19.03.2026):**
-> - Добавлен §9.7 «Масштабирование на длинные контексты (50K–100K предложений)» — HierarchicalContextAggregator, efficient attention стек, линейные альтернативы
-> - Обновлён глоссарий: FlashAttention, FlexAttention, SDPA, Linear Attention, GLA, Gated DeltaNet, FAISS, HNSW
-> - Добавлен Milestone 6 (масштабирование контекста) в Roadmap
-> - Обновлены Приложения B (зависимости) и C (архитектурные решения)
-> - Заметки по позиционному кодированию для длинных контекстов (ALiBi, YaRN)
+> - Добавлен §9.7 «Масштабирование на длинные контексты (50K–100K предложений)»:
+>   - HierarchicalContextAggregator (3 уровня: sliding window + FAISS retrieval + global slots)
+>   - Token Merging — предварительная дедупликация предложений (2–3× сжатие)
+>   - GQA (4:1 ratio) и MLA (low-rank KV compression) для оптимизации attention
+>   - Полная оценка memory budget для RTX 4090 (~4 GB из 24 GB)
+>   - Efficient attention стек: PyTorch SDPA, FlexAttention, FAISS, FLA
+>   - Линейные альтернативы (GLA, Gated DeltaNet) для Predictor
+> - Позиционное кодирование: ALiBi рекомендован для длинных контекстов (сохраняет геометрию SONAR)
+> - Обновлён глоссарий (+15 терминов), Milestone 6, Приложения B и C
 
 ---
 
@@ -111,6 +115,8 @@ CEBCM расширяет JEPA, используя энергетическую �
 | **ALiBi** | Attention with Linear Biases — позиционное кодирование через additive bias −m\|i−j\| к attention scores. Не модифицирует вектора, хорошая экстраполяция |
 | **YaRN** | Yet another RoPE extensioN — расширение RoPE для длинных контекстов. Комбинирует linear interpolation, NTK-aware scaling и temperature correction |
 | **FIRE** | Functional Interpolation Relative Encoding — learned function f(log\|i−j\|) для позиционных biases, хорошая экстраполяция |
+| **MLA** | Multi-head Latent Attention (DeepSeek) — сжимает KV в low-rank latent через down-projection, 8–16× экономия KV-памяти |
+| **Token Merging** | Предварительная кластеризация семантически дублирующихся элементов с заменой на weighted centroids. 2–3× сжатие |
 
 ---
 
@@ -949,6 +955,50 @@ class ContextAggregator(nn.Module):
 
 **Итого:** каждый query-вектор внимателен к ~200 векторам (128 + 64 + 32) вместо 100K. **Speedup: ~500×** по сравнению с full attention.
 
+**Предварительный этап: Token Merging (дедупликация предложений)**
+
+Перед подачей в HierarchicalContextAggregator рекомендуется пре-кластеризация семантически дублирующихся предложений. В документе на 50K предложений до 30–60% могут быть парафразами или близкими по смыслу:
+
+```python
+def merge_similar_sentences(vectors, threshold=0.95):
+    """
+    Кластеризует SONAR-вектора с cosine similarity > threshold.
+    Заменяет кластеры на weighted centroids.
+    Типичное сжатие: 2–3× для длинных документов.
+    """
+    norms = F.normalize(vectors, dim=-1)
+    # FAISS clustering: быстрее, чем pairwise comparison
+    ncentroids = max(vectors.size(0) // 3, 1000)
+    kmeans = faiss.Kmeans(vectors.size(-1), ncentroids, niter=10, gpu=True)
+    kmeans.train(vectors.numpy())
+    _, assignments = kmeans.assign(vectors.numpy())
+
+    # Внутри каждого кластера: merge если cos_sim > threshold
+    merged, weights = [], []
+    for c in range(ncentroids):
+        mask = assignments == c
+        cluster = vectors[mask]
+        if len(cluster) <= 1:
+            merged.append(cluster[0])
+            weights.append(1)
+            continue
+        # Merge near-duplicates, keep distinct vectors
+        centroid = cluster.mean(dim=0)
+        sims = F.cosine_similarity(centroid.unsqueeze(0), cluster, dim=-1)
+        near_dupes = sims > threshold
+        if near_dupes.sum() > 1:
+            merged.append(cluster[near_dupes].mean(dim=0))
+            weights.append(near_dupes.sum().item())
+        distinct = cluster[~near_dupes]
+        for v in distinct:
+            merged.append(v)
+            weights.append(1)
+
+    return torch.stack(merged), torch.tensor(weights)
+```
+
+Этот этап использует тот же FAISS-индекс, что и Level 2 retrieval. Spectrum-Preserving Token Merging (NeurIPS 2024) предлагает более продвинутый подход через spectral graph theory, сохраняющий «уникальные» предложения при агрессивном слиянии похожих.
+
 ```python
 class HierarchicalContextAggregator(nn.Module):
     """
@@ -1065,23 +1115,50 @@ class HierarchicalContextAggregator(nn.Module):
         )
 ```
 
-#### 9.7.4 Оценка ресурсов (RTX 4090, 24GB VRAM)
+#### 9.7.4 Оптимизация attention: GQA и MLA
+
+**GQA (Grouped Query Attention)** — простая оптимизация для transformer-слоёв ContextAggregator:
+- 8 query heads, 2 KV heads (ratio 4:1) → 75% сокращение KV-памяти
+- Практически нулевая деградация качества
+- Встроена в PyTorch через `nn.MultiheadAttention` (параметр `kdim`/`vdim`)
+- Рекомендация: использовать по умолчанию во всех transformer-слоях агрегатора
+
+**MLA (Multi-head Latent Attention, DeepSeek-стиль)** — для продвинутой оптимизации:
+- Вместо хранения полных K/V матриц, сжимаем вход в low-rank latent c_t через down-projection W_DKV
+- При attention: up-projection восстанавливает K/V из c_t
+- Сжатие 8–16× (с 2×1024 = 2048 до 128–256 floats на предложение)
+- Философски выровнено с CEBCM: вся система работает в латентных пространствах
+- **Рекомендация:** рассмотреть при углублении агрегатора (>4 слоёв) или при batch-обработке
+
+#### 9.7.5 Оценка ресурсов (RTX 4090, 24GB VRAM)
 
 ```
-100K предложений × 1024d × 4 bytes (FP32) = 400 MB (хранение)
-С BF16: 200 MB
+Компонент                              FP16        С оптимизациями
+──────────────────────────────────────────────────────────────────
+SONAR encoder (замороженный)           ~1.0 GB     1.0 GB
+EBT (2–4 слоя)                        ~0.1 GB     0.1 GB
+Predictor                              ~0.2 GB     0.2 GB
+100K sentence store                    0.4 GB      0.2 GB (INT8)
+KV cache (transformer агрегатора)      0.4 GB      0.05 GB (MLA, 256d latent)
+FAISS HNSW index                       ~0.8 GB     0.8 GB
+Global compression slots               <0.01 GB    <0.01 GB
+PyTorch/CUDA overhead                  ~1.5 GB     1.5 GB
+──────────────────────────────────────────────────────────────────
+Итого                                  ~4.4 GB     ~3.9 GB
+Headroom для градиентов (Langevin)     ~19 GB      ~20 GB
+```
 
-FlashAttention-2 working memory (sliding window w=128): пренебрежимо
-Модель (4-layer transformer, 1024d, 8 heads): ~50–100M params = 200–400 MB
+**Ключевой вывод:** память НЕ является bottleneck. Основная проблема — **compute** (O(N²) attention). Поэтому приоритет отдаётся методам, сокращающим effective sequence length (token merging, hierarchical sparse attention), а не сжатию KV storage.
 
-Итого: ~1–2 GB — хорошо в пределах 24 GB бюджета.
-
+```
 Compute per forward pass (100K vectors):
   Full attention: 100K × 100K × 1024 ≈ 10 TFLOPS  (>100 sec на 4090)
-  Hierarchical:   100K × 200 × 1024 ≈ 20 GFLOPS   (~0.25 ms на 4090)
+  After token merging (3× reduction): 33K → still O(N²) → ~1.1 TFLOPS
+  Hierarchical sparse: 100K × 200 × 1024 ≈ 20 GFLOPS (~0.25 ms на 4090)
+  Hierarchical + merging: 33K × 200 × 1024 ≈ 7 GFLOPS (~0.09 ms на 4090)
 ```
 
-#### 9.7.5 Стек реализации
+#### 9.7.6 Стек реализации
 
 | Инструмент | Назначение | Версия |
 |------------|-----------|--------|
@@ -1091,7 +1168,7 @@ Compute per forward pass (100K vectors):
 | **FLA** (`pip install fla-core`) | Опционально: GLA/Gated DeltaNet для Predictor backbone | Для экспериментов |
 | **xFormers** (`pip install xformers`) | Альтернатива: memory-efficient attention со structured sparsity | Для экспериментов |
 
-#### 9.7.6 Линейные альтернативы для Predictor
+#### 9.7.7 Линейные альтернативы для Predictor
 
 Для **Predictor** (который обрабатывает контекст последовательно для генерации V_init) можно рассмотреть линейные модели attention как backbone:
 
@@ -1105,14 +1182,14 @@ Compute per forward pass (100K vectors):
 
 **Рекомендация:** гибридная архитектура — GLA/Gated DeltaNet backbone + 1–2 слоя full attention для critical retrieval — даёт лучшее соотношение качества и скорости.
 
-#### 9.7.7 Масштабирование на multi-GPU (после PoC)
+#### 9.7.8 Масштабирование на multi-GPU (после PoC)
 
 При переходе на 4–8 GPU для production:
 - **Ring Attention** позволяет делать exact full attention, распределяя N/num_GPU предложений на каждый GPU
 - **Striped Attention** улучшает load balancing при bidirectional attention (до 1.45× throughput)
 - Реализации: [ring-flash-attention](https://github.com/zhuzilin/ring-flash-attention), [ring-attention-pytorch](https://github.com/lucidrains/ring-attention-pytorch)
 
-#### 9.7.8 Валидация: «Attention over Sentence Embeddings»
+#### 9.7.9 Валидация: «Attention over Sentence Embeddings»
 
 Подход CEBCM валидирован работой **"Attention over pre-trained Sentence Embeddings for Long Document Classification"** (Abdaoui & Dutta, 2023, arXiv:2307.09084): pre-encode предложения sentence transformer'ом, затем применить attention поверх sentence-векторов. Авторы показали конкурентные результаты с fine-tuning при линейном масштабировании по длине документа.
 
@@ -1886,6 +1963,8 @@ pip install tqdm wandb
 | FlashAttention | PyTorch SDPA (встроенный, FA2 на Ampere) | Сторонние FA3/FA4 требуют Hopper GPU, которого нет в PoC |
 | Positional encoding (Chain Head) | RoPE | Цепочки 5–20 элементов, стандартный RoPE достаточен |
 | Positional encoding (Context, масштаб) | ALiBi (основной) | RoPE вращает вектора, нарушая семантическую геометрию SONAR. ALiBi сохраняет эмбеддинги нетронутыми |
+| Token pre-processing | Token Merging (FAISS clustering + cosine dedup) | SONAR-пространство идеально калибровано для семантической дедупликации. 2–3× сжатие без потери информации |
+| KV optimization | GQA 4:1 (PoC), MLA (scale) | MQA слишком агрессивен для EBT-критика. MLA философски выровнена с latent-space подходом |
 
 ---
 
