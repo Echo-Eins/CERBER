@@ -18,7 +18,9 @@
 | Датасет QA | SQuAD v2 → SONAR vectors | ~100K QA-пар, быстро скачать/закодировать |
 | Inertial Navigation | Гиперпараметр `cruise_ratio` + train-time sampling | Модель тренируется в тех же режимах, в которых работает |
 | Кэш контекста | Multi-answer: V_query → [V_answer₁, V_answer₂, ...] | Реальный диалог ≠ 1:1 |
-| Агрегация контекста | Attention-based с MHLA-inspired compression | Масштабируемо, не ломает понимание структуры диалога |
+| Агрегация контекста | PoC: MHLA-inspired compression. Scale: Hierarchical Sparse (window + retrieval + global) | PoC: простота. Scale: O(N×200) вместо O(N²) при 50K–100K предложений |
+| Attention backend | PyTorch SDPA (автоматический FlashAttention-2) + FlexAttention | Встроен в PyTorch 2.x, нулевые доп. зависимости, FA2 на Ampere GPUs |
+| Линейный attention (Predictor) | GLA / Gated DeltaNet через FLA library (опционально) | Лучшее качество среди линейных моделей; не подходит для EBT (нужен bidirectional) |
 
 ---
 
@@ -44,7 +46,8 @@ CERBER/
 │   │   ├── __init__.py
 │   │   ├── energy.py                  # EBT_PairwiseHead, EBT_ChainHead, EBT
 │   │   ├── predictor.py               # SimplePredictor (MLP)
-│   │   ├── context.py                 # ContextCache, ContextAggregator (MHLA-style attention)
+│   │   ├── context.py                 # ContextCache, ContextAggregator, HierarchicalContextAggregator
+│   │   ├── faiss_index.py             # FAISSIndexManager для семантического retrieval (Level 2)
 │   │   └── sonar_wrapper.py           # Обёртка над SONAR encoder/decoder
 │   │
 │   ├── training/                      # Обучение
@@ -500,40 +503,31 @@ class ContextCache:
         ...
 ```
 
-### 3.2 Context Aggregator (MHLA-inspired)
+### 3.2 Context Aggregator (двухфазная стратегия)
+
+> **Обновлено (v1.2):** По результатам исследования efficient attention (март 2026). Для PoC используется простой MHLA-inspired агрегатор (§9.5 спецификации). Для масштабирования — HierarchicalContextAggregator (§9.7.3 спецификации).
 
 ```python
 # cebcm/models/context.py
 
+# === Фаза PoC: Простой агрегатор (до ~1000 контекстных векторов) ===
+
 class ContextAggregator(nn.Module):
     """
-    Attention-based агрегация контекста для Predictor.
-
-    Вдохновлена MHLA (DeepSeek):
-    - KV-compression: сжимаем длинную историю в меньшее число "слотов"
-      через learned down-projection перед attention
-    - Это позволяет масштабировать кэш без квадратичного роста
-
-    Input: [V_query, V_ctx1, V_ctx2, ...] — последовательность 1024d векторов
-    Output: V_aggregated [1024] — готовый вход для Predictor
+    MHLA-inspired attention агрегация контекста для Predictor.
+    Подходит для PoC (десятки–сотни обменов).
+    Для масштабирования на 50K+ используется HierarchicalContextAggregator.
     """
     def __init__(self, dim=1024, n_heads=8, n_layers=2,
-                 compress_ratio=4):
+                 n_compress_slots=16):
         super().__init__()
-        # Type embedding: query=0, answer=1 (чтобы attention знал структуру)
         self.type_embedding = nn.Embedding(2, dim)
-
-        # KV compression (MHLA-inspired)
-        # Вместо attention на 50+ сырых векторов —
-        # сжимаем KV в (N/compress_ratio) слотов через cross-attention
+        self.compress_slots = nn.Parameter(
+            torch.randn(1, n_compress_slots, dim)
+        )
         self.kv_compressor = nn.MultiheadAttention(
             embed_dim=dim, num_heads=n_heads, batch_first=True
         )
-        self.compress_queries = nn.Parameter(
-            torch.randn(1, dim // compress_ratio, dim)
-        )  # learned query slots для compression
-
-        # Main attention
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim, nhead=n_heads, dim_feedforward=dim*2,
             dropout=0.1, activation='gelu', batch_first=True
@@ -542,15 +536,14 @@ class ContextAggregator(nn.Module):
             encoder_layer, num_layers=n_layers
         )
 
-    def forward(self, query: Tensor, context_seq: Tensor,
-                type_ids: Tensor) -> Tensor:
-        """
-        query: [batch, 1024]
-        context_seq: [batch, seq_len, 1024]
-        type_ids: [batch, seq_len] — 0 для query, 1 для answer
-        Returns: [batch, 1024]
-        """
+    def forward(self, query, context_seq, type_ids):
         ...  # Реализация при полной сборке пайплайна
+
+
+# === Масштабирование: Иерархический агрегатор (50K–100K предложений) ===
+# См. §9.7.3 спецификации — HierarchicalContextAggregator
+# Реализуется на Milestone 6 (недели 14–17).
+# Стек: PyTorch SDPA + FlexAttention (sliding window) + FAISS (retrieval).
 ```
 
 ### 3.3 Inference Pipeline (скелет)
@@ -655,6 +648,85 @@ cruise_ratio = random.choice([0.0, 0.0, 0.3, 0.5])  # bias к 0.0
 
 ---
 
+### Фаза 5: Масштабирование контекста (после PoC, 2–3 недели)
+
+> **Добавлено (v1.2):** На основе исследования efficient attention. Реализуется после успешного завершения Фазы 4 (QA PoC).
+
+**Цель:** масштабировать ContextAggregator до 50K–100K предложений на одной RTX 4090.
+
+#### 5.1 Hierarchical Context Aggregator
+
+- [ ] `cebcm/models/context.py` — `HierarchicalContextAggregator`:
+  - Level 1: Sliding window attention (w=128) через FlexAttention
+  - Level 2: FAISS HNSW retrieval (K=64)
+  - Level 3: Global compressed slots (S=32)
+  - Использует `torch.nn.functional.scaled_dot_product_attention` (автоматический FA2)
+
+- [ ] Интеграция с `CEBCMPipeline`:
+  ```python
+  # В pipeline.py: автоматический выбор агрегатора
+  if len(context_vectors) > 1000:
+      aggregator = self.hierarchical_aggregator
+  else:
+      aggregator = self.simple_aggregator
+  ```
+
+#### 5.2 FAISS Index Management
+
+- [ ] `cebcm/models/faiss_index.py`:
+  ```python
+  class FAISSIndexManager:
+      """Управляет FAISS индексом для семантического retrieval."""
+      def __init__(self, dim=1024, use_gpu=True):
+          self.index = faiss.IndexHNSWFlat(dim, 32)  # HNSW с 32 связями
+          if use_gpu:
+              self.index = faiss.index_cpu_to_gpu(
+                  faiss.StandardGpuResources(), 0, self.index
+              )
+
+      def add(self, vectors: Tensor):
+          """Добавляет вектора в индекс."""
+
+      def search(self, query: Tensor, k: int) -> tuple[Tensor, Tensor]:
+          """Возвращает top-K ближайших. O(log N)."""
+  ```
+
+#### 5.3 Эксперименты с линейным attention
+
+- [ ] Опциональный эксперимент: GLA/Gated DeltaNet как backbone Predictor:
+  ```python
+  # Через FLA library (pip install fla-core)
+  from fla.layers import GatedLinearAttention
+
+  class LinearPredictor(nn.Module):
+      """Predictor с GLA вместо standard attention."""
+      def __init__(self, dim=1024, n_layers=4, n_heads=8):
+          ...
+  ```
+  Сравнить с Transformer-Predictor по: качество (cosine sim), скорость, memory.
+
+#### 5.4 Бенчмаркинг
+
+- [ ] Тест масштабирования:
+  ```
+  Для N в [1K, 5K, 10K, 50K, 100K]:
+    Замерить: latency (ms), VRAM (MB), quality (cosine sim)
+    Для каждого подхода:
+      - Full attention (baseline, до OOM)
+      - Hierarchical sparse (window=128, K=64, S=32)
+      - Только sliding window (без retrieval)
+      - Только retrieval (без window)
+  ```
+
+- [ ] Ablation по гиперпараметрам:
+  ```
+  window_size: [64, 128, 256]
+  n_retrieved: [16, 32, 64, 128]
+  n_global_slots: [8, 16, 32, 64]
+  ```
+
+---
+
 ## 5. Логирование и метрики
 
 ### 5.1 Wandb Integration
@@ -702,6 +774,8 @@ torch.save({
 | Фаза 3: Denoising PoC | 2–3 дня | Фазы 1-2 |
 | Фаза 4: EBT QA | 7–14 дней | Фазы 1-3, время обучения |
 | **Итого до первых результатов** | **~3-4 недели** | |
+| Фаза 5: Масштабирование контекста | 2–3 недели | Успешная Фаза 4 |
+| **Итого до production-ready контекста** | **~6-7 недель** | |
 
 ---
 

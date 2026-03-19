@@ -1,9 +1,16 @@
 # CEBCM — Concept-Driven Energy-Based Coding Machine
 ## Полная техническая спецификация проекта
 
-**Версия:** 1.0  
-**Дата:** 18 марта 2026  
-**Статус:** Концептуальное проектирование → Proof of Concept  
+**Версия:** 1.2
+**Дата:** 19 марта 2026
+**Статус:** Концептуальное проектирование → Proof of Concept
+
+> **Changelog v1.2 (19.03.2026):**
+> - Добавлен §9.7 «Масштабирование на длинные контексты (50K–100K предложений)» — HierarchicalContextAggregator, efficient attention стек, линейные альтернативы
+> - Обновлён глоссарий: FlashAttention, FlexAttention, SDPA, Linear Attention, GLA, Gated DeltaNet, FAISS, HNSW
+> - Добавлен Milestone 6 (масштабирование контекста) в Roadmap
+> - Обновлены Приложения B (зависимости) и C (архитектурные решения)
+> - Заметки по позиционному кодированию для длинных контекстов (ALiBi, YaRN)
 
 ---
 
@@ -91,6 +98,19 @@ CEBCM расширяет JEPA, используя энергетическую �
 | **RoPE** | Rotary Position Embedding — позиционное кодирование через вращение векторов в подпространствах |
 | **GQA** | Grouped Query Attention — оптимизация, где несколько Q-головок разделяют общие K,V матрицы |
 | **MoE** | Mixture of Experts — архитектура, где router направляет токен только к 2 из N экспертов (FFN-блоков) |
+| **FlashAttention** | IO-aware exact attention, не материализующий N×N матрицу в HBM. Memory O(N) вместо O(N²), compute остаётся O(N²) |
+| **FlexAttention** | PyTorch API для произвольных block-sparse масок attention с компилированной эффективностью (sliding window, causal, etc.) |
+| **Sliding Window Attention** | Attention только к ±w ближайшим позициям. Complexity O(N×w). Captures локальную когерентность |
+| **Ring Attention** | Распределение exact attention по кольцу GPU. Каждый GPU хранит N/num_GPU элементов, KV блоки циркулируют по кольцу |
+| **Linear Attention** | Семейство моделей (GLA, Mamba, Gated DeltaNet), заменяющих quadratic attention на линейный recurrent state update O(N) |
+| **GLA** | Gated Linear Attention — линейный attention с diagonal data-dependent гейтированием. Библиотека: FLA |
+| **Gated DeltaNet** | Комбинация гейтирования и delta rule для targeted state updates. Лучшее качество среди линейных моделей (ICLR 2025) |
+| **FAISS** | Facebook AI Similarity Search — библиотека для быстрого поиска ближайших соседей в высокоразмерных пространствах |
+| **HNSW** | Hierarchical Navigable Small World — структура данных для approximate nearest neighbor search, O(log N) |
+| **SDPA** | Scaled Dot-Product Attention — стандартная реализация в PyTorch с автоматическим выбором backend (FlashAttention, efficient, math) |
+| **ALiBi** | Attention with Linear Biases — позиционное кодирование через additive bias −m\|i−j\| к attention scores. Не модифицирует вектора, хорошая экстраполяция |
+| **YaRN** | Yet another RoPE extensioN — расширение RoPE для длинных контекстов. Комбинирует linear interpolation, NTK-aware scaling и temperature correction |
+| **FIRE** | Functional Interpolation Relative Encoding — learned function f(log\|i−j\|) для позиционных biases, хорошая экстраполяция |
 
 ---
 
@@ -320,6 +340,23 @@ Input: [CLS, V_1, V_2, ..., V_n]  с позиционным кодировани
 ```
 
 **Attention здесь нужен** — он позволяет оценить, не противоречит ли шаг 5 шагу 2. Self-attention на 5–20 векторах — мгновенная операция (~0.01ms).
+
+> **Ревью-заметка (v1.2): Позиционное кодирование для разных компонентов**
+>
+> **Chain Head (5–20 элементов):** RoPE достаточен. Цепочки короткие, порядок шагов критически важен.
+>
+> **ContextAggregator при масштабировании (50K+ предложений):** Рекомендуется **ALiBi** (Attention with Linear Biases) как основной метод:
+> - Добавляет линейный bias −m|i−j| к attention scores (m — slope, уникальный для каждой head)
+> - **Критическое преимущество для SONAR:** ALiBi не модифицирует сами вектора (в отличие от RoPE, который вращает Q/K). Для pre-encoded семантических эмбеддингов это принципиально — вращение может нарушить геометрию семантического пространства SONAR
+> - Отличная экстраполяция: обучение на N, работа на 50K–100K с плавной деградацией
+> - Нулевые learned параметры, тривиальная реализация
+> - Естественный recency bias: близкие предложения важнее дальних (что совпадает с интуицией для диалога/документа)
+>
+> **Альтернативы (если ALiBi недостаточно выразителен):**
+> - **FIRE:** learned log-scaled bias function f(log|i−j|), сохраняет экстраполяцию при бóльшей выразительности
+> - **YaRN/NTK-aware RoPE:** если backbone pretrained с RoPE, применять только к **выделенному позиционному подпространству** (64–128 dims из 1024d), не вращая остальные измерения
+>
+> Для PoC (до ~1000 контекстных векторов) стандартный RoPE достаточен.
 
 ### 5.3 Обучение: специализированные функции энергии
 
@@ -846,11 +883,14 @@ class ContextAggregator(nn.Module):
 
 **Сравнение с альтернативами:**
 
-| Подход | Плюсы | Минусы |
-|--------|-------|--------|
-| Конкатенация + MLP | Просто | Фиксированная длина, не масштабируется |
-| Vanilla Transformer | Гибко | O(N²) при длинной истории |
-| **MHLA-inspired (выбрано)** | O(N × S) где S — число слотов, масштабируемо | Чуть сложнее в реализации |
+| Подход | Плюсы | Минусы | Масштаб |
+|--------|-------|--------|---------|
+| Конкатенация + MLP | Просто | Фиксированная длина, не масштабируется | До ~10 векторов |
+| Vanilla Transformer | Гибко | O(N²) при длинной истории | До ~1K векторов |
+| **MHLA-inspired (PoC)** | O(N × S) где S — число слотов | Теряет локальную структуру | До ~5K векторов |
+| **Hierarchical Sparse (§9.7.3)** | O(N × 200), сохраняет и локальное и глобальное | Сложнее в реализации | 50K–100K векторов |
+
+> **Ревью-заметка (v1.2):** Для PoC достаточно MHLA-inspired подхода выше. При масштабировании на длинные документы (50K+ предложений) переход на HierarchicalContextAggregator (§9.7) — см. трёхуровневую схему с sliding window + FAISS retrieval + global compression.
 
 ### 9.6 Преимущества перед LLM-подходом
 
@@ -861,6 +901,220 @@ class ContextAggregator(nn.Module):
 | Память | ~200 МБ KV-cache | ~0.8 МБ vector cache |
 | Релевантность | Вся история, включая нерелевантное | Только top-K релевантных |
 | Масштабируемость | Ограничена context window | Растёт линейно, retrieval O(log N) |
+
+### 9.7 Масштабирование на длинные контексты (50K–100K предложений)
+
+> **Ревью-заметка (v1.2):** Добавлен по результатам исследования efficient attention механизмов (март 2026). Критически важен для работы с книгами, длинными документами и длительными диалогами.
+
+#### 9.7.1 Проблема масштаба
+
+При работе с длинными документами (книга ~50K предложений) или длительными диалогами (тысячи обменов) ContextAggregator из §9.5 сталкивается с квадратичной сложностью attention: O(N²) при N = 50K–100K. На одной RTX 4090 это нереализуемо в наивном виде.
+
+**Ключевое отличие от LLM:** CEBCM оперирует **предложениями** (1024d SONAR-вектора), а не токенами (~128d). Это означает:
+- Sequence length N = количество предложений (50K–100K)
+- Каждый элемент — полноценный семантический вектор, уже содержащий смысл
+- Нет autoregressive/causal ограничений — bidirectional attention допустим
+- Можно применять любые механизмы attention поверх pre-encoded векторов
+
+#### 9.7.2 Анализ подходов
+
+| Подход | Сложность | Качество | Применимость к PoC (1×4090) |
+|--------|-----------|----------|----------------------------|
+| **FlashAttention-2** (через PyTorch SDPA) | O(N²) compute, O(N) memory | Точное | До ~50K (borderline) |
+| **Sliding Window + Retrieval** | O(N × (w + K)) | Высокое (~99% full attention) | Да, основной подход |
+| **Hierarchical / Multi-Scale** | O(N log N) | Высокое | Да, естественно для предложений |
+| **Linear Attention** (GLA, Gated DeltaNet) | O(N × d × state) | Среднее-высокое | Для Predictor, не для EBT |
+| **Ring Attention** | O(N² / num_GPU) | Точное | Нет (multi-GPU) |
+
+#### 9.7.3 Выбранная архитектура: Hierarchical Sparse Attention
+
+Рекомендуемый подход для ContextAggregator при масштабировании — трёхуровневая иерархическая схема, комбинирующая локальное внимание, семантический retrieval и глобальное сжатие:
+
+```
+Уровень 1 — Локальное внимание (Sliding Window):
+  Каждое предложение внимательно к ±64 соседним предложениям
+  Captures: когерентность текста, локальные связи
+  Complexity: O(N × w), w = 128
+
+Уровень 2 — Семантический retrieval (FAISS top-K):
+  Для каждого запроса находим 32–64 семантически ближайших предложения
+  Captures: тематические связи через весь документ
+  Complexity: O(N × K), K = 32–64, поиск O(log N) через FAISS HNSW
+
+Уровень 3 — Глобальные summary-токены:
+  16–32 learned compressed slots (как в §9.5) агрегируют всю историю
+  Captures: общий контекст документа/диалога
+  Complexity: O(N × S), S = 16–32
+```
+
+**Итого:** каждый query-вектор внимателен к ~200 векторам (128 + 64 + 32) вместо 100K. **Speedup: ~500×** по сравнению с full attention.
+
+```python
+class HierarchicalContextAggregator(nn.Module):
+    """
+    Трёхуровневая агрегация контекста для масштабирования до 100K предложений.
+
+    Уровень 1: Sliding window attention (локальная когерентность)
+    Уровень 2: FAISS-retrieved attention (семантические связи)
+    Уровень 3: Compressed global slots (общий контекст)
+
+    Total effective attention per query: ~200 vectors вместо 100K.
+    Memory: O(N × d) для хранения + O(batch × 200 × d) для attention.
+    """
+    def __init__(self, dim=1024, n_heads=8, n_layers=2,
+                 window_size=128, n_retrieved=64, n_global_slots=32):
+        super().__init__()
+        self.window_size = window_size
+        self.n_retrieved = n_retrieved
+
+        # Type embedding: query=0, answer=1
+        self.type_embedding = nn.Embedding(2, dim)
+
+        # Positional encoding для sliding window (relative)
+        self.local_pos_embedding = nn.Embedding(window_size + 1, dim)
+
+        # Global compression slots (Level 3)
+        self.global_slots = nn.Parameter(torch.randn(1, n_global_slots, dim))
+        self.global_compressor = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=n_heads, batch_first=True
+        )
+
+        # Main transformer: processes [query, local_ctx, retrieved_ctx, global_ctx]
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=n_heads, dim_feedforward=dim * 2,
+            dropout=0.1, activation='gelu', batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def forward(self, V_query, all_vectors, type_ids, query_position,
+                faiss_index=None):
+        """
+        V_query: [batch, 1024]
+        all_vectors: [batch, N, 1024] — все предложения документа/диалога
+        type_ids: [batch, N]
+        query_position: [batch] — позиция текущего запроса в последовательности
+        faiss_index: опциональный FAISS индекс для Level 2
+
+        Returns: [batch, 1024]
+        """
+        batch_size, N, dim = all_vectors.shape
+
+        # Добавить type embeddings
+        typed_vectors = all_vectors + self.type_embedding(type_ids)
+
+        # === Level 1: Sliding Window ===
+        # Извлекаем окно ±window_size//2 вокруг query_position
+        half_w = self.window_size // 2
+        local_ctx = self._extract_window(typed_vectors, query_position, half_w)
+        # [batch, window_size, dim]
+
+        # === Level 2: FAISS Retrieval ===
+        if faiss_index is not None:
+            retrieved_ctx = self._retrieve_topk(
+                V_query, all_vectors, faiss_index
+            )  # [batch, n_retrieved, dim]
+        else:
+            # Fallback: cosine similarity top-K
+            retrieved_ctx = self._cosine_topk(V_query, typed_vectors)
+
+        # === Level 3: Global Compression ===
+        slots = self.global_slots.expand(batch_size, -1, -1)
+        global_ctx, _ = self.global_compressor(
+            query=slots, key=typed_vectors, value=typed_vectors
+        )  # [batch, n_global_slots, dim]
+
+        # === Combine & Attend ===
+        combined = torch.cat([
+            V_query.unsqueeze(1),  # [batch, 1, dim]
+            local_ctx,             # [batch, window_size, dim]
+            retrieved_ctx,         # [batch, n_retrieved, dim]
+            global_ctx,            # [batch, n_global_slots, dim]
+        ], dim=1)
+
+        out = self.transformer(combined)
+        return out[:, 0, :]  # query position output
+
+    def _extract_window(self, vectors, positions, half_w):
+        """Извлекает sliding window вокруг каждой позиции."""
+        batch_size, N, dim = vectors.shape
+        windows = []
+        for b in range(batch_size):
+            pos = positions[b].item()
+            start = max(0, pos - half_w)
+            end = min(N, pos + half_w)
+            window = vectors[b, start:end]
+            # Pad если нужно
+            if window.size(0) < self.window_size:
+                pad = torch.zeros(
+                    self.window_size - window.size(0), dim,
+                    device=vectors.device
+                )
+                window = torch.cat([window, pad], dim=0)
+            windows.append(window[:self.window_size])
+        return torch.stack(windows)
+
+    def _cosine_topk(self, query, vectors):
+        """Fallback: top-K по cosine similarity."""
+        sims = F.cosine_similarity(
+            query.unsqueeze(1), vectors, dim=-1
+        )  # [batch, N]
+        _, indices = torch.topk(sims, self.n_retrieved, dim=-1)
+        return torch.gather(
+            vectors, 1,
+            indices.unsqueeze(-1).expand(-1, -1, vectors.size(-1))
+        )
+```
+
+#### 9.7.4 Оценка ресурсов (RTX 4090, 24GB VRAM)
+
+```
+100K предложений × 1024d × 4 bytes (FP32) = 400 MB (хранение)
+С BF16: 200 MB
+
+FlashAttention-2 working memory (sliding window w=128): пренебрежимо
+Модель (4-layer transformer, 1024d, 8 heads): ~50–100M params = 200–400 MB
+
+Итого: ~1–2 GB — хорошо в пределах 24 GB бюджета.
+
+Compute per forward pass (100K vectors):
+  Full attention: 100K × 100K × 1024 ≈ 10 TFLOPS  (>100 sec на 4090)
+  Hierarchical:   100K × 200 × 1024 ≈ 20 GFLOPS   (~0.25 ms на 4090)
+```
+
+#### 9.7.5 Стек реализации
+
+| Инструмент | Назначение | Версия |
+|------------|-----------|--------|
+| **PyTorch SDPA** (`torch.nn.functional.scaled_dot_product_attention`) | Базовый attention с автоматическим FlashAttention-2 на Ampere | PyTorch 2.x |
+| **FlexAttention** (`torch.nn.attention.flex_attention`) | Произвольные block-sparse маски с компилированной эффективностью | PyTorch 2.x |
+| **FAISS** (`faiss-gpu`) | Семантический retrieval top-K для Level 2 | Уже в зависимостях |
+| **FLA** (`pip install fla-core`) | Опционально: GLA/Gated DeltaNet для Predictor backbone | Для экспериментов |
+| **xFormers** (`pip install xformers`) | Альтернатива: memory-efficient attention со structured sparsity | Для экспериментов |
+
+#### 9.7.6 Линейные альтернативы для Predictor
+
+Для **Predictor** (который обрабатывает контекст последовательно для генерации V_init) можно рассмотреть линейные модели attention как backbone:
+
+| Модель | Тип гейтинга | Качество recall | Реализация |
+|--------|-------------|----------------|------------|
+| **Gated DeltaNet** (ICLR 2025) | Gating + delta rule | Лучшее среди линейных | [NVlabs/GatedDeltaNet](https://github.com/NVlabs/GatedDeltaNet) |
+| **GLA** | Diagonal data-dependent | Хорошее | FLA library |
+| **Mamba-2/3** | Scalar data-dependent | Хорошее | FLA library |
+
+**Ограничение:** линейные модели обрабатывают последовательность слева направо, накапливая фиксированный state. Для **EBT** (которому нужна глобальная bidirectional оценка) они не подходят. Для Predictor — потенциально хороший выбор.
+
+**Рекомендация:** гибридная архитектура — GLA/Gated DeltaNet backbone + 1–2 слоя full attention для critical retrieval — даёт лучшее соотношение качества и скорости.
+
+#### 9.7.7 Масштабирование на multi-GPU (после PoC)
+
+При переходе на 4–8 GPU для production:
+- **Ring Attention** позволяет делать exact full attention, распределяя N/num_GPU предложений на каждый GPU
+- **Striped Attention** улучшает load balancing при bidirectional attention (до 1.45× throughput)
+- Реализации: [ring-flash-attention](https://github.com/zhuzilin/ring-flash-attention), [ring-attention-pytorch](https://github.com/lucidrains/ring-attention-pytorch)
+
+#### 9.7.8 Валидация: «Attention over Sentence Embeddings»
+
+Подход CEBCM валидирован работой **"Attention over pre-trained Sentence Embeddings for Long Document Classification"** (Abdaoui & Dutta, 2023, arXiv:2307.09084): pre-encode предложения sentence transformer'ом, затем применить attention поверх sentence-векторов. Авторы показали конкурентные результаты с fine-tuning при линейном масштабировании по длине документа.
 
 ---
 
@@ -1523,11 +1777,21 @@ def evaluate_cebcm(test_pairs, predictor, ebt, encoder, decoder):
 - [ ] Реализовать Fast Shot и Deep Thinking режимы
 - [ ] End-to-end оценка на тестовых данных
 
-### Milestone 5: Оптимизация (недели 11–14)
+### Milestone 5: Оптимизация навигации (недели 11–13)
 - [ ] Inertial Navigation
 - [ ] Adaptive step size
 - [ ] RL для автоматического бюджета итераций
 - [ ] Benchmarking: скорость vs качество
+
+### Milestone 6: Масштабирование контекста (недели 14–17)
+- [ ] Реализовать HierarchicalContextAggregator (§9.7.3)
+- [ ] Sliding Window attention через FlexAttention
+- [ ] Интеграция FAISS HNSW для Level 2 retrieval
+- [ ] Global compression slots (Level 3)
+- [ ] Тестирование на документах 10K, 50K, 100K предложений
+- [ ] Ablation: sliding window size (64, 128, 256), retrieved K (32, 64, 128)
+- [ ] Эксперименты с линейными альтернативами (GLA / Gated DeltaNet) для Predictor
+- [ ] Memory profiling на RTX 4090
 
 ---
 
@@ -1594,9 +1858,15 @@ pip install faiss-gpu  # или faiss-cpu
 # Метрики
 pip install rouge-score nltk
 
+# Efficient Attention (опционально, для экспериментов)
+pip install xformers                 # Memory-efficient attention с structured sparsity
+pip install fla-core                 # Flash Linear Attention: GLA, Gated DeltaNet, Mamba и др.
+
 # Utility
 pip install tqdm wandb
 ```
+
+> **Заметка (v1.2):** PyTorch 2.x включает FlashAttention-2 через `torch.nn.functional.scaled_dot_product_attention` (SDPA) и FlexAttention через `torch.nn.attention.flex_attention` — дополнительных зависимостей для них не нужно. xFormers и FLA — опциональные альтернативы для продвинутых экспериментов.
 
 ---
 
@@ -1611,6 +1881,11 @@ pip install tqdm wandb
 | Контекст | Retrieval top-K из кэша | Не пересылаем весь диалог, только релевантное |
 | Attention в EBT | Только для Chain Scoring | Pairwise оценка не требует attention — экономия |
 | Кэш в пространстве | SONAR 1024d (после deprojector) | Единое пространство, нет drift между «памятью» и «речью» |
+| Attention для длинных контекстов | Hierarchical Sparse (window + retrieval + global slots) | Full attention O(N²) нереализуем при 50K+ предложений на 1 GPU. Ring Attention требует multi-GPU |
+| Линейный attention для Predictor | GLA / Gated DeltaNet (опционально) | Mamba менее экспрессивен; RetNet теряет информацию на длинных последовательностях |
+| FlashAttention | PyTorch SDPA (встроенный, FA2 на Ampere) | Сторонние FA3/FA4 требуют Hopper GPU, которого нет в PoC |
+| Positional encoding (Chain Head) | RoPE | Цепочки 5–20 элементов, стандартный RoPE достаточен |
+| Positional encoding (Context, масштаб) | ALiBi (основной) | RoPE вращает вектора, нарушая семантическую геометрию SONAR. ALiBi сохраняет эмбеддинги нетронутыми |
 
 ---
 
