@@ -20,7 +20,7 @@
 >   - GQA (4:1 ratio) и MLA (low-rank KV compression) для оптимизации attention
 >   - Полная оценка memory budget для RTX 4090 (~4 GB из 24 GB)
 >   - Efficient attention стек: PyTorch SDPA, FlexAttention, FAISS, FLA
->   - Линейные альтернативы (GLA, Gated DeltaNet) для Predictor
+>   - Линейные альтернативы (GLA, Gated DeltaNet) для IPP
 > - Позиционное кодирование: ALiBi рекомендован для длинных контекстов (сохраняет геометрию SONAR)
 > - Обновлён глоссарий (+15 терминов), Milestone 6, Приложения B и C
 
@@ -34,7 +34,7 @@
 4. [Слой 1: Латентный фундамент (Autoencoder + Latent Space)](#4-слой-1-латентный-фундамент)
 5. [Слой 2: Энергетический критик (EBT — Energy-Based Transformer)](#5-слой-2-энергетический-критик)
 6. [Слой 3: Генеративный принтер (Decoder + Adapter)](#6-слой-3-генеративный-принтер)
-7. [Predictor: Инициализация ответа в латентном пространстве](#7-predictor-инициализация-ответа)
+7. [IPP: Инициализация ответа в латентном пространстве](#7-ipp-инициализация-ответа)
 8. [Режимы инференса: Fast Shot и Deep Thinking](#8-режимы-инференса)
 9. [Механизм контекста и памяти диалога](#9-механизм-контекста-и-памяти-диалога)
 10. [Оптимизация навигации: за пределами градиентного спуска](#10-оптимизация-навигации)
@@ -84,7 +84,7 @@ CEBCM расширяет JEPA, используя энергетическую �
 | Компонент | Роль | Аналогия |
 |-----------|------|----------|
 | Autoencoder (SONAR) | Кодирование/декодирование | **Глаза и рот** |
-| Predictor (Base-LCM) | Черновик ответа | **Интуиция** |
+| IPP (Base-LCM) | Черновик ответа | **Интуиция** |
 | EBT (Energy Function) | Критик и навигатор | **Логика и совесть** |
 | Decoder | Превращение вектора в текст | **Руки** |
 
@@ -131,7 +131,8 @@ CEBCM расширяет JEPA, используя энергетическую �
 | **External Compaction** | Программный механизм сжатия контекста: модель генерирует summary-заметки для старых секций диалога |
 | **Titans** | Google Research architecture (arXiv:2501.00663): surprise-driven memory для test-time memorization |
 | **SSM (State Space Model)** | Класс моделей (Mamba, RWKV) с рекуррентным обновлением скрытого состояния. O(N) time, O(1) memory per step |
-
+| **IPP (Initialization Point Predictor)** | MLP/Transformer модуль, предсказывающий начальную точку (V_init) для навигации Langevin Dynamics |
+| **Compact Token** | Обучаемый вектор активации (1024d) для системы External Compaction. Сигнализирует о необходимости сжатия. |
 ---
 
 ## 3. Глобальная архитектура: Схема «Сэндвич»
@@ -146,41 +147,41 @@ CEBCM расширяет JEPA, используя энергетическую �
 │                                                                       │
 │  User Text ──► [SONAR Encoder] ──► V_new (1024d)                      │
 │                                        │                              │
-│                             ┌──────────┴──────────┐                   │
-│                             │  Surprise Predictor  │                   │
-│                             │  (SSM: O(N), O(1))   │                   │
-│                             │  V̂ = predict(state)  │                   │
-│                             │  S = 1-cos(V̂, V_new) │                   │
-│                             └──────────┬───────────┘                   │
+│                             ┌──────────┴───────────┐                  │
+│                             │  Surprise Predictor  │                  │
+│                             │  (SSM: O(N), O(1))   │                  │
+│                             │  V̂ = predict(state)  │                  │
+│                             │  S = 1-cos(V̂, V_new) │                  │
+│                             └──────────┬───────────┘                  │
 │                                        │                              │
 │                        S > θ? ──► Global Token                        │
 │                        S ≤ θ? ──► Normal Token                        │
 │                                        │                              │
-│                             Context Cache + metadata{S, turn_id}       │
+│                             Context Cache + metadata{S, turn_id}      │
 │                                        │                              │
-│                             [Context Aggregator]                       │
-│                             Linear Attention (Mamba/GLA)               │
-│                             + Global Tokens attention                  │
+│                             [Context Aggregator]                      │
+│                             Linear Attention (Mamba/GLA)              │
+│                             + Global Tokens attention                 │
 │                                        │                              │
-│                              [Predictor] ──► V_init (1024d)            │
+│                              [IPP] ──► V_init (1024d)                 │
 │                                        │                              │
-│                              ┌─────────────────┐                      │
-│                              │   EBT Critic     │                      │
-│                              │  Langevin Loop:   │                      │
-│                              │  V ← V - η∇E + ε │                      │
-│                              └────────┬──────────┘                     │
+│                              ┌───────────────────┐                    │
+│                              │   EBT Critic      │                    │
+│                              │  Langevin Loop:   │                    │
+│                              │  V ← V - η∇E + ε  │                    │
+│                              └────────┬──────────┘                    │
 │                                       │                               │
-│                                V_answer (1024d)                        │
+│                                V_answer (1024d)                       │
 │                                       │                               │
-│                                [SONAR Decoder]                         │
+│                                [SONAR Decoder]                        │
 │                                       │                               │
-│                                 Output Text                            │
+│                                 Output Text                           │
 │                                                                       │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │ Context Cache: [В₁, В₂, ...] + S_scores + turn_ids              │  │
-│  │ Retrieval: top-K по cosine similarity + все Global Tokens        │  │
-│  │ Compaction: при размере > MAX → summary-заметки через пайплайн  │  │
-│  └────────────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Context Cache: [В₁, В₂, ...] + S_scores + turn_ids             │   │
+│  │ Retrieval: top-K по cosine similarity + все Global Tokens      │   │
+│  │ Compaction: при размере > MAX → summary-заметки через пайплайн │   │
+│  └────────────────────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -190,7 +191,7 @@ CEBCM расширяет JEPA, используя энергетическую �
 
 **Два варианта реализации:**
 
-**Вариант A (PoC — Proof of Concept):** Работа в нативном 1024d пространстве SONAR. Без проекторов вообще. EBT, Predictor, контекст — всё в 1024d. Плюс: простота, нулевые потери на проекцию. Минус: возможно, 1024d недостаточно для тонкого различения.
+**Вариант A (PoC — Proof of Concept):** Работа в нативном 1024d пространстве SONAR. Без проекторов вообще. EBT, IPP, контекст — всё в 1024d. Плюс: простота, нулевые потери на проекцию. Минус: возможно, 1024d недостаточно для тонкого различения.
 
 **Вариант B (Target):** Sparse autoencoder, нативно работающий в высокой размерности. Без SONAR. Собственный encoder/decoder. EBT работает в нативном пространстве этого autoencoder. Проекторов нет.
 
@@ -207,7 +208,7 @@ CEBCM расширяет JEPA, используя энергетическую �
 | 3. Caching | V_new + S_score | Запись в Cache с метаданными | — | 1024d |
 | 4. Context | V_query + Cache | Retrieval top-K + все Global Tokens | Context set | 1024d |
 | 5. Aggregation | Context set | Linear Attention (Mamba/GLA) | V_context | 1024d |
-| 6. Prediction | V_context + V_query | Predictor (MLP/Transformer) | V_init | 1024d |
+| 6. Prediction | V_context + V_query | IPP (MLP/Transformer) | V_init | 1024d |
 | 7. Refinement | V_init + V_query | EBT + Langevin Dynamics | V_answer | 1024d |
 | 8. Decoding | V_answer | SONAR decoder | Текст ответа | — |
 
@@ -330,12 +331,12 @@ Input: [V_query; V_candidate; V_query - V_candidate; V_query ⊙ V_candidate]
        ────────────────── 4096d ──────────────────
                           │
                     Linear(4096, 2048)
-                       ReLU
+                         ReLU
                     Linear(2048, 1024)
-                       ReLU
+                         ReLU
                     Linear(1024, 1)
                           │
-                     Scalar E
+                       Scalar E
 ```
 
 **Attention не используется.** Это чистая feedforward оценка двух векторов. Быстро, дёшево — критично для Langevin loop.
@@ -492,14 +493,14 @@ loss = infonce_loss                          # Основной contrastive loss
 
 **Двухэтапная стратегия:**
 
-**Этап 1: Обучение «мозга» (Predictor + EBT)**
+**Этап 1: Обучение «мозга» (IPP + EBT)**
 - Autoencoder (SONAR) замороженный
-- Predictor учится предсказывать V_target из V_query
+- IPP учится предсказывать V_target из V_query
 - EBT учится оценивать качество векторов
 - Метрика успеха: cosine similarity между сгенерированным V и эталонным V_target
 
 **Этап 2: Обучение декодера (после замораживания «мозга»)**
-- Predictor + EBT заморожены
+- IPP + EBT заморожены
 - Decoder получает на вход вектора, реально генерируемые системой (не чистые из encoder!)
 - Целевой текст известен из датасета
 - Loss: cross-entropy между предсказанными и целевыми токенами
@@ -511,7 +512,7 @@ optimizer = AdamW(decoder.parameters(), lr=1e-4)
 for query_text, target_text in dataset:
     # Генерируем вектор ответа через замороженный пайплайн
     V_query = sonar_encoder(query_text)    # frozen
-    V_init = predictor(V_query)            # frozen
+    V_init = ipp(V_query)            # frozen
     V_answer = langevin_refine(V_init, ebt, V_query, steps=10)  # frozen
 
     # Обучаем декодер
@@ -533,7 +534,7 @@ for query_text, target_text in dataset:
 
 ---
 
-## 7. Predictor: Инициализация ответа
+## 7. IPP (Initialization Point Predictor): Инициализация ответа
 
 ### 7.1 Проблема начальной точки
 
@@ -544,7 +545,7 @@ EBT — критик и навигатор. Langevin Dynamics — метод н�
 | Стратегия | Обучение | Качество старта | Стоимость | Рекомендация |
 |-----------|----------|-----------------|-----------|--------------|
 | **Informed Noise** | Нет | Низкое | Нулевая | PoC, Этап 0 |
-| **Base-LCM (MLP Predictor)** | Да (MSE) | Среднее | Низкая | PoC, Этап 1 |
+| **Base-LCM (MLP IPP)** | Да (MSE) | Среднее | Низкая | PoC, Этап 1 |
 | **Retrieval (k-NN)** | Нет | Среднее-Высокое | Низкая | Дополнение |
 | **Cluster Centroid** | Минимальное | Низкое-Среднее | Низкая | Для cold start |
 | **Diffusion-LCM** | Да (сложное) | Высокое | Высокая | Target |
@@ -561,10 +562,10 @@ V_init = alpha * V_query + (1 - alpha) * torch.randn_like(V_query) * noise_scale
 
 Логика: ответ семантически связан с вопросом, поэтому стартовать из окрестности вопроса разумнее, чем из случайной точки. Если EBT работает — Langevin доведёт этот грубый старт до правильного ответа.
 
-**Этап 1: MLP Predictor (Base-LCM analog)**
+**Этап 1: MLP IPP (Base-LCM analog)**
 
 ```python
-class SimplePredictor(nn.Module):
+class SimpleIPP(nn.Module):
     def __init__(self, dim=1024, hidden=2048):
         super().__init__()
         self.net = nn.Sequential(
@@ -579,13 +580,13 @@ class SimplePredictor(nn.Module):
         return self.net(V_query)
 
 # Обучение:
-# Loss: MSE между выходом predictor и V_target из encoder
-loss = F.mse_loss(predictor(V_query), V_target)
+# Loss: MSE между выходом IPP и V_target из encoder
+loss = F.mse_loss(ipp(V_query), V_target)
 ```
 
-**Известная проблема MSE:** при множестве валидных ответов predictor усредняет их, выдавая вектор «между» всеми вариантами — точку, не соответствующую ни одному осмысленному ответу. Это именно то, что нашла Meta в Base-LCM.
+**Известная проблема MSE:** при множестве валидных ответов IPP усредняет их, выдавая вектор «между» всеми вариантами — точку, не соответствующую ни одному осмысленному ответу. Это именно то, что нашла Meta в Base-LCM.
 
-**Решение:** это нормально для нашей архитектуры! Predictor выдаёт «размытый черновик», а EBT через Langevin подтягивает его к конкретному, точному ответу. Base-LCM плох сам по себе, но идеален как инициализатор для EBT.
+**Решение:** это нормально для нашей архитектуры! IPP выдаёт «размытый черновик», а EBT через Langevin подтягивает его к конкретному, точному ответу. Base-LCM плох сам по себе, но идеален как инициализатор для EBT.
 
 **Этап 2: Retrieval-Augmented Initialization (дополнение)**
 
@@ -603,7 +604,7 @@ distances, indices = index.search(V_query_new, k=5)
 V_init = torch.mean(all_answer_vectors[indices], dim=0)
 ```
 
-Можно комбинировать с MLP: V_init = 0.5 * predictor(V_query) + 0.5 * retrieval_mean.
+Можно комбинировать с MLP: V_init = 0.5 * ipp(V_query) + 0.5 * retrieval_mean.
 
 ---
 
@@ -612,18 +613,18 @@ V_init = torch.mean(all_answer_vectors[indices], dim=0)
 ### 8.1 Режим A: Fast Shot (Быстрый ответ)
 
 ```
-V_query ──► Predictor ──► V_init
+      V_query ──► IPP ──► V_init
                             │
-         EBT(V_query, V_init) = E₀  (одна оценка энергии)
+             EBT(V_query, V_init) = E₀  (одна оценка энергии)
                             │
-         Выбираем лучший из N кандидатов от predictor
-         (никакого градиентного спуска)
+             Выбираем лучший из N кандидатов от IPP
+                 (никакого градиентного спуска)
                             │
                         V_answer ──► Decoder ──► Text
 ```
 
 **Характеристики:**
-- Время: один forward pass через predictor + N forward passes через EBT
+- Время: один forward pass через IPP + N forward passes через EBT
 - Без backward pass вообще
 - Аналог «интуитивного ответа» человека
 - Подходит для простых вопросов
@@ -631,9 +632,9 @@ V_query ──► Predictor ──► V_init
 ### 8.2 Режим B: Deep Thinking (Глубокое мышление)
 
 ```
-V_query ──► Predictor ──► V_init = V₀
+V_query ──► IPP ──► V_init = V₀
                             │
-                   ┌────────┴────────┐
+                   ┌────────┴─────────┐
                    │  Langevin Loop   │
                    │                  │
                    │  while E > θ:    │
@@ -643,7 +644,7 @@ V_query ──► Predictor ──► V_init = V₀
                    │    V ← project(V)│  ← проекция на сферу (OOD protection)
                    │                  │
                    │  Каждые K шагов: │
-                   │    E_chain(CoT)   │  ← Режим B оценки цепочки
+                   │    E_chain(CoT)  │  ← Режим B оценки цепочки
                    │                  │
                    └────────┬─────────┘
                             │
@@ -759,10 +760,10 @@ trajectory = langevin.refine(V_init, V_query, cruise_ratio=cruise_ratio)
 ```
 Context Cache (в 1024d SONAR-пространстве):
 ┌──────────────────────────────────────────────────────────────┐
-│  Slot 1: V_q1 (1024d) │ [V_a1_1, V_a1_2] (1024d each)     │  turn_id=0
-│  Slot 2: V_q2 (1024d) │ [V_a2_1]          (1024d)          │  turn_id=1
+│  Slot 1: V_q1 (1024d) │ [V_a1_1, V_a1_2] (1024d each)        │  turn_id=0
+│  Slot 2: V_q2 (1024d) │ [V_a2_1]          (1024d)            │  turn_id=1
 │  ...                                                         │
-│  Slot N: V_qN (1024d) │ [V_aN_1, ..., V_aN_M] (1024d each) │  turn_id=N
+│  Slot N: V_qN (1024d) │ [V_aN_1, ..., V_aN_M] (1024d each)   │  turn_id=N
 └──────────────────────────────────────────────────────────────┘
 
 Размер: (1 + avg_answers) × 1024 × 4 bytes ≈ 12 КБ на один обмен (при avg 2 ответа)
@@ -868,9 +869,9 @@ SurprisePredictor располагается **сразу после SONAR encod
 ```
 User Text → SONAR Encoder → V_new (1024d)
                                   │
-                       ┌──────────┴──────────┐
+                       ┌──────────┴───────────┐
                        │  Surprise Predictor  │
-                       │  (сразу после encoder)│
+                       │ (сразу после encoder)│
                        │                      │
                        │  V̂ = SSM(V₁..V_{t-1})│
                        │  S = 1-cos(V̂, V_new) │
@@ -978,10 +979,10 @@ def train_surprise_predictor(predictor, dataset):
     dataset: корпус последовательностей SONAR-векторов.
     Wikipedia абзацы / книги / диалоги → разбитые на предложения → SONAR.
     """
-    optimizer = AdamW(predictor.parameters(), lr=3e-4)
+    optimizer = AdamW(surprise_predictor.parameters(), lr=3e-4)
     
     for sequences in dataloader:  # [batch, seq_len, 1024]
-        predictions = predictor.predict_next(sequences[:, :-1])
+        predictions = surprise_predictor.predict_next(sequences[:, :-1])
         targets = sequences[:, 1:]
         
         # Двойной loss: MSE для нормы + cosine для направления
@@ -1012,7 +1013,7 @@ Turn 150: "Напиши мне сетевой модуль"
 
 Без Surprise: Turn 3 давно вылетел из локального контекста, модель забыла. С Surprise: это Global Token, он виден всегда.
 
-### 9.6 Подача контекста в Predictor: Linear Attention + Surprise Global Tokens
+### 9.6 Подача контекста в IPP: Linear Attention + Surprise Global Tokens
 
 > **Ревью-заметка (v1.3):** Заменяет MHLA-inspired агрегатор из v1.2 (перенесён в главу 16). Вместо сжатия KV через learned slots используется Linear Attention для обработки полной последовательности + direct attention к Global Tokens.
 
@@ -1053,7 +1054,7 @@ class ContextAggregator(nn.Module):
         context_vectors: [batch, seq_len, 1024]
         type_ids: [batch, seq_len] — 0 query, 1 answer
         surprise_scores: [batch, seq_len]
-        Returns: [batch, 1024] — агрегированный контекст для Predictor
+        Returns: [batch, 1024] — агрегированный контекст для IPP
         """
         ctx = context_vectors + self.type_embedding(type_ids)
         
@@ -1098,28 +1099,49 @@ class ContextAggregator(nn.Module):
 
 #### 9.7.1 Концепция: Context Garbage Collector
 
-Когда контекст превышает MAX_CONTEXT (например, 1000 векторов), система запускает компакцию:
+Когда контекст превышает MAX_CONTEXT (например, 1000 векторов), система запускает компакцию. Для сигнала компакции используется **Compact Token** — специальный learned embedding (1024d), обучаемый совместно с пайплайном:
+
+```python
+class CompactToken(nn.Module):
+    """
+    Learned embedding для сигнала компакции.
+    Отдельный обучаемый вектор, не текстовый промпт.
+    type_id=2 (0=query, 1=answer, 2=compact)
+    """
+    def __init__(self, dim=1024):
+        super().__init__()
+        self.compact_embedding = nn.Parameter(torch.randn(1, dim) * 0.01)
+        self.type_id = 2
+
+    def get_token(self) -> Tensor:
+        return self.compact_embedding
+```
+
+**Почему отдельный token, а не текстовый промпт:** модель однозначно классифицирует действие «нужно сжать контекст» без двусмысленности текстового описания. Compact Token обучается end-to-end вместе с остальным пайплайном.
 
 ```
 Compaction trigger: context > MAX_CONTEXT (напр. 1000 vectors)
                     │
          Выбираем старейшие K векторов для compaction
                     │
-     ┌──────────────┼───────────────┼─────────────────┐
-     │              │               │                 │
-  Low-surprise   High-surprise   High-surprise
-  вектора из     вектора из     вектора из
-  старого        старого        старого
-  диапазона      диапазона      диапазона
+         Подаём Compact Token + low-surprise вектора в пайплайн
+                    │
+     ┌──────────────┼───────────────┐
      │              │               │
-  СУММАРИЗУЮТСЯ  СОХРАНЯЮТСЯ    или включаются
-  в 2-3 вектора- как global     в summary
-  заметки        tokens         с пометкой
+  Low-surprise   High-surprise   Compact Token
+  вектора из     вектора из      сигнализирует:
+  старого        старого         «сожми контекст»
+  диапазона      диапазона
+     │              │               │
+  СУММАРИЗУЮТСЯ  СОХРАНЯЮТСЯ     IPP → EBT → Langevin
+  в 2-3 вектора- как global      генерируют
+  заметки        tokens          summary-вектора
 ```
 
 **Почему это лучше attention-маски (sliding window):**
 
 - Модель **сама решает**, что важно (а не маска)
+- Compact Token — обучаемый сигнал, модель учится реагировать на него
 - Заметка содержит **выводы** («ошибки X были исправлены»), а не просто сжатые эмбеддинги
 - Пользователь может **видеть** эти заметки и корректировать
 - Масштабируется **линейно** по памяти, без квадратичности
@@ -1144,7 +1166,7 @@ def compact_context(cache, compaction_range, pipeline):
     low_surprise = [s for s in old_slots if s.surprise_score <= threshold]
     
     # Модель генерирует summary для low-surprise части
-    # Используется тот же Predictor+EBT пайплайн,
+    # Используется тот же IPP+EBT пайплайн,
     # но с задачей «сжатие контекста» вместо «ответ на вопрос»
     summary_vectors = pipeline.summarize(low_surprise, full_context=cache)
     
@@ -1177,7 +1199,7 @@ def compact_context(cache, compaction_range, pipeline):
 - Selective state (Mamba) — естественный фильтр: модель сама решает, что запомнить в state
 - Качество: close to Transformer при 10× меньших затратах (Mamba-2 бенчмарки)
 
-**Ограничение:** линейные модели обрабатывают слева направо. Для **EBT** (bidirectional оценка) они не подходят — EBT использует стандартный self-attention на 5–20 векторах (мгновенный). Для Predictor и ContextAggregator — отличный выбор.
+**Ограничение:** линейные модели обрабатывают слева направо. Для **EBT** (bidirectional оценка) они не подходят — EBT использует стандартный self-attention на 5–20 векторах (мгновенный). Для IPP и ContextAggregator — отличный выбор.
 
 #### 9.9.2 Позиционное кодирование
 
@@ -1275,7 +1297,7 @@ if step >= max_steps:
 Фаза 0: Валидация пространства (1-2 дня)
    └─► Убедиться, что SONAR пригоден для градиентной навигации
 
-Фаза 1: Обучение Predictor'а (3-5 дней)
+Фаза 1: Обучение IPP (3-5 дней)
    └─► MLP, MSE loss, пары (V_query, V_target)
 
 Фаза 2: Обучение EBT (1-2 недели)
@@ -1287,10 +1309,10 @@ if step >= max_steps:
    └─► Вход: вектора от замороженной системы, НЕ от encoder'а
 ```
 
-### 11.2 Фаза 1: Обучение Predictor
+### 11.2 Фаза 1: Обучение IPP
 
 ```python
-# === Скрипт обучения Predictor ===
+# === Скрипт обучения IPP ===
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1299,7 +1321,7 @@ from torch.utils.data import DataLoader, TensorDataset
 # Данные: пары (V_query, V_target) из SONAR
 # Предполагается: query_vectors [N, 1024], target_vectors [N, 1024]
 
-class Predictor(nn.Module):
+class IPP(nn.Module):
     def __init__(self, dim=1024, hidden=2048):
         super().__init__()
         self.net = nn.Sequential(
@@ -1315,7 +1337,7 @@ class Predictor(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-model = Predictor()
+model = IPP()
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
@@ -1341,7 +1363,7 @@ for epoch in range(100):
     avg_loss = total_loss / len(loader)
     print(f"Epoch {epoch}: loss={avg_loss:.4f}")
 
-torch.save(model.state_dict(), "predictor.pt")
+torch.save(model.state_dict(), "ipp.pt")
 ```
 
 ### 11.3 Фаза 2: Обучение EBT
@@ -1459,7 +1481,7 @@ torch.save(ebt.state_dict(), "ebt.pt")
 
 ## 12. Датасеты и генерация данных
 
-### 12.1 Источники данных для Predictor и EBT
+### 12.1 Источники данных для IPP и EBT
 
 | Датасет | Формат | Размер | Применение |
 |---------|--------|--------|------------|
@@ -1739,14 +1761,14 @@ print(f"Denoised:  {decoded_denoised[0]}")
 ```python
 # === PoC Experiment 2: QA Generation ===
 
-# Предполагается: Predictor и EBT уже обучены (Фазы 1-2)
+# Предполагается: IPP и EBT уже обучены (Фазы 1-2)
 
-def generate_answer(V_query, predictor, ebt, decoder,
+def generate_answer(V_query, ipp, ebt, decoder,
                     lr=0.01, max_steps=50, threshold=0.5):
     """Полный пайплайн генерации ответа."""
 
-    # 1. Predictor даёт начальную точку
-    V_init = predictor(V_query)
+    # 1. IPP даёт начальную точку
+    V_init = ipp(V_query)
 
     # 2. Langevin refinement
     V = V_init.clone().requires_grad_(True)
@@ -1778,7 +1800,7 @@ test_questions = [
 
 for q in test_questions:
     V_q = encoder.predict([q], source_lang="eng_Latn")
-    answer, V_ans = generate_answer(V_q, predictor, ebt, decoder)
+    answer, V_ans = generate_answer(V_q, ipp, ebt, decoder)
     print(f"Q: {q}")
     print(f"A: {answer}")
     print()
@@ -1792,7 +1814,7 @@ for q in test_questions:
 from rouge_score import rouge_scorer
 from nltk.translate.bleu_score import sentence_bleu
 
-def evaluate_cebcm(test_pairs, predictor, ebt, encoder, decoder):
+def evaluate_cebcm(test_pairs, ipp, ebt, encoder, decoder):
     """Оценка качества генерации на тестовом наборе."""
 
     cosine_sims = []
@@ -1803,7 +1825,7 @@ def evaluate_cebcm(test_pairs, predictor, ebt, encoder, decoder):
         V_q = encoder.predict([query_text], source_lang="eng_Latn")
         V_target = encoder.predict([target_text], source_lang="eng_Latn")
 
-        generated_text, V_gen = generate_answer(V_q, predictor, ebt, decoder)
+        generated_text, V_gen = generate_answer(V_q, ipp, ebt, decoder)
 
         # 1. Cosine similarity в латентном пространстве
         cos = F.cosine_similarity(V_target, V_gen).item()
@@ -1833,7 +1855,7 @@ def evaluate_cebcm(test_pairs, predictor, ebt, encoder, decoder):
 |---|------|-------------|--------|-----------|
 | 1 | **OOD drift**: Langevin выводит вектор за пределы обитаемой зоны SONAR | Высокая | Критический | Sphere projection + L2 reg + KL к prior |
 | 2 | **Ложные негативы**: Hard negatives (sim>0.95) содержат парафразы | Высокая | Высокий | Cross-Encoder фильтрация + Soft-InfoNCE |
-| 3 | **MSE averaging**: Predictor выдаёт «никакой» вектор между валидными ответами | Средняя | Средний | EBT refinement как design, не как костыль |
+| 3 | **MSE averaging**: IPP выдаёт «никакой» вектор между валидными ответами | Средняя | Средний | EBT refinement как design, не как костыль |
 | 4 | **Decoder infidelity**: SONAR decoder ломается на синтетических векторах | Средняя | Высокий | Валидация пространства (эксп. 4.3) перед обучением |
 | 5 | **Energy landscape**: функция энергии имеет «рваный» ландшафт с ложными минимумами | Средняя | Высокий | Spectral norm + gradient penalty + curriculum |
 | 6 | **Latency**: Deep Thinking (100-500 итераций) слишком медленный | Низкая | Средний | Inertial navigation + early stopping + adaptive budget |
@@ -1861,8 +1883,8 @@ def evaluate_cebcm(test_pairs, predictor, ebt, encoder, decoder):
 - [ ] Проверить Langevin denoising (эксперимент 13.1)
 - [ ] Решение: GO / PIVOT
 
-### Milestone 3: Predictor + EBT (недели 4–7)
-- [ ] Обучить Predictor (Фаза 1)
+### Milestone 3: IPP + EBT (недели 4–7)
+- [ ] Обучить IPP (Фаза 1)
 - [ ] Обучить EBT с Curriculum Learning (Фаза 2)
 - [ ] Генерация CoT-цепочек (скрипт 12.3)
 - [ ] Обучить Chain Scoring Head
@@ -1887,7 +1909,7 @@ def evaluate_cebcm(test_pairs, predictor, ebt, encoder, decoder):
 - [ ] Global compression slots (Level 3)
 - [ ] Тестирование на документах 10K, 50K, 100K предложений
 - [ ] Ablation: sliding window size (64, 128, 256), retrieved K (32, 64, 128)
-- [ ] Эксперименты с линейными альтернативами (GLA / Gated DeltaNet) для Predictor
+- [ ] Эксперименты с линейными альтернативами (GLA / Gated DeltaNet) для IPP
 - [ ] Memory profiling на RTX 4090
 
 ---
@@ -1979,7 +2001,7 @@ pip install tqdm wandb
 | Attention в EBT | Только для Chain Scoring | Pairwise оценка не требует attention — экономия |
 | Кэш в пространстве | SONAR 1024d (после deprojector) | Единое пространство, нет drift между «памятью» и «речью» |
 | Attention для длинных контекстов | Hierarchical Sparse (window + retrieval + global slots) | Full attention O(N²) нереализуем при 50K+ предложений на 1 GPU. Ring Attention требует multi-GPU |
-| Линейный attention для Predictor | GLA / Gated DeltaNet (опционально) | Mamba менее экспрессивен; RetNet теряет информацию на длинных последовательностях |
+| Линейный attention для IPP | GLA / Gated DeltaNet (опционально) | Mamba менее экспрессивен; RetNet теряет информацию на длинных последовательностях |
 | FlashAttention | PyTorch SDPA (встроенный, FA2 на Ampere) | Сторонние FA3/FA4 требуют Hopper GPU, которого нет в PoC |
 | Positional encoding (Chain Head) | RoPE | Цепочки 5–20 элементов, стандартный RoPE достаточен |
 | Positional encoding (Context, масштаб) | ALiBi (основной) | RoPE вращает вектора, нарушая семантическую геометрию SONAR. ALiBi сохраняет эмбеддинги нетронутыми |
