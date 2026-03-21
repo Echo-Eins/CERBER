@@ -179,7 +179,7 @@ CEBCM расширяет JEPA, используя энергетическую �
 │                                                                       │
 │  ┌────────────────────────────────────────────────────────────────┐   │
 │  │ Context Cache: [В₁, В₂, ...] + S_scores + turn_ids             │   │
-│  │ Retrieval: top-K по cosine similarity + все Global Tokens      │   │
+│  │ Retrieval: Полная история (до MAX_CONTEXT) + Global Tokens     │   │
 │  │ Compaction: при размере > MAX → summary-заметки через пайплайн │   │
 │  └────────────────────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────────────────────┘
@@ -206,7 +206,7 @@ CEBCM расширяет JEPA, используя энергетическую �
 | 1. Encoding | Текст пользователя | SONAR encoder | V_new | 1024d |
 | 2. Surprise | V_new + Predictor state | SurprisePredictor (SSM) | V_new + S_score | 1024d + скаляр |
 | 3. Caching | V_new + S_score | Запись в Cache с метаданными | — | 1024d |
-| 4. Context | V_query + Cache | Retrieval top-K + все Global Tokens | Context set | 1024d |
+| 4. Context | V_query + Cache | Извлечение всей истории (до MAX) + Global Tokens | Context set | 1024d |
 | 5. Aggregation | Context set | Linear Attention (Mamba/GLA) | V_context | 1024d |
 | 6. Prediction | V_context + V_query | IPP (MLP/Transformer) | V_init | 1024d |
 | 7. Refinement | V_init + V_query | EBT + Langevin Dynamics | V_answer | 1024d |
@@ -751,7 +751,7 @@ trajectory = langevin.refine(V_init, V_query, cruise_ratio=cruise_ratio)
 
 В обычных LLM каждый запрос содержит полную историю чата (конкатенация всех сообщений). Это расточительно и масштабируется плохо.
 
-В CEBCM реализуется **retrieval-based контекст**: храним все вектора, при каждом запросе выбираем только релевантные.
+В CEBCM реализуется **full-context обработка через Linear Attention**: мы подаём всю историю чата (до определённого предела MAX_CONTEXT). Благодаря линейной сложности памяти $O(1)$ на шаг и времени $O(N)$, это работает молниеносно даже для длинных диалогов. Когда предельный размер достигается, срабатывает программный механизм сжатия (External Compaction).
 
 ### 9.2 Архитектура кэша
 
@@ -821,25 +821,22 @@ class ContextCache:
 
 ### 9.4 Retrieval при каждом запросе
 
+В отличие от v1.2, где использовался поиск top-K ближайших векторов через cosine similarity (RAG-подход), в v1.3 **модель читает весь контекст целиком**:
+
 ```python
-def get_context(V_query_new, cache, top_k=5):
+def get_context(cache, max_context=50):
     """
-    Находит top-K наиболее релевантных прошлых обменов.
-    Возвращает слоты отсортированные хронологически (по turn_id).
+    Возвращает весь накопленный контекст диалога до лимита MAX_CONTEXT.
+    Всё, что выходит за лимит, сжимается механизмом External Compaction.
     """
     if len(cache.slots) == 0:
         return []
 
-    all_queries = torch.stack([slot.query_vector for slot in cache.slots])
-    similarities = F.cosine_similarity(
-        V_query_new.unsqueeze(0), all_queries, dim=-1
-    )
-    top_indices = torch.topk(similarities, min(top_k, len(cache.slots))).indices
-
-    selected_slots = [cache.slots[idx] for idx in top_indices]
-    # Сортируем по turn_id для хронологического порядка
+    # Возвращаем все слоты хронологически
+    selected_slots = list(cache.slots)
     selected_slots.sort(key=lambda s: s.turn_id)
-
+    
+    # Ограничение по длине обрабатывается компактором (см. 9.7)
     return selected_slots
 ```
 
@@ -1138,9 +1135,18 @@ Compaction trigger: context > MAX_CONTEXT (напр. 1000 vectors)
   заметки        tokens          summary-вектора
 ```
 
+**Пример процесса сжатия:**
+Допустим, `MAX_CONTEXT = 50` предложений. У нас накопилось 51. Система управления контекстом инициирует сжатие:
+1. В пайплайн подаются предложения с 1 по 51 + `Compact Token`.
+2. Модель "читает" весь этот контекст (через Linear Attention).
+3. EBT генерирует 2-3 новых вектора (`summary-заметки`), в которых отражена суть сжимаемого блока (преимущественно low-surprise векторов).
+4. Важно: при генерации summary модель явно выявляет Global features (high surprise из обобщаемого блока) и "запоминает" их в summary, оставляя специальные флаги-маркеры.
+5. Исходные предложения 1-50 удаляются из кэша и заменяются сгенерированными summary-заметками.
+6. На следующих итерациях обычного attention, модель прочитает это summary и восстановит контекст прошлых обсуждений.
+
 **Почему это лучше attention-маски (sliding window):**
 
-- Модель **сама решает**, что важно (а не маска)
+- Модель **сама решает**, что важно (а не механическое отсечение маской)
 - Compact Token — обучаемый сигнал, модель учится реагировать на него
 - Заметка содержит **выводы** («ошибки X были исправлены»), а не просто сжатые эмбеддинги
 - Пользователь может **видеть** эти заметки и корректировать
@@ -1903,14 +1909,12 @@ def evaluate_cebcm(test_pairs, ipp, ebt, encoder, decoder):
 - [ ] Benchmarking: скорость vs качество
 
 ### Milestone 6: Масштабирование контекста (недели 14–17)
-- [ ] Реализовать HierarchicalContextAggregator (§9.7.3)
-- [ ] Sliding Window attention через FlexAttention
-- [ ] Интеграция FAISS HNSW для Level 2 retrieval
-- [ ] Global compression slots (Level 3)
-- [ ] Тестирование на документах 10K, 50K, 100K предложений
-- [ ] Ablation: sliding window size (64, 128, 256), retrieved K (32, 64, 128)
-- [ ] Эксперименты с линейными альтернативами (GLA / Gated DeltaNet) для IPP
-- [ ] Memory profiling на RTX 4090
+- [ ] Реализовать ContextAggregator на базе Linear Attention (Mamba/GLA) (§9.6)
+- [ ] Интегрировать механизм Surprise Global Tokens
+- [ ] Реализовать External Compaction и обучить Compact Token (§9.7)
+- [ ] Тестирование на длинных диалогах и документах (10K, 50K предложений)
+- [ ] Ablation: surprise threshold θ, MAX_CONTEXT size
+- [ ] Memory profiling на RTX 4090 (сравнение O(N) Linear Attention vs O(N²) SDPA)
 
 ---
 
@@ -1997,16 +2001,14 @@ pip install tqdm wandb
 | Размерность PoC | 1024d нативная | Без проектора, минимум потерь. Если мало — перейдём на sparse |
 | Функция энергии | Specialized per-domain | Универсальная невозможна без потери точности |
 | Инициализация V_init | Informed Noise → Base-LCM | Нулевая стоимость для первого теста, потом усложняем |
-| Контекст | Retrieval top-K из кэша | Не пересылаем весь диалог, только релевантное |
+| Контекст | Linear Attention по всему контексту (до MAX_CONTEXT) | RAG-подход (top-K) может упустить сюжетную логику диалога. При линейном времени можно читать всё |
 | Attention в EBT | Только для Chain Scoring | Pairwise оценка не требует attention — экономия |
-| Кэш в пространстве | SONAR 1024d (после deprojector) | Единое пространство, нет drift между «памятью» и «речью» |
-| Attention для длинных контекстов | Hierarchical Sparse (window + retrieval + global slots) | Full attention O(N²) нереализуем при 50K+ предложений на 1 GPU. Ring Attention требует multi-GPU |
+| Кэш в пространстве | SONAR 1024d нативный | Единое пространство, нет drift между «памятью» и «речью» |
+| Attention для длинных контекстов | Linear Attention (Mamba/GLA) + Surprise Global Tokens | Hierarchical Sparse переусложнён. Full attention O(N²) нереализуем. Linear attention + globals даёт O(N) обработку без потери важных фактов |
 | Линейный attention для IPP | GLA / Gated DeltaNet (опционально) | Mamba менее экспрессивен; RetNet теряет информацию на длинных последовательностях |
 | FlashAttention | PyTorch SDPA (встроенный, FA2 на Ampere) | Сторонние FA3/FA4 требуют Hopper GPU, которого нет в PoC |
 | Positional encoding (Chain Head) | RoPE | Цепочки 5–20 элементов, стандартный RoPE достаточен |
-| Positional encoding (Context, масштаб) | ALiBi (основной) | RoPE вращает вектора, нарушая семантическую геометрию SONAR. ALiBi сохраняет эмбеддинги нетронутыми |
-| Token pre-processing | Token Merging (FAISS clustering + cosine dedup) | SONAR-пространство идеально калибровано для семантической дедупликации. 2–3× сжатие без потери информации |
-| KV optimization | GQA 4:1 (PoC), MLA (scale) | MQA слишком агрессивен для EBT-критика. MLA философски выровнена с latent-space подходом |
+| Positional encoding (Context) | ALiBi (основной) | RoPE вращает вектора, нарушая семантическую геометрию SONAR. ALiBi сохраняет эмбеддинги нетронутыми |
 
 ---
 

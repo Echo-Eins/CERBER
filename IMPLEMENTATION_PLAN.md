@@ -599,7 +599,7 @@ SurprisePredictor (❄️ FROZEN, из параллельного трека)
   ↓ surprise_score + global_token_flag
 Context Cache (+ metadata: surprise, turn_id)
   ↓
-Retrieval top-K + все Global Tokens
+Полный контекст (до MAX) + все Global Tokens
   ↓
 ContextAggregator (🔥 TRAIN) ← Linear Attention (SSM) + Global Tokens attention
   ↓ V_context (aggregated)
