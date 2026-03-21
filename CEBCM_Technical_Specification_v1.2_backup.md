@@ -1,18 +1,10 @@
-﻿# CEBCM — Concept-Driven Energy-Based Coding Machine
+# CEBCM — Concept-Driven Energy-Based Coding Machine
 ## Полная техническая спецификация проекта
 
-**Версия:** 1.3
-**Дата:** 21 марта 2026
+**Версия:** 1.2
+**Дата:** 19 марта 2026
 **Статус:** Концептуальное проектирование → Proof of Concept
 
-> **Changelog v1.3 (21.03.2026):**
-> - Удалены MHLA-проекторы, Hierarchical Attention, GQA — избыточны для 1024d SONAR
-> - Добавлен §9.5 Surprise Mechanism (Google Titans, arXiv:2501.00663)
-> - Добавлен §9.7 External Compaction (Context GC)
-> - Добавлен §9.9 Linear Attention + YaRN/NTK масштабирование
-> - ContextAggregator: Linear Attention (Mamba/GLA) + Surprise Global Tokens
-> - Отклонённые подходы вынесены в главу 16
->
 > **Changelog v1.2 (19.03.2026):**
 > - Добавлен §9.7 «Масштабирование на длинные контексты (50K–100K предложений)»:
 >   - HierarchicalContextAggregator (3 уровня: sliding window + FAISS retrieval + global slots)
@@ -125,12 +117,6 @@ CEBCM расширяет JEPA, используя энергетическую �
 | **FIRE** | Functional Interpolation Relative Encoding — learned function f(log\|i−j\|) для позиционных biases, хорошая экстраполяция |
 | **MLA** | Multi-head Latent Attention (DeepSeek) — сжимает KV в low-rank latent через down-projection, 8–16× экономия KV-памяти |
 | **Token Merging** | Предварительная кластеризация семантически дублирующихся элементов с заменой на weighted centroids. 2–3× сжатие |
-| **Surprise Score** | Мера непредсказуемости вектора: S = (1 − cos_sim(V_predicted, V_actual)) / 2. Высокий Surprise → важная информация |
-| **SurprisePredictor** | SSM-based модуль, предсказывающий следующий вектор в последовательности. Prediction error = Surprise Score |
-| **Global Token** | Вектор с высоким Surprise Score (S > θ), виден всем другим векторам в attention через direct attention |
-| **External Compaction** | Программный механизм сжатия контекста: модель генерирует summary-заметки для старых секций диалога |
-| **Titans** | Google Research architecture (arXiv:2501.00663): surprise-driven memory для test-time memorization |
-| **SSM (State Space Model)** | Класс моделей (Mamba, RWKV) с рекуррентным обновлением скрытого состояния. O(N) time, O(1) memory per step |
 
 ---
 
@@ -141,47 +127,44 @@ CEBCM расширяет JEPA, используя энергетическую �
 Вся система делится на три независимых, но состыкованных слоя:
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                          CEBCM Pipeline v1.3                          │
-│                                                                       │
-│  User Text ──► [SONAR Encoder] ──► V_new (1024d)                      │
-│                                        │                              │
-│                             ┌──────────┴──────────┐                   │
-│                             │  Surprise Predictor  │                   │
-│                             │  (SSM: O(N), O(1))   │                   │
-│                             │  V̂ = predict(state)  │                   │
-│                             │  S = 1-cos(V̂, V_new) │                   │
-│                             └──────────┬───────────┘                   │
-│                                        │                              │
-│                        S > θ? ──► Global Token                        │
-│                        S ≤ θ? ──► Normal Token                        │
-│                                        │                              │
-│                             Context Cache + metadata{S, turn_id}       │
-│                                        │                              │
-│                             [Context Aggregator]                       │
-│                             Linear Attention (Mamba/GLA)               │
-│                             + Global Tokens attention                  │
-│                                        │                              │
-│                              [Predictor] ──► V_init (1024d)            │
-│                                        │                              │
-│                              ┌─────────────────┐                      │
-│                              │   EBT Critic     │                      │
-│                              │  Langevin Loop:   │                      │
-│                              │  V ← V - η∇E + ε │                      │
-│                              └────────┬──────────┘                     │
-│                                       │                               │
-│                                V_answer (1024d)                        │
-│                                       │                               │
-│                                [SONAR Decoder]                         │
-│                                       │                               │
-│                                 Output Text                            │
-│                                                                       │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │ Context Cache: [В₁, В₂, ...] + S_scores + turn_ids              │  │
-│  │ Retrieval: top-K по cosine similarity + все Global Tokens        │  │
-│  │ Compaction: при размере > MAX → summary-заметки через пайплайн  │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         CEBCM Pipeline                              │
+│                                                                     │
+│  User Text ──► [SONAR Encoder] ──► V_query (1024d)                  │
+│                                        │                            │
+│                                        ▼                            │
+│                              ┌─── [Projector] ──► V_sparse (Nd)     │
+│                              │         │                            │
+│                              │         ▼                            │
+│                              │  [Predictor] ──► V_init (Nd)        │
+│                              │         │                            │
+│                              │         ▼                            │
+│                              │  ┌─────────────────┐                 │
+│                              │  │   EBT Critic     │                │
+│                              │  │                   │                │
+│                              │  │  Fast: E(Vq,Vc)  │                │
+│                              │  │  CoT: E(V1..Vn)  │                │
+│                              │  │                   │                │
+│                              │  │  Langevin Loop:   │                │
+│                              │  │  V ← V - η∇E + ε │                │
+│                              │  └────────┬──────────┘               │
+│                              │           │                          │
+│                              │           ▼                          │
+│                              │    V_answer (Nd)                     │
+│                              │           │                          │
+│                              └─── [Deprojector] ──► V_out (1024d)   │
+│                                          │                          │
+│                                          ▼                          │
+│                                   [SONAR Decoder]                   │
+│                                          │                          │
+│                                          ▼                          │
+│                                    Output Text                      │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ Context Cache: [V_q1, V_a1, V_q2, V_a2, ...] в 1024d       │    │
+│  │ Retrieval: top-K ближайших пар по cosine similarity         │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 3.2 Принцип «Projector-Free по максимуму»
@@ -202,14 +185,12 @@ CEBCM расширяет JEPA, используя энергетическую �
 
 | Этап | Вход | Операция | Выход | Пространство |
 |------|------|----------|-------|--------------|
-| 1. Encoding | Текст пользователя | SONAR encoder | V_new | 1024d |
-| 2. Surprise | V_new + Predictor state | SurprisePredictor (SSM) | V_new + S_score | 1024d + скаляр |
-| 3. Caching | V_new + S_score | Запись в Cache с метаданными | — | 1024d |
-| 4. Context | V_query + Cache | Retrieval top-K + все Global Tokens | Context set | 1024d |
-| 5. Aggregation | Context set | Linear Attention (Mamba/GLA) | V_context | 1024d |
-| 6. Prediction | V_context + V_query | Predictor (MLP/Transformer) | V_init | 1024d |
-| 7. Refinement | V_init + V_query | EBT + Langevin Dynamics | V_answer | 1024d |
-| 8. Decoding | V_answer | SONAR decoder | Текст ответа | — |
+| 1. Encoding | Текст пользователя | SONAR encoder | V_query | 1024d |
+| 2. Context | V_query + Cache | Retrieval top-K | [V_ctx1, ..., V_ctxK, V_query] | 1024d |
+| 3. Prediction | Контекст | Predictor (MLP/Transformer) | V_init | 1024d |
+| 4. Refinement | V_init + V_query | EBT + Langevin Dynamics | V_answer | 1024d |
+| 5. Caching | V_answer | Копирование в Cache | — | 1024d |
+| 6. Decoding | V_answer | SONAR decoder | Текст ответа | — |
 
 ---
 
@@ -842,368 +823,82 @@ def get_context(V_query_new, cache, top_k=5):
     return selected_slots
 ```
 
-### 9.5 Surprise Mechanism
+### 9.5 Подача контекста в Predictor
 
-> **Ревью-заметка (v1.3):** Механизм вдохновлён **Google Titans** (arXiv:2501.00663) — surprise-driven memory с gradient-based surprise metrics. CEBCM адаптирует эту идею для **sentence-level vectors** (SONAR 1024d), что является новым применением — Titans работает на уровне токенов.
+> **Ревью-заметка (v1.1):** Выбран Вариант 2 (Attention-based агрегация) с элементами MHLA (Multi-Head Latent Attention) из DeepSeek. Вариант 1 (конкатенация + MLP) не масштабируется при переменном числе контекстных векторов и не сохраняет структуру диалога.
 
-#### 9.5.1 Концепция
+**Выбранная архитектура: MHLA-inspired Context Aggregator**
 
-Не все входящие вектора одинаково ценны. Фраза «Ладно, понял» предсказуема и малоинформативна. Фраза «WebSocket должен переподключаться с exponential backoff и сохранением сессии» — неожиданна и критически важна.
-
-**Surprise Score** — мера того, насколько вектор отличается от предсказания модели:
-
-```
-S_t = (1 − cos_sim(V̂_t, V_t)) / 2    ∈ [0, 1]
-
-где V̂_t = SurprisePredictor(V_1, ..., V_{t-1}) — предсказание следующего вектора
-```
-
-- **S ≈ 0** — вектор полностью предсказуем, банальная информация
-- **S > θ** — вектор неожиданный, содержит важную новую информацию → **Global Token**
-
-#### 9.5.2 Позиция в пайплайне
-
-SurprisePredictor располагается **сразу после SONAR encoder**, до всего остального:
-
-```
-User Text → SONAR Encoder → V_new (1024d)
-                                  │
-                       ┌──────────┴──────────┐
-                       │  Surprise Predictor  │
-                       │  (сразу после encoder)│
-                       │                      │
-                       │  V̂ = SSM(V₁..V_{t-1})│
-                       │  S = 1-cos(V̂, V_new) │
-                       └──────────┬───────────┘
-                                  │
-                       surprise_score ∈ [0, 1]
-                                  │
-                       Context Cache: V_new + metadata{S, turn_id, ...}
-```
-
-#### 9.5.3 Архитектура SurprisePredictor
-
-Требования: O(N) по времени и O(1) по памяти на шаг при инференсе → **SSM (State Space Model)**, Mamba-style linear recurrence:
-
-```python
-class SurprisePredictor(nn.Module):
-    """
-    Предсказывает следующий вектор в последовательности.
-    Surprise = prediction error.
-    
-    Архитектура: Mamba-style SSM (linear recurrence).
-    Complexity: O(N) time, O(1) memory per step.
-    """
-    def __init__(self, dim=1024, state_dim=2048, n_layers=2):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            SSMBlock(dim=dim, state_dim=state_dim)
-            for _ in range(n_layers)
-        ])
-        self.pred_head = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim)
-        )
-        self.hidden_state = None  # Для инкрементального инференса
-    
-    def predict_next(self, V_context_seq):
-        """
-        V_context_seq: [batch, seq_len, 1024]
-        Returns: predicted next vectors [batch, seq_len, 1024]
-        """
-        h = V_context_seq
-        for layer in self.layers:
-            h = layer(h)
-        return self.pred_head(h)
-    
-    def compute_surprise(self, V_sequence):
-        """
-        Для последовательности [V₁, V₂, ..., Vₙ]
-        возвращает surprise для каждого V (кроме первого).
-        
-        surprise_i = (1 - cos_sim(V̂_i, V_i)) / 2
-        """
-        predictions = self.predict_next(V_sequence[:, :-1])
-        actual = V_sequence[:, 1:]
-        
-        surprise = 1 - F.cosine_similarity(predictions, actual, dim=-1)
-        surprise = surprise / 2.0  # Нормализуем в [0, 1]
-        return surprise  # [batch, N-1]
-    
-    def step(self, V_new):
-        """
-        Инкрементальный шаг: принимает один новый вектор,
-        возвращает surprise для него. O(1) по памяти.
-        """
-        V_pred = self.pred_head(self.hidden_state)
-        surprise = (1 - F.cosine_similarity(
-            V_pred.unsqueeze(0), V_new.unsqueeze(0), dim=-1
-        )) / 2.0
-        
-        for layer in self.layers:
-            self.hidden_state = layer.step(V_new, self.hidden_state)
-        
-        return surprise.item()
-```
-
-**Параметры:** ~50–100M параметров (2 SSM-слоя, state_dim=2048). Лёгкий модуль — значительно меньше основного EBT.
-
-#### 9.5.4 Global Tokens (high-surprise вектора)
-
-Вектора с Surprise Score выше порога θ становятся **Global Tokens** — видны **всем** другим векторам при attention:
-
-```
-Context: [V₁, V₂, V₃, V₄, V₅, ..., V₅₀₀₀₀]
-Surprise: [0.1, 0.8, 0.2, 0.9, 0.1, ..., 0.3]
-                 ↑           ↑
-              GLOBAL       GLOBAL
-              TOKEN        TOKEN
-
-Для любого V_t при attention:
-  1. V_t видит все вектора через Linear Attention (SSM state)
-  2. V_t ДОПОЛНИТЕЛЬНО видит все Global Tokens через direct attention
-  3. Global Tokens = вектора с surprise > θ
-```
-
-**Порог θ:** адаптивный, running percentile (top-5% по surprise). Предпочтительнее фиксированного порога, т.к. распределение surprise зависит от домена.
-
-#### 9.5.5 Обучение SurprisePredictor
-
-Полностью **self-supervised** — никакие labels не нужны:
-
-```python
-def train_surprise_predictor(predictor, dataset):
-    """
-    dataset: корпус последовательностей SONAR-векторов.
-    Wikipedia абзацы / книги / диалоги → разбитые на предложения → SONAR.
-    """
-    optimizer = AdamW(predictor.parameters(), lr=3e-4)
-    
-    for sequences in dataloader:  # [batch, seq_len, 1024]
-        predictions = predictor.predict_next(sequences[:, :-1])
-        targets = sequences[:, 1:]
-        
-        # Двойной loss: MSE для нормы + cosine для направления
-        loss_mse = F.mse_loss(predictions, targets)
-        loss_cos = (1 - F.cosine_similarity(predictions, targets, dim=-1)).mean()
-        loss = loss_mse + 0.5 * loss_cos
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-```
-
-**Данные:** те же WikiText / SQuAD, что и для основной системы → разбить на предложения → SONAR. Это та же задача, что у Base-LCM (Meta), и она доказано работает.
-
-#### 9.5.6 Практический пример: программирование
-
-```
-Turn 1: "Используем React для фронтенда"          → surprise=0.15 (ожидаемо)
-Turn 2: "С серверным рендерингом на Next.js"       → surprise=0.20 (ожидаемо)
-Turn 3: "Но WebSocket должен переподключаться      → surprise=0.85 (GLOBAL TOKEN)
-         с exponential backoff и persistence"
-Turn 4: "Обычный REST API для CRUD"                → surprise=0.10 (ожидаемо)
-...
-Turn 150: "Напиши мне сетевой модуль"
-    → модель видит Turn 3 через global attention и ПОМНИТ
-      про exponential backoff, хотя прошло 150 ходов
-```
-
-Без Surprise: Turn 3 давно вылетел из локального контекста, модель забыла. С Surprise: это Global Token, он виден всегда.
-
-### 9.6 Подача контекста в Predictor: Linear Attention + Surprise Global Tokens
-
-> **Ревью-заметка (v1.3):** Заменяет MHLA-inspired агрегатор из v1.2 (перенесён в главу 16). Вместо сжатия KV через learned slots используется Linear Attention для обработки полной последовательности + direct attention к Global Tokens.
+Ключевая идея заимствована у DeepSeek MHLA: вместо полного attention на все контекстные вектора, сначала **сжимаем KV через learned compression** в меньшее число "слотов", потом делаем attention по слотам. У нас это проще, чем у DeepSeek, потому что вектора уже в компактном 1024d (нет раздутых KV-кэшей на тысячи токенов).
 
 ```python
 class ContextAggregator(nn.Module):
     """
-    Linear Attention (SSM) + Surprise Global Tokens.
-    
-    Архитектура:
-    1. SSM (Mamba/GLA) обрабатывает ВСЮ последовательность контекста - O(N)
-    2. Global Tokens (high surprise) сохраняются как явные KV-пары
-    3. Query делает standard attention ТОЛЬКО к SSM-output + Global Tokens
-    
-    Complexity: O(N) для SSM + O(G^2) для Global Tokens, где G << N.
+    MHLA-inspired attention агрегация контекста.
+
+    Преимущества перед простой конкатенацией:
+    1. Масштабируется на произвольное число контекстных векторов
+    2. Type embeddings (query=0, answer=1) сохраняют структуру диалога
+    3. KV-compression позволяет обрабатывать длинные истории без квадратичного роста
     """
-    def __init__(self, dim=1024, n_heads=8, n_layers=2, state_dim=2048):
+    def __init__(self, dim=1024, n_heads=8, n_layers=2, n_compress_slots=16):
         super().__init__()
-        self.type_embedding = nn.Embedding(2, dim)  # query=0, answer=1
-        
-        # Linear SSM для обработки полной последовательности
-        self.ssm_layers = nn.ModuleList([
-            SSMBlock(dim=dim, state_dim=state_dim)
-            for _ in range(n_layers)
-        ])
-        self.state_projector = nn.Linear(dim, dim)
-        
-        # Final attention: query -> [ssm_output, global_tokens]
+        # Type embedding: query=0, answer=1
+        self.type_embedding = nn.Embedding(2, dim)
+
+        # KV compression (MHLA-inspired):
+        # Learned query-slots сжимают произвольно длинную историю
+        # в фиксированное число n_compress_slots векторов
+        self.compress_slots = nn.Parameter(torch.randn(1, n_compress_slots, dim))
+        self.kv_compressor = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=n_heads, batch_first=True
+        )
+
+        # Main attention: current query attends to compressed context
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim, nhead=n_heads, dim_feedforward=dim * 2,
             dropout=0.1, activation='gelu', batch_first=True
         )
-        self.final_attention = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-    def forward(self, V_query, context_vectors, type_ids, surprise_scores,
-                surprise_threshold=None):
+    def forward(self, V_query, context_vectors, type_ids):
         """
-        V_query: [batch, 1024]
-        context_vectors: [batch, seq_len, 1024]
-        type_ids: [batch, seq_len] — 0 query, 1 answer
-        surprise_scores: [batch, seq_len]
+        V_query: [batch, 1024] — текущий запрос
+        context_vectors: [batch, seq_len, 1024] — контекст из кэша
+        type_ids: [batch, seq_len] — 0 для query, 1 для answer
+
         Returns: [batch, 1024] — агрегированный контекст для Predictor
         """
+        # 1. Добавить type embeddings
         ctx = context_vectors + self.type_embedding(type_ids)
-        
-        # Linear SSM: обработка всей последовательности
-        h = ctx
-        for layer in self.ssm_layers:
-            h = layer(h)
-        ssm_output = self.state_projector(h[:, -1:, :])
-        
-        # Извлечь Global Tokens (high surprise)
-        if surprise_threshold is None:
-            surprise_threshold = torch.quantile(surprise_scores, 0.95, dim=-1)
-        global_mask = surprise_scores > surprise_threshold.unsqueeze(-1)
-        global_tokens = self._gather_globals(ctx, global_mask)
-        
-        # Final attention: query -> [ssm_output, global_tokens]
-        full_seq = torch.cat([
-            V_query.unsqueeze(1),  # [batch, 1, dim]
-            ssm_output,            # [batch, 1, dim]
-            global_tokens,         # [batch, G, dim]
-        ], dim=1)
-        
-        out = self.final_attention(full_seq)
-        return out[:, 0, :]
+
+        # 2. KV compression: сжимаем контекст в n_compress_slots векторов
+        batch_size = ctx.size(0)
+        slots = self.compress_slots.expand(batch_size, -1, -1)
+        compressed, _ = self.kv_compressor(
+            query=slots, key=ctx, value=ctx
+        )  # [batch, n_compress_slots, 1024]
+
+        # 3. Prepend current query, apply transformer
+        full_seq = torch.cat([V_query.unsqueeze(1), compressed], dim=1)
+        out = self.transformer(full_seq)
+
+        # 4. Вытаскиваем позицию query (индекс 0)
+        return out[:, 0, :]  # [batch, 1024]
 ```
 
-**Вычислительная сложность:**
+**Сравнение с альтернативами:**
 
-| Подход | Сложность | Качество | Масштаб |
-|--------|-----------|----------|---------|
-| Конкатенация + MLP | O(1) | Низкое | До ~10 векторов |
-| Vanilla Transformer | O(N²) | Высокое | До ~1K векторов |
-| **Linear Attention + Surprise Globals (v1.3)** | O(N) + O(G²) | Высокое | 50K+ векторов |
+| Подход | Плюсы | Минусы | Масштаб |
+|--------|-------|--------|---------|
+| Конкатенация + MLP | Просто | Фиксированная длина, не масштабируется | До ~10 векторов |
+| Vanilla Transformer | Гибко | O(N²) при длинной истории | До ~1K векторов |
+| **MHLA-inspired (PoC)** | O(N × S) где S — число слотов | Теряет локальную структуру | До ~5K векторов |
+| **Hierarchical Sparse (§9.7.3)** | O(N × 200), сохраняет и локальное и глобальное | Сложнее в реализации | 50K–100K векторов |
 
-При N=50K, G=5% от N = 2500: SSM O(50K) + Global attention O(2500²) = 6.25M → **~19× ускорение** vs O(N²) = 2.5B.
+> **Ревью-заметка (v1.2):** Для PoC достаточно MHLA-inspired подхода выше. При масштабировании на длинные документы (50K+ предложений) переход на HierarchicalContextAggregator (§9.7) — см. трёхуровневую схему с sliding window + FAISS retrieval + global compression.
 
-**Ключевое свойство:** ни один важный вектор не теряется — high-surprise вектора видны через direct attention, остальной контекст доступен через SSM state.
-
-### 9.7 External Compaction (Context Garbage Collection)
-
-> **Ревью-заметка (v1.3):** Это не attention-mechanism, а **runtime-система** управления памятью. Модель сама решает, что сжать, опираясь на весь текущий контекст и Surprise Score каждого вектора. Принципиально отличается от механического sliding window или attention-маски.
-
-#### 9.7.1 Концепция: Context Garbage Collector
-
-Когда контекст превышает MAX_CONTEXT (например, 1000 векторов), система запускает компакцию:
-
-```
-Compaction trigger: context > MAX_CONTEXT (напр. 1000 vectors)
-                    │
-         Выбираем старейшие K векторов для compaction
-                    │
-     ┌──────────────┼───────────────┼─────────────────┐
-     │              │               │                 │
-  Low-surprise   High-surprise   High-surprise
-  вектора из     вектора из     вектора из
-  старого        старого        старого
-  диапазона      диапазона      диапазона
-     │              │               │
-  СУММАРИЗУЮТСЯ  СОХРАНЯЮТСЯ    или включаются
-  в 2-3 вектора- как global     в summary
-  заметки        tokens         с пометкой
-```
-
-**Почему это лучше attention-маски (sliding window):**
-
-- Модель **сама решает**, что важно (а не маска)
-- Заметка содержит **выводы** («ошибки X были исправлены»), а не просто сжатые эмбеддинги
-- Пользователь может **видеть** эти заметки и корректировать
-- Масштабируется **линейно** по памяти, без квадратичности
-
-#### 9.7.2 Surprise-aware Compaction
-
-Surprise Score служит подсказкой для компактора:
-
-```python
-def compact_context(cache, compaction_range, pipeline):
-    """
-    Сжимает старую часть контекста в summary-заметки.
-    
-    1. Low-surprise вектора -> модель суммаризует в 2-3 заметки
-    2. High-surprise вектора -> сохраняются как global tokens
-       или их суть включается в summary с приоритетом
-    """
-    old_slots = cache.get_range(compaction_range)
-    
-    # Разделяем по surprise
-    high_surprise = [s for s in old_slots if s.surprise_score > threshold]
-    low_surprise = [s for s in old_slots if s.surprise_score <= threshold]
-    
-    # Модель генерирует summary для low-surprise части
-    # Используется тот же Predictor+EBT пайплайн,
-    # но с задачей «сжатие контекста» вместо «ответ на вопрос»
-    summary_vectors = pipeline.summarize(low_surprise, full_context=cache)
-    
-    # Заменяем старые слоты на summary + сохранённые global tokens
-    cache.replace_range(
-        compaction_range,
-        summary_slots=summary_vectors,
-        preserved_globals=high_surprise
-    )
-```
-
-#### 9.7.3 Триггеры компакции
-
-| Триггер | Порог | Действие |
-|---------|-------|----------|
-| Размер контекста | > MAX_CONTEXT | Компактим старейшие K векторов |
-| Явный запрос | Пользователь/система | Компактим указанный диапазон |
-| Смена темы | Низкая релевантность старого контекста | Компактим нерелевантный блок |
-
-### 9.9 Математическое масштабирование: Linear Attention + YaRN/NTK
-
-> **Ревью-заметка (v1.3):** Заменяет Hierarchical Attention (v1.2, перенесён в главу 16). Вместо «как срезать контекст» — «как максимально эффективно обращаться к каждому элементу контекста».
-
-#### 9.9.1 Linear Attention для основного контекста
-
-**Mamba-2 / GLA** используются как backbone ContextAggregator (см. §9.6):
-
-- O(N) по времени, O(1) по памяти на каждый шаг
-- Обрабатывает **ВСЮ** последовательность, не теряя ни один вектор
-- Selective state (Mamba) — естественный фильтр: модель сама решает, что запомнить в state
-- Качество: close to Transformer при 10× меньших затратах (Mamba-2 бенчмарки)
-
-**Ограничение:** линейные модели обрабатывают слева направо. Для **EBT** (bidirectional оценка) они не подходят — EBT использует стандартный self-attention на 5–20 векторах (мгновенный). Для Predictor и ContextAggregator — отличный выбор.
-
-#### 9.9.2 Позиционное кодирование
-
-| Компонент | PE | Обоснование |
-|-----------|-------|-------------|
-| Chain Head (5–20 элементов) | **RoPE** | Короткие фиксированные цепочки, порядок критичен |
-| ContextAggregator (SSM) | **Implicit** (рекуррентная структура SSM) | Порядок закодирован в state updates |
-| Final Attention (query → globals) | **ALiBi** | Не модифицирует вектора (сохраняет геометрию SONAR) |
-
-**ALiBi для attention поверх SONAR-векторов:** SONAR-вектора уже предобучены с определённой геометрией. RoPE вращает Q/K подпространства, **разрушая семантические расстояния**. ALiBi добавляет только additive bias к attention scores, сохраняя вектора неизменными.
-
-#### 9.9.3 Экстраполяция на длинные контексты
-
-**YaRN / NTK-aware scaling** — для компонентов, использующих RoPE (Chain Head):
-
-- Тренируем на коротких последовательностях (500–2K предложений)
-- Инферим на длинных (10K–50K предложений)
-- Для sentence-level vectors экстраполяция проще: «плотность информации» на позицию значительно выше
-
-**Для SSM-based компонентов (SurprisePredictor, ContextAggregator SSM):** экстраполяция обеспечивается самой рекуррентной архитектурой — state может обновляться бесконечно.
-
-#### 9.9.4 Валидация подхода
-
-Подход «attention over sentence embeddings» валидирован работой **"Attention over pre-trained Sentence Embeddings for Long Document Classification"** (Abdaoui & Dutta, 2023, arXiv:2307.09084). Конкурентные результаты с fine-tuning при линейном масштабировании по длине документа.
-
-### 9.8 Преимущества перед LLM-подходом
+### 9.6 Преимущества перед LLM-подходом
 
 | Параметр | LLM | CEBCM |
 |----------|-----|-------|
@@ -1212,6 +907,291 @@ def compact_context(cache, compaction_range, pipeline):
 | Память | ~200 МБ KV-cache | ~0.8 МБ vector cache |
 | Релевантность | Вся история, включая нерелевантное | Только top-K релевантных |
 | Масштабируемость | Ограничена context window | Растёт линейно, retrieval O(log N) |
+
+### 9.7 Масштабирование на длинные контексты (50K–100K предложений)
+
+> **Ревью-заметка (v1.2):** Добавлен по результатам исследования efficient attention механизмов (март 2026). Критически важен для работы с книгами, длинными документами и длительными диалогами.
+
+#### 9.7.1 Проблема масштаба
+
+При работе с длинными документами (книга ~50K предложений) или длительными диалогами (тысячи обменов) ContextAggregator из §9.5 сталкивается с квадратичной сложностью attention: O(N²) при N = 50K–100K. На одной RTX 4090 это нереализуемо в наивном виде.
+
+**Ключевое отличие от LLM:** CEBCM оперирует **предложениями** (1024d SONAR-вектора), а не токенами (~128d). Это означает:
+- Sequence length N = количество предложений (50K–100K)
+- Каждый элемент — полноценный семантический вектор, уже содержащий смысл
+- Нет autoregressive/causal ограничений — bidirectional attention допустим
+- Можно применять любые механизмы attention поверх pre-encoded векторов
+
+#### 9.7.2 Анализ подходов
+
+| Подход | Сложность | Качество | Применимость к PoC (1×4090) |
+|--------|-----------|----------|----------------------------|
+| **FlashAttention-2** (через PyTorch SDPA) | O(N²) compute, O(N) memory | Точное | До ~50K (borderline) |
+| **Sliding Window + Retrieval** | O(N × (w + K)) | Высокое (~99% full attention) | Да, основной подход |
+| **Hierarchical / Multi-Scale** | O(N log N) | Высокое | Да, естественно для предложений |
+| **Linear Attention** (GLA, Gated DeltaNet) | O(N × d × state) | Среднее-высокое | Для Predictor, не для EBT |
+| **Ring Attention** | O(N² / num_GPU) | Точное | Нет (multi-GPU) |
+
+#### 9.7.3 Выбранная архитектура: Hierarchical Sparse Attention
+
+Рекомендуемый подход для ContextAggregator при масштабировании — трёхуровневая иерархическая схема, комбинирующая локальное внимание, семантический retrieval и глобальное сжатие:
+
+```
+Уровень 1 — Локальное внимание (Sliding Window):
+  Каждое предложение внимательно к ±64 соседним предложениям
+  Captures: когерентность текста, локальные связи
+  Complexity: O(N × w), w = 128
+
+Уровень 2 — Семантический retrieval (FAISS top-K):
+  Для каждого запроса находим 32–64 семантически ближайших предложения
+  Captures: тематические связи через весь документ
+  Complexity: O(N × K), K = 32–64, поиск O(log N) через FAISS HNSW
+
+Уровень 3 — Глобальные summary-токены:
+  16–32 learned compressed slots (как в §9.5) агрегируют всю историю
+  Captures: общий контекст документа/диалога
+  Complexity: O(N × S), S = 16–32
+```
+
+**Итого:** каждый query-вектор внимателен к ~200 векторам (128 + 64 + 32) вместо 100K. **Speedup: ~500×** по сравнению с full attention.
+
+**Предварительный этап: Token Merging (дедупликация предложений)**
+
+Перед подачей в HierarchicalContextAggregator рекомендуется пре-кластеризация семантически дублирующихся предложений. В документе на 50K предложений до 30–60% могут быть парафразами или близкими по смыслу:
+
+```python
+def merge_similar_sentences(vectors, threshold=0.95):
+    """
+    Кластеризует SONAR-вектора с cosine similarity > threshold.
+    Заменяет кластеры на weighted centroids.
+    Типичное сжатие: 2–3× для длинных документов.
+    """
+    norms = F.normalize(vectors, dim=-1)
+    # FAISS clustering: быстрее, чем pairwise comparison
+    ncentroids = max(vectors.size(0) // 3, 1000)
+    kmeans = faiss.Kmeans(vectors.size(-1), ncentroids, niter=10, gpu=True)
+    kmeans.train(vectors.numpy())
+    _, assignments = kmeans.assign(vectors.numpy())
+
+    # Внутри каждого кластера: merge если cos_sim > threshold
+    merged, weights = [], []
+    for c in range(ncentroids):
+        mask = assignments == c
+        cluster = vectors[mask]
+        if len(cluster) <= 1:
+            merged.append(cluster[0])
+            weights.append(1)
+            continue
+        # Merge near-duplicates, keep distinct vectors
+        centroid = cluster.mean(dim=0)
+        sims = F.cosine_similarity(centroid.unsqueeze(0), cluster, dim=-1)
+        near_dupes = sims > threshold
+        if near_dupes.sum() > 1:
+            merged.append(cluster[near_dupes].mean(dim=0))
+            weights.append(near_dupes.sum().item())
+        distinct = cluster[~near_dupes]
+        for v in distinct:
+            merged.append(v)
+            weights.append(1)
+
+    return torch.stack(merged), torch.tensor(weights)
+```
+
+Этот этап использует тот же FAISS-индекс, что и Level 2 retrieval. Spectrum-Preserving Token Merging (NeurIPS 2024) предлагает более продвинутый подход через spectral graph theory, сохраняющий «уникальные» предложения при агрессивном слиянии похожих.
+
+```python
+class HierarchicalContextAggregator(nn.Module):
+    """
+    Трёхуровневая агрегация контекста для масштабирования до 100K предложений.
+
+    Уровень 1: Sliding window attention (локальная когерентность)
+    Уровень 2: FAISS-retrieved attention (семантические связи)
+    Уровень 3: Compressed global slots (общий контекст)
+
+    Total effective attention per query: ~200 vectors вместо 100K.
+    Memory: O(N × d) для хранения + O(batch × 200 × d) для attention.
+    """
+    def __init__(self, dim=1024, n_heads=8, n_layers=2,
+                 window_size=128, n_retrieved=64, n_global_slots=32):
+        super().__init__()
+        self.window_size = window_size
+        self.n_retrieved = n_retrieved
+
+        # Type embedding: query=0, answer=1
+        self.type_embedding = nn.Embedding(2, dim)
+
+        # Positional encoding для sliding window (relative)
+        self.local_pos_embedding = nn.Embedding(window_size + 1, dim)
+
+        # Global compression slots (Level 3)
+        self.global_slots = nn.Parameter(torch.randn(1, n_global_slots, dim))
+        self.global_compressor = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=n_heads, batch_first=True
+        )
+
+        # Main transformer: processes [query, local_ctx, retrieved_ctx, global_ctx]
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=n_heads, dim_feedforward=dim * 2,
+            dropout=0.1, activation='gelu', batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def forward(self, V_query, all_vectors, type_ids, query_position,
+                faiss_index=None):
+        """
+        V_query: [batch, 1024]
+        all_vectors: [batch, N, 1024] — все предложения документа/диалога
+        type_ids: [batch, N]
+        query_position: [batch] — позиция текущего запроса в последовательности
+        faiss_index: опциональный FAISS индекс для Level 2
+
+        Returns: [batch, 1024]
+        """
+        batch_size, N, dim = all_vectors.shape
+
+        # Добавить type embeddings
+        typed_vectors = all_vectors + self.type_embedding(type_ids)
+
+        # === Level 1: Sliding Window ===
+        # Извлекаем окно ±window_size//2 вокруг query_position
+        half_w = self.window_size // 2
+        local_ctx = self._extract_window(typed_vectors, query_position, half_w)
+        # [batch, window_size, dim]
+
+        # === Level 2: FAISS Retrieval ===
+        if faiss_index is not None:
+            retrieved_ctx = self._retrieve_topk(
+                V_query, all_vectors, faiss_index
+            )  # [batch, n_retrieved, dim]
+        else:
+            # Fallback: cosine similarity top-K
+            retrieved_ctx = self._cosine_topk(V_query, typed_vectors)
+
+        # === Level 3: Global Compression ===
+        slots = self.global_slots.expand(batch_size, -1, -1)
+        global_ctx, _ = self.global_compressor(
+            query=slots, key=typed_vectors, value=typed_vectors
+        )  # [batch, n_global_slots, dim]
+
+        # === Combine & Attend ===
+        combined = torch.cat([
+            V_query.unsqueeze(1),  # [batch, 1, dim]
+            local_ctx,             # [batch, window_size, dim]
+            retrieved_ctx,         # [batch, n_retrieved, dim]
+            global_ctx,            # [batch, n_global_slots, dim]
+        ], dim=1)
+
+        out = self.transformer(combined)
+        return out[:, 0, :]  # query position output
+
+    def _extract_window(self, vectors, positions, half_w):
+        """Извлекает sliding window вокруг каждой позиции."""
+        batch_size, N, dim = vectors.shape
+        windows = []
+        for b in range(batch_size):
+            pos = positions[b].item()
+            start = max(0, pos - half_w)
+            end = min(N, pos + half_w)
+            window = vectors[b, start:end]
+            # Pad если нужно
+            if window.size(0) < self.window_size:
+                pad = torch.zeros(
+                    self.window_size - window.size(0), dim,
+                    device=vectors.device
+                )
+                window = torch.cat([window, pad], dim=0)
+            windows.append(window[:self.window_size])
+        return torch.stack(windows)
+
+    def _cosine_topk(self, query, vectors):
+        """Fallback: top-K по cosine similarity."""
+        sims = F.cosine_similarity(
+            query.unsqueeze(1), vectors, dim=-1
+        )  # [batch, N]
+        _, indices = torch.topk(sims, self.n_retrieved, dim=-1)
+        return torch.gather(
+            vectors, 1,
+            indices.unsqueeze(-1).expand(-1, -1, vectors.size(-1))
+        )
+```
+
+#### 9.7.4 Оптимизация attention: GQA и MLA
+
+**GQA (Grouped Query Attention)** — простая оптимизация для transformer-слоёв ContextAggregator:
+- 8 query heads, 2 KV heads (ratio 4:1) → 75% сокращение KV-памяти
+- Практически нулевая деградация качества
+- Встроена в PyTorch через `nn.MultiheadAttention` (параметр `kdim`/`vdim`)
+- Рекомендация: использовать по умолчанию во всех transformer-слоях агрегатора
+
+**MLA (Multi-head Latent Attention, DeepSeek-стиль)** — для продвинутой оптимизации:
+- Вместо хранения полных K/V матриц, сжимаем вход в low-rank latent c_t через down-projection W_DKV
+- При attention: up-projection восстанавливает K/V из c_t
+- Сжатие 8–16× (с 2×1024 = 2048 до 128–256 floats на предложение)
+- Философски выровнено с CEBCM: вся система работает в латентных пространствах
+- **Рекомендация:** рассмотреть при углублении агрегатора (>4 слоёв) или при batch-обработке
+
+#### 9.7.5 Оценка ресурсов (RTX 4090, 24GB VRAM)
+
+```
+Компонент                              FP16        С оптимизациями
+──────────────────────────────────────────────────────────────────
+SONAR encoder (замороженный)           ~1.0 GB     1.0 GB
+EBT (2–4 слоя)                        ~0.1 GB     0.1 GB
+Predictor                              ~0.2 GB     0.2 GB
+100K sentence store                    0.4 GB      0.2 GB (INT8)
+KV cache (transformer агрегатора)      0.4 GB      0.05 GB (MLA, 256d latent)
+FAISS HNSW index                       ~0.8 GB     0.8 GB
+Global compression slots               <0.01 GB    <0.01 GB
+PyTorch/CUDA overhead                  ~1.5 GB     1.5 GB
+──────────────────────────────────────────────────────────────────
+Итого                                  ~4.4 GB     ~3.9 GB
+Headroom для градиентов (Langevin)     ~19 GB      ~20 GB
+```
+
+**Ключевой вывод:** память НЕ является bottleneck. Основная проблема — **compute** (O(N²) attention). Поэтому приоритет отдаётся методам, сокращающим effective sequence length (token merging, hierarchical sparse attention), а не сжатию KV storage.
+
+```
+Compute per forward pass (100K vectors):
+  Full attention: 100K × 100K × 1024 ≈ 10 TFLOPS  (>100 sec на 4090)
+  After token merging (3× reduction): 33K → still O(N²) → ~1.1 TFLOPS
+  Hierarchical sparse: 100K × 200 × 1024 ≈ 20 GFLOPS (~0.25 ms на 4090)
+  Hierarchical + merging: 33K × 200 × 1024 ≈ 7 GFLOPS (~0.09 ms на 4090)
+```
+
+#### 9.7.6 Стек реализации
+
+| Инструмент | Назначение | Версия |
+|------------|-----------|--------|
+| **PyTorch SDPA** (`torch.nn.functional.scaled_dot_product_attention`) | Базовый attention с автоматическим FlashAttention-2 на Ampere | PyTorch 2.x |
+| **FlexAttention** (`torch.nn.attention.flex_attention`) | Произвольные block-sparse маски с компилированной эффективностью | PyTorch 2.x |
+| **FAISS** (`faiss-gpu`) | Семантический retrieval top-K для Level 2 | Уже в зависимостях |
+| **FLA** (`pip install fla-core`) | Опционально: GLA/Gated DeltaNet для Predictor backbone | Для экспериментов |
+| **xFormers** (`pip install xformers`) | Альтернатива: memory-efficient attention со structured sparsity | Для экспериментов |
+
+#### 9.7.7 Линейные альтернативы для Predictor
+
+Для **Predictor** (который обрабатывает контекст последовательно для генерации V_init) можно рассмотреть линейные модели attention как backbone:
+
+| Модель | Тип гейтинга | Качество recall | Реализация |
+|--------|-------------|----------------|------------|
+| **Gated DeltaNet** (ICLR 2025) | Gating + delta rule | Лучшее среди линейных | [NVlabs/GatedDeltaNet](https://github.com/NVlabs/GatedDeltaNet) |
+| **GLA** | Diagonal data-dependent | Хорошее | FLA library |
+| **Mamba-2/3** | Scalar data-dependent | Хорошее | FLA library |
+
+**Ограничение:** линейные модели обрабатывают последовательность слева направо, накапливая фиксированный state. Для **EBT** (которому нужна глобальная bidirectional оценка) они не подходят. Для Predictor — потенциально хороший выбор.
+
+**Рекомендация:** гибридная архитектура — GLA/Gated DeltaNet backbone + 1–2 слоя full attention для critical retrieval — даёт лучшее соотношение качества и скорости.
+
+#### 9.7.8 Масштабирование на multi-GPU (после PoC)
+
+При переходе на 4–8 GPU для production:
+- **Ring Attention** позволяет делать exact full attention, распределяя N/num_GPU предложений на каждый GPU
+- **Striped Attention** улучшает load balancing при bidirectional attention (до 1.45× throughput)
+- Реализации: [ring-flash-attention](https://github.com/zhuzilin/ring-flash-attention), [ring-attention-pytorch](https://github.com/lucidrains/ring-attention-pytorch)
+
+#### 9.7.9 Валидация: «Attention over Sentence Embeddings»
+
+Подход CEBCM валидирован работой **"Attention over pre-trained Sentence Embeddings for Long Document Classification"** (Abdaoui & Dutta, 2023, arXiv:2307.09084): pre-encode предложения sentence transformer'ом, затем применить attention поверх sentence-векторов. Авторы показали конкурентные результаты с fine-tuning при линейном масштабировании по длине документа.
 
 ---
 
@@ -1989,27 +1969,3 @@ pip install tqdm wandb
 ---
 
 *Документ является живой спецификацией. Обновляется по мере получения экспериментальных результатов.*
-
----
-
-## 16. Прочие исследования (реализация отклонена)
-
-> **Заметка (v1.3):** Следующие подходы были исследованы, но отклонены как избыточные или неоптимальные для архитектуры CEBCM с 1024d SONAR-векторами. Сохранены для справки.
-
-### 16.1 MHLA-inspired Context Aggregator (отклонён в v1.3)
-
-**Причина отклонения:** Сжатие 1024d → 512d (MHLA DeepSeek) теряет ~50% информации. При sentence-level vectors каждый бит ценен (в отличие от token-level с высокой redundancy). KV-кэш CEBCM на тысячи векторов ничтожно мал по сравнению с LLM — оптимизация через compression не оправдана.
-
-Оригинальный подход: nn.MultiheadAttention для KV compression в n_compress_slots=16 векторов, затем TransformerEncoder. Заменён на Linear Attention + Surprise Global Tokens (§9.6).
-
-### 16.2 Hierarchical Sparse Attention (отклонён в v1.3)
-
-**Причина отклонения:** Трёхуровневая иерархия (Sliding Window + FAISS Retrieval + Global Compression Slots) — over-engineering. SONAR уже сжал предложение в один вектор — добавлять ещё уровни иерархии избыточно. Заменён на: External Compaction (§9.7) + Linear Attention (§9.9).
-
-### 16.3 GQA / Grouped Query Attention (отклонён в v1.3)
-
-**Причина отклонения:** KV-кэш CEBCM при 50K векторах: 50K × 1024d × 4 bytes × 2 (K+V) = 400 МБ. На GPU с 24 GB это ничтожно. GQA решает проблему, которой у нас нет, а качество attention гарантированно ухудшает.
-
-### 16.4 Token Merging (отложен)
-
-**Статус:** Потенциально полезен для предобработки очень длинных документов (кластеризация семантически дублирующихся предложений, 2–3× сжатие), но отложен до этапа масштабирования. FAISS kmeans + cosine dedup.

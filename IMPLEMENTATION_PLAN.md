@@ -1,94 +1,105 @@
-# CEBCM — План реализации v1 (Proof of Concept)
+﻿# CEBCM — План реализации v2
 
-**Дата:** 18 марта 2026
-**Статус:** Обсуждение → Утверждение
-**Scope:** Milestone 1–2 (валидация SONAR + denoising + QA PoC) + скелет полного пайплайна
+**Дата:** 21 марта 2026
+**Статус:** Утверждение
+**Scope:** Полный цикл разработки от PoC до production-ready модели
 **Hardware:** 1x consumer GPU (RTX 3090/4090, 24GB VRAM)
 
 ---
 
-## 0. Принятые решения
+## 0. Принятые решения (v2)
 
 | Параметр | Решение | Обоснование |
 |---|---|---|
 | Autoencoder | SONAR (замороженный, 1024d) | Нулевая стоимость обучения, готовый decoder |
-| Инициализация | Оба: чистый шум + informed noise | Сравним, чтобы понять реальную силу EBT |
-| Обучение EBT | Curriculum learning с самого начала | Не экономим на архитектуре обучения |
-| Датасет denoising | WikiText-103 → SONAR vectors | Простой корпус предложений для sanity check |
-| Датасет QA | SQuAD v2 → SONAR vectors | ~100K QA-пар, быстро скачать/закодировать |
-| Inertial Navigation | Гиперпараметр `cruise_ratio` + train-time sampling | Модель тренируется в тех же режимах, в которых работает |
-| Кэш контекста | Multi-answer: V_query → [V_answer₁, V_answer₂, ...] | Реальный диалог ≠ 1:1 |
-| Агрегация контекста | PoC: MHLA-inspired compression. Scale: Hierarchical Sparse (window + retrieval + global) | PoC: простота. Scale: O(N×200) вместо O(N²) при 50K–100K предложений |
-| Attention backend | PyTorch SDPA (автоматический FlashAttention-2) + FlexAttention | Встроен в PyTorch 2.x, нулевые доп. зависимости, FA2 на Ampere GPUs |
-| Линейный attention (Predictor) | GLA / Gated DeltaNet через FLA library (опционально) | Лучшее качество среди линейных моделей; не подходит для EBT (нужен bidirectional) |
+| Рабочая размерность | 1024d (нативный SONAR) | Projectors только при kill criterion |
+| EBT | Pairwise Head → Chain Head → Joint | Инкрементальная сложность |
+| SurprisePredictor | SSM (Mamba-style), тренируется параллельно с Stage 2 | Self-supervised, не зависит от пайплайна |
+| IPP (Initialization Point Predictor) | MLP/Transformer, тренируется параллельно с Stage 2 | Входит в пайплайн в Stage 4, дотренировывается |
+| SurprisePredictor freeze | **Навсегда замороженный** после обучения | Простая модель — другие модули подстраиваются под неё |
+| ContextAggregator | Linear Attention (Mamba/GLA) + Surprise Global Tokens | O(N) + O(G²), масштабируется на 50K+ |
+| Compact token | Learned embedding (отдельный token) | Чтобы модель чётко классифицировала действие сжатия |
+| Decoder | Fine-tune малой LM (~1B) в конце каждого Stage | Cross-entropy: Langevin output → ground truth текст |
+| Batch contrastive | 1 positive + N negatives одновременно (InfoNCE) | Модель учится **почему** каждый negative плох → System 2 |
+| Curriculum | easy (0.3–0.7) → medium (0.7–0.9) → hard (0.9–0.98) | + масштабирование: short→long contexts + compact |
+| Thinking modes | System 1 (fast) + System 2 (deep) с train-time sampling | Модель учится в обоих режимах |
+| Inertial Navigation | cruise_ratio sampling при обучении | Модель привыкает к momentum в разных режимах |
 
 ---
 
-## 1. Файловая структура проекта
+## 1. Файловая структура проекта (v2)
 
 ```
 CERBER/
-├── CEBCM_Technical_Specification.md   # Спецификация (уже есть)
+├── CEBCM_Technical_Specification.md   # Спецификация v1.3
 ├── IMPLEMENTATION_PLAN.md             # Этот файл
-├── README.md                          # Краткое описание + quick start
+├── README.md
 │
-├── configs/                           # Конфигурации (dataclass + yaml)
+├── configs/
 │   ├── __init__.py
-│   ├── base.py                        # @dataclass Config с дефолтами
-│   ├── sonar.yaml                     # Параметры SONAR encoder/decoder
-│   ├── ebt.yaml                       # Параметры EBT (dims, heads, layers)
-│   ├── training.yaml                  # lr, batch_size, curriculum schedule
-│   └── inference.yaml                 # Langevin params, cruise_ratio, presets
+│   ├── base.py                        # @dataclass Config
+│   ├── sonar.yaml
+│   ├── ebt.yaml
+│   ├── surprise.yaml                  # Параметры SurprisePredictor
+│   ├── context.yaml                   # ContextAggregator + compaction
+│   ├── training.yaml                  # lr, batch_size, curriculum
+│   └── inference.yaml                 # Langevin, cruise_ratio, presets
 │
-├── cebcm/                            # Основной пакет
+├── cebcm/
 │   ├── __init__.py
-│   ├── models/                        # Все модели
+│   ├── models/
 │   │   ├── __init__.py
 │   │   ├── energy.py                  # EBT_PairwiseHead, EBT_ChainHead, EBT
-│   │   ├── predictor.py               # SimplePredictor (MLP)
-│   │   ├── context.py                 # ContextCache, ContextAggregator, HierarchicalContextAggregator
-│   │   ├── faiss_index.py             # FAISSIndexManager для семантического retrieval (Level 2)
-│   │   └── sonar_wrapper.py           # Обёртка над SONAR encoder/decoder
+│   │   ├── ipp.py                     # IPP (Initialization Point Predictor)
+│   │   ├── surprise.py                # SurprisePredictor (SSM-based)
+│   │   ├── context.py                 # ContextCache, ContextAggregator
+│   │   ├── decoder.py                 # TrainableDecoder (fine-tuned LM)
+│   │   ├── compact.py                 # CompactToken, CompactionController
+│   │   ├── faiss_index.py             # FAISSIndexManager
+│   │   └── sonar_wrapper.py           # SONAR encoder/decoder wrapper
 │   │
-│   ├── training/                      # Обучение
+│   ├── training/
 │   │   ├── __init__.py
-│   │   ├── losses.py                  # InfoNCE, margin loss, gradient penalty
-│   │   ├── curriculum.py              # CurriculumScheduler (easy→medium→hard)
-│   │   ├── negatives.py               # Генерация негативов через FAISS
-│   │   ├── train_ebt.py               # Скрипт обучения EBT
-│   │   └── train_predictor.py         # Скрипт обучения Predictor
+│   │   ├── losses.py                  # InfoNCE, margin, gradient penalty
+│   │   ├── curriculum.py              # CurriculumScheduler
+│   │   ├── negatives.py               # NegativeGenerator (FAISS-based)
+│   │   ├── batch_contrastive.py       # Batch contrastive logic
+│   │   ├── train_ebt.py               # Обучение EBT (Pairwise + Chain)
+│   │   ├── train_ipp.py         # Обучение IPP (параллельный трек)
+│   │   ├── train_surprise.py          # Обучение SurprisePredictor (параллельный)
+│   │   ├── train_context.py           # Обучение ContextAggregator
+│   │   ├── train_decoder.py           # Fine-tune Decoder LM
+│   │   └── train_e2e.py               # End-to-end fine-tune (Stage 4E)
 │   │
-│   ├── inference/                     # Инференс
+│   ├── inference/
 │   │   ├── __init__.py
-│   │   ├── langevin.py                # Langevin dynamics (с inertial navigation)
-│   │   ├── pipeline.py                # Полный pipeline: query → answer text
-│   │   └── modes.py                   # InferenceMode presets (fast/balanced/deep/extra_deep)
+│   │   ├── langevin.py                # Langevin dynamics + inertial navigation
+│   │   ├── pipeline.py                # CEBCMPipeline (полный E2E)
+│   │   ├── compaction.py              # External Compaction runtime
+│   │   └── modes.py                   # InferencePresets (fast/balanced/deep)
 │   │
-│   └── data/                          # Работа с данными
+│   └── data/
 │       ├── __init__.py
-│       ├── encode_dataset.py          # WikiText/SQuAD → SONAR vectors
-│       ├── dataset.py                 # PyTorch Dataset/DataLoader
-│       └── utils.py                   # Утилиты (нормы, статистики, визуализация)
+│       ├── encode_dataset.py          # Text → SONAR vectors
+│       ├── dataset.py                 # PyTorch Datasets
+│       ├── dialogue_builder.py        # Синтетические multi-turn диалоги
+│       └── utils.py
 │
-├── experiments/                       # Эксперименты (скрипты + результаты)
-│   ├── 01_sonar_validation/           # Фаза 1: валидация пространства
-│   │   ├── run_noise_test.py
-│   │   ├── run_interpolation_test.py
-│   │   └── run_distribution_analysis.py
-│   │
-│   ├── 02_denoising_poc/              # Фаза 3: denoising sanity check
-│   │   ├── train_denoiser.py
-│   │   └── eval_denoising.py
-│   │
-│   └── 03_qa_poc/                     # Фаза 4: QA с EBT
-│       ├── train_qa_ebt.py
-│       └── eval_qa.py
+├── experiments/
+│   ├── 00_sonar_validation/
+│   ├── 01_denoising_poc/
+│   ├── 02_qa_pairwise/
+│   ├── 03_chain_of_thought/
+│   ├── 04_full_pipeline/
+│   └── 05_scale_test/
 │
-├── tests/                             # Юнит-тесты
+├── tests/
 │   ├── test_energy.py
 │   ├── test_langevin.py
-│   ├── test_curriculum.py
-│   └── test_context_cache.py
+│   ├── test_surprise.py
+│   ├── test_context.py
+│   ├── test_compaction.py
+│   └── test_curriculum.py
 │
 ├── requirements.txt
 └── setup.py
@@ -96,687 +107,870 @@ CERBER/
 
 ---
 
-## 2. Фазы реализации
+## 2. Обзор стадий развития
 
-### Фаза 1: Инфраструктура + Валидация SONAR (3–4 дня)
+```
+Stage 0          Stage 1          Stage 2              Stage 3              Stage 4                Stage 5
+SONAR Valid  →   Denoising   →   EBT Pairwise    →   Chain of Thought →   Full Pipeline      →   Projectors
+                  PoC             + ‖ Surprise       + System 2            Integration            (если надо)
+                                  + ‖ IPP             + ‖ IPP               (всё вместе)
+                                  (параллельно)       (параллельно)
+```
 
-**Цель:** убедиться, что SONAR-пространство пригодно для градиентной навигации, и заложить скелет проекта.
+**Параллельные треки (не в пайплайне):**
+- SurprisePredictor: тренируется с Stage 2, входит frozen в Stage 4 (остаётся frozen навсегда)
+- IPP: тренируется с Stage 2, входит в Stage 4 и дотренировывается в пайплайне
 
-#### 1.1 Инфраструктура (день 1)
+---
 
-- [ ] Создать файловую структуру проекта (все директории и `__init__.py`)
-- [ ] Реализовать конфиг-систему (`configs/base.py` — `@dataclass` с вложенными конфигами)
-- [ ] `requirements.txt` с пинами версий
-- [ ] `cebcm/models/sonar_wrapper.py` — обёртка для SONAR:
+## 3. Stage 0: Валидация SONAR пространства (3–4 дня)
+
+**Цель:** убедиться, что SONAR-пространство пригодно для градиентной навигации.
+
+### 3.1 Инфраструктура (день 1)
+
+- [ ] Файловая структура, `configs/base.py`, `requirements.txt`
+- [ ] `cebcm/models/sonar_wrapper.py`:
   ```python
   class SONARWrapper:
-      def __init__(self, device="cuda"):
-          ...
-      def encode(self, texts: list[str], lang="eng_Latn") -> Tensor:  # [N, 1024]
-      def decode(self, vectors: Tensor, lang="eng_Latn") -> list[str]:
-      def encode_batched(self, texts, lang, batch_size=64) -> Tensor:
+      def encode(self, texts: list[str], lang="eng_Latn") -> Tensor  # [N, 1024]
+      def decode(self, vectors: Tensor, lang="eng_Latn") -> list[str]
+      def encode_batched(self, texts, lang, batch_size=64) -> Tensor
   ```
-- [ ] Проверить VRAM: encoder + decoder + EBT на одной GPU
+- [ ] VRAM estimation: encoder + decoder + EBT на одной GPU
 
-#### 1.2 Валидация SONAR (дни 2–3)
+### 3.2 Эксперименты (дни 2–3)
 
-**Эксперимент A: Устойчивость к шуму**
-```
-Для noise_scale в [0.01, 0.05, 0.1, 0.2, 0.5]:
-  1. Закодировать 100 предложений
-  2. Добавить шум
-  3. Декодировать
-  4. Измерить: cosine_sim(V, V_noisy), семантическое сходство decoded текстов
-```
-**Kill criterion:** при noise_scale > 0.05 decoded текст полностью теряет смысл → SONAR непригоден.
+| Эксперимент | Что проверяем | Kill criterion |
+|---|---|---|
+| A: Noise robustness | decode(V + noise) | noise>0.05 — полная потеря смысла |
+| B: Interpolation | decode(αV₁ + (1-α)V₂) | Промежуточные предложения бессмысленны |
+| C: Distribution | norms, cosine distances | Кластеризация / коллапс пространства |
+| D: Gradient flow | ∂output/∂V через decoder | Нет градиентов (не критично — EBT свой) |
 
-**Эксперимент B: Интерполяция**
-```
-Для 50 пар предложений, alpha в [0.0, 0.25, 0.5, 0.75, 1.0]:
-  1. V_interp = (1-alpha) * V_a + alpha * V_b
-  2. Декодировать V_interp
-  3. Проверить: осмысленность промежуточных предложений
-```
+### 3.3 GO/NO-GO (день 3–4)
 
-**Эксперимент C: Анализ распределения** (критично для OOD protection)
-```
-Для 10,000 предложений из WikiText:
-  1. Закодировать в SONAR
-  2. Измерить: mean(||V||), std(||V||), min/max нормы
-  3. Визуализировать распределение норм (histogram)
-  4. Измерить среднюю cosine similarity между случайными парами
-  5. PCA/t-SNE визуализация (для понимания геометрии)
-```
-Эти статистики нужны для:
-- `target_norm` в sphere projection при Langevin
-- Порогов для OOD detection
-- Калибровки `noise_scale` для informed noise
-
-**Эксперимент D: Градиенты через SONAR decoder**
-```
-V = encoder("test sentence").requires_grad_(True)
-output = decoder(V)  # Проверяем, что decoder дифференцируем по V
-grad = torch.autograd.grad(output_loss, V)  # Проверяем наличие градиента
-```
-Это критично: если SONAR decoder не пропускает градиенты, нужен workaround.
-
-> **ВАЖНО:** Для наших целей градиенты через decoder НЕ нужны напрямую.
-> Langevin считает ∇_V E(V_query, V), где E — это EBT (наша MLP).
-> EBT полностью дифференцируема по V. Decoder используется только
-> для финальной визуализации результата. Но проверить стоит на будущее.
-
-#### 1.3 GO/NO-GO Decision (день 3–4)
-
-Документируем результаты. Если SONAR проходит — переходим к Фазе 2.
+Документируем результаты. Получаем `target_norm` из Эксперимента C.
 
 ---
 
-### Фаза 2: Подготовка данных (2–3 дня)
+## 4. Stage 1: Denoising PoC (2–3 дня)
 
-**Цель:** закодировать датасеты в SONAR-вектора, подготовить негативы для curriculum learning.
+**Цель:** sanity check — работает ли EBT + Langevin в SONAR-пространстве.
 
-#### 2.1 WikiText для denoising (день 1)
+### 4.1 Пайплайн обучения
 
-- [ ] `cebcm/data/encode_dataset.py`:
-  ```python
-  def encode_wikitext(num_sentences=10000, lang="eng_Latn") -> Tensor:
-      # 1. Загрузить WikiText-103 через datasets
-      # 2. Разбить на предложения (sent_tokenize)
-      # 3. Отфильтровать: длина 5–50 слов
-      # 4. Закодировать батчами через SONAR
-      # 5. Сохранить: wikitext_vectors.pt + wikitext_texts.json
-  ```
-- [ ] Замерить время кодирования (ожидание: ~10-20 мин на 10K при batch=64)
+```
+Компоненты в пайплайне:
+  SONAR encoder (frozen) → [SimpleEnergy] → Langevin → SONAR decoder (frozen)
+                            ^^^ТРЕНИРУЕТСЯ^^^
+```
 
-#### 2.2 SQuAD v2 для QA (день 1–2)
+**Данные:** WikiText-103 → SONAR vectors (10K предложений)
 
-- [ ] Загрузить SQuAD v2, отфильтровать пары с ответами (~87K пар)
-- [ ] Закодировать вопросы и ответы отдельно:
-  ```
-  V_questions: [87000, 1024]
-  V_answers: [87000, 1024]
-  questions_text: list[str]
-  answers_text: list[str]
-  ```
-- [ ] Сохранить: `squad_vectors.pt`
+**Training loop:**
+1. Берём V_orig из датасета
+2. V_noisy = V_orig + noise (noise_scale ∈ [0.1, 0.2, 0.3])
+3. E_pos = SimpleEnergy(V_orig, V_orig) — энергия позитивной пары
+4. E_neg = SimpleEnergy(V_orig, V_noisy) — энергия негативной пары
+5. Loss = margin_contrastive(E_pos, E_neg, margin=1.0)
+6. 50 эпох, batch=32, lr=1e-4
 
-#### 2.3 Генерация негативов для curriculum (день 2–3)
+| Компонент | Статус | Параметры |
+|---|---|---|
+| SONAR encoder | ❄️ frozen | — |
+| SimpleEnergy (MLP) | 🔥 train | ~10M params |
+| SONAR decoder | ❄️ frozen | — |
 
-- [ ] `cebcm/training/negatives.py`:
-  ```python
-  class NegativeGenerator:
-      def __init__(self, V_questions, V_answers):
-          # Строим FAISS-индекс по V_questions
-          self.index = faiss.IndexFlatIP(1024)
-          self.index.add(F.normalize(V_questions, dim=-1).numpy())
+### 4.2 Тестирование
 
-      def get_negatives(self, query_idx, level="easy", num_neg=31):
-          # easy:   cosine sim 0.3–0.7 (случайные из корпуса)
-          # medium: cosine sim 0.7–0.9 (похожие вопросы, их ответы)
-          # hard:   cosine sim 0.9–0.98 (очень похожие вопросы)
-          # Возвращаем V_answers соответствующих вопросов
-  ```
+```
+Для 100 тестовых векторов:
+  V_noisy = V_orig + noise → Langevin refine → V_denoised
+  Метрики: cos_sim(V_orig, V_denoised) > cos_sim(V_orig, V_noisy)
+  + decode обоих, сравнение текстов
+```
 
-- [ ] **Проблема масштаба:** полная sim-матрица 87K×87K = 30GB float32.
-  **Решение:** FAISS top-K поиск. Для каждого вопроса ищем 200 ближайших,
-  потом фильтруем по порогам similarity.
+**Kill criterion:** denoised не ближе к оригиналу → энергетическая функция не работает.
 
-- [ ] Предрассчитать и сохранить индексы негативов:
-  ```
-  negatives_easy.pt:   [87000, 10] — индексы easy-негативов
-  negatives_medium.pt: [87000, 10] — индексы medium-негативов
-  negatives_hard.pt:   [87000, 11] — индексы hard-негативов
-  ```
+### 4.3 Decoder тренировка (Stage 1)
 
-- [ ] `cebcm/data/dataset.py`:
-  ```python
-  class EBTDataset(Dataset):
-      """Возвращает (V_query, V_positive, V_negatives) с учётом curriculum phase."""
-      def __init__(self, vectors_path, negatives_path, phase="easy"):
-          ...
-      def set_phase(self, phase: str):
-          """Переключение curriculum phase."""
-          ...
-  ```
+Проверяем, нужен ли fine-tune decoder:
+1. Если SONAR decoder хорошо декодирует Langevin outputs → используем as is
+2. Если ломается → fine-tune малой LM (~1B) на парах (V_denoised → original text)
+3. Cross-entropy loss, 10-20 эпох
 
 ---
 
-### Фаза 3: Denoising PoC — Sanity Check (2–3 дня)
+## 5. Stage 2: EBT Pairwise + Параллельные треки (2–4 недели)
 
-**Цель:** быстро проверить, что энергетическая функция + Langevin dynamics в принципе работают в SONAR-пространстве. Не задерживаемся.
+**Цель:** обучить EBT различать правильные и неправильные ответы на QA, параллельно тренировать SurprisePredictor и Predictor.
 
-#### 3.1 SimpleEnergy для denoising
+### 5.1 Подготовка данных
 
-- [ ] `cebcm/models/energy.py` — начальная версия:
-  ```python
-  class SimpleEnergy(nn.Module):
-      """Простая MLP: оценивает 'расстояние' между двумя векторами."""
-      def __init__(self, dim=1024, hidden=2048):
-          # Input: [V_orig; V_candidate; V_orig-V_candidate; V_orig*V_candidate] = 4096d
-          # Output: scalar energy
-  ```
+- [ ] SQuAD v2 → SONAR: ~87K QA-пар
+- [ ] WikiText → SONAR: 50K предложений (для параллельных треков)
+- [ ] MultiWOZ / Ubuntu Dialogue → SONAR: multi-turn диалоги (для Stage 4)
+- [ ] FAISS-индекс по V_questions для генерации негативов
+- [ ] Предрассчёт негативов по уровням (easy/medium/hard)
 
-- [ ] `cebcm/training/losses.py`:
-  ```python
-  def margin_contrastive_loss(E_pos, E_neg, margin=1.0):
-      """L = ReLU(E_pos - E_neg + margin).mean()"""
+### 5.2 Пайплайн обучения EBT Pairwise
 
-  def infonce_loss(energies_pos, energies_neg, temperature=0.07):
-      """Standard InfoNCE: -log(exp(-E_pos/τ) / Σ exp(-E_i/τ))"""
-  ```
+```
+Компоненты в пайплайне:
+  SONAR encoder (frozen) → [EBT Pairwise] → Langevin → SONAR decoder (frozen)
+                            ^^^ТРЕНИРУЕТСЯ^^^
+```
 
-#### 3.2 Обучение denoising energy
+| Компонент | Статус | Параметры |
+|---|---|---|
+| SONAR encoder | ❄️ frozen | — |
+| EBT_PairwiseHead | 🔥 train | ~30M params |
+| Langevin dynamics | — | lr, noise, cruise_ratio |
+| SONAR decoder | ❄️ frozen | — |
 
-- [ ] `experiments/02_denoising_poc/train_denoiser.py`:
-  - Данные: 10K WikiText SONAR-векторов
-  - Позитив: (V, V) — идентичная пара
-  - Негатив: (V, V + noise) с noise_scale из [0.1, 0.2, 0.3]
-  - Loss: margin contrastive
-  - 50 эпох, batch=32, ~10 мин на GPU
+#### Curriculum Learning
 
-#### 3.3 Langevin denoising loop
+```
+Phase 1 (Easy, 20% эпох):
+  Негативы: cos_sim 0.3–0.7 (случайные из корпуса)
+  Модель учится: "этот ответ вообще не из этой темы"
 
-- [ ] `cebcm/inference/langevin.py`:
-  ```python
-  class LangevinDynamics:
-      def __init__(self, energy_fn, config: LangevinConfig):
-          self.energy_fn = energy_fn
-          self.lr = config.lr                      # 0.01
-          self.noise_scale = config.noise_scale    # sqrt(2*lr)
-          self.max_steps = config.max_steps        # 100
-          self.threshold = config.threshold        # early stopping
-          self.cruise_ratio = config.cruise_ratio  # 0.0 for denoising PoC
-          self.target_norm = config.target_norm    # from SONAR distribution analysis
+Phase 2 (Medium, 30% эпох):
+  Негативы: cos_sim 0.7–0.9 (похожие вопросы → их ответы)
+  Модель учится: "этот ответ из той же темы, но не тот"
 
-      def refine(self, V_init, V_query, return_trajectory=False):
-          """
-          Langevin refinement loop.
-          Returns: V_refined, metadata (энергия по шагам, trajectory если нужно)
-          """
-          V = V_init.clone().requires_grad_(True)
-          trajectory = [V.detach().clone()] if return_trajectory else None
-          energies = []
+Phase 3 (Hard, 50% эпох):
+  Негативы: cos_sim 0.9–0.98 (очень похожие вопросы)
+  Модель учится: "эти ответы почти одинаковы, но один правильнее"
+```
 
-          for step in range(self.max_steps):
-              E = self.energy_fn(V_query, V)
-              energies.append(E.item())
-
-              if E.item() < self.threshold:
-                  break
-
-              grad = torch.autograd.grad(E, V, create_graph=False)[0]
-              V = (V - self.lr * grad + self.noise_scale * torch.randn_like(V))
-              V = V.detach().requires_grad_(True)
-
-              # OOD protection: sphere projection
-              V.data = F.normalize(V.data, dim=-1) * self.target_norm
-
-              if return_trajectory:
-                  trajectory.append(V.detach().clone())
-
-          return V.detach(), {"energies": energies, "steps": len(energies),
-                              "trajectory": trajectory}
-  ```
-
-#### 3.4 Тестирование denoising
-
-- [ ] `experiments/02_denoising_poc/eval_denoising.py`:
-  ```
-  Для 100 тестовых векторов:
-    1. V_noisy = V_orig + noise (noise_scale=0.2)
-    2. V_denoised = langevin.refine(V_noisy, V_orig)
-    3. Метрики:
-       - cos_sim(V_orig, V_noisy)  vs  cos_sim(V_orig, V_denoised)
-       - SONAR decode обоих, сравнение текстов
-    4. Дополнительно: тест с чистым шумом (V_init = randn)
-       - cos_sim(V_orig, V_random) vs cos_sim(V_orig, V_denoised_from_random)
-  ```
-
-**Kill criterion:** если denoised НЕ ближе к оригиналу, чем noisy → энергетическая функция не работает.
-
-**Ожидание:** denoising должен работать тривиально. Если нет — проблема фундаментальная.
-
----
-
-### Фаза 4: EBT на QA-парах — Настоящий тест теории (1–2 недели)
-
-**Цель:** обучить EBT различать правильные и неправильные ответы, затем проверить, может ли Langevin навигировать из шума к правильному ответу.
-
-#### 4.1 EBT с Pairwise Head
-
-- [ ] `cebcm/models/energy.py` — полная версия:
-  ```python
-  class EBT_PairwiseHead(nn.Module):
-      """
-      MLP: [V_q; V_c; V_q-V_c; V_q*V_c] → scalar energy.
-      Spectral normalization на всех Linear слоях.
-      """
-      def __init__(self, dim=1024, hidden_dims=[2048, 1024]):
-          # Все Linear обёрнуты в spectral_norm()
-          ...
-
-  class EBT(nn.Module):
-      def __init__(self, dim=1024):
-          self.pairwise = EBT_PairwiseHead(dim)
-          # chain head — скелет, реализуем позже
-          # self.chain = EBT_ChainHead(dim)
-
-      def energy(self, V_query, V_candidate) -> Tensor:
-          return self.pairwise(V_query, V_candidate)
-  ```
-
-#### 4.2 Curriculum Learning
-
-- [ ] `cebcm/training/curriculum.py`:
-  ```python
-  class CurriculumScheduler:
-      """
-      Управляет переключением фаз обучения.
-
-      phases:
-        - easy:   epochs 0–19   (20%), cos_sim 0.3–0.7
-        - medium: epochs 20–49  (30%), cos_sim 0.7–0.9
-        - hard:   epochs 50–99  (50%), cos_sim 0.9–0.98
-      """
-      def __init__(self, total_epochs=100, phase_ratios=[0.2, 0.3, 0.5]):
-          ...
-
-      def get_phase(self, epoch: int) -> str:
-          ...
-
-      def get_negatives_config(self, epoch: int) -> dict:
-          """Возвращает параметры для NegativeGenerator."""
-          ...
-  ```
-
-#### 4.3 Обучение EBT
-
-- [ ] `cebcm/training/train_ebt.py`:
-  ```python
-  # Основной training loop
-  # 1. InfoNCE loss с temperature=0.07
-  # 2. + gradient penalty (λ_grad * ||∇_V E||²)
-  # 3. + norm penalty (λ_norm * max(0, ||E||² - margin))
-  # 4. Spectral norm уже в модели
-  # 5. CurriculumScheduler переключает phase каждые N эпох
-  # 6. wandb logging: loss, accuracy (E_pos < E_neg), gradient norms
-  # 7. Checkpointing каждые 10 эпох
-  ```
-
-- [ ] Гиперпараметры (начальные, подлежат тюнингу):
-  ```yaml
-  training:
-    lr: 1e-4
-    weight_decay: 0.01
-    batch_size: 256
-    num_negatives: 31
-    temperature: 0.07
-    total_epochs: 100
-    gradient_penalty_lambda: 0.1
-    norm_penalty_lambda: 0.01
-    norm_penalty_margin: 10.0
-  ```
-
-#### 4.4 Тестирование QA-генерации (главный эксперимент)
-
-- [ ] `experiments/03_qa_poc/eval_qa.py`:
-
-  **Тест A: Ранжирование (проверяем, что EBT вообще различает ответы)**
-  ```
-  Для 1000 тестовых QA-пар:
-    1. E_correct = EBT(V_question, V_correct_answer)
-    2. E_random  = EBT(V_question, V_random_answer)
-    3. Метрика: accuracy = (E_correct < E_random).mean()
-    Ожидание: > 0.9 (иначе EBT не обучилась)
-  ```
-
-  **Тест B: Langevin из informed noise**
-  ```
-  Для 100 тестовых QA-пар:
-    1. V_init = 0.5 * V_query + 0.5 * randn * target_norm_std
-    2. V_refined = langevin.refine(V_init, V_query, max_steps=100)
-    3. cos_sim(V_refined, V_correct_answer)
-    4. Decode V_refined, сравнить с target_text (ROUGE-L, BLEU)
-  ```
-
-  **Тест C: Langevin из чистого шума**
-  ```
-  Для тех же 100 пар:
-    1. V_init = randn(1024) * target_norm  (на сфере правильного радиуса)
-    2. V_refined = langevin.refine(V_init, V_query, max_steps=500)
-    3. Те же метрики
-    4. Сравнить с Тестом B
-  ```
-
-  **Тест D: Ablation по cruise_ratio**
-  ```
-  Для 50 пар, cruise_ratio в [0.0, 0.3, 0.5, 0.7]:
-    Сравнить: качество ответа vs количество backward passes
-  ```
-
-**Критерии успеха Фазы 4:**
-- Тест A: accuracy > 0.9
-- Тест B: avg cosine sim > 0.6, decoded текст осмысленный
-- Тест C: avg cosine sim > 0.4 (ожидаем хуже, чем B — это нормально)
-- Тест D: cruise_ratio=0.5 даёт < 10% деградации качества при 2x ускорении
-
----
-
-## 3. Скелет для будущих компонентов (реализуется параллельно с Фазой 1)
-
-Интерфейсы и заглушки, которые закладываем сразу, но реализуем полноценно позже:
-
-### 3.1 Context Cache (multi-answer)
+#### Batch Contrastive Learning
 
 ```python
-# cebcm/models/context.py
-
-@dataclass
-class CacheSlot:
-    query_vector: Tensor          # [1024]
-    answer_vectors: list[Tensor]  # [N, 1024] — несколько ответов
-    turn_ids: list[int]           # порядок в диалоге
-    timestamp: float
-
-class ContextCache:
+# Каждый batch содержит 1 positive + N negatives ОДНОВРЕМЕННО
+def batch_contrastive_step(ebt, V_query, V_positive, V_negatives):
     """
-    Хранит историю диалога как последовательность (query, [answers]).
-    Retrieval: top-K по cosine similarity к текущему запросу.
-    Возвращает упорядоченные подпоследовательности, не мешанину.
+    V_query: [batch, 1024]
+    V_positive: [batch, 1024]
+    V_negatives: [batch, N_neg, 1024]
+
+    Модель видит ВСЮ пачку негативов и учится:
+    1. Почему positive лучше каждого negative
+    2. Почему одни negatives ближе, а другие дальше
+    3. Это формирует System 2: рассуждение через сравнение
     """
-    def __init__(self, max_slots=1000):
-        ...
+    E_pos = ebt.energy(V_query, V_positive)             # [batch]
+    E_neg = ebt.energy(
+        V_query.unsqueeze(1).expand_as(V_negatives),
+        V_negatives
+    )                                                     # [batch, N_neg]
 
-    def add(self, V_query, V_answer, turn_id):
-        """Добавляет или обновляет слот (append answer к существующему query)."""
-        ...
+    # InfoNCE: модель сравнивает positive со ВСЕМИ negatives
+    logits = torch.cat([-E_pos.unsqueeze(1), -E_neg], dim=1) / temperature
+    labels = torch.zeros(batch_size, dtype=torch.long)    # positive = index 0
+    loss = F.cross_entropy(logits, labels)
 
-    def retrieve(self, V_query_new, top_k=5) -> list[CacheSlot]:
-        """Возвращает top-K слотов, отсортированных по turn_id (хронологически)."""
-        ...
+    # Gradient penalty для гладкости энергетического ландшафта
+    loss += gradient_penalty(ebt, V_query, V_positive, lambda_gp=0.1)
 
-    def to_sequence(self, slots: list[CacheSlot]) -> Tensor:
-        """
-        Разворачивает слоты в последовательность для attention.
-        [V_q1, V_a1_1, V_a1_2, V_q2, V_a2_1, ...] с type embeddings.
-        """
-        ...
+    return loss
 ```
 
-### 3.2 Context Aggregator (двухфазная стратегия)
-
-> **Обновлено (v1.2):** По результатам исследования efficient attention (март 2026). Для PoC используется простой MHLA-inspired агрегатор (§9.5 спецификации). Для масштабирования — HierarchicalContextAggregator (§9.7.3 спецификации).
+#### Inertial Navigation Awareness
 
 ```python
-# cebcm/models/context.py
+# При обучении: sampling cruise_ratio для каждого батча
+cruise_ratios = [0.0, 0.0, 0.0, 0.3, 0.5, 0.7]  # bias к чистому Langevin
+cruise_ratio = random.choice(cruise_ratios)
 
-# === Фаза PoC: Простой агрегатор (до ~1000 контекстных векторов) ===
+# EBT учится оценивать вектора, достигнутые разными стратегиями
+# Это критично: иначе модель будет хорошо работать только с чистым Langevin
+```
 
-class ContextAggregator(nn.Module):
+#### Training hyperparameters
+
+```yaml
+training:
+  lr: 1e-4
+  weight_decay: 0.01
+  batch_size: 256
+  num_negatives: 31              # 1 positive + 31 negatives в батче
+  temperature: 0.07
+  total_epochs: 100
+  gradient_penalty_lambda: 0.1
+  spectral_norm: true            # на всех Linear слоях EBT
+```
+
+### 5.3 Параллельный трек A: SurprisePredictor
+
+```
+Тренируется ОТДЕЛЬНО от пайплайна, на том же корпусе:
+  WikiText + SQuAD → предложения → SONAR вектора → последовательности
+
+Задача: next-vector prediction (self-supervised)
+```
+
+```python
+class SurprisePredictor(nn.Module):
+    """SSM-based, ~50-100M params, 2 слоя, state_dim=2048"""
+
+# Training loop (полностью независимый):
+for sequences in dataloader:  # [batch, seq_len, 1024]
+    predictions = surprise_predictor.predict_next(sequences[:, :-1])
+    targets = sequences[:, 1:]
+
+    loss_mse = F.mse_loss(predictions, targets)
+    loss_cos = (1 - F.cosine_similarity(predictions, targets, dim=-1)).mean()
+    loss = loss_mse + 0.5 * loss_cos
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+```
+
+| Компонент | Статус |
+|---|---|
+| SONAR encoder | ❄️ frozen (только для кодирования данных) |
+| SurprisePredictor | 🔥 train (отдельный процесс) |
+
+**Критерий готовности:** prediction loss сходится, surprise scores осмысленны (высокие для неожиданных предложений, низкие для банальных).
+
+### 5.4 Параллельный трек B: IPP (Initialization Point Predictor)
+
+```
+Тренируется ОТДЕЛЬНО от пайплайна, на SQuAD QA-парах:
+  Задача: V_query + context → предсказать V_answer
+
+Это "предсказатель хорошей начальной точки" для Langevin.
+```
+
+```python
+class IPP(nn.Module):
+    """MLP или shallow Transformer, ~20-50M params"""
+
+# Training loop (полностью независимый):
+for V_query, V_context, V_answer_target in dataloader:
+    V_init_predicted = ipp(V_query, V_context)
+
+    loss_cos = (1 - F.cosine_similarity(V_init_predicted, V_answer_target, dim=-1)).mean()
+    loss_mse = F.mse_loss(V_init_predicted, V_answer_target)
+    loss = loss_cos + 0.5 * loss_mse
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+```
+
+| Компонент | Статус |
+|---|---|
+| IPP | 🔥 train (отдельный процесс) |
+
+**Важно:** IPP не входит в основной пайплайн до Stage 4. Он просто учится давать хорошую V_init.
+
+### 5.5 Тестирование Stage 2
+
+**Тест A: Ранжирование**
+```
+accuracy = (E_correct < E_random).mean() → ожидание: >0.9
+```
+
+**Тест B: Langevin из informed noise** (без IPP — просто noisy V_query)
+```
+V_init = 0.5 * V_query + 0.5 * noise
+V_refined = langevin.refine(V_init, V_query)
+cos_sim(V_refined, V_correct_answer) → ожидание: >0.6
+SONAR decode → осмысленный текст
+```
+
+**Тест C: Ablation по cruise_ratio**
+```
+cruise_ratio ∈ [0.0, 0.3, 0.5, 0.7]:
+  Качество vs скорость (backward passes)
+  cruise_ratio=0.5 → <10% деградации при 2x ускорении
+```
+
+### 5.6 Decoder тренировка (Stage 2)
+
+Fine-tune decoder LM на парах (V_refined → answer_text):
+1. Берём Langevin outputs от Stage 2
+2. Ground truth = original answer text из SQuAD
+3. Cross-entropy loss, teacher forcing
+4. 20-50 эпох
+
+---
+
+## 6. Stage 3: Chain of Thought + System 2 (3–5 недель)
+
+**Цель:** добавить Chain Head для рассуждений, обучить System 2 thinking.
+
+### 6.1 Фаза A: Chain Head — Scoring цепочек (1–2 недели)
+
+```
+Компоненты в пайплайне:
+  SONAR (frozen) → EBT [Pairwise(FROZEN) + ChainHead(TRAIN)] → Langevin → SONAR decoder (frozen)
+```
+
+| Компонент | Статус |
+|---|---|
+| SONAR encoder | ❄️ frozen |
+| EBT_PairwiseHead | ❄️ frozen (из Stage 2) |
+| EBT_ChainHead | 🔥 train |
+| Langevin | — |
+| SONAR decoder | ❄️ frozen |
+| SurprisePredictor | ❄️ тренируется отдельно, не в пайплайне |
+| IPP | 🔥‖ тренируется отдельно, не в пайплайне |
+
+#### Архитектура Chain Head
+
+```python
+class EBT_ChainHead(nn.Module):
     """
-    MHLA-inspired attention агрегация контекста для Predictor.
-    Подходит для PoC (десятки–сотни обменов).
-    Для масштабирования на 50K+ используется HierarchicalContextAggregator.
+    Оценивает качество цепочки рассуждений V₁ → V₂ → ... → Vₙ.
+    Self-attention между элементами цепочки.
     """
-    def __init__(self, dim=1024, n_heads=8, n_layers=2,
-                 n_compress_slots=16):
-        super().__init__()
-        self.type_embedding = nn.Embedding(2, dim)
-        self.compress_slots = nn.Parameter(
-            torch.randn(1, n_compress_slots, dim)
-        )
-        self.kv_compressor = nn.MultiheadAttention(
-            embed_dim=dim, num_heads=n_heads, batch_first=True
-        )
+    def __init__(self, dim=1024, n_heads=8, n_layers=2, max_chain_len=20):
+        self.position_embedding = nn.Embedding(max_chain_len, dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim, nhead=n_heads, dim_feedforward=dim*2,
             dropout=0.1, activation='gelu', batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=n_layers
+        self.chain_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.energy_head = nn.Sequential(
+            nn.Linear(dim, dim // 2), nn.GELU(),
+            nn.Linear(dim // 2, 1)
         )
 
-    def forward(self, query, context_seq, type_ids):
-        ...  # Реализация при полной сборке пайплайна
-
-
-# === Масштабирование: Иерархический агрегатор (50K–100K предложений) ===
-# См. §9.7.3 спецификации — HierarchicalContextAggregator
-# Реализуется на Milestone 6 (недели 14–17).
-# Стек: PyTorch SDPA + FlexAttention (sliding window) + FAISS (retrieval).
-```
-
-### 3.3 Inference Pipeline (скелет)
-
-```python
-# cebcm/inference/pipeline.py
-
-class CEBCMPipeline:
-    """End-to-end pipeline: text query → text answer."""
-
-    def __init__(self, sonar, predictor, ebt, langevin, context_cache,
-                 context_aggregator=None):
-        ...
-
-    def answer(self, query_text: str, mode="balanced") -> str:
+    def forward(self, chain: Tensor) -> Tensor:
         """
-        1. Encode query через SONAR
-        2. Retrieve context из cache
-        3. Aggregate context (если aggregator есть)
-        4. Predictor → V_init (или informed noise для PoC)
-        5. Langevin refinement (с параметрами из mode)
-        6. Decode V_answer через SONAR
-        7. Cache (V_query, V_answer)
-        8. Return text
+        chain: [batch, chain_len, 1024]
+        Returns: scalar energy for each chain [batch]
         """
-        ...
+        positions = torch.arange(chain.size(1), device=chain.device)
+        chain = chain + self.position_embedding(positions)
+        encoded = self.chain_encoder(chain)
+        pooled = encoded.mean(dim=1)  # или CLS-style
+        return self.energy_head(pooled).squeeze(-1)
 ```
 
-### 3.4 Inference Modes
+#### Данные для Chain Head
 
 ```python
-# cebcm/inference/modes.py
+# Positive chains: осмысленные последовательности рассуждений
+# Из SQuAD: question → context_sentence₁ → context_sentence₂ → answer
+# Из WikiText: последовательные предложения абзаца
 
-@dataclass
-class InferencePreset:
-    name: str
-    max_langevin_steps: int
-    cruise_ratio: float        # 0.0 = чистый Langevin, 0.7 = агрессивная инерция
-    lr: float
-    noise_scale: float
-    early_stop_threshold: float
-
-PRESETS = {
-    "fast":       InferencePreset("fast",       max_langevin_steps=10,  cruise_ratio=0.7, lr=0.05, noise_scale=0.01, early_stop_threshold=0.3),
-    "balanced":   InferencePreset("balanced",   max_langevin_steps=50,  cruise_ratio=0.5, lr=0.02, noise_scale=0.02, early_stop_threshold=0.2),
-    "deep":       InferencePreset("deep",       max_langevin_steps=200, cruise_ratio=0.2, lr=0.01, noise_scale=0.03, early_stop_threshold=0.1),
-    "extra_deep": InferencePreset("extra_deep", max_langevin_steps=500, cruise_ratio=0.0, lr=0.01, noise_scale=0.05, early_stop_threshold=0.05),
-}
+# Negative chains:
+# 1. Shuffled: те же вектора, но в случайном порядке
+# 2. Truncated: отсутствует ключевой шаг
+# 3. Corrupted: один вектор заменён на случайный
+# 4. Wrong conclusion: правильные шаги → неправильный финальный ответ
 ```
+
+#### Training loop Chain Head
+
+```python
+for positive_chains, negative_chains in dataloader:
+    E_pos = chain_head(positive_chains)     # [batch]
+    E_neg = chain_head(negative_chains)     # [batch, N_neg_chains]
+
+    # InfoNCE по цепочкам
+    logits = torch.cat([-E_pos.unsqueeze(1), -E_neg], dim=1) / temperature
+    labels = torch.zeros(batch_size, dtype=torch.long)
+    loss = F.cross_entropy(logits, labels)
+
+    # Batch contrastive: модель сравнивает негативные цепочки между собой
+    # "Эта цепочка плоха потому что порядок нарушен,
+    #  а эта плоха потому что вывод неверный"
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+```
+
+### 6.2 Фаза B: Joint fine-tune + Thinking modes (1–2 недели)
+
+```
+Компоненты в пайплайне:
+  SONAR (frozen) → EBT [Pairwise(TRAIN) + ChainHead(TRAIN)] → Langevin → SONAR decoder (frozen)
+                    ^^^^^^^^^^^РАЗМОРАЖИВАЕМ ОБА^^^^^^^^^^^
+```
+
+| Компонент | Статус |
+|---|---|
+| SONAR | ❄️ frozen |
+| EBT_PairwiseHead | 🔥 train (размороженный) |
+| EBT_ChainHead | 🔥 train |
+| Langevin | — (cruise_ratio sampling) |
+| SONAR decoder | ❄️ frozen |
+
+#### System 1 vs System 2 — Train-time switching
+
+```python
+# Каждый батч обрабатывается в случайном режиме:
+thinking_mode = random.choices(
+    ["system1", "system2"],
+    weights=[0.3, 0.7]  # bias к System 2 (сложнее, нужно больше)
+)[0]
+
+if thinking_mode == "system1":
+    # Fast shot: Pairwise scoring
+    E = ebt.pairwise(V_query, V_candidate)
+    langevin_config = LangevinConfig(
+        max_steps=random.choice([10, 20, 50]),
+        cruise_ratio=random.choice([0.5, 0.7]),
+    )
+
+elif thinking_mode == "system2":
+    # Deep thinking: Chain scoring
+    chain = generate_chain(V_query, V_candidate, steps=random.randint(3, 15))
+    E = ebt.chain(chain)
+    langevin_config = LangevinConfig(
+        max_steps=random.choice([100, 200, 500]),
+        cruise_ratio=random.choice([0.0, 0.1, 0.3]),
+    )
+
+# Langevin refinement с выбранным config
+V_refined = langevin.refine(V_init, V_query, config=langevin_config)
+```
+
+#### Momentum (Inertial Navigation) тренировка
+
+```python
+# Модель должна привыкнуть к РАЗНЫМ cruise_ratio:
+# cruise_ratio=0.0 — чистый Langevin (каждый шаг = gradient + noise)
+# cruise_ratio=0.7 — агрессивная инерция (70% шагов без backward)
+
+# При обучении: EBT видит вектора, достигнутые РАЗНЫМИ стратегиями
+# Это критично для robustness при инференсе
+
+# Training: для каждого примера генерируем 2-3 траектории с разными cruise_ratio
+for cr in [0.0, 0.3, 0.5]:
+    V_refined = langevin.refine(V_init, V_query,
+                                 config=LangevinConfig(cruise_ratio=cr))
+    # EBT должен давать сопоставимую энергию для всех V_refined,
+    # если они все пришли к хорошему ответу
+```
+
+### 6.3 Тестирование Stage 3
+
+**Тест A: Chain ranking**
+```
+accuracy = (E_positive_chain < E_negative_chain).mean() → >0.85
+```
+
+**Тест B: System 1 vs System 2 quality**
+```
+System 1 (fast): avg cos_sim с ground truth, ROUGE-L
+System 2 (deep): avg cos_sim, ROUGE-L
+System 2 > System 1 по качеству (но медленнее)
+```
+
+**Тест C: Momentum robustness**
+```
+Для cruise_ratio ∈ [0.0, 0.3, 0.5, 0.7]:
+  Quality degradation < 15% при cruise_ratio=0.5
+```
+
+### 6.4 Decoder тренировка (Stage 3)
+
+Fine-tune decoder LM на Langevin outputs от Stage 3:
+1. System 1 outputs + System 2 outputs → decoder
+2. Cross-entropy vs ground truth text
+3. Проверяем: один decoder работает для обоих режимов?
+   Если нет → два decoder или conditional decoder
 
 ---
 
-## 4. Критические технические решения
+## 7. Stage 4: Полная интеграция пайплайна (4–8 недель)
 
-### 4.1 Spectral Normalization на EBT
+**Цель:** собрать все компоненты в единый пайплайн, обучить работать с контекстом, Global Tokens, компакцией.
 
-Все Linear слои EBT оборачиваются в `torch.nn.utils.spectral_norm()`. Это:
-- Ограничивает Lipschitz-константу каждого слоя до 1
-- Гарантирует гладкость энергетического ландшафта
-- Предотвращает взрыв градиентов при Langevin dynamics
+### 7.0 Полный пайплайн Stage 4
 
-### 4.2 Gradient Penalty
-
-```python
-def gradient_penalty(energy_fn, V_query, V_candidate, lambda_gp=0.1):
-    V_candidate.requires_grad_(True)
-    E = energy_fn(V_query, V_candidate)
-    grad = torch.autograd.grad(E.sum(), V_candidate, create_graph=True)[0]
-    penalty = (grad.norm(2, dim=-1) ** 2).mean()
-    return lambda_gp * penalty
+```
+User text
+  ↓
+SONAR encoder (frozen)
+  ↓
+V_new (1024d)
+  ↓
+SurprisePredictor (❄️ FROZEN, из параллельного трека)
+  ↓ surprise_score + global_token_flag
+Context Cache (+ metadata: surprise, turn_id)
+  ↓
+Retrieval top-K + все Global Tokens
+  ↓
+ContextAggregator (🔥 TRAIN) ← Linear Attention (SSM) + Global Tokens attention
+  ↓ V_context (aggregated)
+IPP (🔥 TRAIN, дотренировывается в пайплайне) → V_init
+  ↓
+EBT (Pairwise + Chain) (🔥 TRAIN) + Langevin
+  ↓ V_answer
+Decoder LM (🔥 TRAIN) → answer text
 ```
 
-Штраф за слишком большой градиент → Langevin не будет "прыгать" на огромные расстояния.
+### 7.1 Фаза A: Интеграция новых модулей (1–2 недели)
 
-### 4.3 Sphere Projection (OOD Protection)
+**Что происходит:** модель впервые видит SurprisePredictor outputs и IPP V_init. IPP дотренировывается в пайплайне.
 
-После каждого шага Langevin:
+| Компонент | Статус | Комментарий |
+|---|---|---|
+| SONAR | ❄️ frozen | — |
+| SurprisePredictor | ❄️ frozen | Навсегда frozen |
+| ContextAggregator | 🔥 train | Тренируется с нуля |
+| IPP | 🔥 train | Дотренировывается в пайплайне |
+| EBT (Pairwise + Chain) | 🔥 train | Дообучается с Global Tokens |
+| Decoder LM | ❄️ frozen | Из Stage 3 |
+
+**Короткие контексты:** 5–20 ходов (диалоги из MultiWOZ / синтетические из SQuAD)
+
 ```python
-V.data = F.normalize(V.data, dim=-1) * target_norm
+# Тренировка Phase A:
+
+for dialogue in short_dialogues:  # 5-20 ходов
+    vectors = sonar.encode(dialogue.sentences)
+
+    # 1. SurprisePredictor (frozen) размечает surprise scores
+    surprise_scores = surprise_predictor.compute_surprise(vectors)
+    global_mask = surprise_scores > theta  # top-5% → Global Tokens
+
+    # 2. Модель ВПЕРВЫЕ видит Global Token flags
+    #    ContextAggregator учится: global tokens → direct attention,
+    #    обычные → через SSM state
+    context = context_aggregator(
+        V_query=vectors[-1],
+        context_vectors=vectors[:-1],
+        surprise_scores=surprise_scores[:-1],
+        global_mask=global_mask[:-1]
+    )
+
+    # 3. IPP даёт V_init (дотренировывается)
+    V_init = ipp(vectors[-1], context)
+
+    # 4. EBT + Langevin refinement
+    V_answer = langevin.refine(V_init, vectors[-1], ebt)
+
+    # Loss: cos_sim(V_answer, V_target) + InfoNCE + gradient penalty
+    loss = compute_loss(V_answer, V_target, ebt, V_query, negatives)
 ```
 
-`target_norm` = среднее ||V|| по обучающим векторам (из Фазы 1, Эксперимент C).
+**Curriculum (Phase A):** Easy негативы (cos_sim 0.3–0.7) — модель привыкает к новой архитектуре.
 
-Это не позволяет Langevin уйти в OOD-зону, где decoder SONAR выдаст мусор.
+### 7.2 Фаза B: Масштабирование контекста (1–2 недели)
 
-### 4.4 Inertial Navigation с train-time awareness
+| Компонент | Статус |
+|---|---|
+| ContextAggregator | 🔥 train |
+| EBT | 🔥 train |
+| Остальные | ❄️ frozen |
 
-При обучении EBT каждый батч обрабатывается с **случайным** `cruise_ratio`:
-```python
-# В training loop:
-cruise_ratio = random.choice([0.0, 0.0, 0.3, 0.5])  # bias к 0.0
-# Прогоняем Langevin с этим cruise_ratio для генерации training trajectories
-# EBT видит как "чистые", так и "инерционные" траектории
+**Масштаб контекста:**
+```
+Week 1: 20 → 50 → 100 ходов
+Week 2: 100 → 200 → 500 ходов
 ```
 
-Это гарантирует, что EBT обучается оценивать вектора, до которых можно добраться
-разными стратегиями навигации, а не только идеальным полным градиентным спуском.
+**Curriculum:** Easy → Medium негативы
 
-> **Замечание:** для Фазы 4 (QA PoC) этот механизм реализуем в упрощённом виде —
-> EBT обучается на статических парах, не на траекториях. Train-time trajectory
-> sampling — для полной версии (Milestone 3+).
+**Данные:** Multi-turn диалоги:
+- MultiWOZ: ~10K диалогов, 10-15 ходов
+- Ubuntu Dialogue: ~1M диалогов, длинные
+- Синтетические: конкатенация SQuAD пар в псевдо-диалоги
+
+```python
+# Mamba SSM context scaling:
+# state_dim=2048, n_layers=2
+# Train на 500-2K предложений, inference на 5K-10K
+# SSM state обновляется рекуррентно → нет ограничения на длину
+```
+
+### 7.3 Фаза C: Compact Prompt + External Compaction (1–2 недели)
+
+**Вводим compact token — learned embedding для сжатия контекста.**
+
+| Компонент | Статус |
+|---|---|
+| ContextAggregator | 🔥 train |
+| CompactToken embedding | 🔥 train |
+| EBT | 🔥 train |
+| Predictor + SurprisePredictor | ❄️ frozen |
+
+```python
+class CompactToken(nn.Module):
+    """Learned embedding для сигнала компакции."""
+    def __init__(self, dim=1024):
+        super().__init__()
+        self.compact_embedding = nn.Parameter(torch.randn(1, dim) * 0.01)
+        self.type_id = 2  # 0=query, 1=answer, 2=compact
+
+    def get_token(self) -> Tensor:
+        return self.compact_embedding
+```
+
+#### Compaction training loop
+
+```python
+# Когда контекст > MAX_CONTEXT:
+
+def compaction_step(pipeline, cache, max_context=200):
+    if len(cache) <= max_context:
+        return  # Не нужна компакция
+
+    # 1. Выбираем старейшие K векторов
+    old_vectors = cache.get_oldest(K=50)
+    old_surprises = cache.get_surprise_scores(old_vectors)
+
+    # 2. Разделяем по surprise
+    high_surprise = old_vectors[old_surprises > theta]  # Сохраняем как Global
+    low_surprise = old_vectors[old_surprises <= theta]   # Суммаризуем
+
+    # 3. Compact prompt: подаём compact_token + low_surprise вектора
+    compact_input = torch.cat([
+        compact_token.get_token(),  # [1, 1024] — сигнал "сожми это"
+        low_surprise               # [M, 1024] — что сжимаем
+    ], dim=0)
+
+    # 4. Через пайплайн (IPP → EBT → Langevin) генерируем 2-3 summary-вектора
+    summary_vectors = pipeline.generate_summary(compact_input, n_summaries=3)
+
+    # 5. Заменяем старые вектора на summary + сохранённые globals
+    cache.replace_range(old_vectors, summary_vectors, preserved_globals=high_surprise)
+
+    # Loss: качество ответов ДО компакции ≈ ПОСЛЕ компакции
+    # loss_compaction = |cos_sim(answer_before, target) - cos_sim(answer_after, target)|
+```
+
+#### Training: привыкание к compact
+
+```
+Этап C.1 (первые дни): Модель видит compact_token, но компакция не обязательна.
+  Подаём compact_token в 30% батчей, остальные — обычные.
+  Модель учится: compact_token → "нужно сжать контекст"
+
+Этап C.2: Принудительная компакция на длинных контекстах.
+  Контексты 200+ ходов → trigger compaction → продолжение диалога
+  Loss: quality_after_compaction ≈ quality_before_compaction
+
+Этап C.3: Итеративная компакция.
+  Контексты 500+ ходов → несколько раундов compaction
+  Модель учится делать 2-3 compaction подряд без деградации
+```
+
+### 7.4 Фаза D: Hard negatives + полный масштаб (1–2 недели)
+
+| Компонент | Статус |
+|---|---|
+| ContextAggregator | 🔥 train |
+| EBT (Pairwise + Chain) | 🔥 train |
+| CompactToken | 🔥 train |
+| Decoder LM | 🔥 train |
+| Predictor + SurprisePredictor | ❄️ frozen |
+
+**Полный curriculum:**
+```
+1. Длинные контексты: 500 → 1000 → 5000+ ходов
+2. Hard negatives: cos_sim 0.9–0.98
+3. Компакция: автоматическая при превышении MAX_CONTEXT
+4. System 1 + System 2: switching (30/70)
+5. Batch contrastive: 1 positive + 31 negatives, полный пайплайн
+6. Momentum: cruise_ratio sampling [0.0, 0.3, 0.5, 0.7]
+```
+
+**Весь пайплайн проходит через все нагрузки:**
+```
+SurprisePredictor (frozen) → ContextAggregator → Predictor (frozen) →
+→ EBT + Langevin (System 1/2) → Decoder LM → answer text
+
+На каждом батче:
+  - Random thinking_mode (System 1 / System 2)
+  - Random cruise_ratio
+  - Random context length (50 → 5000)
+  - Compaction если context > MAX
+  - Batch contrastive с hard negatives
+```
+
+### 7.5 Фаза E: End-to-end fine-tune (1–2 недели)
+
+**Размораживаем всё кроме SONAR и SurprisePredictor:**
+
+| Компонент | Статус | Комментарий |
+|---|---|---|
+| SONAR | ❄️ frozen | Никогда не трогаем |
+| SurprisePredictor | ❄️ frozen | Навсегда frozen |
+| ContextAggregator | 🔥 train | joint fine-tune |
+| IPP | 🔥 train | Продолжает дотренировываться |
+| EBT (Pairwise + Chain) | 🔥 train | joint fine-tune |
+| CompactToken | 🔥 train | joint fine-tune |
+| Decoder LM | 🔥 train | joint fine-tune |
+
+**End-to-end loss:**
+```python
+def e2e_loss(pipeline, query, target_answer, context, negatives):
+    """
+    Полный loss через весь пайплайн.
+    Каждый gradient flow проходит: ContextAggregator → IPP → EBT → ответ.
+    """
+    # Forward pass через весь пайплайн
+    V_answer, metadata = pipeline.full_forward(query, context)
+
+    # 1. Answer quality loss
+    loss_answer = 1 - F.cosine_similarity(V_answer, target_answer, dim=-1).mean()
+
+    # 2. EBT contrastive loss (batch)
+    loss_contrastive = batch_contrastive_loss(
+        pipeline.ebt, query, target_answer, negatives
+    )
+
+    # 3. Decoder cross-entropy loss
+    decoded_logits = pipeline.decoder(V_answer)
+    loss_decoder = F.cross_entropy(decoded_logits, target_text_tokens)
+
+    # 4. Compaction quality loss (если была компакция в этом forward)
+    if metadata.get("compacted"):
+        loss_compact = compaction_quality_loss(
+            answer_before=metadata["answer_before_compact"],
+            answer_after=V_answer,
+            target=target_answer
+        )
+    else:
+        loss_compact = 0.0
+
+    return loss_answer + loss_contrastive + loss_decoder + 0.5 * loss_compact
+```
+
+**Все режимы тренировки в Phase E:**
+```
+✅ Curriculum: easy → medium → hard negatives
+✅ Batch contrastive: 1 positive + N negatives
+✅ Short contexts (5-20 ходов) + Long contexts (500-5000)
+✅ External Compaction + итеративная компакция
+✅ System 1 (fast shot) + System 2 (deep thinking)
+✅ Momentum: cruise_ratio ∈ [0.0 .. 0.7]
+✅ Decoder: cross-entropy через весь пайплайн
+✅ Global Tokens: surprise-aware attention
+```
+
+### 7.6 Тестирование Stage 4
+
+| Тест | Метрика | Ожидание |
+|---|---|---|
+| QA без контекста | cos_sim + ROUGE-L | >0.7 cos_sim |
+| QA с коротким контекстом (20 ходов) | cos_sim + ROUGE-L | Лучше чем без контекста |
+| QA с длинным контекстом (500+ ходов) | cos_sim + ROUGE-L | Не хуже чем с коротким |
+| QA после компакции | cos_sim degradation | <5% деградации |
+| System 2 vs System 1 | Quality gap | System 2 > System 1 на hard примерах |
+| Momentum robustness | Quality @ cruise_ratio=0.5 | <10% деградации vs cruise_ratio=0.0 |
+| Global Token recall | Модель помнит high-surprise info через 100+ ходов | Качественный тест |
+
+### 7.7 Decoder тренировка (Stage 4)
+
+Fine-tune decoder LM на **всех** типах outputs:
+1. System 1 outputs (fast, с контекстом)
+2. System 2 outputs (deep, с цепочками)
+3. Post-compaction outputs
+4. Different cruise_ratios outputs
+5. Cross-entropy vs ground truth text
 
 ---
 
-### Фаза 5: Масштабирование контекста (после PoC, 2–3 недели)
+## 8. Stage 5: Projectors (если 1024d недостаточно)
 
-> **Добавлено (v1.2):** На основе исследования efficient attention. Реализуется после успешного завершения Фазы 4 (QA PoC).
+**Trigger:** kill criterion из Stage 2–4 (модель не может различать достаточно тонкие нюансы в 1024d).
 
-**Цель:** масштабировать ContextAggregator до 50K–100K предложений на одной RTX 4090.
+**Подход:**
+1. Тренируем Sparse Projector (1024d → Nd) + Deprojector (Nd → 1024d) как autoencoder
+2. Reconstruction loss: minimize cos_sim(V, Deproj(Proj(V)))
+3. Затем fine-tune всей системы в Nd пространстве
+4. EBT, IPP, ContextAggregator работают в Nd
+5. Только SONAR endpoints остаются в 1024d
 
-#### 5.1 Hierarchical Context Aggregator
-
-- [ ] `cebcm/models/context.py` — `HierarchicalContextAggregator`:
-  - Level 1: Sliding window attention (w=128) через FlexAttention
-  - Level 2: FAISS HNSW retrieval (K=64)
-  - Level 3: Global compressed slots (S=32)
-  - Использует `torch.nn.functional.scaled_dot_product_attention` (автоматический FA2)
-
-- [ ] Интеграция с `CEBCMPipeline`:
-  ```python
-  # В pipeline.py: автоматический выбор агрегатора
-  if len(context_vectors) > 1000:
-      aggregator = self.hierarchical_aggregator
-  else:
-      aggregator = self.simple_aggregator
-  ```
-
-#### 5.2 FAISS Index Management
-
-- [ ] `cebcm/models/faiss_index.py`:
-  ```python
-  class FAISSIndexManager:
-      """Управляет FAISS индексом для семантического retrieval."""
-      def __init__(self, dim=1024, use_gpu=True):
-          self.index = faiss.IndexHNSWFlat(dim, 32)  # HNSW с 32 связями
-          if use_gpu:
-              self.index = faiss.index_cpu_to_gpu(
-                  faiss.StandardGpuResources(), 0, self.index
-              )
-
-      def add(self, vectors: Tensor):
-          """Добавляет вектора в индекс."""
-
-      def search(self, query: Tensor, k: int) -> tuple[Tensor, Tensor]:
-          """Возвращает top-K ближайших. O(log N)."""
-  ```
-
-#### 5.3 Эксперименты с линейным attention
-
-- [ ] Опциональный эксперимент: GLA/Gated DeltaNet как backbone Predictor:
-  ```python
-  # Через FLA library (pip install fla-core)
-  from fla.layers import GatedLinearAttention
-
-  class LinearPredictor(nn.Module):
-      """Predictor с GLA вместо standard attention."""
-      def __init__(self, dim=1024, n_layers=4, n_heads=8):
-          ...
-  ```
-  Сравнить с Transformer-Predictor по: качество (cosine sim), скорость, memory.
-
-#### 5.4 Бенчмаркинг
-
-- [ ] Тест масштабирования:
-  ```
-  Для N в [1K, 5K, 10K, 50K, 100K]:
-    Замерить: latency (ms), VRAM (MB), quality (cosine sim)
-    Для каждого подхода:
-      - Full attention (baseline, до OOM)
-      - Hierarchical sparse (window=128, K=64, S=32)
-      - Только sliding window (без retrieval)
-      - Только retrieval (без window)
-  ```
-
-- [ ] Ablation по гиперпараметрам:
-  ```
-  window_size: [64, 128, 256]
-  n_retrieved: [16, 32, 64, 128]
-  n_global_slots: [8, 16, 32, 64]
-  ```
+**Это Stage реализуется только если предыдущие Stage показали, что 1024d мало.**
 
 ---
 
-## 5. Логирование и метрики
+## 9. Сводная таблица: что замораживаем, что тренируем
 
-### 5.1 Wandb Integration
+| Компонент | Stage 0 | Stage 1 | Stage 2 | Stage 3 | Stage 4A-D | Stage 4E |
+|---|---|---|---|---|---|---|
+| SONAR encoder | — | ❄️ | ❄️ | ❄️ | ❄️ | ❄️ |
+| SONAR decoder | — | ❄️ | ❄️ | ❄️ | ❄️ | ❄️ |
+| SimpleEnergy | — | 🔥 | — | — | — | — |
+| EBT Pairwise | — | — | 🔥 | ❄️→🔥 | 🔥 | 🔥 |
+| EBT Chain | — | — | — | 🔥 | 🔥 | 🔥 |
+| SurprisePredictor | — | — | 🔥‖ | 🔥‖ | ❄️ | ❄️ |
+| IPP | — | — | 🔥‖ | 🔥‖ | 🔥 | 🔥 |
+| ContextAggregator | — | — | — | — | 🔥 | 🔥 |
+| CompactToken | — | — | — | — | 🔥 | 🔥 |
+| Decoder LM | — | ❄️ | 🔥† | 🔥† | 🔥† | 🔥 |
 
-Все эксперименты логируются в Weights & Biases:
-- **Training:** loss, accuracy, gradient norms, learning rate
-- **Evaluation:** cosine sim, ROUGE-L, BLEU, energy distribution
-- **Langevin:** trajectory visualization (энергия по шагам)
+**Легенда:**
+- ❄️ = frozen
+- 🔥 = training (в пайплайне)
+- 🔥‖ = training (параллельный трек, вне пайплайна)
+- 🔥† = fine-tune в конце Stage
+- 🔥* = размораживается только если нужно
 
-### 5.2 Checkpointing
+---
+
+## 10. Логирование и метрики
+
+### 10.1 Wandb Integration
+
+Все стадии логируются:
+- **Training:** loss (total, contrastive, decoder, compact), accuracy, gradient norms
+- **Evaluation:** cosine similarity, ROUGE-L, BLEU, energy distributions
+- **Langevin:** trajectory visualization, convergence speed
+- **System 2:** chain quality scores, chain length vs quality
+- **Compaction:** quality before/after, compression ratio
+
+### 10.2 Checkpointing
 
 ```python
-# Каждые 10 эпох:
+# Каждые 10 эпох + при смене curriculum phase:
 torch.save({
-    "epoch": epoch,
-    "model_state": model.state_dict(),
-    "optimizer_state": optimizer.state_dict(),
-    "scheduler_state": scheduler.state_dict(),
+    "stage": stage, "phase": phase, "epoch": epoch,
+    "model_states": {name: model.state_dict() for name, model in models.items()},
+    "optimizer_states": {name: opt.state_dict() for name, opt in optimizers.items()},
     "config": config,
     "metrics": metrics,
-}, f"checkpoints/ebt_epoch_{epoch}.pt")
+    "curriculum_state": curriculum.state_dict(),
+}, f"checkpoints/stage{stage}_{phase}_epoch{epoch}.pt")
 ```
 
 ---
 
-## 6. Риски для PoC и План B
+## 11. Риски и Plan B
 
 | Риск | Вероятность | Что делаем |
-|------|-------------|------------|
-| SONAR не пропускает градиенты через decoder | Низкая | Нам не нужно — EBT дифференцируема. Но проверим |
-| SONAR decoder ломается на Langevin-точках | Средняя | Sphere projection. Если не помогает — fine-tune decoder (Фаза 3 спеки) |
-| 1024d недостаточно для QA | Средняя | Начинаем с простых QA (SQuAD). Если не хватает — переход к Варианту B (свой autoencoder) |
-| FAISS на 87K не находит достаточно hard negatives | Низкая | Увеличить поиск до top-500, или добавить MS MARCO |
-| Curriculum не даёт преимущества над простым contrastive | Средняя | Запускаем ablation: с curriculum vs без. Держим обе версии |
-| Langevin из чистого шума не сходится | Высокая | Ожидаемо хуже informed noise. Главное — informed noise работает. Чистый шум = bonus |
+|---|---|---|
+| SONAR decoder ломается на Langevin outputs | Средняя | Fine-tune decoder LM (заложено в каждый Stage) |
+| 1024d недостаточно для QA | Средняя | Stage 5: Projectors |
+| SurprisePredictor плохо скалируется | Низкая | Простая модель, SSM-based, проблем быть не должно |
+| Chain Head не даёт улучшения | Средняя | Вернуться к Pairwise-only, усилить curriculum |
+| Compact не сохраняет информацию | Средняя | Увеличить число summary-векторов, уменьшить compression ratio |
+| End-to-end training нестабилен | Высокая | Gradient clipping, раздельные lr для компонентов, warm-up |
+| Batch contrastive не помогает System 2 | Низкая | Увеличить batch size, добавить harder negatives |
 
 ---
 
-## 7. Timeline (оценочный)
+## 12. Timeline (оценочный)
 
-| Фаза | Длительность | Блокеры |
-|------|-------------|---------|
-| Фаза 1: Инфраструктура + SONAR | 3–4 дня | Установка SONAR/fairseq2 |
-| Фаза 2: Данные | 2–3 дня | Кодирование 87K пар (~2-3 часа GPU) |
-| Фаза 3: Denoising PoC | 2–3 дня | Фазы 1-2 |
-| Фаза 4: EBT QA | 7–14 дней | Фазы 1-3, время обучения |
-| **Итого до первых результатов** | **~3-4 недели** | |
-| Фаза 5: Масштабирование контекста | 2–3 недели | Успешная Фаза 4 |
-| **Итого до production-ready контекста** | **~6-7 недель** | |
+| Stage | Длительность | Блокеры |
+|---|---|---|
+| Stage 0: SONAR Validation | 3–4 дня | Установка SONAR |
+| Stage 1: Denoising PoC | 2–3 дня | Stage 0 |
+| Stage 2: EBT Pairwise | 2–4 недели | Stage 1, данные |
+| Stage 2‖: SurprisePredictor + Predictor | 1–2 недели (параллельно) | Данные |
+| Stage 3: Chain of Thought | 3–5 недель | Stage 2 |
+| Stage 4A: Привыкание к Global Tokens | 1–2 недели | Stage 3, Stage 2‖ |
+| Stage 4B: Масштабирование контекста | 1–2 недели | Stage 4A |
+| Stage 4C: Compact Prompt | 1–2 недели | Stage 4B |
+| Stage 4D: Hard negatives + масштаб | 1–2 недели | Stage 4C |
+| Stage 4E: End-to-end fine-tune | 1–2 недели | Stage 4D |
+| **Итого до первых QA результатов** | **~5–7 недель** | |
+| **Итого до полного пайплайна** | **~15–22 недели** | |
 
 ---
 
-*Этот план — живой документ. Обновляется по мере экспериментов.*
+*Этот план — живой документ. Обновляется по мере экспериментов и результатов.*
