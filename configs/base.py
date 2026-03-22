@@ -66,7 +66,7 @@ class TrainingConfig:
 class Stage0Config:
     """Stage 0: SONAR validation experiment config."""
     sonar: SONARConfig = field(default_factory=SONARConfig)
-    # Noise robustness
+    # Noise robustness (relative: 0.05 = 5% of embedding norm)
     noise_scales: list[float] = field(
         default_factory=lambda: [0.01, 0.05, 0.1, 0.2, 0.3, 0.5]
     )

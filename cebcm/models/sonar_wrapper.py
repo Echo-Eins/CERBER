@@ -91,7 +91,7 @@ class SONARWrapper:
         self,
         vectors: Tensor,
         lang: str = "eng_Latn",
-        max_seq_len: int = 512,
+        max_seq_len: int = 128,
     ) -> list[str]:
         """
         Decode SONAR embeddings back to text.
@@ -108,6 +108,35 @@ class SONARWrapper:
         vectors = vectors.to(self.device)
         texts = decoder.predict(vectors, target_lang=lang, max_seq_len=max_seq_len)
         return texts
+
+    def decode_safe(
+        self,
+        vectors: Tensor,
+        lang: str = "eng_Latn",
+        max_seq_len: int = 128,
+    ) -> list[str]:
+        """
+        Decode embeddings one-by-one with OOM protection.
+
+        Noisy/corrupted embeddings can cause beam search to generate
+        very long sequences, exhausting VRAM. This method decodes each
+        vector individually and catches OOM errors gracefully.
+
+        Returns:
+            List of decoded strings (or "[OOM]"/"[ERROR]" on failure).
+        """
+        results = []
+        for i in range(vectors.shape[0]):
+            try:
+                v = vectors[i : i + 1]
+                texts = self.decode(v, lang=lang, max_seq_len=max_seq_len)
+                results.append(texts[0])
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                results.append("[OOM]")
+            except Exception as e:
+                results.append(f"[ERROR: {type(e).__name__}]")
+        return results
 
     def encode_batched(
         self,

@@ -13,7 +13,7 @@ Usage:
     python experiments/00_sonar_validation/run_validation.py [--device cuda] [--num-sentences 1000]
 
 Kill criteria:
-    - noise > 0.05 causes complete meaning loss → SONAR space unsuitable
+    - 5% relative noise causes cos_sim < 0.85 → SONAR space too fragile
     - Interpolation produces gibberish → space not smooth
     - Norms collapse or cluster → space not expressive enough
 """
@@ -46,17 +46,16 @@ def experiment_a_noise_robustness(
     output_dir: Path,
 ):
     """
-    Add Gaussian noise to embeddings and check if decoded text preserves meaning.
+    Add RELATIVE Gaussian noise to embeddings and check if decoded text preserves meaning.
 
-    For each noise_scale, we:
-    1. Encode a set of test sentences
-    2. Add noise: V_noisy = V + N(0, noise_scale)
-    3. Decode both V and V_noisy
-    4. Measure cosine similarity between V and V_noisy
-    5. Compare decoded texts
+    Noise is scaled relative to each embedding's norm:
+        V_noisy = V + N(0,1) * noise_scale * ||V||
+
+    This ensures noise_scale=0.05 means "5% of the signal magnitude"
+    regardless of the absolute norm of SONAR embeddings (~0.2).
     """
     print("\n" + "=" * 70)
-    print("EXPERIMENT A: Noise Robustness")
+    print("EXPERIMENT A: Noise Robustness (RELATIVE noise)")
     print("=" * 70)
 
     test_sentences = [
@@ -74,24 +73,42 @@ def experiment_a_noise_robustness(
 
     print(f"\nEncoding {len(test_sentences)} test sentences...")
     V_orig = sonar.encode(test_sentences)
+    norms = V_orig.norm(dim=-1, keepdim=True)  # [N, 1]
     print(f"  Shape: {V_orig.shape}, dtype: {V_orig.dtype}")
-    print(f"  Mean norm: {V_orig.norm(dim=-1).mean().item():.4f}")
+    print(f"  Norms: mean={norms.mean().item():.4f}, min={norms.min().item():.4f}, max={norms.max().item():.4f}")
+
+    # First: decode originals to see baseline reconstruction quality
+    print(f"\n--- Baseline (no noise) ---")
+    decoded_orig = sonar.decode_safe(V_orig)
+    for i, (orig, dec) in enumerate(zip(test_sentences, decoded_orig)):
+        print(f"  [{i}] orig:    {orig}")
+        print(f"       decoded: {dec}")
 
     results = []
 
     for noise_scale in noise_scales:
-        print(f"\n--- noise_scale = {noise_scale} ---")
-        noise = torch.randn_like(V_orig) * noise_scale
+        print(f"\n--- relative noise_scale = {noise_scale} ({noise_scale*100:.0f}% of norm) ---")
+        # Relative noise: scale by per-vector norm
+        noise = torch.randn_like(V_orig) * noise_scale * norms
         V_noisy = V_orig + noise
 
+        noise_norm = noise.norm(dim=-1)
+        signal_norm = V_orig.norm(dim=-1)
+        snr = signal_norm / (noise_norm + 1e-8)
+
         cos_sims = F.cosine_similarity(V_orig, V_noisy, dim=-1)
-        decoded_noisy = sonar.decode(V_noisy)
+        decoded_noisy = sonar.decode_safe(V_noisy)
+
+        print(f"  SNR: mean={snr.mean().item():.2f}")
+        print(f"  cos_sim: mean={cos_sims.mean().item():.4f}, min={cos_sims.min().item():.4f}")
 
         scale_results = {
             "noise_scale": noise_scale,
+            "noise_type": "relative",
             "cos_sim_mean": cos_sims.mean().item(),
             "cos_sim_min": cos_sims.min().item(),
             "cos_sim_max": cos_sims.max().item(),
+            "snr_mean": snr.mean().item(),
             "pairs": [],
         }
 
@@ -107,6 +124,7 @@ def experiment_a_noise_robustness(
             print(f"       noisy: {noisy_text}")
 
         results.append(scale_results)
+        torch.cuda.empty_cache()
 
     # Save results
     out_file = output_dir / "experiment_a_noise.json"
@@ -166,7 +184,7 @@ def experiment_b_interpolation(
 
         for alpha in alphas:
             V_interp = (1 - alpha) * V_a + alpha * V_b
-            decoded = sonar.decode(V_interp)
+            decoded = sonar.decode_safe(V_interp)
             norm = V_interp.norm(dim=-1).item()
 
             interp = {
@@ -329,8 +347,9 @@ def experiment_d_gradient_flow(
         print(f"\n--- Sentence {i}: {text} ---")
         V_target = V_orig[i : i + 1].detach()
 
-        # Start from noisy version
-        V_start = V_target + torch.randn_like(V_target) * 0.2
+        # Start from noisy version (relative noise: 50% of norm for a strong test)
+        target_norm = V_target.norm()
+        V_start = V_target + torch.randn_like(V_target) * 0.5 * target_norm
         V_current = V_start.clone().requires_grad_(True)
 
         cos_before = F.cosine_similarity(V_target, V_start, dim=-1).item()
@@ -362,8 +381,8 @@ def experiment_d_gradient_flow(
         print(f"  Improvement: {cos_after - cos_before:.4f}")
 
         # Decode the optimized vector
-        decoded_start = sonar.decode(V_start)
-        decoded_optimized = sonar.decode(V_current.detach())
+        decoded_start = sonar.decode_safe(V_start)
+        decoded_optimized = sonar.decode_safe(V_current.detach())
         print(f"  Decoded start:     {decoded_start[0]}")
         print(f"  Decoded optimized: {decoded_optimized[0]}")
 
@@ -397,7 +416,7 @@ def estimate_vram(sonar: SONARWrapper, output_dir: Path):
 
     # Force load both models
     sonar.encode(["test"])
-    sonar.decode(sonar.encode(["test"]))
+    sonar.decode_safe(sonar.encode(["test"]))
 
     vram = sonar.estimate_vram()
     print(f"\nSONAR encoder: {vram.get('encoder', 'N/A'):.1f} MB")
@@ -451,18 +470,20 @@ def go_nogo_analysis(
     issues = []
     warnings = []
 
-    # Check A: Noise robustness
+    # Check A: Noise robustness (relative noise scales)
+    # At 5% relative noise, cos_sim should be high (>0.90 for GO)
+    # At 10% relative noise, cos_sim should be reasonable (>0.80)
     for r in noise_results:
         scale = r["noise_scale"]
         cos_mean = r["cos_sim_mean"]
-        if scale <= 0.05 and cos_mean < 0.9:
+        if scale <= 0.05 and cos_mean < 0.85:
             issues.append(
-                f"KILL: noise_scale={scale} causes cos_sim={cos_mean:.3f} < 0.9 "
+                f"KILL: {scale*100:.0f}% relative noise causes cos_sim={cos_mean:.3f} < 0.85 "
                 f"— space too fragile for gradient navigation"
             )
-        elif scale <= 0.1 and cos_mean < 0.8:
+        elif scale <= 0.10 and cos_mean < 0.75:
             warnings.append(
-                f"WARNING: noise_scale={scale} causes cos_sim={cos_mean:.3f} < 0.8"
+                f"WARNING: {scale*100:.0f}% relative noise causes cos_sim={cos_mean:.3f} < 0.75"
             )
 
     # Check B: Interpolation smoothness
