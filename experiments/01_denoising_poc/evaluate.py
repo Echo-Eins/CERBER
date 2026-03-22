@@ -95,18 +95,17 @@ def main():
 
             cos_before = F.cosine_similarity(v_orig, v_noisy, dim=-1).item()
 
-            # Langevin denoising
-            with torch.no_grad():
-                result = langevin_dynamics(
-                    energy_fn=model,
-                    v_query=v_orig,
-                    v_init=v_noisy,
-                    lr=config.langevin.lr,
-                    noise_scale=config.langevin.noise_scale,
-                    max_steps=config.langevin.max_steps,
-                    target_norm=config.langevin.target_norm,
-                    v_target=v_orig,
-                )
+            # Langevin denoising (no torch.no_grad — energy_and_grad needs grad computation)
+            result = langevin_dynamics(
+                energy_fn=model,
+                v_query=v_orig,
+                v_init=v_noisy,
+                lr=config.langevin.lr,
+                noise_scale=config.langevin.noise_scale,
+                max_steps=config.langevin.max_steps,
+                target_norm=config.langevin.target_norm,
+                v_target=v_orig,
+            )
 
             cos_after = F.cosine_similarity(v_orig, result.v_final, dim=-1).item()
             improved = cos_after > cos_before
