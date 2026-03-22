@@ -117,7 +117,6 @@ def train_epoch(
     }
 
 
-@torch.no_grad()
 def evaluate_denoising(
     model: SimpleEnergy,
     dataset: SONARVectorDataset,
