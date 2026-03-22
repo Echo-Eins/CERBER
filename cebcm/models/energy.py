@@ -30,7 +30,7 @@ class SimpleEnergy(nn.Module):
         self,
         dim: int = 1024,
         hidden_dims: list[int] | None = None,
-        spectral_norm: bool = True,
+        spectral_norm: bool = False,
     ):
         super().__init__()
         if hidden_dims is None:

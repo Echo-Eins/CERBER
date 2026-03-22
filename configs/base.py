@@ -100,10 +100,10 @@ class Stage1Config:
     weight_decay: float = 0.01
     batch_size: int = 32
     num_epochs: int = 50
-    margin: float = 1.0
+    margin: float = 0.1
     # Noise for training negatives (relative to norm)
     train_noise_scales: list[float] = field(
-        default_factory=lambda: [0.005, 0.01, 0.015, 0.02]
+        default_factory=lambda: [0.1, 0.2, 0.3]
     )
     # Data
     num_train_sentences: int = 10000
@@ -112,7 +112,7 @@ class Stage1Config:
     dataset_config: str = "wikitext-103-raw-v1"
     # Evaluation
     eval_noise_scales: list[float] = field(
-        default_factory=lambda: [0.005, 0.01, 0.02, 0.03]
+        default_factory=lambda: [0.05, 0.1, 0.2, 0.3]
     )
     # Output
     output_dir: str = "experiments/01_denoising_poc"
