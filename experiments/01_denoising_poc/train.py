@@ -5,21 +5,34 @@ Pipeline:
     SONAR encoder (frozen) → [SimpleEnergy] → Langevin → SONAR decoder (frozen)
                                ^^^TRAINS^^^
 
-Training loop:
-    1. Sample V_orig from pre-encoded WikiText vectors
-    2. V_noisy = V_orig + relative_noise (scale sampled from train_noise_scales)
-    3. E_pos = SimpleEnergy(V_orig, V_orig)  — energy of correct pair
-    4. E_neg = SimpleEnergy(V_orig, V_noisy) — energy of noisy pair
-    5. Loss = margin_contrastive(E_pos, E_neg) + λ·gradient_penalty
+Training loop (MDSM — Multi-Scale Denoising Score Matching):
+    1. Sample V_clean from pre-encoded WikiText vectors
+    2. σ ~ LogUniform(σ_min, σ_max) — continuous noise scale
+    3. V_noisy = V_clean + σ·||V_clean||·ε  (relative Gaussian noise)
+    4. Loss = ||∇_V E(V_clean, V_noisy) - target_score||² + λ·GP
+       where target_score = -(V_noisy - V_clean) / σ² is the analytic
+       denoising score direction.
+
+    This trains the energy gradient to point correctly from any noisy vector
+    back toward the clean vector, at ALL noise scales simultaneously.
+    Langevin dynamics then follows these gradients for refinement.
+
+Architecture:
+    - OrthoLinear layers (Bjorck orthonormalization, all σ_i ≈ 1)
+    - GroupSort activation (1-Lipschitz, no gradient attenuation)
+    - 4 layers: 4096→2048→1024→512→1
 
 Usage:
     # 1. First encode the dataset (one-time):
     python -m cebcm.data.encode_dataset --num_sentences 10500 --output data/wikitext_sonar_10k.pt
 
-    # 2. Train:
+    # 2. Train (MDSM with PID Langevin, orthonorm+GroupSort):
     python experiments/01_denoising_poc/train.py --data data/wikitext_sonar_10k.pt
 
-    # 3. Train with wandb:
+    # 3. Train with legacy margin contrastive + spectral norm:
+    python experiments/01_denoising_poc/train.py --data data/wikitext_sonar_10k.pt --loss margin_contrastive --norm spectral_norm --activation relu
+
+    # 4. Train with wandb:
     python experiments/01_denoising_poc/train.py --data data/wikitext_sonar_10k.pt --wandb
 
 Spec reference: §13.1, IMPLEMENTATION_PLAN §4.1
@@ -40,8 +53,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from configs.base import Stage1Config
 from cebcm.models.energy import SimpleEnergy
-from cebcm.training.losses import margin_contrastive_loss, gradient_penalty
-from cebcm.inference.langevin import langevin_dynamics
+from cebcm.training.losses import (
+    multiscale_dsm_loss,
+    margin_contrastive_loss,
+    gradient_penalty,
+)
+from cebcm.inference.langevin import (
+    langevin_dynamics,
+    pid_langevin_dynamics,
+    underdamped_langevin_dynamics,
+    run_langevin,
+)
 from cebcm.data.dataset import SONARVectorDataset
 
 
@@ -52,7 +74,77 @@ def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
     return v + noise
 
 
-def train_epoch(
+def train_epoch_mdsm(
+    model: SimpleEnergy,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    config: Stage1Config,
+    device: torch.device,
+    epoch: int,
+    global_step: int,
+) -> tuple[dict, int]:
+    """Train one epoch with MDSM loss. Returns (metrics, new_global_step)."""
+    model.train()
+    total_loss = 0.0
+    total_dsm = 0.0
+    total_gp = 0.0
+    num_batches = 0
+
+    for batch_idx, v_clean in enumerate(dataloader):
+        v_clean = v_clean.to(device)
+
+        # Warmup: linearly increase LR from 0 to target
+        if global_step < config.warmup_steps:
+            warmup_factor = global_step / config.warmup_steps
+            for pg in optimizer.param_groups:
+                pg["lr"] = config.lr * warmup_factor
+
+        # MDSM loss: learn correct score at all noise scales
+        loss_dsm = multiscale_dsm_loss(
+            energy_fn=model,
+            v_clean=v_clean,
+            sigma_min=config.mdsm_sigma_min,
+            sigma_max=config.mdsm_sigma_max,
+            relative_noise=True,
+        )
+
+        # Optional gradient penalty (lighter with orthonorm — already Lipschitz)
+        loss_gp = torch.tensor(0.0, device=device)
+        if config.gradient_penalty_lambda > 0:
+            noise_scale = 0.1  # fixed scale for GP sampling
+            v_noisy = add_relative_noise(v_clean, noise_scale)
+            loss_gp = gradient_penalty(model, v_clean, v_noisy)
+
+        loss = loss_dsm + config.gradient_penalty_lambda * loss_gp
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_dsm += loss_dsm.item()
+        total_gp += loss_gp.item()
+        num_batches += 1
+        global_step += 1
+
+        if config.log_every > 0 and (batch_idx + 1) % config.log_every == 0:
+            print(
+                f"  [{batch_idx + 1}/{len(dataloader)}] "
+                f"loss={loss.item():.4f} DSM={loss_dsm.item():.4f} "
+                f"GP={loss_gp.item():.4f} "
+                f"lr={optimizer.param_groups[0]['lr']:.6f}"
+            )
+
+    return {
+        "loss": total_loss / max(num_batches, 1),
+        "dsm_loss": total_dsm / max(num_batches, 1),
+        "gradient_penalty": total_gp / max(num_batches, 1),
+    }, global_step
+
+
+def train_epoch_contrastive(
     model: SimpleEnergy,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -60,7 +152,7 @@ def train_epoch(
     device: torch.device,
     epoch: int,
 ) -> dict:
-    """Train for one epoch. Returns metrics dict."""
+    """Train one epoch with legacy margin contrastive loss. Returns metrics."""
     model.train()
     total_loss = 0.0
     total_e_pos = 0.0
@@ -71,27 +163,19 @@ def train_epoch(
     for batch_idx, v_orig in enumerate(dataloader):
         v_orig = v_orig.to(device)
 
-        # Sample noise scale from training scales
         scale_idx = torch.randint(0, len(config.train_noise_scales), (1,)).item()
         noise_scale = config.train_noise_scales[scale_idx]
 
-        # Positive pair: (V_orig, V_orig) → low energy
         e_pos = model(v_orig, v_orig)
-
-        # Negative pair: (V_orig, V_noisy) → high energy
         v_noisy = add_relative_noise(v_orig, noise_scale)
         e_neg = model(v_orig, v_noisy)
 
-        # Margin contrastive loss
         loss_contrastive = margin_contrastive_loss(e_pos, e_neg, margin=config.margin)
-
-        # Gradient penalty for smooth energy landscape
         gp = gradient_penalty(model, v_orig, v_noisy)
-        loss = loss_contrastive + 0.1 * gp
+        loss = loss_contrastive + config.gradient_penalty_lambda * gp
 
         optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping for stability
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
@@ -109,11 +193,11 @@ def train_epoch(
             )
 
     return {
-        "loss": total_loss / num_batches,
-        "e_pos_mean": total_e_pos / num_batches,
-        "e_neg_mean": total_e_neg / num_batches,
-        "gradient_penalty": total_gp / num_batches,
-        "energy_gap": (total_e_neg - total_e_pos) / num_batches,
+        "loss": total_loss / max(num_batches, 1),
+        "e_pos_mean": total_e_pos / max(num_batches, 1),
+        "e_neg_mean": total_e_neg / max(num_batches, 1),
+        "gradient_penalty": total_gp / max(num_batches, 1),
+        "energy_gap": (total_e_neg - total_e_pos) / max(num_batches, 1),
     }
 
 
@@ -125,13 +209,31 @@ def evaluate_denoising(
     num_samples: int = 100,
 ) -> dict:
     """
-    Evaluate denoising quality: run Langevin dynamics on noisy vectors,
-    measure if they get closer to originals.
+    Evaluate denoising quality using the configured Langevin method.
+    Run Langevin dynamics on noisy vectors, measure if they get closer to originals.
     """
     model.eval()
     results = {}
 
     indices = torch.randperm(len(dataset))[:num_samples]
+
+    # Method-specific kwargs
+    method = config.langevin.method
+    method_kwargs = {}
+    if method == "pid":
+        method_kwargs = dict(
+            kp=config.langevin.pid_kp,
+            ki=config.langevin.pid_ki,
+            kd=config.langevin.pid_kd,
+            integral_decay=config.langevin.pid_integral_decay,
+        )
+    elif method == "underdamped":
+        method_kwargs = dict(
+            friction=config.langevin.underdamped_friction,
+            mass=config.langevin.underdamped_mass,
+        )
+    elif method == "overdamped":
+        method_kwargs = dict(momentum_beta=config.langevin.momentum_beta)
 
     for noise_scale in config.eval_noise_scales:
         cos_before_list = []
@@ -143,11 +245,10 @@ def evaluate_denoising(
             v_orig = dataset[idx.item()].unsqueeze(0).to(device)
             v_noisy = add_relative_noise(v_orig, noise_scale)
 
-            # Cosine similarity before denoising
             cos_before = F.cosine_similarity(v_orig, v_noisy, dim=-1).item()
 
-            # Run Langevin denoising (pass v_orig as query — model minimizes E(v_orig, v_candidate))
-            result = langevin_dynamics(
+            result = run_langevin(
+                method=method,
                 energy_fn=model,
                 v_query=v_orig,
                 v_init=v_noisy,
@@ -155,16 +256,15 @@ def evaluate_denoising(
                 noise_scale=config.langevin.noise_scale,
                 max_steps=config.langevin.max_steps,
                 target_norm=config.langevin.target_norm,
-                momentum_beta=config.langevin.momentum_beta,
                 energy_threshold=config.langevin.energy_threshold,
                 plateau_patience=config.langevin.plateau_patience,
                 plateau_delta=config.langevin.plateau_delta,
                 v_target=v_orig,
+                **method_kwargs,
             )
 
             cos_after = F.cosine_similarity(v_orig, result.v_final, dim=-1).item()
 
-            # Energy before/after
             e_before = model(v_orig, v_noisy).item()
             e_after = model(v_orig, result.v_final).item()
 
@@ -200,6 +300,19 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch_size")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    # Architecture flags
+    parser.add_argument("--loss", type=str, default=None,
+                        choices=["mdsm", "margin_contrastive"],
+                        help="Loss type (default: mdsm)")
+    parser.add_argument("--norm", type=str, default=None,
+                        choices=["orthonorm", "spectral_norm", "none"],
+                        help="Normalization (default: orthonorm)")
+    parser.add_argument("--activation", type=str, default=None,
+                        choices=["groupsort", "lipschitz_spline", "relu"],
+                        help="Activation (default: groupsort)")
+    parser.add_argument("--langevin_method", type=str, default=None,
+                        choices=["overdamped", "pid", "underdamped"],
+                        help="Langevin method (default: pid)")
     args = parser.parse_args()
 
     config = Stage1Config()
@@ -209,6 +322,14 @@ def main():
         config.batch_size = args.batch_size
     if args.lr is not None:
         config.lr = args.lr
+    if args.loss is not None:
+        config.loss_type = args.loss
+    if args.norm is not None:
+        config.norm_mode = args.norm
+    if args.activation is not None:
+        config.activation = args.activation
+    if args.langevin_method is not None:
+        config.langevin.method = args.langevin_method
     config.use_wandb = args.wandb
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -221,7 +342,6 @@ def main():
     full_dataset = SONARVectorDataset(args.data)
     print(f"  Total vectors: {len(full_dataset)}, dim: {full_dataset.embeddings.shape[1]}")
 
-    # Split: last 500 for test
     n_test = min(config.num_test_sentences, len(full_dataset) // 10)
     n_train = len(full_dataset) - n_test
     train_dataset = full_dataset.subset(0, n_train)
@@ -238,11 +358,19 @@ def main():
     model = SimpleEnergy(
         dim=config.energy_dim,
         hidden_dims=config.energy_hidden_dims,
-        spectral_norm=True,
+        norm_mode=config.norm_mode,
+        activation=config.activation,
+        ortho_n_iters=config.ortho_n_iters,
+        groupsort_size=config.groupsort_size,
+        spline_num_knots=config.spline_num_knots,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"SimpleEnergy: {num_params:,} parameters")
+    print(f"  Architecture: norm={config.norm_mode}, activation={config.activation}")
+    print(f"  Hidden dims: {config.energy_hidden_dims}")
+    print(f"  Loss: {config.loss_type}")
+    print(f"  Langevin: {config.langevin.method}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
@@ -252,6 +380,7 @@ def main():
     )
 
     start_epoch = 0
+    global_step = 0
     if args.resume:
         print(f"Resuming from {args.resume}...")
         ckpt = torch.load(args.resume, weights_only=False, map_location=device)
@@ -259,6 +388,7 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         start_epoch = ckpt["epoch"] + 1
+        global_step = ckpt.get("global_step", 0)
         print(f"  Resumed at epoch {start_epoch}")
 
     # ============================================================
@@ -273,10 +403,13 @@ def main():
                 "lr": config.lr,
                 "batch_size": config.batch_size,
                 "num_epochs": config.num_epochs,
-                "margin": config.margin,
-                "train_noise_scales": config.train_noise_scales,
-                "eval_noise_scales": config.eval_noise_scales,
+                "loss_type": config.loss_type,
+                "norm_mode": config.norm_mode,
+                "activation": config.activation,
                 "energy_hidden_dims": config.energy_hidden_dims,
+                "mdsm_sigma_min": config.mdsm_sigma_min,
+                "mdsm_sigma_max": config.mdsm_sigma_max,
+                "langevin_method": config.langevin.method,
                 "langevin_lr": config.langevin.lr,
                 "langevin_steps": config.langevin.max_steps,
                 "target_norm": config.langevin.target_norm,
@@ -298,11 +431,15 @@ def main():
     print(f"\n{'='*60}")
     print(f"Training SimpleEnergy for {config.num_epochs} epochs")
     print(f"  Batch size: {config.batch_size}")
-    print(f"  LR: {config.lr}")
-    print(f"  Margin: {config.margin}")
-    print(f"  Train noise scales: {config.train_noise_scales}")
+    print(f"  LR: {config.lr} (warmup: {config.warmup_steps} steps)")
+    print(f"  Loss: {config.loss_type}")
+    if config.loss_type == "mdsm":
+        print(f"  MDSM σ range: [{config.mdsm_sigma_min}, {config.mdsm_sigma_max}]")
+    else:
+        print(f"  Margin: {config.margin}")
+        print(f"  Train noise scales: {config.train_noise_scales}")
     print(f"  Eval noise scales: {config.eval_noise_scales}")
-    print(f"  Langevin LR: {config.langevin.lr}, steps: {config.langevin.max_steps}")
+    print(f"  Langevin: method={config.langevin.method}, lr={config.langevin.lr}, steps={config.langevin.max_steps}")
     print(f"  Target norm: {config.langevin.target_norm}")
     print(f"{'='*60}\n")
 
@@ -315,19 +452,23 @@ def main():
         print(f"Epoch {epoch + 1}/{config.num_epochs}")
 
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, config, device, epoch)
-        scheduler.step()
+        if config.loss_type == "mdsm":
+            train_metrics, global_step = train_epoch_mdsm(
+                model, train_loader, optimizer, scheduler,
+                config, device, epoch, global_step,
+            )
+        else:
+            train_metrics = train_epoch_contrastive(
+                model, train_loader, optimizer, config, device, epoch,
+            )
+
+        # Step scheduler after warmup completes
+        if global_step >= config.warmup_steps:
+            scheduler.step()
 
         epoch_time = time.time() - epoch_start
-        print(
-            f"  loss={train_metrics['loss']:.4f} "
-            f"E_pos={train_metrics['e_pos_mean']:.4f} "
-            f"E_neg={train_metrics['e_neg_mean']:.4f} "
-            f"gap={train_metrics['energy_gap']:.4f} "
-            f"GP={train_metrics['gradient_penalty']:.4f} "
-            f"lr={scheduler.get_last_lr()[0]:.6f} "
-            f"({epoch_time:.1f}s)"
-        )
+        metrics_str = " ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
+        print(f"  {metrics_str} lr={optimizer.param_groups[0]['lr']:.6f} ({epoch_time:.1f}s)")
 
         # Evaluate periodically
         eval_metrics = None
@@ -339,13 +480,12 @@ def main():
             for noise_key, metrics in eval_metrics.items():
                 print(
                     f"    {noise_key}: "
-                    f"cos_before={metrics['cos_before_mean']:.4f} → "
+                    f"cos_before={metrics['cos_before_mean']:.4f} -> "
                     f"cos_after={metrics['cos_after_mean']:.4f} "
-                    f"(Δ={metrics['improvement']:+.4f}, "
+                    f"(d={metrics['improvement']:+.4f}, "
                     f"success={metrics['success_rate']:.0%})"
                 )
 
-            # Track best
             avg_improvement = sum(
                 m["improvement"] for m in eval_metrics.values()
             ) / len(eval_metrics)
@@ -357,15 +497,19 @@ def main():
                         "optimizer_state": optimizer.state_dict(),
                         "scheduler_state": scheduler.state_dict(),
                         "epoch": epoch,
+                        "global_step": global_step,
                         "metrics": eval_metrics,
                         "config": {
                             "energy_dim": config.energy_dim,
                             "energy_hidden_dims": config.energy_hidden_dims,
+                            "norm_mode": config.norm_mode,
+                            "activation": config.activation,
+                            "loss_type": config.loss_type,
                         },
                     },
                     checkpoint_dir / "best.pt",
                 )
-                print(f"    ★ New best (avg improvement: {avg_improvement:+.4f})")
+                print(f"    * New best (avg improvement: {avg_improvement:+.4f})")
 
         # Log
         epoch_record = {"epoch": epoch + 1, "train": train_metrics}
@@ -375,7 +519,7 @@ def main():
 
         if wandb_run is not None:
             log_dict = {f"train/{k}": v for k, v in train_metrics.items()}
-            log_dict["train/lr"] = scheduler.get_last_lr()[0]
+            log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
             if eval_metrics is not None:
                 for noise_key, metrics in eval_metrics.items():
                     for mk, mv in metrics.items():
@@ -390,6 +534,7 @@ def main():
                     "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(),
                     "epoch": epoch,
+                    "global_step": global_step,
                 },
                 checkpoint_dir / f"epoch_{epoch + 1:03d}.pt",
             )
@@ -400,36 +545,37 @@ def main():
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time:.1f}s")
 
-    # Final evaluation
     print("\nFinal evaluation on test set...")
     model.eval()
     final_eval = evaluate_denoising(model, test_dataset, config, device, num_samples=min(200, len(test_dataset)))
     for noise_key, metrics in final_eval.items():
         print(
             f"  {noise_key}: "
-            f"cos_before={metrics['cos_before_mean']:.4f} → "
+            f"cos_before={metrics['cos_before_mean']:.4f} -> "
             f"cos_after={metrics['cos_after_mean']:.4f} "
-            f"(Δ={metrics['improvement']:+.4f}, "
+            f"(d={metrics['improvement']:+.4f}, "
             f"success={metrics['success_rate']:.0%})"
         )
 
-    # Save final checkpoint
     torch.save(
         {
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "epoch": config.num_epochs - 1,
+            "global_step": global_step,
             "final_eval": final_eval,
             "config": {
                 "energy_dim": config.energy_dim,
                 "energy_hidden_dims": config.energy_hidden_dims,
+                "norm_mode": config.norm_mode,
+                "activation": config.activation,
+                "loss_type": config.loss_type,
             },
         },
         checkpoint_dir / "final.pt",
     )
 
-    # Save metrics log
     summary = {
         "total_time_seconds": total_time,
         "num_epochs": config.num_epochs,
@@ -438,10 +584,13 @@ def main():
         "config": {
             "lr": config.lr,
             "batch_size": config.batch_size,
-            "margin": config.margin,
-            "train_noise_scales": config.train_noise_scales,
-            "eval_noise_scales": config.eval_noise_scales,
+            "loss_type": config.loss_type,
+            "norm_mode": config.norm_mode,
+            "activation": config.activation,
             "energy_hidden_dims": config.energy_hidden_dims,
+            "mdsm_sigma_min": config.mdsm_sigma_min,
+            "mdsm_sigma_max": config.mdsm_sigma_max,
+            "langevin_method": config.langevin.method,
             "langevin_lr": config.langevin.lr,
             "langevin_steps": config.langevin.max_steps,
             "target_norm": config.langevin.target_norm,
@@ -460,15 +609,15 @@ def main():
     for noise_key, metrics in final_eval.items():
         passed = metrics["improvement"] > 0 and metrics["success_rate"] > 0.5
         status = "PASS" if passed else "FAIL"
-        print(f"  {noise_key}: improvement={metrics['improvement']:+.4f}, success={metrics['success_rate']:.0%} → {status}")
+        print(f"  {noise_key}: improvement={metrics['improvement']:+.4f}, success={metrics['success_rate']:.0%} -> {status}")
         if not passed:
             all_pass = False
 
     if all_pass:
-        print("\n  ★ VERDICT: Stage 1 PASSED — energy function works for denoising")
+        print("\n  VERDICT: Stage 1 PASSED — energy function works for denoising")
     else:
-        print("\n  ✗ VERDICT: Stage 1 FAILED — denoised vectors not closer to originals")
-        print("    → Energy function does not work. Review architecture or training.")
+        print("\n  VERDICT: Stage 1 FAILED — denoised vectors not closer to originals")
+        print("    -> Energy function does not work. Review architecture or training.")
 
     if wandb_run is not None:
         wandb_run.finish()

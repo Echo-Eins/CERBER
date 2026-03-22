@@ -43,23 +43,37 @@ class LangevinConfig:
     cruise_ratio: float = 0.0  # 0.0 = pure Langevin, 0.7 = aggressive inertia
     momentum_beta: float = 0.9
     target_norm: float | None = None  # set from data statistics
+    # Method selection: "overdamped", "pid", "underdamped"
+    method: str = "pid"
+    # PID-specific (arXiv:2511.12603)
+    pid_kp: float = 1.0
+    pid_ki: float = 0.3
+    pid_kd: float = 0.1
+    pid_integral_decay: float = 0.95
+    # Underdamped-specific (GAUL, SIAM JUQ 2025)
+    underdamped_friction: float = 0.5
+    underdamped_mass: float = 1.0
 
 
 @dataclass
 class TrainingConfig:
     """Training hyperparameters."""
-    lr: float = 1e-4
+    lr: float = 5e-5  # Lowered from 1e-4 for orthonorm + learnable activations
     weight_decay: float = 0.01
     batch_size: int = 256
     num_negatives: int = 31
     temperature: float = 0.07
     total_epochs: int = 100
     gradient_penalty_lambda: float = 0.1
-    spectral_norm: bool = True
+    # Architecture
+    norm_mode: str = "orthonorm"    # "orthonorm" or "spectral_norm"
+    activation: str = "groupsort"  # "groupsort", "lipschitz_spline", or "relu"
     # Curriculum
     easy_epochs_pct: float = 0.2
     medium_epochs_pct: float = 0.3
     hard_epochs_pct: float = 0.5
+    # Focal-InfoNCE (for Stage 2+)
+    focal_gamma: float = 2.0  # 0 = standard InfoNCE, 2 = strong focal
 
 
 @dataclass
@@ -89,19 +103,36 @@ class Stage1Config:
         noise_scale=0.0,
         max_steps=100,
         target_norm=0.2051,
+        method="pid",
+        pid_kp=1.0,
+        pid_ki=0.3,
+        pid_kd=0.1,
+        pid_integral_decay=0.95,
     ))
     # SimpleEnergy architecture
     energy_dim: int = 1024
     energy_hidden_dims: list[int] = field(
-        default_factory=lambda: [2048, 512]
+        default_factory=lambda: [2048, 1024, 512]  # Deeper: +1 layer for expressiveness
     )
+    # Architecture choices
+    norm_mode: str = "orthonorm"       # "orthonorm" (default) or "spectral_norm"
+    activation: str = "groupsort"      # "groupsort" (default), "lipschitz_spline", "relu"
+    ortho_n_iters: int = 15            # Bjorck iterations
+    groupsort_size: int = 2            # Group size (2 = MaxMin)
+    spline_num_knots: int = 4          # Knots for lipschitz_spline
     # Training
-    lr: float = 1e-4
+    lr: float = 5e-5  # Lowered for orthonorm + learnable activations (was 1e-4)
+    warmup_steps: int = 500            # Linear warmup from 0 to lr
     weight_decay: float = 0.01
     batch_size: int = 32
     num_epochs: int = 50
-    margin: float = 1.0
-    # Noise for training negatives (relative to norm)
+    # MDSM (Multi-Scale Denoising Score Matching) — replaces margin contrastive
+    loss_type: str = "mdsm"            # "mdsm" (default) or "margin_contrastive" (legacy)
+    mdsm_sigma_min: float = 0.01       # Minimum noise scale (fine structure)
+    mdsm_sigma_max: float = 0.5        # Maximum noise scale (global structure)
+    gradient_penalty_lambda: float = 0.05  # Lower for orthonorm (already Lipschitz)
+    margin: float = 1.0                # Only used with margin_contrastive loss
+    # Noise for training negatives (only used with margin_contrastive loss)
     train_noise_scales: list[float] = field(
         default_factory=lambda: [0.1, 0.2, 0.3]
     )

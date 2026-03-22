@@ -1,10 +1,19 @@
 ﻿# CEBCM — Concept-Driven Energy-Based Coding Machine
 ## Полная техническая спецификация проекта
 
-**Версия:** 1.3
-**Дата:** 21 марта 2026
+**Версия:** 1.4
+**Дата:** 22 марта 2026
 **Статус:** Концептуальное проектирование → Proof of Concept
 
+> **Changelog v1.4 (22.03.2026):**
+> - §5.2: Архитектура EBM обновлена — OrthoLinear (Bjorck) заменяет Spectral Norm, GroupSort/LipschitzSpline заменяют ReLU
+> - §5.4: MDSM (Multi-Scale Denoising Score Matching) заменяет Margin Contrastive Loss для Stage 1
+> - §5.4.2: Добавлены Focal-InfoNCE и Soft-InfoNCE для Stage 2+ (заменяют стандартный InfoNCE)
+> - §7.3: IPP — Latent Flow Matching заменяет MSE-обучение (планируется для Stage 2+)
+> - §10: PID-Controlled Langevin Dynamics (PIDLD, arXiv:2511.12603) и Underdamped Langevin (GAUL, SIAM JUQ 2025)
+> - §10.5: Energy Matching (NeurIPS 2025, arXiv:2504.10612) — потенциальный target training objective
+> - Обновлены таблицы архитектур в §11.3 и Приложение C
+>
 > **Changelog v1.3 (21.03.2026):**
 > - Удалены MHLA-проекторы, Hierarchical Attention, GQA — избыточны для 1024d SONAR
 > - Добавлен §9.5 Surprise Mechanism (Google Titans, arXiv:2501.00663)
@@ -459,20 +468,51 @@ EBT имеет общий backbone и два специализированны�
 
 **Вход:** два вектора (V_query, V_candidate)  
 **Выход:** скаляр E ∈ ℝ  
-**Архитектура:** MLP поверх конкатенации  
+**Архитектура:** MLP поверх конкатенации с Lipschitz-оптимальными компонентами
 
 ```
 Input: [V_query; V_candidate; V_query - V_candidate; V_query ⊙ V_candidate]
        ────────────────── 4096d ──────────────────
                           │
-                    Linear(4096, 2048)
-                         ReLU
-                    Linear(2048, 1024)
-                         ReLU
-                    Linear(1024, 1)
+                    OrthoLinear(4096, 2048)     ← Bjorck orthonormalization (все σ_i ≈ 1)
+                         GroupSort(2)           ← MaxMin activation (1-Lipschitz)
+                    OrthoLinear(2048, 1024)
+                         GroupSort(2)
+                    OrthoLinear(1024, 512)
+                         GroupSort(2)
+                    OrthoLinear(512, 1)
                           │
                        Scalar E
 ```
+
+> **Ревью-заметка (v1.4): Обновление архитектуры EBM**
+>
+> **Замена Spectral Normalization на Bjorck Orthonormalization:**
+> Spectral Norm ограничивает только максимальное сингулярное число σ_max(W)=1, оставляя остальные около 0.
+> Это вызывает gradient attenuation — якобиан значительно меньше теоретически допустимого (JMLR 2024, vol 25, 22-1347).
+> Bjorck Orthonormalization принуждает ВСЕ σ_i ≈ 1, обеспечивая:
+> - Идеальный gradient flow без атенюации
+> - 1-Lipschitz гарантия по конструкции
+> - Максимальная выразительность в рамках Lipschitz-ограничения
+> - Квадратичная сходимость (15 итераций достаточно)
+>
+> **Замена ReLU на GroupSort:**
+> ReLU — наихудший выбор для Lipschitz-constrained сетей (JMLR 2024):
+> при Spectral Norm + ReLU большинство нейронов неактивны, сеть теряет ёмкость.
+> GroupSort(2) (aka MaxMin): для каждой пары (a,b) → (max(a,b), min(a,b)).
+> - 1-Lipschitz по конструкции (перестановка сохраняет нормы)
+> - Нет «мёртвых» нейронов — все градиенты проходят
+> - Значительно выше выразительность при том же бюджете параметров
+>
+> **Альтернативная активация: LipschitzLinearSpline**
+> Learnable кусочно-линейная активация с 4 узлами (3 линейных региона).
+> Slopes ∈ [-1, 1] через tanh — 1-Lipschitz по конструкции.
+> Оптимальная выразительность среди всех component-wise 1-Lipschitz активаций.
+> Доступна как опция, по умолчанию GroupSort (проще, быстрее).
+>
+> **Добавлен 4-й скрытый слой** (2048→1024→512 вместо 2048→512):
+> С orthonormalization + GroupSort глубина не вредит gradient flow,
+> но добавляет ёмкости для тонких energy landscapes.
 
 **Attention не используется.** Это чистая feedforward оценка двух векторов. Быстро, дёшево — критично для Langevin loop.
 
@@ -530,11 +570,60 @@ Input: [CLS, V_1, V_2, ..., V_n]  с позиционным кодировани
 
 **Критическое свойство:** функции энергии не зависят от структуры векторного пространства конкретного autoencoder'а. Они оценивают *отношения* между векторами. Если размерность входа совпадает — одна EBT теоретически работает с разными autoencoder'ами (с деградацией из-за разных распределений активаций).
 
-### 5.4 Training Objective: Contrastive Loss / InfoNCE
+### 5.4 Training Objective
 
-**Цель:** научить E_θ выдавать низкую энергию для правильных пар (query, answer) и высокую для неправильных.
+#### 5.4.1 Stage 1: MDSM (Multi-Scale Denoising Score Matching)
 
-**Формула InfoNCE с temperature:**
+> **Ревью-заметка (v1.4):** Заменяет Margin Contrastive Loss для Stage 1 (denoising PoC). MDSM напрямую обучает ∇_V E указывать от зашумлённого вектора к чистому — именно это нужно Langevin dynamics. Margin Contrastive лишь учит различать «хорошо/плохо», но не даёт корректный score.
+
+**Мотивация:** Li et al. (Entropy 2023, arXiv:1910.07762) показали, что в высокоразмерных пространствах (1024d — именно наш случай) обучение с одним уровнем шума **недостаточно** для learning score function. Нужен спектр от крупного σ (для глобальной структуры) до мелкого (для тонкой навигации).
+
+**Формула DSM:**
+
+```
+L_DSM = E_{σ~LogUniform(σ_min,σ_max)} [ σ² · ||∇_V E(V_clean, V_noisy) - s*(V_noisy)||² ]
+
+где s*(V_noisy) = -(V_noisy - V_clean) / σ² — аналитический denoising score
+    V_noisy = V_clean + σ·||V_clean||·ε, ε ~ N(0, I)
+    σ² — весовой коэффициент для баланса вклада разных масштабов
+```
+
+**Параметры:**
+- `σ_min = 0.01` — для тонкой структуры (финишная доводка Langevin)
+- `σ_max = 0.5` — для глобальной структуры (грубый старт)
+- Noise relative to `||V||` — как в исходной спеке
+- LogUniform sampling — равная плотность на каждую октаву шума
+
+**Преимущества перед Margin Contrastive:**
+1. Gradient ∇E корректен на **всех** масштабах (не только при конкретных noise_scales)
+2. Непрерывный schedule вместо 3 дискретных уровней [0.1, 0.2, 0.3]
+3. Energy landscape гладкий по конструкции — GP штраф можно снизить (0.05 вместо 0.1)
+
+#### 5.4.2 Stage 2+: Focal-InfoNCE (с Curriculum Negatives)
+
+> **Ревью-заметка (v1.4):** Заменяет стандартный InfoNCE. Стандартный InfoNCE одинаково обрабатывает все негативы, easy negatives доминируют в loss. Focal-InfoNCE перевзвешивает — harder negatives получают больший вес.
+
+**Формула Focal-InfoNCE** (Hou & Li, EMNLP 2023, arXiv:2310.06918):
+
+```
+L = -log( exp(-E(q, k⁺) / τ) / (exp(-E(q, k⁺) / τ) + Σᵢ wᵢ · exp(-E(q, kᵢ⁻) / τ)) )
+
+где wᵢ = pᵢ^γ,  pᵢ = softmax(-E(q, kᵢ⁻) / τ) — «hardness» негатива i
+    γ = 2.0 — focal exponent (γ=0 восстанавливает стандартный InfoNCE)
+```
+
+- γ = 2.0 → strong focal: самые hard negatives получают вес в 4× больше easy
+- Результат: +1.6 Spearman на sentence embeddings (BERT-base)
+- Особенно ценно на Stage 3 (hard negatives, cos 0.9–0.98)
+
+**Альтернатива для ablation: Soft-InfoNCE** (SoftCSE, CIKM 2024):
+Индивидуальная temperature τ_i для каждого негатива:
+`τ_i = τ · (1 + softness · (1 - hardness_i))`
+Более плавная дифференциация, но менее изучена на sentence embeddings.
+
+**Рекомендация:** Focal-InfoNCE как primary для Stage 2+. SoftCSE — резервный вариант для ablation.
+
+**Стандартный InfoNCE (для справки):**
 
 ```
 L = -log( exp(-E(q, k+) / τ) / Σᵢ exp(-E(q, kᵢ) / τ) )
@@ -593,15 +682,19 @@ for neg in hard_negatives_top10:
 
 **Решения:**
 
-1. **L2-regularization:** штраф за слишком высокую норму выхода EBT
-2. **Spectral Normalization:** на всех слоях EBT, ограничивает Lipschitz-константу
-3. **Gradient Penalty:** штраф за слишком большой градиент ∇_V E — гарантирует гладкость
+1. **Bjorck Orthonormalization** (v1.4, заменяет Spectral Norm): все σ_i ≈ 1, сеть 1-Lipschitz по конструкции. Нет gradient attenuation, идеальный gradient flow.
+2. **GroupSort/LipschitzSpline** (v1.4, заменяет ReLU): 1-Lipschitz активации, не «убивают» градиенты. Общая Lipschitz-константа сети = произведение констант слоёв = 1^L = 1.
+3. **Gradient Penalty:** штраф за слишком большой градиент ∇_V E — дополнительная гладкость поверх архитектурной гарантии. С orthonorm λ_grad можно снизить (0.05 vs 0.1).
 4. **Projection на сферу:** после каждого шага Langevin нормализовать вектор: V ← V / ||V|| * r, где r — средний радиус обучающих векторов
 
 ```python
-# Комбинированная loss для обучения EBT
-loss = infonce_loss                          # Основной contrastive loss
-     + λ_spec * spectral_norm_penalty        # Гладкость весов
+# Комбинированная loss для обучения EBT (v1.4)
+# Stage 1: MDSM
+loss = mdsm_loss                             # Multi-Scale Denoising Score Matching
+     + λ_grad * gradient_penalty(E, V)       # Гладкость ландшафта (λ=0.05 с orthonorm)
+
+# Stage 2+: Focal-InfoNCE
+loss = focal_infonce_loss                    # Основной contrastive loss с focal weighting
      + λ_grad * gradient_penalty(E, V)       # Гладкость ландшафта
      + λ_norm * max(0, ||E||² - margin)      # Ограничение величины энергии
 ```
@@ -697,31 +790,61 @@ V_init = alpha * V_query + (1 - alpha) * torch.randn_like(V_query) * noise_scale
 
 Логика: ответ семантически связан с вопросом, поэтому стартовать из окрестности вопроса разумнее, чем из случайной точки. Если EBT работает — Langevin доведёт этот грубый старт до правильного ответа.
 
-**Этап 1: MLP IPP (Base-LCM analog)**
+**Этап 1: Latent Flow Matching IPP**
+
+> **Ревью-заметка (v1.4):** MSE-обучение IPP отклонено в пользу Latent Flow Matching. MSE при множестве валидных ответов выдаёт «среднее между вариантами» — точку, не соответствующую ни одному осмысленному ответу (Meta Base-LCM подтверждает). Latent Flow Matching генерирует sample из распределения ответов, а не его среднее.
+
+**Latent Conditional Flow Matching** (Latent-CFM, arXiv:2505.04486, май 2025; LIRF, arXiv:2509.19903, янв 2026):
 
 ```python
-class SimpleIPP(nn.Module):
+class FlowIPP(nn.Module):
+    """
+    IPP обучается через Conditional Flow Matching в латентном пространстве.
+    Вместо предсказания конкретного V_target → генерирует sample
+    из распределения валидных ответов за один forward pass.
+    """
     def __init__(self, dim=1024, hidden=2048):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
+        # Velocity field v(V_t, t, V_query) предсказывает направление потока
+        self.velocity_net = nn.Sequential(
+            nn.Linear(dim * 2 + 1, hidden),   # V_t + V_query + t
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.GELU(),
-            nn.Linear(hidden, dim)
+            nn.Linear(hidden, dim)            # velocity в пространстве SONAR
         )
 
-    def forward(self, V_query):
-        return self.net(V_query)
+    def forward(self, V_query, V_t, t):
+        """Predict velocity field at time t."""
+        t_embed = t.unsqueeze(-1)  # [B, 1]
+        x = torch.cat([V_t, V_query, t_embed], dim=-1)
+        return self.velocity_net(x)
 
-# Обучение:
-# Loss: MSE между выходом IPP и V_target из encoder
-loss = F.mse_loss(ipp(V_query), V_target)
+    def sample(self, V_query, num_steps=10):
+        """Generate answer via ODE integration from noise to answer."""
+        V_t = torch.randn_like(V_query)  # Start from noise
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((V_query.shape[0],), i * dt, device=V_query.device)
+            velocity = self.forward(V_query, V_t, t)
+            V_t = V_t + dt * velocity
+        return V_t
+
+# Обучение (Conditional Flow Matching):
+# Прямой путь: V_0 = noise, V_1 = V_target
+# t ~ Uniform(0, 1)
+# V_t = (1-t)·V_0 + t·V_target  (линейная интерполяция)
+# target_velocity = V_target - V_0
+# loss = ||FlowIPP(V_query, V_t, t) - target_velocity||²
 ```
 
-**Известная проблема MSE:** при множестве валидных ответов IPP усредняет их, выдавая вектор «между» всеми вариантами — точку, не соответствующую ни одному осмысленному ответу. Это именно то, что нашла Meta в Base-LCM.
+**Преимущества Latent Flow Matching перед MSE:**
+1. **Нет mode averaging** — генерирует sample из конкретного модуса, не среднее
+2. **Стартовая точка ближе к ответу** → Langevin потребует меньше шагов (2-3×)
+3. **Simulation-free training** — не нужен многошаговый ODE при обучении
+4. **Один forward pass при инференсе** (с num_steps=1 для Fast Shot)
 
-**Решение:** это нормально для нашей архитектуры! IPP выдаёт «размытый черновик», а EBT через Langevin подтягивает его к конкретному, точному ответу. Base-LCM плох сам по себе, но идеален как инициализатор для EBT.
+**Планирование:** реализация запланирована на Stage 2+. Для Stage 1 (denoising PoC) IPP не используется — достаточно Informed Noise (V_query + noise).
 
 **Этап 2: Retrieval-Augmented Initialization (дополнение)**
 
@@ -1380,20 +1503,78 @@ def compact_context(cache, compaction_range, pipeline):
 
 ## 10. Оптимизация навигации
 
-### 10.1 Momentum для Langevin Dynamics
+> **Ревью-заметка (v1.4):** Реализованы три варианта Langevin dynamics: классический overdamped, PID-controlled (PIDLD) и underdamped (second-order). PID — рекомендуемый по умолчанию. Underdamped — для Deep Thinking (200+ шагов).
 
-Вместо обычного SGD используем Adam-like обновление:
+### 10.1 Три варианта Langevin Dynamics
 
-```python
-m_t = β₁ · m_{t-1} + (1 - β₁) · ∇E      # первый момент (направление)
-v_t = β₂ · v_{t-1} + (1 - β₂) · (∇E)²   # второй момент (масштаб)
+| Метод | Формула | Когда использовать | Скорость сходимости |
+|-------|---------|-------------------|---------------------|
+| **Overdamped** (classic) | V_{t+1} = V_t - η∇E + √(2η)ε | Baseline, ablation | 1× (базовая) |
+| **PID-Controlled** (default) | update = Kp·∇E + Ki·I + Kd·D | Все режимы | ~2× быстрее |
+| **Underdamped** (second-order) | p_{t+1} = (1-γ)p_t - η∇E + noise; V += (η/m)p | Deep Thinking 200+ шагов | 2-5× быстрее |
 
-V_{t+1} = V_t - η · m_t / (√v_t + ε_adam) + noise
+### 10.2 PID-Controlled Langevin Dynamics (PIDLD)
+
+> Ref: arXiv:2511.12603 «PID-controlled Langevin Dynamics for Faster Sampling of Generative Models»
+
+Переосмысляет Langevin sampling через **теорию управления PID-регулятором**:
+
+```
+update_t = Kp · ∇E_t + Ki · I_t + Kd · D_t
+
+где:
+  ∇E_t = текущий градиент                          (P — proportional)
+  I_t  = decay · I_{t-1} + ∇E_t                    (I — integral с экспоненциальным decay)
+  D_t  = ∇E_t - ∇E_{t-1}                           (D — дискретная производная)
+
+V_{t+1} = V_t - η · update_t + √(2η) · ε_t
 ```
 
-Преимущество: стабильное движение по «долинам» ландшафта, автоматическая адаптация step size для каждого измерения.
+**Компоненты PID:**
+- **P** (Proportional): стандартный градиент. Как в обычном Langevin.
+- **I** (Integral): накопленный исторический градиент с decay (≈ momentum, но с экспоненциальным затуханием). Обеспечивает persistent drift direction, предотвращает anti-windup через decay=0.95.
+- **D** (Derivative): скорость изменения градиента. Позволяет **быстрее тормозить** у минимума (∇E стабилизируется → D→0) и **агрессивнее двигаться** вдали от него (∇E резко меняется → D большое).
 
-### 10.2 Oscillation Detection
+**Гиперпараметры (по умолчанию):**
+- `Kp = 1.0` — вес текущего градиента
+- `Ki = 0.3` — вес интеграла (accumulated history)
+- `Kd = 0.1` — вес производной (trend prediction)
+- `integral_decay = 0.95` — затухание интеграла
+
+**Ключевое преимущество:** drop-in replacement для стандартного Langevin — не требует переобучения модели, не требует дополнительных данных, работает с любой энергетической функцией. Естественно комбинируется с Inertial Navigation (§8.3).
+
+### 10.3 Underdamped (Second-Order) Langevin Dynamics
+
+> Ref: «Gradient-Adjusted Underdamped Langevin Dynamics» (SIAM JUQ 2025); arXiv:2503.01006 «Underdamped Diffusion Bridges»
+
+Добавляет **вспомогательную переменную momentum** p (по аналогии с HMC, но без шага accept/reject):
+
+```
+p_{t+1} = (1 - γ) · p_t - η · ∇_V E + √(2γη/m) · ε
+V_{t+1} = V_t + (η/m) · p_{t+1}
+
+где:
+  p — вектор momentum (вспомогательная «скорость»)
+  γ — friction (коэффициент трения), ∈ (0, 1]
+  m — масса частицы
+```
+
+**Физическая интуиция:** частица имеет инерцию. Она может «перескочить» через энергетический барьер между локальными минимумами — в отличие от overdamped, где частица всегда движется «вниз по холму» и застревает.
+
+**Роль параметра friction γ:**
+- `γ → 0`: чистая гамильтонова динамика (без диссипации, осциллирует)
+- `γ → 1`: сильно демпфированная (приближается к overdamped)
+- `γ ≈ 0.3–0.7`: оптимальный баланс для большинства energy landscapes
+
+**Гиперпараметры по умолчанию:**
+- `friction = 0.5` — баланс инерции и стабильности
+- `mass = 1.0` — стандартная масса
+
+**Ожидаемое ускорение:** 2–5× быстрее overdamped, особенно для Deep Thinking (200–500 шагов), где мультимодальность ландшафта — основная проблема.
+
+**Проекция momentum на касательную плоскость:** при OOD-проекции на сферу momentum тоже проецируется, чтобы не «бороться» с constraint'ом нормы.
+
+### 10.4 Oscillation Detection и Early Stopping
 
 ```python
 def detect_oscillation(history, window=5):
@@ -1401,15 +1582,12 @@ def detect_oscillation(history, window=5):
     if len(history) < window:
         return False
     recent = torch.stack(history[-window:])
-    # Если текущий вектор ближе к V_{t-3}, чем к V_{t-1} → осцилляция
     dist_prev = torch.norm(recent[-1] - recent[-2])
     dist_older = torch.norm(recent[-1] - recent[-3])
-    return dist_older < dist_prev * 0.8  # порог
+    return dist_older < dist_prev * 0.8
 ```
 
 При обнаружении осцилляции: уменьшить lr в 2 раза или переключиться на fine-grained mode с маленьким step size.
-
-### 10.3 Early Stopping
 
 ```python
 # Критерии остановки Langevin Loop:
@@ -1427,6 +1605,31 @@ if abs(E_prev - E) < delta_threshold:
 if step >= max_steps:
     break
 ```
+
+### 10.5 Energy Matching (перспективное исследование)
+
+> Ref: «Energy Matching: Unifying Flow Matching and Energy-Based Models for Generative Modeling» (NeurIPS 2025, arXiv:2504.10612)
+
+**Потенциальная замена training objective для будущих стадий.** Energy Matching учит **скалярное потенциальное поле** (без time-conditioning, без auxiliary сетей), из которого генеративная динамика выводится автоматически:
+- Далеко от данных → optimal transport (кратчайшие пути)
+- Близко к данным → Больцмановское равновесие
+
+**Результаты:** CIFAR-10 FID ≈ 3.3, ImageNet32 FID ≈ 6.6 на 50M параметров — SOTA для EBM. Simulation-free training (не нужен Langevin при обучении).
+
+**Статус:** исследование. Потребуется адаптация для 1024d sentence embeddings на сфере. SimpleEnergy — уже скалярный потенциал, что упрощает интеграцию. Запланировано для Stage 5+.
+
+### 10.6 Momentum для Langevin (legacy, v1.3)
+
+Adam-like обновление (сохранено для backward compat и overdamped mode):
+
+```python
+m_t = β₁ · m_{t-1} + (1 - β₁) · ∇E
+v_t = β₂ · v_{t-1} + (1 - β₂) · (∇E)²
+
+V_{t+1} = V_t - η · m_t / (√v_t + ε_adam) + noise
+```
+
+Преимущество: стабильное движение по «долинам» ландшафта. В v1.4 заменён PIDLD как primary method.
 
 ---
 
@@ -1481,11 +1684,11 @@ Stage 5: Projectors (только если 1024d недостаточно)
 
 | Компонент | Архитектура | Секция спеки | Секция плана |
 |-----------|-------------|--------------|--------------|
-| SimpleEnergy | MLP (4096→2048→512→1) | §13.1 | IMPL Stage 1 |
-| EBT Pairwise | MLP (4096→2048→1024→1) | §5.2 Режим A | IMPL Stage 2 |
+| SimpleEnergy | OrthoLinear+GroupSort (4096→2048→1024→512→1) | §13.1 | IMPL Stage 1 |
+| EBT Pairwise | OrthoLinear+GroupSort (4096→2048→1024→1) | §5.2 Режим A | IMPL Stage 2 |
 | EBT Chain | Transformer (2L, 8H) + CLS | §5.2 Режим B | IMPL Stage 3 |
 | SurprisePredictor | SSM (2L, state=2048) | §9.5.3 | IMPL Stage 2‖ |
-| IPP | MLP (1024→2048→2048→1024) | §7.3 | IMPL Stage 2‖ |
+| IPP | Flow Matching (Latent-CFM, 1024→2048→2048→1024) | §7.3 | IMPL Stage 2‖ |
 | ContextAggregator | SSM + Global Tokens attention | §9.6 | IMPL Stage 4A |
 | CompactToken | Learned embedding (1024d) | §9.7 | IMPL Stage 4C |
 | Decoder | Fine-tune LM (~1B) | §6.3 | IMPL Stage 1–4 |
@@ -1686,77 +1889,70 @@ def create_cot_dataset(questions, answers, num_samples=1000):
 **Железо:** 1 GPU (RTX 3090/4090 или эквивалент)
 
 ```python
-# === PoC Experiment 1: Denoising ===
+# === PoC Experiment 1: Denoising (v1.4) ===
+# Архитектура: OrthoLinear + GroupSort (1-Lipschitz по конструкции)
+# Loss: MDSM (Multi-Scale Denoising Score Matching)
+# Langevin: PID-Controlled
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from cebcm.models.energy import SimpleEnergy
+from cebcm.training.losses import multiscale_dsm_loss, gradient_penalty
+from cebcm.inference.langevin import pid_langevin_dynamics
 
 # 1. Подготовка данных
-# Кодируем 10,000 предложений из WikiText в SONAR
 texts = load_wikitext_sentences(10000)
 V_all = encode_batch(texts)  # [10000, 1024]
 
-# 2. Простая функция энергии: MLP
-class SimpleEnergy(nn.Module):
-    def __init__(self, dim=1024):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim * 4, 2048),
-            nn.ReLU(),
-            nn.Linear(2048, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1)
-        )
+# 2. Функция энергии: OrthoLinear + GroupSort MLP
+energy_fn = SimpleEnergy(
+    dim=1024,
+    hidden_dims=[2048, 1024, 512],   # 4 слоя (расширен с 3)
+    norm_mode="orthonorm",            # Bjorck orthonormalization (все σ_i ≈ 1)
+    activation="groupsort",           # GroupSort(2) aka MaxMin (1-Lipschitz)
+)
+optimizer = torch.optim.AdamW(energy_fn.parameters(), lr=5e-5)  # Снижен LR
 
-    def forward(self, V_orig, V_candidate):
-        diff = V_orig - V_candidate
-        prod = V_orig * V_candidate
-        x = torch.cat([V_orig, V_candidate, diff, prod], dim=-1)
-        return self.net(x).squeeze(-1)
-
-energy_fn = SimpleEnergy()
-optimizer = torch.optim.AdamW(energy_fn.parameters(), lr=1e-4)
-
-# 3. Обучение: позитив = (V, V), негатив = (V, V + noise)
+# 3. Обучение: MDSM — score matching на непрерывном спектре шумов
 for epoch in range(50):
     perm = torch.randperm(len(V_all))
     for i in range(0, len(V_all), 32):
         batch = V_all[perm[i:i+32]]
 
-        # Позитив: идентичная пара → энергия = 0
-        E_pos = energy_fn(batch, batch)
-
-        # Негатив: зашумлённая версия → энергия > 0
-        noise = torch.randn_like(batch) * 0.2
-        E_neg = energy_fn(batch, batch + noise)
-
-        # Contrastive: E_pos должна быть меньше E_neg
-        loss = F.relu(E_pos - E_neg + 1.0).mean()  # margin = 1.0
+        # MDSM: σ ~ LogUniform(0.01, 0.5), relative noise
+        loss_dsm = multiscale_dsm_loss(
+            energy_fn, batch, sigma_min=0.01, sigma_max=0.5
+        )
+        loss_gp = gradient_penalty(energy_fn, batch,
+                                    batch + torch.randn_like(batch) * 0.1)
+        loss = loss_dsm + 0.05 * loss_gp  # λ=0.05 (orthonorm уже Lipschitz)
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(energy_fn.parameters(), 1.0)
         optimizer.step()
 
-# 4. Тест: Langevin denoising
-V_orig = V_all[0:1]  # один вектор
-V_noisy = V_orig + torch.randn_like(V_orig) * 0.2  # зашумлённый
+# 4. Тест: PID-Controlled Langevin denoising
+V_orig = V_all[0:1]
+V_noisy = V_orig + torch.randn_like(V_orig) * 0.2 * V_orig.norm()
 
-V_current = V_noisy.clone().requires_grad_(True)
-lr = 0.01
+result = pid_langevin_dynamics(
+    energy_fn=energy_fn,
+    v_query=V_orig,
+    v_init=V_noisy,
+    lr=0.001,
+    max_steps=100,
+    target_norm=V_all.norm(dim=-1).mean().item(),
+    v_target=V_orig,
+    kp=1.0, ki=0.3, kd=0.1,  # PID коэффициенты
+)
 
-for step in range(100):
-    E = energy_fn(V_orig, V_current)
-    grad = torch.autograd.grad(E, V_current)[0]
-    V_current = (V_current - lr * grad).detach().requires_grad_(True)
-
-    cos_sim = F.cosine_similarity(V_orig, V_current).item()
-    print(f"Step {step}: E={E.item():.4f}, cos_sim={cos_sim:.4f}")
+cos_before = F.cosine_similarity(V_orig, V_noisy).item()
+cos_after = F.cosine_similarity(V_orig, result.v_final).item()
+print(f"cos_sim: {cos_before:.4f} → {cos_after:.4f} ({result.num_steps} steps)")
 
 # 5. Декодируем результат
 decoded_orig = decoder.predict(V_orig, target_lang="eng_Latn")
 decoded_noisy = decoder.predict(V_noisy, target_lang="eng_Latn")
-decoded_denoised = decoder.predict(V_current.detach(), target_lang="eng_Latn")
+decoded_denoised = decoder.predict(result.v_final, target_lang="eng_Latn")
 
 print(f"Original:  {decoded_orig[0]}")
 print(f"Noisy:     {decoded_noisy[0]}")
@@ -1958,8 +2154,22 @@ r̄ = mean(||V_train||₂)  — средняя норма обучающих в�
 
 ### A.5 Combined Training Loss для EBT
 
+**Stage 1 (MDSM):**
 ```
-L = L_InfoNCE + λ_spec · L_spectral + λ_grad · L_gradient_penalty + λ_norm · max(0, ||E||² − margin)
+L = L_MDSM + λ_grad · L_gradient_penalty
+
+L_MDSM = E_{σ~LogUniform(σ_min,σ_max)} [ σ² · ||∇_V E(V_clean, V_noisy) - s*(V_noisy)||² ]
+s*(V_noisy) = -(V_noisy - V_clean) / σ²
+
+λ_grad = 0.05 (с orthonorm; 0.1 с spectral norm)
+```
+
+**Stage 2+ (Focal-InfoNCE):**
+```
+L = L_Focal_InfoNCE + λ_grad · L_gradient_penalty + λ_norm · max(0, ||E||² − margin)
+
+L_Focal_InfoNCE = -log( exp(-E⁺/τ) / (exp(-E⁺/τ) + Σ wᵢ·exp(-Eᵢ⁻/τ)) )
+wᵢ = softmax(-Eᵢ⁻/τ)^γ, γ=2.0
 ```
 
 ---
@@ -2007,7 +2217,12 @@ pip install tqdm wandb
 | Autoencoder для PoC | SONAR | Готовый, проверенный, с декодером. ColBERT/SPLADE нет декодера |
 | Размерность PoC | 1024d нативная | Без проектора, минимум потерь. Если мало — перейдём на sparse |
 | Функция энергии | Specialized per-domain | Универсальная невозможна без потери точности |
-| Инициализация V_init | Informed Noise → Base-LCM | Нулевая стоимость для первого теста, потом усложняем |
+| Нормализация весов EBM (v1.4) | Bjorck Orthonormalization | Spectral Norm ограничивает только σ_max, вызывает gradient attenuation (JMLR 2024). Orthonorm: все σ_i≈1, идеальный gradient flow |
+| Активация EBM (v1.4) | GroupSort(2) / LipschitzSpline | ReLU — наихудший выбор для Lipschitz-constrained сетей: мёртвые нейроны, потеря ёмкости. GroupSort 1-Lipschitz по конструкции, нет мёртвых нейронов |
+| Training loss Stage 1 (v1.4) | MDSM (Multi-Scale DSM) | Margin Contrastive не учит корректный score (∇E). MDSM прямо обучает gradient указывать от шума к чистому вектору. Необходим в 1024d (Li et al. 2023) |
+| Training loss Stage 2+ (v1.4) | Focal-InfoNCE (γ=2.0) | Стандартный InfoNCE — easy negatives доминируют. Focal перевзвешивает в пользу hard (+1.6 Spearman). SoftCSE — резерв для ablation |
+| Langevin method (v1.4) | PID-Controlled (PIDLD) | Overdamped слишком медленный. PIDLD — drop-in replacement, не требует переобучения. Underdamped для Deep Thinking |
+| Инициализация V_init (v1.4) | Informed Noise → Latent Flow Matching IPP | MSE усредняет множественные ответы (Meta Base-LCM). Flow Matching генерирует sample из модуса |
 | Контекст | Linear Attention по всему контексту (до MAX_CONTEXT) | RAG-подход (top-K) может упустить сюжетную логику диалога. При линейном времени можно читать всё |
 | Attention в EBT | Только для Chain Scoring | Pairwise оценка не требует attention — экономия |
 | Кэш в пространстве | SONAR 1024d нативный | Единое пространство, нет drift между «памятью» и «речью» |
