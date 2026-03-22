@@ -85,7 +85,7 @@ class Stage1Config:
     """Stage 1: Denoising PoC configuration."""
     sonar: SONARConfig = field(default_factory=SONARConfig)
     langevin: LangevinConfig = field(default_factory=lambda: LangevinConfig(
-        lr=0.01,
+        lr=0.001,
         noise_scale=0.003,
         max_steps=100,
         target_norm=0.2051,
