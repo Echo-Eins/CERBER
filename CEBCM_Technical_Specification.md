@@ -1236,10 +1236,10 @@ def compact_context(cache, compaction_range, pipeline):
 | Параметр | LLM | CEBCM |
 |----------|-----|-------|
 | Контекст 50 обменов | 3000–5000 токенов | 100 векторов (1024d) |
-| Attention complexity | O(5000²) = 25M operations | O(100²) = 10K operations |
+| Attention complexity | O(5000²) = 25M operations | O(N) Linear Attention + O(G²) Global Tokens |
 | Память | ~200 МБ KV-cache | ~0.8 МБ vector cache |
-| Релевантность | Вся история, включая нерелевантное | Только top-K релевантных |
-| Масштабируемость | Ограничена context window | Растёт линейно, retrieval O(log N) |
+| Релевантность | Вся история, включая нерелевантное | Полный контекст через SSM + приоритет high-surprise |
+| Масштабируемость | Ограничена context window | Растёт линейно (SSM O(N)), External Compaction при переполнении |
 
 ---
 
@@ -1297,191 +1297,63 @@ if step >= max_steps:
 
 ## 11. Пайплайн обучения
 
-### 11.1 Общая последовательность (4 фазы)
+> **Заметка (v1.3):** Полный детализированный план обучения с конкретными Stage'ами, параллельными треками, curriculum'ом, гиперпараметрами и тестовыми критериями — см. **IMPLEMENTATION_PLAN.md**. Ниже — краткий обзор стадий и ключевых принципов.
+
+### 11.1 Общая последовательность (6 стадий)
 
 ```
-Фаза 0: Валидация пространства (1-2 дня)
-   └─► Убедиться, что SONAR пригоден для градиентной навигации
+Stage 0: Валидация SONAR пространства (3–4 дня)
+   └─► Noise robustness, interpolation, distribution, gradient flow
+   └─► GO/NO-GO решение
 
-Фаза 1: Обучение IPP (3-5 дней)
-   └─► MLP, MSE loss, пары (V_query, V_target)
+Stage 1: Denoising PoC (2–3 дня)
+   └─► SimpleEnergy + Langevin → sanity check
 
-Фаза 2: Обучение EBT (1-2 недели)
-   └─► Contrastive Learning, Curriculum, InfoNCE loss
-   └─► Два scoring head'а: pairwise + chain
+Stage 2: EBT Pairwise + параллельные треки (2–4 недели)
+   └─► EBT Pairwise с Curriculum Learning (easy → medium → hard negatives)
+   └─► ‖ SurprisePredictor (self-supervised, SSM) — параллельный трек
+   └─► ‖ IPP (MLP, MSE+cosine loss) — параллельный трек
 
-Фаза 3: Обучение Decoder'а (1-2 недели, после заморозки Фаз 1-2)
-   └─► Cross-entropy, teacher forcing
-   └─► Вход: вектора от замороженной системы, НЕ от encoder'а
+Stage 3: Chain of Thought + System 2 (3–5 недель)
+   └─► Chain Head (оценка цепочек рассуждений)
+   └─► Joint fine-tune Pairwise + Chain
+   └─► System 1 / System 2 switching при обучении
+
+Stage 4: Полная интеграция пайплайна (4–8 недель)
+   └─► A: Интеграция SurprisePredictor (frozen) + IPP + ContextAggregator
+   └─► B: Масштабирование контекста (20 → 500+ ходов)
+   └─► C: External Compaction + CompactToken
+   └─► D: Hard negatives + полный масштаб
+   └─► E: End-to-end fine-tune всех размороженных компонентов
+
+Stage 5: Projectors (только если 1024d недостаточно)
+   └─► Sparse Projector 1024d → Nd, kill criterion из Stage 2–4
 ```
 
-### 11.2 Фаза 1: Обучение IPP
+### 11.2 Ключевые принципы обучения
 
-```python
-# === Скрипт обучения IPP ===
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+1. **Инкрементальная сложность:** каждый Stage добавляет один компонент, не ломая предыдущие
+2. **Параллельные треки:** SurprisePredictor и IPP тренируются отдельно от основного пайплайна (Stage 2–3), интегрируются в Stage 4
+3. **SurprisePredictor замораживается навсегда** после обучения — простая модель, остальные подстраиваются под неё
+4. **Curriculum:** easy (cos 0.3–0.7) → medium (0.7–0.9) → hard (0.9–0.98) негативы
+5. **Batch contrastive:** 1 positive + 31 negatives одновременно (InfoNCE) — модель учится *почему* каждый negative плох
+6. **Inertial Navigation awareness:** cruise_ratio сэмплируется при обучении, чтобы модель привыкла к разным стратегиям навигации
+7. **Decoder fine-tune** в конце каждого Stage на Langevin outputs (не на чистых encoder-векторах)
 
-# Данные: пары (V_query, V_target) из SONAR
-# Предполагается: query_vectors [N, 1024], target_vectors [N, 1024]
+### 11.3 Детали реализации
 
-class IPP(nn.Module):
-    def __init__(self, dim=1024, hidden=2048):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, dim)
-        )
+Конкретные архитектуры, training loops, гиперпараметры и тестовые критерии — см. соответствующие секции:
 
-    def forward(self, x):
-        return self.net(x)
-
-model = IPP()
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-
-dataset = TensorDataset(query_vectors, target_vectors)
-loader = DataLoader(dataset, batch_size=256, shuffle=True)
-
-for epoch in range(100):
-    total_loss = 0
-    for V_q, V_t in loader:
-        pred = model(V_q)
-        loss = F.mse_loss(pred, V_t)
-
-        # Дополнительно: cosine similarity loss для направления
-        cos_loss = 1 - F.cosine_similarity(pred, V_t, dim=-1).mean()
-        total_loss_step = loss + 0.5 * cos_loss
-
-        optimizer.zero_grad()
-        total_loss_step.backward()
-        optimizer.step()
-        total_loss += total_loss_step.item()
-
-    scheduler.step()
-    avg_loss = total_loss / len(loader)
-    print(f"Epoch {epoch}: loss={avg_loss:.4f}")
-
-torch.save(model.state_dict(), "ipp.pt")
-```
-
-### 11.3 Фаза 2: Обучение EBT
-
-```python
-# === Скрипт обучения EBT ===
-
-class EBT_PairwiseHead(nn.Module):
-    """Режим A: оценка пары векторов."""
-    def __init__(self, dim=1024):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim * 4, 2048),  # [q; c; q-c; q*c]
-            nn.ReLU(),
-            nn.Linear(2048, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 1)
-        )
-
-    def forward(self, V_query, V_candidate):
-        diff = V_query - V_candidate
-        prod = V_query * V_candidate
-        x = torch.cat([V_query, V_candidate, diff, prod], dim=-1)
-        return self.net(x).squeeze(-1)  # scalar energy
-
-
-class EBT_ChainHead(nn.Module):
-    """Режим B: оценка цепочки векторов."""
-    def __init__(self, dim=1024, n_layers=2, n_heads=8):
-        super().__init__()
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=n_heads, dim_feedforward=2048,
-            dropout=0.1, activation='gelu', batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.head = nn.Sequential(
-            nn.Linear(dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1)
-        )
-
-    def forward(self, sequence):
-        # sequence: [batch, seq_len, 1024]
-        batch_size = sequence.size(0)
-        cls = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([cls, sequence], dim=1)  # [batch, 1+seq_len, 1024]
-        x = self.transformer(x)
-        cls_out = x[:, 0, :]  # CLS token output
-        return self.head(cls_out).squeeze(-1)
-
-
-class EBT(nn.Module):
-    def __init__(self, dim=1024):
-        super().__init__()
-        self.pairwise = EBT_PairwiseHead(dim)
-        self.chain = EBT_ChainHead(dim)
-
-    def energy(self, V_query, V_candidate):
-        """Режим A: быстрая оценка пары."""
-        return self.pairwise(V_query, V_candidate)
-
-    def chain_energy(self, sequence):
-        """Режим B: оценка цепочки рассуждений."""
-        return self.chain(sequence)
-
-
-# === Обучение EBT с Curriculum Learning ===
-
-ebt = EBT()
-optimizer = torch.optim.AdamW(ebt.parameters(), lr=1e-4)
-
-def infonce_loss(ebt, V_query, V_positive, V_negatives, temperature=0.07):
-    """
-    V_query: [batch, 1024]
-    V_positive: [batch, 1024]
-    V_negatives: [batch, num_neg, 1024]
-    """
-    E_pos = ebt.energy(V_query, V_positive)  # [batch]
-    E_neg = torch.stack([
-        ebt.energy(V_query, V_negatives[:, i])
-        for i in range(V_negatives.size(1))
-    ], dim=1)  # [batch, num_neg]
-
-    # InfoNCE: позитив должен иметь НИЗКУЮ энергию
-    logits = torch.cat([-E_pos.unsqueeze(1), -E_neg], dim=1) / temperature
-    labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-    return F.cross_entropy(logits, labels)
-
-
-# Curriculum: переключение сложности негативов
-for phase, (neg_generator, epochs) in enumerate([
-    (easy_negatives,   20),  # cosine sim 0.3-0.7
-    (medium_negatives, 30),  # cosine sim 0.7-0.9
-    (hard_negatives,   50),  # cosine sim 0.9-0.98
-]):
-    print(f"Phase {phase}: training for {epochs} epochs")
-    for epoch in range(epochs):
-        for V_q, V_pos in dataloader:
-            V_neg = neg_generator(V_q, V_pos, num_neg=31)
-            loss = infonce_loss(ebt, V_q, V_pos, V_neg)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-torch.save(ebt.state_dict(), "ebt.pt")
-```
-
-### 11.4 Фаза 3: Обучение Decoder
-
-Описан в разделе 6.3.
+| Компонент | Архитектура | Секция спеки | Секция плана |
+|-----------|-------------|--------------|--------------|
+| SimpleEnergy | MLP (4096→2048→512→1) | §13.1 | IMPL Stage 1 |
+| EBT Pairwise | MLP (4096→2048→1024→1) | §5.2 Режим A | IMPL Stage 2 |
+| EBT Chain | Transformer (2L, 8H) + CLS | §5.2 Режим B | IMPL Stage 3 |
+| SurprisePredictor | SSM (2L, state=2048) | §9.5.3 | IMPL Stage 2‖ |
+| IPP | MLP (1024→2048→2048→1024) | §7.3 | IMPL Stage 2‖ |
+| ContextAggregator | SSM + Global Tokens attention | §9.6 | IMPL Stage 4A |
+| CompactToken | Learned embedding (1024d) | §9.7 | IMPL Stage 4C |
+| Decoder | Fine-tune LM (~1B) | §6.3 | IMPL Stage 1–4 |
 
 ---
 
