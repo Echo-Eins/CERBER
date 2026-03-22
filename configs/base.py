@@ -86,7 +86,7 @@ class Stage1Config:
     sonar: SONARConfig = field(default_factory=SONARConfig)
     langevin: LangevinConfig = field(default_factory=lambda: LangevinConfig(
         lr=0.001,
-        noise_scale=0.003,
+        noise_scale=0.0,
         max_steps=100,
         target_norm=0.2051,
     ))

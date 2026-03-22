@@ -74,6 +74,7 @@ def langevin_dynamics(
     trajectory: list[float] = []
     cos_trajectory: list[float] = []
     best_energy = float("inf")
+    v_best = v_current.clone()
     plateau_counter = 0
 
     for step in range(max_steps):
@@ -90,7 +91,7 @@ def langevin_dynamics(
         # Early stopping: energy threshold
         if energy_threshold is not None and e_mean < energy_threshold:
             return LangevinResult(
-                v_final=v_current,
+                v_final=v_best,
                 trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
                 num_steps=step + 1,
@@ -100,12 +101,13 @@ def langevin_dynamics(
         # Early stopping: plateau detection
         if e_mean < best_energy - plateau_delta:
             best_energy = e_mean
+            v_best = v_current.clone()
             plateau_counter = 0
         else:
             plateau_counter += 1
             if plateau_counter >= plateau_patience:
                 return LangevinResult(
-                    v_final=v_current,
+                    v_final=v_best,
                     trajectory=trajectory,
                     cos_trajectory=cos_trajectory,
                     num_steps=step + 1,
@@ -135,7 +137,7 @@ def langevin_dynamics(
             v_current = F.normalize(v_current, dim=-1) * target_norm
 
     return LangevinResult(
-        v_final=v_current,
+        v_final=v_best,
         trajectory=trajectory,
         cos_trajectory=cos_trajectory,
         num_steps=max_steps,
