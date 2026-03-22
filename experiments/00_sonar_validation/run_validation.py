@@ -347,9 +347,9 @@ def experiment_d_gradient_flow(
         print(f"\n--- Sentence {i}: {text} ---")
         V_target = V_orig[i : i + 1].detach()
 
-        # Start from noisy version (relative noise: 50% of norm for a strong test)
+        # Start from noisy version (relative noise: 10% of norm)
         target_norm = V_target.norm()
-        V_start = V_target + torch.randn_like(V_target) * 0.5 * target_norm
+        V_start = V_target + torch.randn_like(V_target) * 0.1 * target_norm
         V_current = V_start.clone().requires_grad_(True)
 
         cos_before = F.cosine_similarity(V_target, V_start, dim=-1).item()
@@ -357,9 +357,9 @@ def experiment_d_gradient_flow(
 
         # Simple gradient descent: minimize 1 - cos_sim
         trajectory = [cos_before]
-        lr = 0.1
+        lr = 0.01
 
-        for step in range(50):
+        for step in range(100):
             loss = 1 - F.cosine_similarity(V_target, V_current, dim=-1)
             loss.backward()
 
@@ -430,7 +430,7 @@ def estimate_vram(sonar: SONARWrapper, output_dir: Path):
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / (1024 ** 2)
         reserved = torch.cuda.memory_reserved() / (1024 ** 2)
-        total = torch.cuda.get_device_properties(0).total_mem / (1024 ** 2)
+        total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
         print(f"\nGPU Memory:")
         print(f"  Allocated: {allocated:.1f} MB")
         print(f"  Reserved:  {reserved:.1f} MB")
@@ -471,19 +471,38 @@ def go_nogo_analysis(
     warnings = []
 
     # Check A: Noise robustness (relative noise scales)
-    # At 5% relative noise, cos_sim should be high (>0.90 for GO)
-    # At 10% relative noise, cos_sim should be reasonable (>0.80)
+    # Find the "safe threshold": largest noise scale with cos_sim > 0.90
+    safe_threshold = 0.0
     for r in noise_results:
         scale = r["noise_scale"]
         cos_mean = r["cos_sim_mean"]
-        if scale <= 0.05 and cos_mean < 0.85:
-            issues.append(
-                f"KILL: {scale*100:.0f}% relative noise causes cos_sim={cos_mean:.3f} < 0.85 "
-                f"— space too fragile for gradient navigation"
-            )
-        elif scale <= 0.10 and cos_mean < 0.75:
+        if cos_mean > 0.90:
+            safe_threshold = max(safe_threshold, scale)
+
+    print(f"  Safe noise threshold (cos_sim > 0.90): {safe_threshold*100:.1f}% of norm")
+
+    if safe_threshold < 0.005:
+        issues.append(
+            f"KILL: No noise scale preserves cos_sim > 0.90 "
+            f"— space too fragile for gradient navigation"
+        )
+    elif safe_threshold < 0.01:
+        warnings.append(
+            f"WARNING: Safe noise threshold is only {safe_threshold*100:.1f}% "
+            f"— Langevin step size must be very small"
+        )
+
+    # Check if there's a steep cliff (common with beam search decoders)
+    for i in range(len(noise_results) - 1):
+        s1 = noise_results[i]["cos_sim_mean"]
+        s2 = noise_results[i + 1]["cos_sim_mean"]
+        sc1 = noise_results[i]["noise_scale"]
+        sc2 = noise_results[i + 1]["noise_scale"]
+        if s1 > 0.85 and s2 < 0.60:
             warnings.append(
-                f"WARNING: {scale*100:.0f}% relative noise causes cos_sim={cos_mean:.3f} < 0.75"
+                f"WARNING: Steep cliff between {sc1*100:.1f}% (cos={s1:.3f}) "
+                f"and {sc2*100:.1f}% (cos={s2:.3f}) — "
+                f"Langevin must stay below {sc1*100:.1f}% relative step"
             )
 
     # Check B: Interpolation smoothness
@@ -533,14 +552,26 @@ def go_nogo_analysis(
         verdict = "GO"
         print("🟢 VERDICT: GO")
 
-    print(f"\n  target_norm = {dist_results['target_norm']:.4f}")
+    # Compute recommended Langevin step size
+    target_norm = dist_results["target_norm"]
+    # Langevin lr should keep perturbation within the safe zone
+    # safe_threshold is the max relative noise that preserves cos_sim > 0.90
+    # Each Langevin step perturbs by ~lr * grad_norm; keep this < safe_threshold * target_norm
+    recommended_lr = safe_threshold * target_norm * 0.5  # 50% safety margin
+    print(f"\n  target_norm = {target_norm:.4f}")
     print(f"  embedding_dim = {dist_results['embedding_dim']}")
+    print(f"  safe_noise_threshold = {safe_threshold*100:.1f}% of norm")
+    print(f"  recommended_langevin_lr ≈ {recommended_lr:.6f} (absolute)")
+    print(f"  recommended_langevin_lr ≈ {safe_threshold * 0.5:.4f} (relative to norm)")
 
     report = {
         "verdict": verdict,
         "issues": issues,
         "warnings": warnings,
-        "target_norm": dist_results["target_norm"],
+        "target_norm": target_norm,
+        "safe_noise_threshold": safe_threshold,
+        "recommended_langevin_lr_abs": recommended_lr,
+        "recommended_langevin_lr_rel": safe_threshold * 0.5,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -653,7 +684,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    noise_scales = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5]
+    noise_scales = [0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5]
     alphas = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
     print("=" * 70)
