@@ -1,0 +1,10 @@
+{
+  "verdict": "GO",
+  "issues": [],
+  "warnings": [],
+  "target_norm": 0.20510703325271606,
+  "safe_noise_threshold": 0.01,
+  "recommended_langevin_lr_abs": 0.0010255351662635803,
+  "recommended_langevin_lr_rel": 0.005,
+  "timestamp": "2026-03-22 21:43:23"
+}

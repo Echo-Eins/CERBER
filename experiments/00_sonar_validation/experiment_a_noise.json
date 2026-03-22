@@ -1,0 +1,482 @@
+[
+  {
+    "noise_scale": 0.005,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.9867954254150391,
+    "cos_sim_min": 0.9861702919006348,
+    "cos_sim_max": 0.9874264001846313,
+    "snr_mean": 6.085186004638672,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "The cat sat on the mat.",
+        "cos_sim": 0.9866045713424683
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "Machine learning is a subset of artificial intelligence.",
+        "cos_sim": 0.9863734841346741
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "Python is a popular programming language for data science.",
+        "cos_sim": 0.9874264001846313
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "The weather forecast predicts rain tomorrow afternoon.",
+        "cos_sim": 0.987372636795044
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "Quantum computing may revolutionize cryptography in the future.",
+        "cos_sim": 0.9862018823623657
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": "She walked to the park and sat under a large oak tree.",
+        "cos_sim": 0.9871575832366943
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": "The stock market experienced significant volatility this week.",
+        "cos_sim": 0.9868046045303345
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "Renewable energy sources are becoming more cost-effective.",
+        "cos_sim": 0.9861702919006348
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "The neural network achieved state-of-the-art precision on the benchmark.",
+        "cos_sim": 0.9865872263908386
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "He opened the book and began to read the first chapter.",
+        "cos_sim": 0.9872561693191528
+      }
+    ]
+  },
+  {
+    "noise_scale": 0.01,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.9539043307304382,
+    "cos_sim_min": 0.9484418630599976,
+    "cos_sim_max": 0.9573782682418823,
+    "snr_mean": 3.1605324745178223,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "The cat sat on the mat.",
+        "cos_sim": 0.9484418630599976
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "Machine learning is a subset of artificial intelligence.",
+        "cos_sim": 0.9511610269546509
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "Python is a popular programming language for data science.",
+        "cos_sim": 0.9573782682418823
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "The weather forecast predicts rain tomorrow afternoon.",
+        "cos_sim": 0.9559596180915833
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "Quantum computing may revolutionize cryptography in the future.",
+        "cos_sim": 0.9555435180664062
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": "She walked to the park and sat under a large oak tree.",
+        "cos_sim": 0.9567536115646362
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": "The stock market experienced significant volatility this week.",
+        "cos_sim": 0.9558290243148804
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "Renewable energy sources are becoming more cost-effective.",
+        "cos_sim": 0.9509289264678955
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "cos_sim": 0.9536997675895691
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "He opened the book and began to read the first chapter.",
+        "cos_sim": 0.9533476233482361
+      }
+    ]
+  },
+  {
+    "noise_scale": 0.02,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.8469340205192566,
+    "cos_sim_min": 0.8408092260360718,
+    "cos_sim_max": 0.8518248796463013,
+    "snr_mean": 1.592558741569519,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "The cat sat on the mat.",
+        "cos_sim": 0.8408092260360718
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "Machine learning is a subset of artificial intelligence.",
+        "cos_sim": 0.8496726751327515
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "Python is a popular programming language for data science.",
+        "cos_sim": 0.849004864692688
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "The weather forecast predicts rain to tomorrow afternoon.",
+        "cos_sim": 0.8518248796463013
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "Quantum computing may revolutionize cryptography in the future.",
+        "cos_sim": 0.8418210744857788
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": "She walked to the park and sat under a large oak tree.",
+        "cos_sim": 0.8456283211708069
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": "The Stock Market experienced significant volatility this week.",
+        "cos_sim": 0.8453329801559448
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "Renewable energy sources are becoming more and more cost effective.",
+        "cos_sim": 0.8498102426528931
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "cos_sim": 0.8438639640808105
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "He opened the book and began to read the first chapter.",
+        "cos_sim": 0.8515720367431641
+      }
+    ]
+  },
+  {
+    "noise_scale": 0.03,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.7253433465957642,
+    "cos_sim_min": 0.7070983648300171,
+    "cos_sim_max": 0.745692253112793,
+    "snr_mean": 1.0481646060943604,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "The cat sat on the mat.",
+        "cos_sim": 0.7070983648300171
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "Machine learning is a subset of artificial intelligence.",
+        "cos_sim": 0.7438986897468567
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "Python software is a popular programming language for data science.",
+        "cos_sim": 0.7146444320678711
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "The weather forecast says rain tomorrow afternoon.",
+        "cos_sim": 0.7248130440711975
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "The quantum computing may revolutionize in the cryptography in the future.",
+        "cos_sim": 0.710698127746582
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": "She walked to the park and sat under a large oak tree.",
+        "cos_sim": 0.7255542278289795
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": "The stock market had significant volatility this week.",
+        "cos_sim": 0.70966637134552
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "Renewable energy sources are becoming more cost effective.",
+        "cos_sim": 0.745692253112793
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "cos_sim": 0.7441033720970154
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "He opened the book and began to read the first chapter.",
+        "cos_sim": 0.7272643446922302
+      }
+    ]
+  },
+  {
+    "noise_scale": 0.05,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.5276703834533691,
+    "cos_sim_min": 0.5112111568450928,
+    "cos_sim_max": 0.57191401720047,
+    "snr_mean": 0.6291959881782532,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "The cat sat on the mattress.",
+        "cos_sim": 0.5228292346000671
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "Machine learning is a subset of machine learning.",
+        "cos_sim": 0.5112111568450928
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "Python Python used a student language for data science data science.",
+        "cos_sim": 0.5135295987129211
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "The weather forecast predicts rain tomorrow morning for tomorrow's rain.",
+        "cos_sim": 0.513424277305603
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "Quantum communications may breakthrough in cryptanalysis in the future.",
+        "cos_sim": 0.5134665966033936
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": "She went to a park and sat down under a tree in a tree.",
+        "cos_sim": 0.5501528978347778
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": "The stock market encountered speculation this time, also this time.",
+        "cos_sim": 0.5227535963058472
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "Renewable energy sources are becoming more cost-effective.",
+        "cos_sim": 0.57191401720047
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "The neural network was able to achieve a high-precision accuracy.",
+        "cos_sim": 0.5113968849182129
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "He opened the book and began reading the book.",
+        "cos_sim": 0.5460252165794373
+      }
+    ]
+  },
+  {
+    "noise_scale": 0.1,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.2933056354522705,
+    "cos_sim_min": 0.24850687384605408,
+    "cos_sim_max": 0.34051769971847534,
+    "snr_mean": 0.3144744336605072,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "The car was on the other side of the road.",
+        "cos_sim": 0.26171594858169556
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "Sourcing is a part of life.",
+        "cos_sim": 0.3119511604309082
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "Programming Language is a Programming Language for Programs that are used for",
+        "cos_sim": 0.3368731141090393
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "It's the time for a few hours of silence.",
+        "cos_sim": 0.24850687384605408
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "However, that does not imply that she may for some time be restricted to the use of the information for which she may be entitled to the use of the information for which she is entitled to the use of the information for which she is entitled to the use of the information for which she is entitled to the use of the information for which she is entitled to the use of the information for which she is entitled to the use of the information for which she is entitled to the use of the information for which she is entitled to the use of the information for which she is entitled",
+        "cos_sim": 0.28191089630126953
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": "There's a lot of people in the area.",
+        "cos_sim": 0.27384480834007263
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": "All of the company's liquidation was carried out.",
+        "cos_sim": 0.28468143939971924
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "Many of these renewable energy sources are more cost-effective and they need to be more efficient.",
+        "cos_sim": 0.34051769971847534
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "The retrospective of the real with the state; the country was the same as the same country.",
+        "cos_sim": 0.2645142078399658
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "When she opened the book, she had it opened for the first day of the month.",
+        "cos_sim": 0.3285403251647949
+      }
+    ]
+  },
+  {
+    "noise_scale": 0.2,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.1512797623872757,
+    "cos_sim_min": 0.0963485985994339,
+    "cos_sim_max": 0.18926675617694855,
+    "snr_mean": 0.15553300082683563,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "Her time will d't. D. D.T. D.T. D.T. D.T. D.T. D.T.T. D.T.T. D.T.T.T.T.T.T.T.T.T.T. D.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.T.",
+        "cos_sim": 0.18926675617694855
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -",
+        "cos_sim": 0.18190960586071014
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "B. According to the story of the story of the story of the story of the story of the story of the story.",
+        "cos_sim": 0.1548939049243927
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "It goes out for example, for example, for example.",
+        "cos_sim": 0.13517151772975922
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "ක ක ක ක ක ක ක ක ක ක ක ක ක ක ක ක ක ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර ර",
+        "cos_sim": 0.10512933135032654
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": "in..",
+        "cos_sim": 0.18689700961112976
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": "without vo vo vo vo vo vo vo vo vo vo without without without without without without without without without without VO VO VO VO 2000 2000 2000 2000 2000 2000 2000 prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior VO VO VO VO VO VO VO VO VO VO 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 2000 prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior prior",
+        "cos_sim": 0.18374666571617126
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "grows up my own and i am grow up in a high quality environment where the quality of the environment and the quality of the air is increased from a humidity to quality quality and quality of the climate and how to optimise the quality of the environment.",
+        "cos_sim": 0.12270563840866089
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "Scee to the Rejeoinging of All Your Rejeoing System in the Rejeoing of All Your Deeds in the Outspending of his or Rejeoing of All of Your Deeds in the Rejeoing of All of Your Deeds in the Extense of his or Rejeoing of His Rejeoing of His Rejeoing System, To the Rejeoing of His Rejeoing of His Rejeoing System, to the Rejeoing of His Rejeooing of His Rejeooo",
+        "cos_sim": 0.0963485985994339
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "something something something something somewhere somewhere somewhere somewhere somewhere over over over over over over over over over over over over last last last last last last last last last last last last last last last last last last last last last last last last last last last last.",
+        "cos_sim": 0.1567286103963852
+      }
+    ]
+  },
+  {
+    "noise_scale": 0.5,
+    "noise_type": "relative",
+    "cos_sim_mean": 0.05699468404054642,
+    "cos_sim_min": 0.0050918664783239365,
+    "cos_sim_max": 0.09277255833148956,
+    "snr_mean": 0.0630316212773323,
+    "pairs": [
+      {
+        "original": "The cat sat on the mat.",
+        "noisy_decoded": "harharharharsssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+        "cos_sim": 0.06645075976848602
+      },
+      {
+        "original": "Machine learning is a subset of artificial intelligence.",
+        "noisy_decoded": "encour - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -",
+        "cos_sim": 0.09277255833148956
+      },
+      {
+        "original": "Python is a popular programming language for data science.",
+        "noisy_decoded": "An H Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Hom Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Robot Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel Hotel",
+        "cos_sim": 0.06154853105545044
+      },
+      {
+        "original": "The weather forecast predicts rain tomorrow afternoon.",
+        "noisy_decoded": "/ / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / /",
+        "cos_sim": 0.08199846744537354
+      },
+      {
+        "original": "Quantum computing may revolutionize cryptography in the future.",
+        "noisy_decoded": "potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential potential",
+        "cos_sim": 0.017851170152425766
+      },
+      {
+        "original": "She walked to the park and sat under a large oak tree.",
+        "noisy_decoded": ", ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ( ()))))))))))?????????????????",
+        "cos_sim": 0.0050918664783239365
+      },
+      {
+        "original": "The stock market experienced significant volatility this week.",
+        "noisy_decoded": ";;;;;;;;,,, you you you you you you you you,,,, and and and and and and and,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+        "cos_sim": 0.0829269140958786
+      },
+      {
+        "original": "Renewable energy sources are becoming more cost-effective.",
+        "noisy_decoded": "KOBBbrebrebrebrebrebrebreeshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesheshesh....",
+        "cos_sim": 0.03620518743991852
+      },
+      {
+        "original": "The neural network achieved state-of-the-art accuracy on the benchmark.",
+        "noisy_decoded": "[ [...........................................................................................................................",
+        "cos_sim": 0.07914555072784424
+      },
+      {
+        "original": "He opened the book and began reading the first chapter.",
+        "noisy_decoded": "////////////",
+        "cos_sim": 0.0459558367729187
+      }
+    ]
+  }
+]

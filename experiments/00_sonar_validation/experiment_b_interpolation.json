@@ -1,0 +1,312 @@
+[
+  {
+    "text_a": "I love programming in Python.",
+    "text_b": "Machine learning is fascinating.",
+    "cos_sim_ab": 0.38917070627212524,
+    "interpolations": [
+      {
+        "alpha": 0.0,
+        "decoded": "I love programming in Python.",
+        "norm": 0.21218068897724152
+      },
+      {
+        "alpha": 0.1,
+        "decoded": "I love programming in Python.",
+        "norm": 0.19912372529506683
+      },
+      {
+        "alpha": 0.2,
+        "decoded": "I love programming in Python.",
+        "norm": 0.18781472742557526
+      },
+      {
+        "alpha": 0.3,
+        "decoded": "I love programming in Python.",
+        "norm": 0.17858603596687317
+      },
+      {
+        "alpha": 0.4,
+        "decoded": "I love machine learning in python.",
+        "norm": 0.17177332937717438
+      },
+      {
+        "alpha": 0.5,
+        "decoded": "I love machine learning is fascinating.",
+        "norm": 0.167671337723732
+      },
+      {
+        "alpha": 0.6,
+        "decoded": "Machine learning is fascinating.",
+        "norm": 0.16648057103157043
+      },
+      {
+        "alpha": 0.7,
+        "decoded": "Machine learning is fascinating.",
+        "norm": 0.16826282441616058
+      },
+      {
+        "alpha": 0.8,
+        "decoded": "Machine learning is fascinating.",
+        "norm": 0.17292620241641998
+      },
+      {
+        "alpha": 0.9,
+        "decoded": "Machine learning is fascinating.",
+        "norm": 0.1802472323179245
+      },
+      {
+        "alpha": 1.0,
+        "decoded": "Machine learning is fascinating.",
+        "norm": 0.18991881608963013
+      }
+    ]
+  },
+  {
+    "text_a": "The cat sat on the mat.",
+    "text_b": "The dog ran through the park.",
+    "cos_sim_ab": 0.49911147356033325,
+    "interpolations": [
+      {
+        "alpha": 0.0,
+        "decoded": "The cat sat on the mat.",
+        "norm": 0.2043919712305069
+      },
+      {
+        "alpha": 0.1,
+        "decoded": "The cat sat on the mat.",
+        "norm": 0.1949835568666458
+      },
+      {
+        "alpha": 0.2,
+        "decoded": "The cat sat on the mat.",
+        "norm": 0.18734930455684662
+      },
+      {
+        "alpha": 0.3,
+        "decoded": "The cat sat on the mat.",
+        "norm": 0.18171291053295135
+      },
+      {
+        "alpha": 0.4,
+        "decoded": "The dog sat on the mat.",
+        "norm": 0.17826403677463531
+      },
+      {
+        "alpha": 0.5,
+        "decoded": "The dog ran on the park.",
+        "norm": 0.17713047564029694
+      },
+      {
+        "alpha": 0.6,
+        "decoded": "The dog ran through the park.",
+        "norm": 0.17835640907287598
+      },
+      {
+        "alpha": 0.7,
+        "decoded": "The dog ran through the park.",
+        "norm": 0.18189409375190735
+      },
+      {
+        "alpha": 0.8,
+        "decoded": "The dog ran through the park.",
+        "norm": 0.187612846493721
+      },
+      {
+        "alpha": 0.9,
+        "decoded": "The dog ran through the park.",
+        "norm": 0.19532114267349243
+      },
+      {
+        "alpha": 1.0,
+        "decoded": "The dog ran through the park.",
+        "norm": 0.2047944813966751
+      }
+    ]
+  },
+  {
+    "text_a": "It is raining heavily outside.",
+    "text_b": "The sun is shining brightly today.",
+    "cos_sim_ab": 0.5950989723205566,
+    "interpolations": [
+      {
+        "alpha": 0.0,
+        "decoded": "It is raining heavily outside.",
+        "norm": 0.22374990582466125
+      },
+      {
+        "alpha": 0.1,
+        "decoded": "It is raining heavily outside.",
+        "norm": 0.21407577395439148
+      },
+      {
+        "alpha": 0.2,
+        "decoded": "It is raining heavily outside.",
+        "norm": 0.20575962960720062
+      },
+      {
+        "alpha": 0.3,
+        "decoded": "It is raining heavily outside.",
+        "norm": 0.19897176325321198
+      },
+      {
+        "alpha": 0.4,
+        "decoded": "It is raining heavily outside today.",
+        "norm": 0.1938728243112564
+      },
+      {
+        "alpha": 0.5,
+        "decoded": "The sun is shining strongly today.",
+        "norm": 0.19059838354587555
+      },
+      {
+        "alpha": 0.6,
+        "decoded": "The sun is shining strongly today.",
+        "norm": 0.1892431676387787
+      },
+      {
+        "alpha": 0.7,
+        "decoded": "The sun is shining brightly today.",
+        "norm": 0.18984827399253845
+      },
+      {
+        "alpha": 0.8,
+        "decoded": "The sun is shining brightly today.",
+        "norm": 0.19239524006843567
+      },
+      {
+        "alpha": 0.9,
+        "decoded": "The sun is shining brightly today.",
+        "norm": 0.19680865108966827
+      },
+      {
+        "alpha": 1.0,
+        "decoded": "The sun is shining brightly today.",
+        "norm": 0.2029668241739273
+      }
+    ]
+  },
+  {
+    "text_a": "She is a brilliant scientist.",
+    "text_b": "He is an excellent musician.",
+    "cos_sim_ab": 0.6501849889755249,
+    "interpolations": [
+      {
+        "alpha": 0.0,
+        "decoded": "She is a genius scientist.",
+        "norm": 0.18199649453163147
+      },
+      {
+        "alpha": 0.1,
+        "decoded": "She is a genius scientist.",
+        "norm": 0.1761350780725479
+      },
+      {
+        "alpha": 0.2,
+        "decoded": "She is a brilliant scientist.",
+        "norm": 0.17142492532730103
+      },
+      {
+        "alpha": 0.3,
+        "decoded": "She is a brilliant scientist.",
+        "norm": 0.1679629236459732
+      },
+      {
+        "alpha": 0.4,
+        "decoded": "She is a brilliant scientist.",
+        "norm": 0.16582725942134857
+      },
+      {
+        "alpha": 0.5,
+        "decoded": "She is an excellent scientist.",
+        "norm": 0.16506940126419067
+      },
+      {
+        "alpha": 0.6,
+        "decoded": "He is an excellent musician.",
+        "norm": 0.1657082885503769
+      },
+      {
+        "alpha": 0.7,
+        "decoded": "He is an excellent musician.",
+        "norm": 0.16772794723510742
+      },
+      {
+        "alpha": 0.8,
+        "decoded": "He is an excellent musician.",
+        "norm": 0.17107947170734406
+      },
+      {
+        "alpha": 0.9,
+        "decoded": "He is an excellent musician.",
+        "norm": 0.17568665742874146
+      },
+      {
+        "alpha": 1.0,
+        "decoded": "He is an excellent musician.",
+        "norm": 0.1814539134502411
+      }
+    ]
+  },
+  {
+    "text_a": "The economy is growing rapidly.",
+    "text_b": "Unemployment rates are falling.",
+    "cos_sim_ab": 0.5372768640518188,
+    "interpolations": [
+      {
+        "alpha": 0.0,
+        "decoded": "The economy is growing rapidly.",
+        "norm": 0.16737723350524902
+      },
+      {
+        "alpha": 0.1,
+        "decoded": "The economy is growing rapidly.",
+        "norm": 0.16037267446517944
+      },
+      {
+        "alpha": 0.2,
+        "decoded": "The economy is growing rapidly.",
+        "norm": 0.15475212037563324
+      },
+      {
+        "alpha": 0.3,
+        "decoded": "The economy is growing rapidly.",
+        "norm": 0.15067054331302643
+      },
+      {
+        "alpha": 0.4,
+        "decoded": "The economy is growing rapidly.",
+        "norm": 0.1482550948858261
+      },
+      {
+        "alpha": 0.5,
+        "decoded": "The unemployment is growing fast.",
+        "norm": 0.1475875973701477
+      },
+      {
+        "alpha": 0.6,
+        "decoded": "The unemployment is rising.",
+        "norm": 0.14869162440299988
+      },
+      {
+        "alpha": 0.7,
+        "decoded": "The unemployment rate is falling.",
+        "norm": 0.15152841806411743
+      },
+      {
+        "alpha": 0.8,
+        "decoded": "Unemployment rate is falling.",
+        "norm": 0.15600350499153137
+      },
+      {
+        "alpha": 0.9,
+        "decoded": "Unemployment rates are falling.",
+        "norm": 0.16198113560676575
+      },
+      {
+        "alpha": 1.0,
+        "decoded": "Unemployment rates are falling.",
+        "norm": 0.16930226981639862
+      }
+    ]
+  }
+]

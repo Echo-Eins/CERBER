@@ -188,9 +188,6 @@ cython_debug/
 *.ckpt
 
 # Experiment results (regenerable)
-experiments/*/experiment_*.json
-experiments/*/vram_estimation.json
-experiments/*/go_nogo_report.json
 experiments/*/target_norm.pt
 
 # Wandb
