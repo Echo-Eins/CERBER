@@ -126,6 +126,8 @@ def main():
 
             # Decode if requested
             if sonar is not None:
+                texts_clean = sonar.decode_safe(v_orig.cpu())
+                sample_result["decoded_clean"] = texts_clean[0]
                 texts_noisy = sonar.decode_safe(v_noisy.cpu())
                 texts_denoised = sonar.decode_safe(result.v_final.cpu())
                 sample_result["decoded_noisy"] = texts_noisy[0]
@@ -138,6 +140,7 @@ def main():
             print(f"\n  [{i}] {marker} cos: {cos_before:.4f} → {cos_after:.4f} (Δ={cos_after - cos_before:+.4f}, {result.num_steps} steps)")
             print(f"       orig:     {sample_result['original_text'][:100]}")
             if sonar is not None:
+                print(f"       clean:    {sample_result['decoded_clean'][:100]}")
                 print(f"       noisy:    {sample_result['decoded_noisy'][:100]}")
                 print(f"       denoised: {sample_result['decoded_denoised'][:100]}")
 
