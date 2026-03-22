@@ -78,3 +78,47 @@ class Stage0Config:
     num_sentences: int = 1000
     # Output
     output_dir: str = "experiments/00_sonar_validation"
+
+
+@dataclass
+class Stage1Config:
+    """Stage 1: Denoising PoC configuration."""
+    sonar: SONARConfig = field(default_factory=SONARConfig)
+    langevin: LangevinConfig = field(default_factory=lambda: LangevinConfig(
+        lr=0.01,
+        noise_scale=0.003,
+        max_steps=100,
+        target_norm=0.2051,
+    ))
+    # SimpleEnergy architecture
+    energy_dim: int = 1024
+    energy_hidden_dims: list[int] = field(
+        default_factory=lambda: [2048, 512]
+    )
+    # Training
+    lr: float = 1e-4
+    weight_decay: float = 0.01
+    batch_size: int = 32
+    num_epochs: int = 50
+    margin: float = 1.0
+    # Noise for training negatives (relative to norm)
+    train_noise_scales: list[float] = field(
+        default_factory=lambda: [0.005, 0.01, 0.015, 0.02]
+    )
+    # Data
+    num_train_sentences: int = 10000
+    num_test_sentences: int = 500
+    dataset_name: str = "wikitext"
+    dataset_config: str = "wikitext-103-raw-v1"
+    # Evaluation
+    eval_noise_scales: list[float] = field(
+        default_factory=lambda: [0.005, 0.01, 0.02, 0.03]
+    )
+    # Output
+    output_dir: str = "experiments/01_denoising_poc"
+    checkpoint_dir: str = "experiments/01_denoising_poc/checkpoints"
+    # Logging
+    wandb_project: str = "cebcm-stage1"
+    use_wandb: bool = False
+    log_every: int = 50
+    eval_every_epoch: int = 5
