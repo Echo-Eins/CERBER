@@ -100,7 +100,7 @@ class Stage1Config:
     weight_decay: float = 0.01
     batch_size: int = 32
     num_epochs: int = 50
-    margin: float = 0.1
+    margin: float = 1.0
     # Noise for training negatives (relative to norm)
     train_noise_scales: list[float] = field(
         default_factory=lambda: [0.1, 0.2, 0.3]

@@ -87,7 +87,7 @@ def train_epoch(
 
         # Gradient penalty for smooth energy landscape
         gp = gradient_penalty(model, v_orig, v_noisy)
-        loss = loss_contrastive + 0.01 * gp
+        loss = loss_contrastive + 0.1 * gp
 
         optimizer.zero_grad()
         loss.backward()
@@ -238,7 +238,7 @@ def main():
     model = SimpleEnergy(
         dim=config.energy_dim,
         hidden_dims=config.energy_hidden_dims,
-        spectral_norm=False,
+        spectral_norm=True,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
