@@ -155,6 +155,10 @@ def evaluate_denoising(
                 noise_scale=config.langevin.noise_scale,
                 max_steps=config.langevin.max_steps,
                 target_norm=config.langevin.target_norm,
+                momentum_beta=config.langevin.momentum_beta,
+                energy_threshold=config.langevin.energy_threshold,
+                plateau_patience=config.langevin.plateau_patience,
+                plateau_delta=config.langevin.plateau_delta,
                 v_target=v_orig,
             )
 

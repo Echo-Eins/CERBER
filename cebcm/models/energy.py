@@ -10,6 +10,7 @@ Spec reference: §13.1, §5.2 Mode A
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -67,6 +68,10 @@ class SimpleEnergy(nn.Module):
         Returns:
             [B] energy scalars
         """
+        # Normalize to unit sphere — eliminates norm as a learnable feature,
+        # forcing the model to learn directional (cosine) similarity.
+        v_query = F.normalize(v_query, dim=-1)
+        v_candidate = F.normalize(v_candidate, dim=-1)
         diff = v_query - v_candidate
         prod = v_query * v_candidate
         x = torch.cat([v_query, v_candidate, diff, prod], dim=-1)

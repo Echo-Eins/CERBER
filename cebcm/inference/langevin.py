@@ -119,6 +119,13 @@ def langevin_dynamics(
         else:
             update = grad
 
+        # Tangent plane projection: remove radial component so the update
+        # moves along the sphere rather than fighting the norm projection.
+        if target_norm is not None:
+            v_hat = F.normalize(v_current, dim=-1)
+            radial = (update * v_hat).sum(dim=-1, keepdim=True) * v_hat
+            update = update - radial
+
         # Langevin step: gradient descent + stochastic noise
         langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
         v_current = v_current - lr * update + langevin_noise
