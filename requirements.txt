@@ -1,0 +1,30 @@
+# === CEBCM Project Dependencies ===
+
+# PyTorch (install separately with correct CUDA version)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# SONAR (Meta's sentence-level autoencoder)
+# IMPORTANT: install fairseq2 FIRST with matching PyTorch/CUDA version:
+#   pip install fairseq2 --extra-index-url https://fair.pkg.atmeta.com/fairseq2/whl/pt2.6.0/cu124
+sonar-space>=0.5.0
+
+# Datasets & NLP
+datasets>=2.14.0
+transformers>=4.30.0
+sentence-transformers>=2.2.0
+
+# Retrieval
+faiss-cpu>=1.7.4  # or faiss-gpu for GPU support
+
+# Metrics
+rouge-score>=0.1.2
+nltk>=3.8.0
+
+# Efficient Attention (optional, for scaling experiments)
+# fla-core  # Flash Linear Attention: GLA, Gated DeltaNet, Mamba
+
+# Utilities
+tqdm>=4.65.0
+wandb>=0.15.0
+numpy>=1.24.0
+pyyaml>=6.0

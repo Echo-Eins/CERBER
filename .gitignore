@@ -179,3 +179,27 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# === CEBCM Project ===
+
+# PyTorch model files
+*.pt
+*.pth
+*.ckpt
+
+# Experiment results (regenerable)
+experiments/*/experiment_*.json
+experiments/*/vram_estimation.json
+experiments/*/go_nogo_report.json
+experiments/*/target_norm.pt
+
+# Wandb
+wandb/
+
+# Data files (root-level only, not cebcm/data/)
+/data/
+*.h5
+*.hdf5
+
+# IDE
+.idea/
