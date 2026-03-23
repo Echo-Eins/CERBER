@@ -1,0 +1,69 @@
+Критические findings (по severity)
+
+[P1] Конфигурация инференса не сохраняется в checkpoint, из‑за чего оценка может идти в другом режиме, чем тренировка.
+Сохраняются только параметры energy‑сети, без langevin.method/lr/steps/threshold и др. (train.py (line 517), train.py (line 583)).
+evaluate.py берет Stage1Config() по умолчанию и использует его как truth (evaluate.py (line 48), evaluate.py (line 85), evaluate.py (line 123)).
+Итог: метрики могут быть несопоставимы с реальным train-режимом.
+
+[P1] Несогласованная логика early-stop между train-eval и standalone evaluate.
+В train-eval передается energy_threshold (train.py (line 263)), а в evaluate.py — нет (evaluate.py (line 123)).
+Итог: два скрипта дают разные траектории/метрики при одном checkpoint.
+
+[P1] Выбор best.pt шумный и нерепродуцируемый.
+Каждая валидация берёт случайные 100 примеров без фиксированного seed (train.py (line 222), train.py (line 490), train.py (line 507)).
+Итог: можно сохранить “лучший” checkpoint случайно.
+
+[P1] Баг трекинга лучшей точки в Langevin: допускается перезапись v_best худшей точкой.
+После _check_early_stop используется условие e_mean <= best_energy + plateau_delta, что позволяет записать точку хуже true-best (в пределах delta) (langevin.py (line 152), langevin.py (line 156), аналогично langevin.py (line 276), langevin.py (line 280), langevin.py (line 409), langevin.py (line 413)).
+
+[P1] Визуализация траектории может вводить в заблуждение: рисуется не траектория выбранного метода.
+Сначала запускается реальный run_langevin, затем траектория перегенерируется “простым overdamped walk” без PID/underdamped/noise (visualize_landscape.py (line 111), visualize_landscape.py (line 131), visualize_landscape.py (line 135)).
+Итог: графики могут подтверждать ложную динамику.
+
+[P2] Лишняя дорогая вычислительная ветка: GP считается даже при lambda=0 в contrastive-режиме.
+gradient_penalty вызывается всегда (train.py (line 178)), хотя в loss умножается на gradient_penalty_lambda (train.py (line 179)).
+Итог: ненужный overhead и память.
+
+[P2] Главный bottleneck: Bjorck-ортонормализация в каждом forward, 15 итераций, с full autograd.
+Реализация внутри train path (normalization.py (line 64), normalization.py (line 66), normalization.py (line 126)).
+Это сильное отклонение от текущего SOTA-подхода “ускорить сначала системно” и одна из причин медленного обучения.
+
+[P2] В Bjorck нет явной преднормировки/guard-контура устойчивости.
+При дрейфе весов гарантия быстрой сходимости итерации хуже, риск численной нестабильности выше (normalization.py (line 35), normalization.py (line 64)).
+
+[P2] Отсутствует базовый SOTA speed stack в train hot-path.
+Нет torch.amp.autocast, GradScaler, torch.compile, activation checkpointing в основном цикле (train.py (line 96), train.py (line 123), train.py (line 124), train.py (line 126)).
+
+[P2] DataLoader не настроен под throughput.
+Используются дефолты (num_workers=0, без pin_memory, без persistent workers) (train.py (line 355)).
+Это заметное отклонение от практик PyTorch tuning guide.
+
+[P2] Ненужное построение графа в eval-энергиях.
+В train-eval e_before/e_after считаются без torch.no_grad() (train.py (line 272), train.py (line 273)).
+Итог: лишняя стоимость при частой валидации.
+
+[P2] Неполная воспроизводимость экспериментов.
+В train/evaluate нет фиксации seed; при этом много stochastic шагов (randperm, noise sampling) (train.py (line 222), train.py (line 250), evaluate.py (line 81), evaluate.py (line 113)).
+
+[P2] Objective-space ограничен и отстает от SOTA-фронтира, который уже зафиксирован в research.md.
+В коде Stage 1 только mdsm/margin_contrastive (train.py (line 308), base.py (line 130)); нет Energy Matching / Flow Matching / consistency-style student path.
+
+[P2] Inference path строго итеративный, без few-step student/distilled path.
+run_langevin — только iterative samplers (langevin.py (line 458)).
+Для текущей проблемы “очень медленно” это ключевое отклонение от SOTA deployment-практики.
+
+[P3] Мелкие code-quality дрейфы, которые мешают сопровождению.
+selected_slopes вычисляется и не используется (activations.py (line 119)); v_query_expanded не используется (energy_landscape.py (line 152)); scheduler аргумент передается, но не используется в train_epoch_mdsm (train.py (line 83)).
+
+[P3] Warmup реализован с систематическим недобором target LR.
+warmup_factor = global_step / warmup_steps при условии < warmup_steps не достигает ровно 1.0 (train.py (line 100), train.py (line 101)).
+Эффект небольшой, но это техническая неточность.
+
+[P3] Early-stop использует batch-mean energy.
+Для batch>1 это может останавливать шаги по “легким” примерам раньше, чем сложные сойдутся (langevin.py (line 144), langevin.py (line 268), langevin.py (line 401)).
+
+
+Коротко по итогу:
+Есть несколько реальных корректностных проблем (конфиг-рассинхрон train/eval, шумный выбор best, bug в v_best, неверная траектория в visualization).
+Главная причина медленности — архитектурно тяжелый train path (2nd-order MDSM + per-forward Bjorck) и отсутствие базового speed stack.
+Относительно SOTA ваш Stage 1 сейчас ближе к исследовательскому baseline, чем к production-grade pipeline.
