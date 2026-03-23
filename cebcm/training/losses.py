@@ -45,10 +45,12 @@ def multiscale_dsm_loss(
     ensuring the energy landscape is smooth across all scales — from coarse
     global structure (high σ) to fine-grained adjustments (low σ).
 
-    DSM objective: ||∇_V E(V_q, V_noisy) - (V_clean - V_noisy) / σ²||²
+    Direction matching objective: maximize cos(∇_V E, V_clean - V_noisy)
 
-    The score function ∇ log p_σ(V_noisy | V_clean) = -(V_noisy - V_clean) / σ²
-    for Gaussian perturbation. We train the energy gradient to match this.
+    Standard DSM trains ||∇E - target_score||², but target_score has magnitude
+    ~sqrt(D)/σ_eff (300-16000) which is unreachable for 1-Lipschitz networks.
+    Instead we train ∇E to point in the correct DIRECTION (toward clean),
+    using cosine similarity. Gradient magnitude is controlled by Langevin lr.
 
     Args:
         energy_fn: Energy model E(v_query, v_candidate) → scalar.
@@ -86,26 +88,24 @@ def multiscale_dsm_loss(
         energy.sum(), v_noisy_grad, create_graph=True
     )[0]  # [B, D]
 
-    # Target score: ∇ log p_σ(V_noisy | V_clean) = -(V_noisy - V_clean) / σ²
-    # With relative noise, the effective σ_eff = σ * ||V_clean||
-    if relative_noise:
-        sigma_eff_sq = (sigma * norms) ** 2  # [B, 1]
-    else:
-        sigma_eff_sq = sigma ** 2  # [B, 1]
+    # Target score direction: points from noisy back toward clean.
+    # ∇ log p_σ(V_noisy | V_clean) = -(V_noisy - V_clean) / σ²
+    # The magnitude is ~sqrt(D)/σ_eff which is 300-16000 — far beyond what
+    # a 1-Lipschitz network can produce (||∇E|| ≤ exp(scale) ≈ O(1)).
+    # Standard MSE against this target gives a constant loss baseline.
+    #
+    # Fix: Direction matching via cosine loss. We only need ∇E to POINT
+    # from noisy toward clean — the step magnitude is controlled by
+    # Langevin lr at inference time. This makes the loss scale-invariant
+    # and immediately trainable with 1-Lipschitz architectures.
+    target_direction = v_clean - v_noisy.detach()  # [B, D] points toward clean
 
-    target_score = -(v_noisy.detach() - v_clean) / sigma_eff_sq  # [B, D]
+    # Cosine loss: 1 - cos(∇E, target_direction)
+    # = 0 when perfectly aligned, 2 when opposite
+    cos_sim = F.cosine_similarity(grad_energy, target_direction, dim=-1)  # [B]
+    loss = (1 - cos_sim).mean()
 
-    # DSM loss: ||∇E - target_score||² with σ²-weighting for scale balance
-    # Weight by σ² to equalize contribution across noise levels
-    # (low σ → small gradients → needs amplification)
-    score_diff = grad_energy - target_score  # [B, D]
-    loss_per_sample = (score_diff ** 2).sum(dim=-1)  # [B]
-
-    # Weight by σ² for balanced multi-scale learning
-    weights = sigma_eff_sq.squeeze(-1)  # [B]
-    weighted_loss = (weights * loss_per_sample).mean()
-
-    return weighted_loss
+    return loss
 
 
 def dsm_loss_fixed_sigma(

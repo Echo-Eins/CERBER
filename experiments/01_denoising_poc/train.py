@@ -9,12 +9,12 @@ Training loop (MDSM — Multi-Scale Denoising Score Matching):
     1. Sample V_clean from pre-encoded WikiText vectors
     2. σ ~ LogUniform(σ_min, σ_max) — continuous noise scale
     3. V_noisy = V_clean + σ·||V_clean||·ε  (relative Gaussian noise)
-    4. Loss = ||∇_V E(V_clean, V_noisy) - target_score||² + λ·GP
-       where target_score = -(V_noisy - V_clean) / σ² is the analytic
-       denoising score direction.
+    4. Loss = 1 - cos(∇_V E(V_clean, V_noisy), V_clean - V_noisy)
+       Direction matching: train ∇E to point from noisy toward clean.
+       Uses cosine loss because 1-Lipschitz networks can't match the
+       raw target score magnitude (~sqrt(D)/σ_eff).
 
-    This trains the energy gradient to point correctly from any noisy vector
-    back toward the clean vector, at ALL noise scales simultaneously.
+    This trains the energy gradient direction at ALL noise scales.
     Langevin dynamics then follows these gradients for refinement.
 
 Architecture:
@@ -374,16 +374,11 @@ def main():
     print(f"  Loss: {config.loss_type}")
     print(f"  Langevin: {config.langevin.method}")
 
-    # Separate param groups: log_energy_scale needs much higher LR because
-    # 1-Lipschitz hidden layers bound ||∇f|| ≤ 1, and the scale must grow
-    # exponentially to match DSM target scores (~sqrt(D)/(σ·||V||)).
-    scale_params = [model.log_energy_scale]
-    other_params = [p for n, p in model.named_parameters() if "log_energy_scale" not in n]
-    scale_lr = config.lr * 2000  # e.g., 5e-5 * 2000 = 0.1
-    optimizer = torch.optim.AdamW([
-        {"params": other_params, "lr": config.lr, "weight_decay": config.weight_decay},
-        {"params": scale_params, "lr": scale_lr, "weight_decay": 0.0},
-    ])
+    # With direction matching (cosine loss), energy scale magnitude doesn't
+    # matter — only gradient direction is trained. Single param group suffices.
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.num_epochs, eta_min=config.lr * 0.1
     )

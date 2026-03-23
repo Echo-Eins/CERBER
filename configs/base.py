@@ -99,8 +99,8 @@ class Stage1Config:
     """Stage 1: Denoising PoC configuration."""
     sonar: SONARConfig = field(default_factory=SONARConfig)
     langevin: LangevinConfig = field(default_factory=lambda: LangevinConfig(
-        lr=0.001,
-        noise_scale=0.0,
+        lr=0.01,             # Increased: ∇E is O(1) with direction matching
+        noise_scale=0.005,   # Small Langevin noise for exploration
         max_steps=100,
         target_norm=0.2051,
         method="pid",
@@ -121,7 +121,7 @@ class Stage1Config:
     groupsort_size: int = 2            # Group size (2 = MaxMin)
     spline_num_knots: int = 4          # Knots for lipschitz_spline
     # Training
-    lr: float = 5e-5  # Lowered for orthonorm + learnable activations (was 1e-4)
+    lr: float = 1e-3  # Raised: cosine loss has O(1) gradients (was 5e-5 for MSE)
     warmup_steps: int = 500            # Linear warmup from 0 to lr
     weight_decay: float = 0.01
     batch_size: int = 32
@@ -130,7 +130,7 @@ class Stage1Config:
     loss_type: str = "mdsm"            # "mdsm" (default) or "margin_contrastive" (legacy)
     mdsm_sigma_min: float = 0.01       # Minimum noise scale (fine structure)
     mdsm_sigma_max: float = 0.5        # Maximum noise scale (global structure)
-    gradient_penalty_lambda: float = 0.05  # Lower for orthonorm (already Lipschitz)
+    gradient_penalty_lambda: float = 0.0   # Disabled: orthonorm is already 1-Lipschitz
     margin: float = 1.0                # Only used with margin_contrastive loss
     # Noise for training negatives (only used with margin_contrastive loss)
     train_noise_scales: list[float] = field(
