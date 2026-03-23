@@ -5,18 +5,18 @@ Pipeline:
     SONAR encoder (frozen) → [SimpleEnergy] → Langevin → SONAR decoder (frozen)
                                ^^^TRAINS^^^
 
-Training loop (MDSM — Multi-Scale Denoising Score Matching, NCSN-style):
+Training loop (MDSM — Multi-Scale Denoising Score Matching):
     1. Sample V_clean from pre-encoded WikiText vectors
     2. σ ~ LogUniform(σ_min, σ_max) — continuous noise scale
     3. V_noisy = V_clean + σ·||V_clean||·ε  (relative Gaussian noise)
-    4. Loss = σ²·||∇_V E(V_clean, V_noisy, σ) - target_score||²
-       where target_score = -(V_noisy - V_clean) / σ_eff² is the analytic
-       denoising score. The energy function is σ-conditioned (NCSN-style)
-       via sinusoidal embedding of log(σ), enabling scale-appropriate
-       gradient magnitudes despite 1-Lipschitz hidden layers.
+    4. Loss = 1 - cos(∇_V E(V_clean, V_noisy, σ), V_clean - V_noisy)
+       Direction matching: train ∇E to point from noisy toward clean.
+       The energy function is σ-conditioned (NCSN-style) via sinusoidal
+       embedding of log(σ) — this gives the network extra context about
+       the noise regime, but cosine loss is used because 1-Lipschitz
+       hidden layers cap ||∇E|| far below the raw target score magnitude.
 
-    This trains the energy gradient to point correctly from any noisy vector
-    back toward the clean vector, at ALL noise scales simultaneously.
+    This trains the energy gradient direction at ALL noise scales.
     Langevin dynamics then follows these gradients for refinement.
 
 Architecture:
@@ -96,11 +96,11 @@ def train_epoch_mdsm(
     for batch_idx, v_clean in enumerate(dataloader):
         v_clean = v_clean.to(device)
 
-        # Warmup: linearly increase LR from 0 to target for each param group
+        # Warmup: linearly increase LR from 0 to target
         if global_step < config.warmup_steps:
             warmup_factor = global_step / config.warmup_steps
             for pg in optimizer.param_groups:
-                pg["lr"] = pg["initial_lr"] * warmup_factor
+                pg["lr"] = config.lr * warmup_factor
 
         # MDSM loss: learn correct score at all noise scales
         loss_dsm = multiscale_dsm_loss(
@@ -376,20 +376,11 @@ def main():
     print(f"  Loss: {config.loss_type}")
     print(f"  Langevin: {config.langevin.method}")
 
-    # With σ-conditioned NCSN, the network learns scale-appropriate gradients.
-    # The energy_scale still needs a higher LR to match the overall DSM target
-    # magnitude range (the σ-embedding handles relative scaling between noise
-    # levels, but the global magnitude needs energy_scale to grow).
-    scale_params = [model.log_energy_scale]
-    other_params = [p for n, p in model.named_parameters() if "log_energy_scale" not in n]
-    scale_lr = config.lr * 100  # e.g., 1e-3 * 100 = 0.1
-    optimizer = torch.optim.AdamW([
-        {"params": other_params, "lr": config.lr, "weight_decay": config.weight_decay},
-        {"params": scale_params, "lr": scale_lr, "weight_decay": 0.0},
-    ])
-    # Store initial LR per group for warmup scheduling
-    for pg in optimizer.param_groups:
-        pg["initial_lr"] = pg["lr"]
+    # Cosine direction loss is scale-invariant: gradient magnitude doesn't matter,
+    # only direction. Single param group with uniform LR suffices.
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.num_epochs, eta_min=config.lr * 0.1
     )

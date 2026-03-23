@@ -35,32 +35,27 @@ def multiscale_dsm_loss(
     relative_noise: bool = True,
 ) -> Tensor:
     """
-    Multi-Scale Denoising Score Matching loss with σ-conditioning (NCSN-style).
+    Multi-Scale Denoising Score Matching via direction matching + σ-conditioning.
 
-    Trains the energy function so that ∇_V E(V_query, V_candidate, σ) correctly
-    points from noisy vectors back toward clean vectors at ALL noise levels.
-    The energy function receives σ as input, enabling it to output scale-appropriate
-    gradients despite 1-Lipschitz hidden layers.
+    Trains ∇_V E(V_query, V_candidate, σ) to point from noisy vectors back
+    toward clean vectors at ALL noise levels. The energy function receives σ
+    as input (NCSN-style) for richer per-noise-level representation.
 
-    The noise level σ is sampled continuously from LogUniform(σ_min, σ_max),
-    ensuring the energy landscape is smooth across all scales.
-
-    DSM objective: ||∇_V E(V_q, V_noisy, σ) - (V_clean - V_noisy) / σ_eff²||²
-    weighted by σ_eff² for balanced multi-scale learning.
-
-    Reference: Song & Ermon, "Generative Modeling by Estimating Gradients
-    of the Data Distribution" (NeurIPS 2019) — NCSN with σ-conditioning.
+    Direction matching (cosine loss) is used because 1-Lipschitz hidden layers
+    bound ||∇E|| ≤ exp(scale) × ||W_final|| ≈ O(10-100), while the raw DSM
+    target has ||target|| = sqrt(D)/(σ_eff) ≈ O(2000-16000). MSE against this
+    target is fundamentally untrainable. Cosine loss is scale-invariant and
+    immediately trainable — gradient MAGNITUDE is controlled by Langevin lr.
 
     Args:
         energy_fn: Energy model E(v_query, v_candidate, sigma) → scalar.
-                   Must accept sigma as third argument.
         v_clean: [B, D] clean embeddings (from SONAR encoder).
         sigma_min: Minimum noise scale (for fine structure).
         sigma_max: Maximum noise scale (for global structure).
         relative_noise: If True, scale noise relative to embedding norm.
 
     Returns:
-        Scalar DSM loss (mean over batch).
+        Scalar cosine DSM loss (mean over batch), range [0, 2].
     """
     B, D = v_clean.shape
     device = v_clean.device
@@ -75,7 +70,6 @@ def multiscale_dsm_loss(
     noise = torch.randn_like(v_clean)  # [B, D]
 
     if relative_noise:
-        # Scale noise relative to embedding norm (as in CEBCM spec)
         norms = v_clean.norm(dim=-1, keepdim=True)  # [B, 1]
         v_noisy = v_clean + noise * sigma * norms
     else:
@@ -88,26 +82,13 @@ def multiscale_dsm_loss(
         energy.sum(), v_noisy_grad, create_graph=True
     )[0]  # [B, D]
 
-    # Target score: ∇ log p_σ(V_noisy | V_clean) = -(V_noisy - V_clean) / σ_eff²
-    # With σ-conditioning, the network CAN learn to match this magnitude
-    # because it adapts its output scale based on the σ input.
-    if relative_noise:
-        sigma_eff_sq = (sigma * norms) ** 2  # [B, 1]
-    else:
-        sigma_eff_sq = sigma ** 2  # [B, 1]
+    # Target direction: points from noisy back toward clean.
+    # Cosine loss: 1 - cos(∇E, target_direction), range [0, 2].
+    target_direction = v_clean - v_noisy.detach()  # [B, D]
+    cos_sim = F.cosine_similarity(grad_energy, target_direction, dim=-1)  # [B]
+    loss = (1 - cos_sim).mean()
 
-    target_score = -(v_noisy.detach() - v_clean) / sigma_eff_sq  # [B, D]
-
-    # DSM loss: ||∇E - target_score||² with σ²-weighting for scale balance
-    # Weight by σ_eff² to equalize contribution across noise levels:
-    # at small σ, ||target||² ∝ 1/σ², so σ² weighting gives O(1) per scale.
-    score_diff = grad_energy - target_score  # [B, D]
-    loss_per_sample = (score_diff ** 2).sum(dim=-1)  # [B]
-
-    weights = sigma_eff_sq.squeeze(-1)  # [B]
-    weighted_loss = (weights * loss_per_sample).mean()
-
-    return weighted_loss
+    return loss
 
 
 def dsm_loss_fixed_sigma(
@@ -138,12 +119,9 @@ def dsm_loss_fixed_sigma(
     if relative_noise:
         norms = v_clean.norm(dim=-1, keepdim=True)
         v_noisy = v_clean + noise * sigma * norms
-        sigma_eff_sq = (sigma * norms) ** 2
     else:
         v_noisy = v_clean + noise * sigma
-        sigma_eff_sq = sigma ** 2
 
-    # Pass σ to the energy function for conditioning
     sigma_tensor = torch.full((B, 1), sigma, device=device)
 
     v_noisy_grad = v_noisy.detach().requires_grad_(True)
@@ -152,9 +130,10 @@ def dsm_loss_fixed_sigma(
         energy.sum(), v_noisy_grad, create_graph=True
     )[0]
 
-    target_score = -(v_noisy.detach() - v_clean) / sigma_eff_sq
-    score_diff = grad_energy - target_score
-    loss = (score_diff ** 2).sum(dim=-1).mean()
+    # Cosine direction loss (consistent with multiscale_dsm_loss)
+    target_direction = v_clean - v_noisy.detach()
+    cos_sim = F.cosine_similarity(grad_energy, target_direction, dim=-1)
+    loss = (1 - cos_sim).mean()
 
     return loss
 
