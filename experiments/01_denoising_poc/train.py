@@ -130,11 +130,13 @@ def train_epoch_mdsm(
         global_step += 1
 
         if config.log_every > 0 and (batch_idx + 1) % config.log_every == 0:
+            e_scale = model.log_energy_scale.exp().item()
             print(
                 f"  [{batch_idx + 1}/{len(dataloader)}] "
                 f"loss={loss.item():.4f} DSM={loss_dsm.item():.4f} "
                 f"GP={loss_gp.item():.4f} "
-                f"lr={optimizer.param_groups[0]['lr']:.6f}"
+                f"lr={optimizer.param_groups[0]['lr']:.6f} "
+                f"E_scale={e_scale:.1f}"
             )
 
     return {
@@ -372,9 +374,16 @@ def main():
     print(f"  Loss: {config.loss_type}")
     print(f"  Langevin: {config.langevin.method}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
-    )
+    # Separate param groups: log_energy_scale needs much higher LR because
+    # 1-Lipschitz hidden layers bound ||∇f|| ≤ 1, and the scale must grow
+    # exponentially to match DSM target scores (~sqrt(D)/(σ·||V||)).
+    scale_params = [model.log_energy_scale]
+    other_params = [p for n, p in model.named_parameters() if "log_energy_scale" not in n]
+    scale_lr = config.lr * 2000  # e.g., 5e-5 * 2000 = 0.1
+    optimizer = torch.optim.AdamW([
+        {"params": other_params, "lr": config.lr, "weight_decay": config.weight_decay},
+        {"params": scale_params, "lr": scale_lr, "weight_decay": 0.0},
+    ])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.num_epochs, eta_min=config.lr * 0.1
     )

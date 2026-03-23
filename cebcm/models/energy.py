@@ -90,11 +90,24 @@ class SimpleEnergy(nn.Module):
 
             prev_dim = h_dim
 
-        # Final projection to scalar (no activation)
-        final_linear = self._make_linear(prev_dim, 1, norm_mode, ortho_n_iters)
+        # Final projection to scalar (no activation, unconstrained).
+        # The hidden layers are 1-Lipschitz (OrthoLinear + GroupSort) for smooth
+        # feature extraction. The final layer is a regular Linear so the energy
+        # magnitude can be learned freely — critical for MDSM where the target
+        # score ∇logp has magnitude ~sqrt(D)/(σ·||V||) which exceeds what a
+        # 1-Lipschitz network can produce.
+        final_linear = nn.Linear(prev_dim, 1)
         layers.append(final_linear)
 
         self.net = nn.Sequential(*layers)
+
+        # Learnable energy scale (log-parameterized for fast adaptation).
+        # MDSM target score has magnitude ~sqrt(D)/(σ·||V||) which can be >>1,
+        # but 1-Lipschitz hidden layers bound ||∇f|| ≤ 1. This scale factor
+        # lets the energy output grow: E = exp(log_scale) · f(x), so
+        # ||∇E|| = exp(log_scale) · ||∇f||. The log parameterization allows
+        # exponential growth via small additive updates to log_scale.
+        self.log_energy_scale = nn.Parameter(torch.tensor(0.0))
 
     @staticmethod
     def _make_linear(
@@ -140,14 +153,10 @@ class SimpleEnergy(nn.Module):
         Returns:
             [B] energy scalars
         """
-        # Normalize to unit sphere — eliminates norm as a learnable feature,
-        # forcing the model to learn directional (cosine) similarity.
-        v_query = F.normalize(v_query, dim=-1)
-        v_candidate = F.normalize(v_candidate, dim=-1)
         diff = v_query - v_candidate
         prod = v_query * v_candidate
         x = torch.cat([v_query, v_candidate, diff, prod], dim=-1)
-        return self.net(x).squeeze(-1)
+        return self.log_energy_scale.exp() * self.net(x).squeeze(-1)
 
     def energy_and_grad(
         self, v_query: Tensor, v_candidate: Tensor
