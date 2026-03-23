@@ -20,206 +20,170 @@ Training SimpleEnergy for 50 epochs
   MDSM sigma sampling: loguniform
   MDSM sigma weighting: sigma2
   MDSM directional: True
+  MDSM magnitude aux weight: 0.0
   MDSM tangent projection: True
+  MDSM cosine eps: 0.0001
+  MDSM norm floor: 0.0001
   MDSM force FP32 path: True
   Eval noise scales: [0.05, 0.1, 0.2, 0.3]
   Langevin: method=pid, lr=0.01, steps=100
   Target norm: 0.2051
   GP lambda: 0.0
-  Non-finite handling: skip=True, max_streak=20, lr_backoff=0.5
+  Non-finite handling: skip=True, max_streak=20, lr_backoff=0.5, backoff_trigger=3
 ============================================================
 
 Epoch 1/50
   Ortho schedule: n_iters=15 on 3 layers
-  [50/312] loss=0.0052 DSM=0.0052 GP=0.0000 lr=0.000100 E_scale=1.05 sigma=[0.1000,0.5000]
-  [100/312] loss=0.0044 DSM=0.0044 GP=0.0000 lr=0.000200 E_scale=1.22 sigma=[0.1000,0.5000]
-  [WARN] non-finite MDSM gradients at batch 138, streak=1, lr=0.000138; step skipped
-  [WARN] non-finite MDSM loss at batch 140, streak=1, lr=7e-05; batch skipped
-  [WARN] non-finite MDSM gradients at batch 144, streak=1, lr=3.6e-05; step skipped
-  [WARN] non-finite MDSM gradients at batch 146, streak=1, lr=1.825e-05; step skipped
-  [WARN] non-finite MDSM gradients at batch 150, streak=1, lr=9.375e-06; step skipped
-  [WARN] non-finite MDSM gradients at batch 153, streak=1, lr=4.78125e-06; step skipped
-  [WARN] non-finite MDSM loss at batch 158, streak=1, lr=2.46875e-06; batch skipped
-  [WARN] non-finite MDSM gradients at batch 160, streak=1, lr=1.25e-06; step skipped
-  [WARN] non-finite MDSM gradients at batch 163, streak=1, lr=6.36719e-07; step skipped
-  [WARN] non-finite MDSM gradients at batch 164, streak=2, lr=3.20313e-07; step skipped
-  [WARN] non-finite MDSM gradients at batch 175, streak=1, lr=1.70898e-07; step skipped
-  [WARN] non-finite MDSM loss at batch 178, streak=1, lr=8.69141e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 185, streak=1, lr=4.5166e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 189, streak=1, lr=2.30713e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 192, streak=1, lr=1.17188e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 194, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 200, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 211, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 220, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 230, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 234, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 235, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 242, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 250, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 253, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 254, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 258, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 265, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 267, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 269, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 270, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 277, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 283, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 286, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 287, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 291, streak=1, lr=1e-08; batch skipped
-  [300/312] loss=0.0058 DSM=0.0058 GP=0.0000 lr=0.000000 E_scale=1.46 sigma=[0.1000,0.5000]
-  [WARN] non-finite MDSM gradients at batch 303, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 304, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 306, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 311, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 312, streak=2, lr=1e-08; step skipped
-  loss=0.0050 dsm_loss=0.0050 gradient_penalty=0.0000 sigma_min=0.1000 sigma_max=0.5000 lr=0.000000 (128.5s)
+  [50/312] loss=0.0042 DSM=0.0042 GP=0.0000 lr=0.000100 E_scale=1.00 sigma=[0.1000,0.5000]
+  [100/312] loss=0.0036 DSM=0.0036 GP=0.0000 lr=0.000200 E_scale=1.00 sigma=[0.1000,0.5000]
+  [150/312] loss=0.0039 DSM=0.0039 GP=0.0000 lr=0.000300 E_scale=1.00 sigma=[0.1000,0.5000]
+  [WARN] non-finite MDSM gradients at batch 165, streak=1, lr=0.00033; step skipped
+  [WARN] non-finite MDSM gradients at batch 166, streak=2, lr=0.000332; step skipped
+  [WARN] non-finite MDSM gradients at batch 167, streak=3, lr=0.000167; step skipped
+  [WARN] non-finite MDSM gradients at batch 169, streak=1, lr=0.000338; step skipped
+  [WARN] non-finite MDSM gradients at batch 176, streak=1, lr=0.000352; step skipped
+  [WARN] non-finite MDSM gradients at batch 181, streak=1, lr=0.000362; step skipped
+  [WARN] non-finite MDSM gradients at batch 185, streak=1, lr=0.00037; step skipped
+  [WARN] non-finite MDSM gradients at batch 187, streak=1, lr=0.000374; step skipped
+  [WARN] non-finite MDSM gradients at batch 193, streak=1, lr=0.000386; step skipped
+  [WARN] non-finite MDSM gradients at batch 196, streak=1, lr=0.000392; step skipped
+  [WARN] non-finite MDSM gradients at batch 197, streak=2, lr=0.000394; step skipped
+  [WARN] non-finite MDSM gradients at batch 200, streak=1, lr=0.0004; step skipped
+  [WARN] non-finite MDSM gradients at batch 206, streak=1, lr=0.000412; step skipped
+  [WARN] non-finite MDSM gradients at batch 210, streak=1, lr=0.00042; step skipped
+  [WARN] non-finite MDSM gradients at batch 211, streak=2, lr=0.000422; step skipped
+  [WARN] non-finite MDSM gradients at batch 213, streak=1, lr=0.000426; step skipped
+  [WARN] non-finite MDSM gradients at batch 215, streak=1, lr=0.00043; step skipped
+  [WARN] non-finite MDSM gradients at batch 222, streak=1, lr=0.000444; step skipped
+  [WARN] non-finite MDSM gradients at batch 224, streak=1, lr=0.000448; step skipped
+  [WARN] non-finite MDSM gradients at batch 227, streak=1, lr=0.000454; step skipped
+  [WARN] non-finite MDSM gradients at batch 229, streak=1, lr=0.000458; step skipped
+  [WARN] non-finite MDSM gradients at batch 231, streak=1, lr=0.000462; step skipped
+  [WARN] non-finite MDSM gradients at batch 237, streak=1, lr=0.000474; step skipped
+  [WARN] non-finite MDSM gradients at batch 241, streak=1, lr=0.000482; step skipped
+  [WARN] non-finite MDSM gradients at batch 243, streak=1, lr=0.000486; step skipped
+  [WARN] non-finite MDSM gradients at batch 245, streak=1, lr=0.00049; step skipped
+  [250/312] loss=0.0034 DSM=0.0034 GP=0.0000 lr=0.000500 E_scale=1.00 sigma=[0.1000,0.5000]
+  [WARN] non-finite MDSM gradients at batch 251, streak=1, lr=0.000502; step skipped
+  [WARN] non-finite MDSM gradients at batch 253, streak=1, lr=0.000506; step skipped
+  [WARN] non-finite MDSM gradients at batch 256, streak=1, lr=0.000512; step skipped
+  [WARN] non-finite MDSM gradients at batch 261, streak=1, lr=0.000522; step skipped
+  [WARN] non-finite MDSM gradients at batch 262, streak=2, lr=0.000524; step skipped
+  [WARN] non-finite MDSM gradients at batch 267, streak=1, lr=0.000534; step skipped
+  [WARN] non-finite MDSM gradients at batch 268, streak=2, lr=0.000536; step skipped
+  [WARN] non-finite MDSM gradients at batch 276, streak=1, lr=0.000552; step skipped
+  [WARN] non-finite MDSM gradients at batch 280, streak=1, lr=0.00056; step skipped
+  [WARN] non-finite MDSM gradients at batch 282, streak=1, lr=0.000564; step skipped
+  [WARN] non-finite MDSM gradients at batch 291, streak=1, lr=0.000582; step skipped
+  [WARN] non-finite MDSM gradients at batch 292, streak=2, lr=0.000584; step skipped
+  [WARN] non-finite MDSM gradients at batch 293, streak=3, lr=0.000293; step skipped
+  [300/312] loss=0.0048 DSM=0.0048 GP=0.0000 lr=0.000600 E_scale=1.00 sigma=[0.1000,0.5000]
+  loss=0.0042 dsm_loss=0.0042 gradient_penalty=0.0000 sigma_min=0.1000 sigma_max=0.5000 skipped_batches=39.0000 skip_rate=0.1250 lr=0.000624 (132.1s)
 Epoch 2/50
   Ortho schedule: n_iters=15 on 3 layers
-  [WARN] non-finite MDSM gradients at batch 5, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 6, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 8, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 9, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 13, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 19, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 23, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 26, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 28, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 30, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 35, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 37, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 40, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 41, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 46, streak=1, lr=1e-08; step skipped
-  [50/312] loss=0.0036 DSM=0.0036 GP=0.0000 lr=0.000000 E_scale=1.46 sigma=[0.0982,0.5000]
-  [WARN] non-finite MDSM loss at batch 57, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 61, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 62, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 64, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 67, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 73, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 74, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 83, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 84, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 85, streak=3, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 89, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 90, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 94, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 97, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 99, streak=1, lr=1e-08; batch skipped
-  [100/312] loss=0.0041 DSM=0.0041 GP=0.0000 lr=0.000000 E_scale=1.46 sigma=[0.0982,0.5000]
-  [WARN] non-finite MDSM gradients at batch 101, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 103, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 106, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 109, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 110, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 111, streak=3, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 114, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 120, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 123, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 129, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 131, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 136, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 139, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 140, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 143, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 146, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 150, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 154, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 157, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 162, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 165, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 168, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 172, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 175, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 177, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 181, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 183, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 185, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 186, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 188, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 189, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 192, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 195, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 198, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 199, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 200, streak=3, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 203, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 208, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 211, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 212, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 213, streak=3, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 214, streak=4, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 221, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 223, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 225, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 230, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 232, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 240, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 243, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 249, streak=1, lr=1e-08; step skipped
-  [250/312] loss=0.0063 DSM=0.0063 GP=0.0000 lr=0.000000 E_scale=1.46 sigma=[0.0982,0.5000]
-  [WARN] non-finite MDSM gradients at batch 256, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 258, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 264, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 266, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 269, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 272, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 274, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 278, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 283, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 285, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 298, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 299, streak=2, lr=1e-08; step skipped
-  [300/312] loss=0.0048 DSM=0.0048 GP=0.0000 lr=0.000000 E_scale=1.46 sigma=[0.0982,0.5000]
-  [WARN] non-finite MDSM gradients at batch 303, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 305, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 306, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 307, streak=3, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 308, streak=4, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 310, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 312, streak=1, lr=1e-08; step skipped
-  loss=0.0047 dsm_loss=0.0047 gradient_penalty=0.0000 sigma_min=0.0982 sigma_max=0.5000 lr=0.000000 (122.3s)
+  [WARN] non-finite MDSM gradients at batch 3, streak=1, lr=0.00063; step skipped
+  [WARN] non-finite MDSM gradients at batch 5, streak=1, lr=0.000634; step skipped
+  [WARN] non-finite MDSM gradients at batch 10, streak=1, lr=0.000644; step skipped
+  [WARN] non-finite MDSM gradients at batch 15, streak=1, lr=0.000654; step skipped
+  [WARN] non-finite MDSM gradients at batch 20, streak=1, lr=0.000664; step skipped
+  [WARN] non-finite MDSM gradients at batch 26, streak=1, lr=0.000676; step skipped
+  [WARN] non-finite MDSM gradients at batch 28, streak=1, lr=0.00068; step skipped
+  [WARN] non-finite MDSM gradients at batch 31, streak=1, lr=0.000686; step skipped
+  [WARN] non-finite MDSM gradients at batch 40, streak=1, lr=0.000704; step skipped
+  [WARN] non-finite MDSM gradients at batch 42, streak=1, lr=0.000708; step skipped
+  [WARN] non-finite MDSM gradients at batch 47, streak=1, lr=0.000718; step skipped
+  [WARN] non-finite MDSM gradients at batch 50, streak=1, lr=0.000724; step skipped
+  [WARN] non-finite MDSM gradients at batch 54, streak=1, lr=0.000732; step skipped
+  [WARN] non-finite MDSM gradients at batch 60, streak=1, lr=0.000744; step skipped
+  [WARN] non-finite MDSM gradients at batch 84, streak=1, lr=0.000792; step skipped
+  [WARN] non-finite MDSM gradients at batch 100, streak=1, lr=0.000824; step skipped
+  [WARN] non-finite MDSM gradients at batch 111, streak=1, lr=0.000846; step skipped
+  [WARN] non-finite MDSM gradients at batch 113, streak=1, lr=0.00085; step skipped
+  [WARN] non-finite MDSM gradients at batch 139, streak=1, lr=0.000902; step skipped
+  [WARN] non-finite MDSM gradients at batch 145, streak=1, lr=0.000914; step skipped
+  [150/312] loss=0.0042 DSM=0.0042 GP=0.0000 lr=0.000924 E_scale=1.00 sigma=[0.0982,0.5000]
+  [WARN] non-finite MDSM gradients at batch 163, streak=1, lr=0.00095; step skipped
+  [WARN] non-finite MDSM gradients at batch 180, streak=1, lr=0.000984; step skipped
+  [200/312] loss=0.0044 DSM=0.0044 GP=0.0000 lr=0.001000 E_scale=1.00 sigma=[0.0982,0.5000]
+  [WARN] non-finite MDSM gradients at batch 201, streak=1, lr=0.001; step skipped
+  [WARN] non-finite MDSM gradients at batch 214, streak=1, lr=0.001; step skipped
+  [WARN] non-finite MDSM gradients at batch 229, streak=1, lr=0.001; step skipped
+  [WARN] non-finite MDSM gradients at batch 235, streak=1, lr=0.001; step skipped
+  [250/312] loss=0.0052 DSM=0.0052 GP=0.0000 lr=0.001000 E_scale=1.00 sigma=[0.0982,0.5000]
+  [300/312] loss=0.0039 DSM=0.0039 GP=0.0000 lr=0.001000 E_scale=1.00 sigma=[0.0982,0.5000]
+  [WARN] non-finite MDSM gradients at batch 303, streak=1, lr=0.001; step skipped
+  loss=0.0039 dsm_loss=0.0039 gradient_penalty=0.0000 sigma_min=0.0982 sigma_max=0.5000 skipped_batches=27.0000 skip_rate=0.0865 lr=0.000999 (134.7s)
 Epoch 3/50
   Ortho schedule: n_iters=15 on 3 layers
-  [WARN] non-finite MDSM gradients at batch 4, streak=1, lr=5.43269e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 7, streak=1, lr=2.71634e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 10, streak=1, lr=1.35817e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 15, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 16, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 17, streak=3, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 18, streak=4, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 21, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 24, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 25, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 27, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 28, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 34, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 38, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 39, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 42, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 43, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 45, streak=1, lr=1e-08; step skipped
-  [50/312] loss=0.0040 DSM=0.0040 GP=0.0000 lr=0.000000 E_scale=1.46 sigma=[0.0963,0.5000]
-  [WARN] non-finite MDSM loss at batch 56, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 57, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 61, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 63, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 64, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 65, streak=3, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 68, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 70, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 74, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 75, streak=2, lr=1e-08; step skipped
-  [WARN] non-finite MDSM gradients at batch 78, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 79, streak=2, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 80, streak=3, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM loss at batch 91, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 93, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 96, streak=1, lr=1e-08; batch skipped
-  [100/312] loss=0.0046 DSM=0.0046 GP=0.0000 lr=0.000000 E_scale=1.46 sigma=[0.0963,0.5000]
-  [WARN] non-finite MDSM gradients at batch 103, streak=1, lr=1e-08; step skipped
-  [WARN] non-finite MDSM loss at batch 108, streak=1, lr=1e-08; batch skipped
-  [WARN] non-finite MDSM gradients at batch 113, streak=1, lr=1e-08; step
+  [WARN] non-finite MDSM gradients at batch 19, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 20, streak=2, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 32, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 42, streak=1, lr=0.000999112; step skipped
+  [50/312] loss=0.0032 DSM=0.0032 GP=0.0000 lr=0.000999 E_scale=1.00 sigma=[0.0963,0.5000]
+  [WARN] non-finite MDSM gradients at batch 69, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 75, streak=1, lr=0.000999112; step skipped
+  [100/312] loss=0.0037 DSM=0.0037 GP=0.0000 lr=0.000999 E_scale=1.00 sigma=[0.0963,0.5000]
+  [WARN] non-finite MDSM gradients at batch 132, streak=1, lr=0.000999112; step skipped
+  [150/312] loss=0.0039 DSM=0.0039 GP=0.0000 lr=0.000999 E_scale=1.00 sigma=[0.0963,0.5000]
+  [WARN] non-finite MDSM gradients at batch 161, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 187, streak=1, lr=0.000999112; step skipped
+  [200/312] loss=0.0031 DSM=0.0031 GP=0.0000 lr=0.000999 E_scale=1.00 sigma=[0.0963,0.5000]
+  [WARN] non-finite MDSM gradients at batch 202, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 206, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 210, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 217, streak=1, lr=0.000999112; step skipped
+  [250/312] loss=0.0040 DSM=0.0040 GP=0.0000 lr=0.000999 E_scale=1.00 sigma=[0.0963,0.5000]
+  [WARN] non-finite MDSM gradients at batch 263, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 267, streak=1, lr=0.000999112; step skipped
+  [WARN] non-finite MDSM gradients at batch 289, streak=1, lr=0.000999112; step skipped
+  [300/312] loss=0.0038 DSM=0.0038 GP=0.0000 lr=0.000999 E_scale=1.00 sigma=[0.0963,0.5000]
+  [WARN] non-finite MDSM gradients at batch 312, streak=1, lr=0.000999112; step skipped
+  loss=0.0038 dsm_loss=0.0038 gradient_penalty=0.0000 sigma_min=0.0963 sigma_max=0.5000 skipped_batches=17.0000 skip_rate=0.0545 lr=0.000996 (135.6s)
+Epoch 4/50
+  Ortho schedule: n_iters=15 on 3 layers
+  [WARN] non-finite MDSM gradients at batch 36, streak=1, lr=0.000996452; step skipped
+  [50/312] loss=0.0019 DSM=0.0019 GP=0.0000 lr=0.000996 E_scale=1.00 sigma=[0.0945,0.5000]
+  [WARN] non-finite MDSM gradients at batch 89, streak=1, lr=0.000996452; step skipped
+  [100/312] loss=0.0043 DSM=0.0043 GP=0.0000 lr=0.000996 E_scale=1.00 sigma=[0.0945,0.5000]
+  [WARN] non-finite MDSM gradients at batch 103, streak=1, lr=0.000996452; step skipped
+  [WARN] non-finite MDSM gradients at batch 129, streak=1, lr=0.000996452; step skipped
+  [150/312] loss=0.0043 DSM=0.0043 GP=0.0000 lr=0.000996 E_scale=1.00 sigma=[0.0945,0.5000]
+  [WARN] non-finite MDSM gradients at batch 173, streak=1, lr=0.000996452; step skipped
+  [WARN] non-finite MDSM gradients at batch 179, streak=1, lr=0.000996452; step skipped
+  [200/312] loss=0.0032 DSM=0.0032 GP=0.0000 lr=0.000996 E_scale=1.00 sigma=[0.0945,0.5000]
+  [WARN] non-finite MDSM gradients at batch 218, streak=1, lr=0.000996452; step skipped
+  [250/312] loss=0.0036 DSM=0.0036 GP=0.0000 lr=0.000996 E_scale=1.00 sigma=[0.0945,0.5000]
+  [WARN] non-finite MDSM gradients at batch 257, streak=1, lr=0.000996452; step skipped
+  [WARN] non-finite MDSM gradients at batch 269, streak=1, lr=0.000996452; step skipped
+  [300/312] loss=0.0031 DSM=0.0031 GP=0.0000 lr=0.000996 E_scale=1.00 sigma=[0.0945,0.5000]
+  [WARN] non-finite MDSM gradients at batch 309, streak=1, lr=0.000996452; step skipped
+  loss=0.0037 dsm_loss=0.0037 gradient_penalty=0.0000 sigma_min=0.0945 sigma_max=0.5000 skipped_batches=10.0000 skip_rate=0.0321 lr=0.000992 (135.5s)
+Epoch 5/50
+  Ortho schedule: n_iters=15 on 3 layers
+  [50/312] loss=0.0038 DSM=0.0038 GP=0.0000 lr=0.000992 E_scale=1.00 sigma=[0.0927,0.5000]
+  [100/312] loss=0.0039 DSM=0.0039 GP=0.0000 lr=0.000992 E_scale=1.00 sigma=[0.0927,0.5000]
+  [150/312] loss=0.0039 DSM=0.0039 GP=0.0000 lr=0.000992 E_scale=1.00 sigma=[0.0927,0.5000]
+  [200/312] loss=0.0045 DSM=0.0045 GP=0.0000 lr=0.000992 E_scale=1.00 sigma=[0.0927,0.5000]
+  [250/312] loss=0.0041 DSM=0.0041 GP=0.0000 lr=0.000992 E_scale=1.00 sigma=[0.0927,0.5000]
+  [300/312] loss=0.0033 DSM=0.0033 GP=0.0000 lr=0.000992 E_scale=1.00 sigma=[0.0927,0.5000]
+  loss=0.0038 dsm_loss=0.0038 gradient_penalty=0.0000 sigma_min=0.0927 sigma_max=0.5000 skipped_batches=0.0000 skip_rate=0.0000 lr=0.000986 (136.3s)
+  Evaluating denoising...
+    noise_0.05: cos_before=0.5315 -> cos_after=0.5315 (d=+0.0000, success=0%)
+    noise_0.1: cos_before=0.2977 -> cos_after=0.2977 (d=+0.0000, success=0%)
+    noise_0.2: cos_before=0.1602 -> cos_after=0.1589 (d=-0.0012, success=0%)
+    noise_0.3: cos_before=0.1075 -> cos_after=0.1075 (d=+0.0000, success=0%)
+    * New best (avg improvement: -0.0003)
+Epoch 6/50
+  Ortho schedule: n_iters=15 on 3 layers
+  [50/312] loss=0.0031 DSM=0.0031 GP=0.0000 lr=0.000986 E_scale=1.00 sigma=[0.0908,0.5000]
+  [100/312] loss=0.0031 DSM=0.0031 GP=0.0000 lr=0.000986 E_scale=1.00 sigma=[0.0908,0.5000]
+  [150/312] loss=0.0037 DSM=0.0037 GP=0.0000 lr=0.000986 E_scale=1.00 sigma=[0.0908,0.5000]
+  [200/312] loss=0.0027 DSM=0.0027 GP=0.0000 lr=0.000986 E_scale=1.00 sigma=[0.0908,0.5000]
+  [250/312] loss=0.0042 DSM=0.0042 GP=0.0000 lr=0.000986 E_scale=1.00 sigma=[0.0908,0.5000]
+  [300/312] loss=0.0041 DSM=0.0041 GP=0.0000 lr=0.000986 E_scale=1.00 sigma=[0.0908,0.5000]
+  loss=0.0036 dsm_loss=0.0036 gradient_penalty=0.0000 sigma_min=0.0908 sigma_max=0.5000 skipped_batches=0.0000 skip_rate=0.0000 lr=0.000978 (136.6s)
+Epoch 7/50
+  Ortho schedule: n_iters=15 on 3 layers
+  [WARN] non-finite MDSM gradients at batch 5, streak=1, lr=0.000977975; step skipped
+  [50/312] loss=0.0047 DSM=0.0047 GP=0.0000 lr=0.000978 E_scale=1.00 sigma=[0.0890,0.5000]
+  [WARN] non-finite MDSM gradients at batch 61, streak=1, lr=0.000977975; step skipped
