@@ -1,36 +1,36 @@
-﻿# SOTA Research Plan - CEBCM/CERBER (2026-03-23)
+﻿# Stage 1 Improvement Plan (2026-03-23)
 
 ## Goal
-Run a deep SOTA research pass for CEBCM/CERBER focused on:
-1) faster training,
-2) more predictable convergence,
-3) lower risk of converging to wrong behavior.
+Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility while preserving current architecture semantics.
 
-## Checklist (Pass 2 - extended)
-- [x] Re-read updated `AGENTS.md`
-- [x] Re-read full specification and implementation plan
-- [x] Read code of all Stage 1 modules
-- [x] Re-open existing `research.md`
-- [x] Extend SOTA for simulation-free / few-step EBM alternatives
-- [x] Extend SOTA for sampler acceleration and distillation pipelines
-- [x] Extend SOTA for latent reasoning models beyond baseline JEPA/LCM references
-- [x] Extend SOTA for long-context memory efficiency frontier
-- [x] Extend single-GPU optimization stack with concrete implementation recommendations
-- [x] Append all new findings to `research.md` with source links
-- [x] Finalize updated review section
+## Checklist
+- [x] Add config support for Bjorck schedule, DSM geometry options, and systems tuning
+- [x] Implement DSM extensions: sigma sampling/weighting, tangent projection, directional mode, magnitude auxiliary
+- [x] Fix Langevin best-state tracking bug and early-stop behavior
+- [x] Add true trajectory capture in Langevin API
+- [x] Align visualization trajectory with actual sampler trajectory
+- [x] Rewrite training loop with deterministic seeds + fixed eval subset
+- [x] Add AMP / compile / dataloader throughput options
+- [x] Skip unnecessary GP computation when lambda=0
+- [x] Save full Stage1 config in checkpoints
+- [x] Make evaluate script consume checkpoint Stage1 config to avoid train/eval drift
 
 ## Review
-### Completed in pass 2
-- Added deep addendum to `research.md` (sections 12-14).
-- Expanded SOTA coverage with additional frontier lines:
-  - simulation-free / near-simulation-free samplers,
-  - few-step / one-step distillation families,
-  - language-specific EBM diffusion (EDLM),
-  - SONAR-native LM direction,
-  - long-context memory frontier (Samba, Gated DeltaNet, RWKV-7, Titans/Atlas/Kimi).
-- Added practical single-GPU optimization order grounded in official docs.
-- Added updated decision framework for when to pivot away from incremental Stage 1 tuning.
+### Implemented files
+- `configs/base.py`
+- `cebcm/training/losses.py`
+- `cebcm/inference/langevin.py`
+- `experiments/01_denoising_poc/train.py`
+- `experiments/01_denoising_poc/evaluate.py`
+- `experiments/01_denoising_poc/visualize_landscape.py`
 
-### Current status
-- Research document now contains both strategic and execution-level recommendations.
-- Ready to move from research to implementation of Phase 0 speed stack.
+### Major outcomes
+- Main Stage 1 bottlenecks addressed at implementation level:
+  - Bjorck schedule hooks are now available,
+  - training/evaluation are reproducible and config-consistent,
+  - systems acceleration path is integrated,
+  - Langevin and visualization correctness gaps are fixed.
+
+### Validation status
+- Runtime execution was not possible in this environment due unavailable Python runtime.
+- Code was validated via static inspection only.

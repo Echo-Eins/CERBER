@@ -28,6 +28,7 @@ Usage:
 
 import argparse
 import sys
+from dataclasses import is_dataclass
 from pathlib import Path
 
 import torch
@@ -44,6 +45,26 @@ from cebcm.visualization.energy_landscape import (
     plot_landscape,
     plot_comparison,
 )
+
+
+def update_dataclass(target, updates: dict) -> None:
+    for key, value in updates.items():
+        if not hasattr(target, key):
+            continue
+        current = getattr(target, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            update_dataclass(current, value)
+        else:
+            setattr(target, key, value)
+
+
+def maybe_load_stage1_config(checkpoint_path: str | None, config: Stage1Config, device: torch.device) -> None:
+    if checkpoint_path is None:
+        return
+    ckpt = torch.load(checkpoint_path, weights_only=False, map_location=device)
+    stage1_cfg = ckpt.get("stage1_config")
+    if isinstance(stage1_cfg, dict):
+        update_dataclass(config, stage1_cfg)
 
 
 def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
@@ -104,10 +125,6 @@ def run_langevin_with_trajectory(
     elif method == "overdamped":
         method_kwargs = dict(momentum_beta=config.langevin.momentum_beta)
 
-    # Collect trajectory by running step-by-step
-    trajectory = [v_noisy.clone().cpu()]
-    v_current = v_noisy.clone().detach()
-
     result = run_langevin(
         method=method,
         energy_fn=model,
@@ -120,22 +137,10 @@ def run_langevin_with_trajectory(
         plateau_patience=config.langevin.plateau_patience,
         plateau_delta=config.langevin.plateau_delta,
         v_target=v_query,
+        track_vectors=True,
         **method_kwargs,
     )
-
-    # Since we can't easily get intermediate trajectory from run_langevin,
-    # re-run manually step by step for trajectory capture
-    v_current = v_noisy.clone().detach()
-    trajectory = [v_current.clone().cpu()]
-
-    # Simple overdamped walk just for trajectory visualization
-    # (actual result comes from run_langevin above)
-    for step in range(min(max_steps, result.num_steps)):
-        _, grad = model.energy_and_grad(v_query, v_current)
-        v_current = v_current - config.langevin.lr * grad
-        if config.langevin.target_norm is not None:
-            v_current = F.normalize(v_current, dim=-1) * config.langevin.target_norm
-        trajectory.append(v_current.clone().cpu())
+    trajectory = result.v_trajectory
 
     return result.v_final, trajectory
 
@@ -166,6 +171,10 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     print(f"Device: {device}")
+
+    # Align visualization dynamics with checkpoint train-time config when available
+    if args.checkpoint and not args.no_checkpoint:
+        maybe_load_stage1_config(args.checkpoint, config, device)
 
     # Load data
     full_dataset = SONARVectorDataset(args.data)

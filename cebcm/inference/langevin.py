@@ -47,6 +47,7 @@ class LangevinResult:
     v_final: Tensor          # [B, D] refined vectors
     trajectory: list[float] = field(default_factory=list)  # energy at each step
     cos_trajectory: list[float] = field(default_factory=list)  # cos_sim to target at each step
+    v_trajectory: list[Tensor] = field(default_factory=list)  # optional vector trajectory
     num_steps: int = 0       # actual steps taken
     stopped_early: bool = False  # whether early stopping triggered
 
@@ -58,20 +59,27 @@ def _check_early_stop(
     energy_threshold: float | None,
     plateau_patience: int,
     plateau_delta: float,
-) -> tuple[bool, float, int]:
+) -> tuple[bool, float, int, bool]:
     """
     Check early stopping conditions. Returns (should_stop, new_best, new_counter).
     """
-    if energy_threshold is not None and e_mean < energy_threshold:
-        return True, best_energy, plateau_counter
+    best_before = best_energy
+    improved = e_mean < best_before
+    if improved:
+        best_energy = e_mean
 
-    if e_mean < best_energy - plateau_delta:
-        return False, e_mean, 0
+    if e_mean < best_before - plateau_delta:
+        plateau_counter = 0
     else:
-        new_counter = plateau_counter + 1
-        if new_counter >= plateau_patience:
-            return True, best_energy, new_counter
-        return False, best_energy, new_counter
+        plateau_counter += 1
+
+    if energy_threshold is not None and e_mean < energy_threshold:
+        return True, best_energy, plateau_counter, improved
+
+    if plateau_counter >= plateau_patience:
+        return True, best_energy, plateau_counter, improved
+
+    return False, best_energy, plateau_counter, improved
 
 
 def _project_to_sphere(v: Tensor, target_norm: float) -> Tensor:
@@ -103,6 +111,7 @@ def langevin_dynamics(
     plateau_patience: int = 10,
     plateau_delta: float = 1e-4,
     v_target: Tensor | None = None,
+    track_vectors: bool = False,
 ) -> LangevinResult:
     """
     Classic overdamped Langevin dynamics.
@@ -135,9 +144,12 @@ def langevin_dynamics(
 
     trajectory: list[float] = []
     cos_trajectory: list[float] = []
+    v_trajectory: list[Tensor] = []
     best_energy = float("inf")
     v_best = v_current.clone()
     plateau_counter = 0
+    if track_vectors:
+        v_trajectory.append(v_current.detach().cpu().clone())
 
     for step in range(max_steps):
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
@@ -149,16 +161,17 @@ def langevin_dynamics(
             cos_trajectory.append(cos)
 
         # Early stopping
-        should_stop, best_energy, plateau_counter = _check_early_stop(
+        should_stop, best_energy, plateau_counter, improved = _check_early_stop(
             e_mean, best_energy, plateau_counter,
             energy_threshold, plateau_patience, plateau_delta,
         )
-        if e_mean <= best_energy + plateau_delta:
+        if improved:
             v_best = v_current.clone()
         if should_stop:
             return LangevinResult(
                 v_final=v_best, trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
+                v_trajectory=v_trajectory,
                 num_steps=step + 1, stopped_early=True,
             )
 
@@ -180,10 +193,13 @@ def langevin_dynamics(
         # OOD projection
         if target_norm is not None:
             v_current = _project_to_sphere(v_current, target_norm)
+        if track_vectors:
+            v_trajectory.append(v_current.detach().cpu().clone())
 
     return LangevinResult(
         v_final=v_best, trajectory=trajectory,
         cos_trajectory=cos_trajectory,
+        v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
     )
 
@@ -209,6 +225,7 @@ def pid_langevin_dynamics(
     ki: float = 0.3,
     kd: float = 0.1,
     integral_decay: float = 0.95,
+    track_vectors: bool = False,
 ) -> LangevinResult:
     """
     PID-Controlled Langevin Dynamics (PIDLD).
@@ -259,9 +276,12 @@ def pid_langevin_dynamics(
 
     trajectory: list[float] = []
     cos_trajectory: list[float] = []
+    v_trajectory: list[Tensor] = []
     best_energy = float("inf")
     v_best = v_current.clone()
     plateau_counter = 0
+    if track_vectors:
+        v_trajectory.append(v_current.detach().cpu().clone())
 
     for step in range(max_steps):
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
@@ -273,16 +293,17 @@ def pid_langevin_dynamics(
             cos_trajectory.append(cos)
 
         # Early stopping
-        should_stop, best_energy, plateau_counter = _check_early_stop(
+        should_stop, best_energy, plateau_counter, improved = _check_early_stop(
             e_mean, best_energy, plateau_counter,
             energy_threshold, plateau_patience, plateau_delta,
         )
-        if e_mean <= best_energy + plateau_delta:
+        if improved:
             v_best = v_current.clone()
         if should_stop:
             return LangevinResult(
                 v_final=v_best, trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
+                v_trajectory=v_trajectory,
                 num_steps=step + 1, stopped_early=True,
             )
 
@@ -315,10 +336,13 @@ def pid_langevin_dynamics(
         # OOD projection
         if target_norm is not None:
             v_current = _project_to_sphere(v_current, target_norm)
+        if track_vectors:
+            v_trajectory.append(v_current.detach().cpu().clone())
 
     return LangevinResult(
         v_final=v_best, trajectory=trajectory,
         cos_trajectory=cos_trajectory,
+        v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
     )
 
@@ -342,6 +366,7 @@ def underdamped_langevin_dynamics(
     # Underdamped parameters
     friction: float = 0.5,
     mass: float = 1.0,
+    track_vectors: bool = False,
 ) -> LangevinResult:
     """
     Underdamped (second-order) Langevin Dynamics.
@@ -392,9 +417,12 @@ def underdamped_langevin_dynamics(
 
     trajectory: list[float] = []
     cos_trajectory: list[float] = []
+    v_trajectory: list[Tensor] = []
     best_energy = float("inf")
     v_best = v_current.clone()
     plateau_counter = 0
+    if track_vectors:
+        v_trajectory.append(v_current.detach().cpu().clone())
 
     for step in range(max_steps):
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
@@ -406,16 +434,17 @@ def underdamped_langevin_dynamics(
             cos_trajectory.append(cos)
 
         # Early stopping
-        should_stop, best_energy, plateau_counter = _check_early_stop(
+        should_stop, best_energy, plateau_counter, improved = _check_early_stop(
             e_mean, best_energy, plateau_counter,
             energy_threshold, plateau_patience, plateau_delta,
         )
-        if e_mean <= best_energy + plateau_delta:
+        if improved:
             v_best = v_current.clone()
         if should_stop:
             return LangevinResult(
                 v_final=v_best, trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
+                v_trajectory=v_trajectory,
                 num_steps=step + 1, stopped_early=True,
             )
 
@@ -443,10 +472,13 @@ def underdamped_langevin_dynamics(
                 (momentum * F.normalize(v_current, dim=-1)).sum(dim=-1, keepdim=True)
                 * F.normalize(v_current, dim=-1)
             )
+        if track_vectors:
+            v_trajectory.append(v_current.detach().cpu().clone())
 
     return LangevinResult(
         v_final=v_best, trajectory=trajectory,
         cos_trajectory=cos_trajectory,
+        v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
     )
 
@@ -468,6 +500,7 @@ def run_langevin(
     plateau_patience: int = 10,
     plateau_delta: float = 1e-4,
     v_target: Tensor | None = None,
+    track_vectors: bool = False,
     **method_kwargs,
 ) -> LangevinResult:
     """
@@ -491,6 +524,7 @@ def run_langevin(
         target_norm=target_norm, energy_threshold=energy_threshold,
         plateau_patience=plateau_patience, plateau_delta=plateau_delta,
         v_target=v_target,
+        track_vectors=track_vectors,
     )
 
     if method == LangevinMethod.OVERDAMPED:

@@ -118,6 +118,9 @@ class Stage1Config:
     norm_mode: str = "orthonorm"       # "orthonorm" (default) or "spectral_norm"
     activation: str = "groupsort"      # "groupsort" (default), "lipschitz_spline", "relu"
     ortho_n_iters: int = 15            # Bjorck iterations
+    ortho_schedule_enabled: bool = True
+    ortho_schedule_iters: list[int] = field(default_factory=lambda: [15, 8, 4])
+    ortho_schedule_boundaries: list[float] = field(default_factory=lambda: [0.34, 0.67])
     groupsort_size: int = 2            # Group size (2 = MaxMin)
     spline_num_knots: int = 4          # Knots for lipschitz_spline
     # Training
@@ -130,6 +133,15 @@ class Stage1Config:
     loss_type: str = "mdsm"            # "mdsm" (default) or "margin_contrastive" (legacy)
     mdsm_sigma_min: float = 0.01       # Minimum noise scale (fine structure)
     mdsm_sigma_max: float = 0.5        # Maximum noise scale (global structure)
+    mdsm_sigma_sampling: str = "loguniform"  # "loguniform" or "edm"
+    mdsm_sigma_weighting: str = "sigma2"  # "sigma2", "uniform", "inv_sigma2"
+    mdsm_directional: bool = False
+    mdsm_magnitude_aux_weight: float = 0.0
+    mdsm_tangent_projection: bool = True
+    mdsm_sigma_curriculum: bool = True
+    mdsm_sigma_curriculum_start_min: float = 0.1
+    mdsm_edm_p_mean: float = -1.2
+    mdsm_edm_p_std: float = 1.2
     gradient_penalty_lambda: float = 0.0   # Disabled: orthonorm is already 1-Lipschitz
     margin: float = 1.0                # Only used with margin_contrastive loss
     # Noise for training negatives (only used with margin_contrastive loss)
@@ -148,6 +160,16 @@ class Stage1Config:
     # Output
     output_dir: str = "experiments/01_denoising_poc"
     checkpoint_dir: str = "experiments/01_denoising_poc/checkpoints"
+    # Systems optimization
+    seed: int = 42
+    dataloader_num_workers: int = 4
+    dataloader_pin_memory: bool = True
+    dataloader_persistent_workers: bool = True
+    dataloader_prefetch_factor: int = 2
+    enable_amp: bool = True
+    amp_dtype: str = "bf16"  # "bf16" or "fp16"
+    enable_compile: bool = False
+    compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
     # Logging
     wandb_project: str = "cebcm-stage1"
     use_wandb: bool = False

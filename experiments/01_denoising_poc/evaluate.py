@@ -1,20 +1,14 @@
-"""
-Stage 1: Evaluation — Detailed denoising quality assessment with SONAR decode.
+﻿"""
+Stage 1: detailed denoising evaluation with optional SONAR decoding.
 
-Loads a trained SimpleEnergy checkpoint, runs Langevin denoising on test vectors,
-decodes both noisy and denoised versions, and compares them to originals.
-
-Usage:
-    python experiments/01_denoising_poc/evaluate.py \
-        --data data/wikitext_sonar_10k.pt \
-        --checkpoint experiments/01_denoising_poc/checkpoints/best.pt
-
-Spec reference: §13.1, IMPLEMENTATION_PLAN §4.2
+This script now prefers checkpoint-embedded Stage1 config to avoid train/eval drift.
 """
 
 import argparse
 import json
+import random
 import sys
+from dataclasses import is_dataclass
 from pathlib import Path
 
 import torch
@@ -35,33 +29,62 @@ def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
     return v + noise
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def update_dataclass(target, updates: dict) -> None:
+    for key, value in updates.items():
+        if not hasattr(target, key):
+            continue
+        current = getattr(target, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            update_dataclass(current, value)
+        else:
+            setattr(target, key, value)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Stage 1: Evaluate denoising quality")
     parser.add_argument("--data", type=str, required=True, help="Path to encoded .pt dataset")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_samples", type=int, default=20, help="Number of samples to evaluate")
-    parser.add_argument("--decode", action="store_true", help="Decode vectors to text (requires SONAR decoder VRAM)")
+    parser.add_argument("--decode", action="store_true", help="Decode vectors to text")
     parser.add_argument("--noise_scales", type=float, nargs="+", default=None)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    config = Stage1Config()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # Load data (use test split — last portion)
+    # Load checkpoint first so we can restore exact train-time config
+    ckpt = torch.load(args.checkpoint, weights_only=False, map_location=device)
+
+    config = Stage1Config()
+    if "stage1_config" in ckpt and isinstance(ckpt["stage1_config"], dict):
+        update_dataclass(config, ckpt["stage1_config"])
+
+    if args.seed is not None:
+        config.seed = args.seed
+    set_seed(config.seed)
+
     full_dataset = SONARVectorDataset(args.data)
     n_test = min(config.num_test_sentences, len(full_dataset) // 10)
     test_dataset = full_dataset.subset(len(full_dataset) - n_test, len(full_dataset))
     print(f"Test set: {len(test_dataset)} vectors")
 
-    # Load model
-    ckpt = torch.load(args.checkpoint, weights_only=False, map_location=device)
     model_config = ckpt.get("config", {})
     model = SimpleEnergy(
         dim=model_config.get("energy_dim", config.energy_dim),
         hidden_dims=model_config.get("energy_hidden_dims", config.energy_hidden_dims),
         norm_mode=model_config.get("norm_mode", config.norm_mode),
         activation=model_config.get("activation", config.activation),
+        ortho_n_iters=config.ortho_n_iters,
+        groupsort_size=config.groupsort_size,
+        spline_num_knots=config.spline_num_knots,
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -69,19 +92,17 @@ def main():
 
     noise_scales = args.noise_scales or config.eval_noise_scales
 
-    # Load SONAR decoder if needed
     sonar = None
     if args.decode:
         sonar = SONARWrapper(device=args.device)
         print("SONAR decoder loaded for text decoding")
 
-    # ============================================================
-    # Evaluation
-    # ============================================================
-    indices = torch.randperm(len(test_dataset))[: args.num_samples]
+    indices_gen = torch.Generator()
+    indices_gen.manual_seed(config.seed + 77)
+    indices = torch.randperm(len(test_dataset), generator=indices_gen)[: args.num_samples]
+
     all_results = {}
 
-    # Build method-specific kwargs (same for all samples)
     method = config.langevin.method
     method_kwargs = {}
     if method == "pid":
@@ -109,12 +130,12 @@ def main():
         cos_after_list = []
 
         for i, idx in enumerate(indices):
-            v_orig = test_dataset[idx.item()].unsqueeze(0).to(device)
+            sample_idx = int(idx.item())
+            v_orig = test_dataset[sample_idx].unsqueeze(0).to(device)
             v_noisy = add_relative_noise(v_orig, noise_scale)
 
             cos_before = F.cosine_similarity(v_orig, v_noisy, dim=-1).item()
 
-            # Langevin denoising (no torch.no_grad — energy_and_grad needs grad computation)
             result = run_langevin(
                 method=method,
                 energy_fn=model,
@@ -124,6 +145,7 @@ def main():
                 noise_scale=config.langevin.noise_scale,
                 max_steps=config.langevin.max_steps,
                 target_norm=config.langevin.target_norm,
+                energy_threshold=config.langevin.energy_threshold,
                 plateau_patience=config.langevin.plateau_patience,
                 plateau_delta=config.langevin.plateau_delta,
                 v_target=v_orig,
@@ -137,42 +159,44 @@ def main():
             cos_after_list.append(cos_after)
 
             sample_result = {
-                "idx": idx.item(),
+                "idx": sample_idx,
                 "cos_before": cos_before,
                 "cos_after": cos_after,
                 "improvement": cos_after - cos_before,
                 "steps": result.num_steps,
                 "early_stopped": result.stopped_early,
-                "original_text": test_dataset.get_text(idx.item()),
+                "original_text": test_dataset.get_text(sample_idx),
             }
 
-            # Decode if requested
             if sonar is not None:
-                texts_clean = sonar.decode_safe(v_orig.cpu())
-                sample_result["decoded_clean"] = texts_clean[0]
-                texts_noisy = sonar.decode_safe(v_noisy.cpu())
-                texts_denoised = sonar.decode_safe(result.v_final.cpu())
-                sample_result["decoded_noisy"] = texts_noisy[0]
-                sample_result["decoded_denoised"] = texts_denoised[0]
+                sample_result["decoded_clean"] = sonar.decode_safe(v_orig.cpu())[0]
+                sample_result["decoded_noisy"] = sonar.decode_safe(v_noisy.cpu())[0]
+                sample_result["decoded_denoised"] = sonar.decode_safe(result.v_final.cpu())[0]
 
             results.append(sample_result)
 
-            # Print sample
-            marker = "✓" if improved else "✗"
-            print(f"\n  [{i}] {marker} cos: {cos_before:.4f} → {cos_after:.4f} (Δ={cos_after - cos_before:+.4f}, {result.num_steps} steps)")
+            marker = "OK" if improved else "NO"
+            print(
+                f"\n  [{i}] {marker} cos: {cos_before:.4f} -> {cos_after:.4f} "
+                f"(d={cos_after - cos_before:+.4f}, {result.num_steps} steps)"
+            )
             print(f"       orig:     {sample_result['original_text'][:100]}")
             if sonar is not None:
                 print(f"       clean:    {sample_result['decoded_clean'][:100]}")
                 print(f"       noisy:    {sample_result['decoded_noisy'][:100]}")
                 print(f"       denoised: {sample_result['decoded_denoised'][:100]}")
 
-        # Summary for this noise scale
         cos_before_mean = sum(cos_before_list) / len(cos_before_list)
         cos_after_mean = sum(cos_after_list) / len(cos_after_list)
-        success_rate = sum(1 for a, b in zip(cos_after_list, cos_before_list) if a > b) / len(cos_after_list)
+        success_rate = sum(
+            1 for a, b in zip(cos_after_list, cos_before_list) if a > b
+        ) / len(cos_after_list)
 
         print(f"\n  Summary (noise={noise_scale}):")
-        print(f"    cos_sim:  {cos_before_mean:.4f} → {cos_after_mean:.4f} (Δ={cos_after_mean - cos_before_mean:+.4f})")
+        print(
+            f"    cos_sim:  {cos_before_mean:.4f} -> {cos_after_mean:.4f} "
+            f"(d={cos_after_mean - cos_before_mean:+.4f})"
+        )
         print(f"    Success rate: {success_rate:.0%}")
 
         all_results[f"noise_{noise_scale}"] = {
@@ -183,35 +207,32 @@ def main():
             "samples": results,
         }
 
-    # ============================================================
-    # Save results
-    # ============================================================
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "evaluation_results.json"
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     print(f"\nResults saved to {output_path}")
 
-    # ============================================================
-    # Kill criterion
-    # ============================================================
     print(f"\n{'='*60}")
-    print("KILL CRITERION CHECK (§14.2 criterion #2)")
+    print("KILL CRITERION CHECK")
     print(f"{'='*60}")
     all_pass = True
     for noise_key, data in all_results.items():
         passed = data["improvement"] > 0 and data["success_rate"] > 0.5
         status = "PASS" if passed else "FAIL"
-        print(f"  {noise_key}: Δcos={data['improvement']:+.4f}, success={data['success_rate']:.0%} → {status}")
+        print(
+            f"  {noise_key}: dcos={data['improvement']:+.4f}, "
+            f"success={data['success_rate']:.0%} -> {status}"
+        )
         if not passed:
             all_pass = False
 
     if all_pass:
-        print("\n  VERDICT: PASS — denoising works, proceed to Stage 2")
+        print("\n  VERDICT: PASS - denoising works, proceed to Stage 2")
     else:
-        print("\n  VERDICT: FAIL — energy function does not denoise effectively")
+        print("\n  VERDICT: FAIL - energy function does not denoise effectively")
 
 
 if __name__ == "__main__":
