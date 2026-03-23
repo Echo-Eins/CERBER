@@ -992,6 +992,8 @@ def main():
     parser.add_argument("--langevin_method", type=str, default=None,
                         choices=["overdamped", "pid", "underdamped"],
                         help="Langevin method (default: pid)")
+    parser.add_argument("--ed", type=str, default=None,
+                        help="Eval denoising frequency: 'none' to disable, or integer N for every N epochs (default: config.eval_every_epoch)")
     args = parser.parse_args()
 
     config = Stage1Config()
@@ -1022,6 +1024,13 @@ def main():
     if args.amp_dtype is not None:
         config.amp_dtype = args.amp_dtype
     config.use_wandb = args.wandb
+
+    # --ed flag: eval denoising frequency
+    if args.ed is not None:
+        if args.ed.lower() == "none":
+            config.eval_every_epoch = 0  # 0 = disabled
+        else:
+            config.eval_every_epoch = int(args.ed)
 
     if (
         config.loss_type == "mdsm"
@@ -1334,7 +1343,9 @@ def main():
         print(f"  {metrics_str} lr={optimizer.param_groups[0]['lr']:.6f} ({epoch_time:.1f}s)")
 
         eval_metrics = None
-        if (epoch + 1) % config.eval_every_epoch == 0 or epoch == config.num_epochs - 1:
+        if config.eval_every_epoch > 0 and (
+            (epoch + 1) % config.eval_every_epoch == 0 or epoch == config.num_epochs - 1
+        ):
             print("  Evaluating denoising...")
             eval_metrics = evaluate_denoising(
                 model=model,

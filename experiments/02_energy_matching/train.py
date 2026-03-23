@@ -332,6 +332,8 @@ def main():
                         choices=["groupsort", "lipschitz_spline", "relu"])
     parser.add_argument("--no_nce_warmstart", action="store_true",
                         help="Disable NCE warmstart even in nce_warmstart_em mode")
+    parser.add_argument("--ed", type=str, default=None,
+                        help="Eval denoising frequency: 'none' to disable, or integer N for every N epochs (default: config.eval_every_epoch)")
     args = parser.parse_args()
 
     config = EnergyMatchingConfig()
@@ -357,6 +359,13 @@ def main():
     if args.no_nce_warmstart:
         config.nce_warmstart = False
     config.use_wandb = args.wandb
+
+    # --ed flag: eval denoising frequency
+    if args.ed is not None:
+        if args.ed.lower() == "none":
+            config.eval_every_epoch = 0  # 0 = disabled
+        else:
+            config.eval_every_epoch = int(args.ed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -505,7 +514,9 @@ def main():
 
         # ── Evaluate ──
         eval_metrics = None
-        if (epoch + 1) % config.eval_every_epoch == 0 or epoch == config.num_epochs - 1:
+        if config.eval_every_epoch > 0 and (
+            (epoch + 1) % config.eval_every_epoch == 0 or epoch == config.num_epochs - 1
+        ):
             print("  Evaluating...")
             eval_metrics = evaluate_energy_matching(
                 model, test_dataset, config, device,
