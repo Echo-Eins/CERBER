@@ -174,12 +174,12 @@ def scan_energy_landscape(
 
     denoised_xy = None
     if v_denoised is not None:
-        denoised_xy = _project_to_2d(v_denoised.squeeze(0), v_clean_flat, axis1, axis2)
+        denoised_xy = _project_to_2d(v_denoised.squeeze(0).to(device), v_clean_flat, axis1, axis2)
 
     trajectory_xy = None
     if trajectory is not None:
         trajectory_xy = [
-            _project_to_2d(t.squeeze(0), v_clean_flat, axis1, axis2)
+            _project_to_2d(t.squeeze(0).to(device), v_clean_flat, axis1, axis2)
             for t in trajectory
         ]
 

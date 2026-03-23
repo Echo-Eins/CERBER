@@ -86,3 +86,205 @@ Implement a full Stage 1 `Actor + EBM Critic` pipeline to reduce training fragil
 - [x] Extend checkpoint/resume logic to persist both components
 - [x] Run static validation (compile checks) and document usage
 - [ ] Run full CUDA training/evaluation for actor_critic and tune initial hyperparameters from first logs
+
+---
+
+# Energy Matching Pipeline — Mathematically Verified Implementation Plan
+
+**Date:** 2026-03-23
+**Status:** Implementation complete, pending CUDA validation
+**Branch:** `claude/review-tech-spec-xGHfW`
+
+---
+
+## 0. Mathematical Foundation
+
+### 0.1 Energy Matching Core Idea (Balcerak et al., NeurIPS 2025)
+
+Energy Matching trains a **time-invariant scalar energy** E_θ(x) : ℝ^d → ℝ such that
+its negative gradient -∇_x E_θ(x) approximates the velocity field of an optimal
+transport flow from noise to data.
+
+**Key insight:** unlike flow matching (which learns a vector field v_θ(x,t)), Energy
+Matching learns a *conservative* vector field derived from a scalar potential.
+This guarantees:
+- Path independence (the energy landscape is well-defined)
+- Thermodynamic consistency (Boltzmann distribution at equilibrium)
+- No need for time conditioning
+
+### 0.2 The Conditional Optimal Transport (OT) Path
+
+Given data point x₁ ~ p_data and noise x₀ ~ p_prior (typically N(0,I)):
+
+```
+x_t = (1 - t) · x₀ + t · x₁,  t ∈ [0, 1]
+```
+
+The conditional velocity field (ground truth):
+
+```
+u_t(x_t | x₁) = x₁ - x₀ = (x₁ - x_t) / (1 - t)
+```
+
+### 0.3 Flow Matching Loss (Lipman et al., ICLR 2023)
+
+Standard flow matching trains v_θ(x_t, t) to match u_t:
+
+```
+L_FM = E_{t~U(0,1), x₁~p_data, x₀~p_prior} [ ||v_θ(x_t, t) - u_t(x_t | x₁)||² ]
+```
+
+### 0.4 Energy Matching Adaptation
+
+Energy Matching replaces the free vector field v_θ(x_t, t) with the
+**negative gradient of a scalar energy** -∇_x E_θ(x):
+
+```
+L_EM = E_{t~U(0,1), x₁~p_data, x₀~p_prior} [ ||-∇_x E_θ(x_t) - u_t(x_t | x₁)||² ]
+```
+
+**Critical property:** E_θ has NO time conditioning. The single energy landscape
+must simultaneously encode the correct velocity at all points along all OT paths.
+
+### 0.5 Two-Phase Behavior
+
+The paper identifies that the loss naturally separates into two regimes:
+
+**Phase 1 (t ≈ 0, far from data):**
+- x_t ≈ x₀ (near noise)
+- Target velocity ≈ x₁ - x₀ (points toward data)
+- Energy gradient learns OT transport directions
+- This is the "flow matching" regime
+
+**Phase 2 (t ≈ 1, near data):**
+- x_t ≈ x₁ (near data manifold)
+- Velocity field converges to score function: ∇ log p(x)
+- Energy learns Boltzmann-like landscape near data
+- This is the "EBM" regime
+
+### 0.6 Sampling from Trained Model
+
+After training, generate samples via ODE integration:
+
+```
+dx/dt = -∇_x E_θ(x),  x(0) ~ p_prior
+```
+
+Discretized (Euler):
+```
+x_{k+1} = x_k + Δt · (-∇_x E_θ(x_k))
+```
+
+Or with Langevin noise for stochastic sampling:
+```
+x_{k+1} = x_k - η · ∇_x E_θ(x_k) + √(2η) · ε,  ε ~ N(0,I)
+```
+
+### 0.7 Adaptation for SONAR Embeddings (our contribution)
+
+**Key differences from image domain:**
+
+1. **Hypersphere geometry:** SONAR embeddings have ||x|| ≈ 0.2051 (not unit norm,
+   but concentrated). After each integration step, project back:
+   ```
+   x_{k+1} = normalize(x_{k+1}) · target_norm
+   ```
+
+2. **Prior distribution:** Instead of N(0,I), use N(0, σ²I) matched to data distribution:
+   ```
+   σ_prior = target_norm / √d ≈ 0.2051 / √1024 ≈ 0.00641
+   ```
+   This ensures prior samples have similar norm to data.
+
+3. **Relative noise scaling:** Following CERBER convention, noise is relative to norm:
+   ```
+   x_t = (1-t) · x₀ + t · x₁  where  x₀ = x₁ + ε,  ε ~ N(0, σ²·||x₁||²·I)
+   ```
+   This preserves the SONAR geometry better than absolute noise.
+
+4. **1-Lipschitz constraint:** We keep OrthoLinear + GroupSort for the energy network
+   to ensure smooth gradients. The final layer is unconstrained for energy magnitude.
+
+### 0.8 Mathematical Verification Checklist
+
+- [x] OT path x_t is well-defined: linear interpolation, ∂x_t/∂t = x₁ - x₀ ✓
+- [x] Conditional velocity u_t = (x₁ - x₀) is correct: by definition of linear OT ✓
+- [x] Loss L_EM minimizes ||∇E + u_t||²: convex in function space ✓
+- [x] At convergence, -∇E_θ = u_t almost everywhere: by optimality of L² loss ✓
+- [x] Conservative field guarantee: v = -∇E is curl-free by construction ✓
+- [x] Sampling via ODE follows learned flow: by definition of gradient flow ✓
+- [x] Sphere projection preserves tangent dynamics: projects only radial component ✓
+- [x] Prior norm matches data norm: by construction of σ_prior ✓
+
+---
+
+## 1. Implementation
+
+### 1.1 Implemented Files
+
+```
+cebcm/models/energy_unconditional.py     — E(x) → scalar, no pairwise, no σ (~3.7M params)
+cebcm/training/energy_matching.py        — EM loss (MSE, cosine, weighted) + OT path + sampling
+cebcm/training/negative_buffer.py        — Replay buffer + NCE loss (full & simple)
+configs/energy_matching.py               — EnergyMatchingConfig dataclass
+experiments/02_energy_matching/train.py   — Training script (3 modes)
+experiments/02_energy_matching/evaluate.py — Evaluation (denoise + sample quality + SONAR decode)
+```
+
+### 1.2 Training Modes
+
+1. **`nce_warmstart_em`** (recommended) — NCE (10 epochs) → Cosine EM fine-tune
+2. **`energy_matching`** — Pure MSE EM from scratch
+3. **`cosine_em`** — Cosine direction EM (for 1-Lipschitz networks)
+4. **`weighted_em`** — Near-data weighted EM
+
+---
+
+## 2. Verification Against Known Failure Modes
+
+| Failure Mode | Mitigation |
+|---|---|
+| Energy collapse (flat E) | NCE warmstart creates initial landscape; EM refines |
+| Score matching mode blindness | NCE explicitly learns p(x)/p_n(x) ratio |
+| Gradient magnitude mismatch | Cosine EM variant; unconstrained final layer |
+| Prior mismatch | Matched prior σ = target_norm/√d |
+| OOD sampling | Sphere projection after each step |
+| Hessian cost at 1024d | Not needed — EM uses first-order only |
+
+---
+
+## 3. Task Checklist
+
+- [x] Fix visualization device mismatch bug
+- [x] Create `cebcm/models/energy_unconditional.py`
+- [x] Create `cebcm/training/energy_matching.py`
+- [x] Create `cebcm/training/negative_buffer.py`
+- [x] Create `configs/energy_matching.py`
+- [x] Create `experiments/02_energy_matching/train.py`
+- [x] Create `experiments/02_energy_matching/evaluate.py`
+- [ ] Run full CUDA training/evaluation and tune from first logs
+
+---
+
+## 4. Architecture Review: Actor + Critic Pattern
+
+**Current CERBER architecture (from Tech Spec §3.1):**
+
+| Component | Role | Training |
+|-----------|------|----------|
+| SONAR Encoder | Text → V (1024d) | Frozen |
+| IPP | Predicts V_init (the "Actor") | Stage 2+ |
+| EBT (SimpleEnergy) | Evaluates quality (the "Critic") | Stage 1+ |
+| Langevin Dynamics | Refines V_init → V_answer | No training (uses ∇E) |
+| SONAR Decoder | V → Text | Frozen |
+
+**The Actor-Critic analogy:**
+- **Critic = E_θ** — evaluates "how good is this candidate?"
+- **Actor = IPP** — proposes initial answer
+- **Refinement = Langevin** — uses Critic's gradients to improve Actor's proposal
+
+**Energy Matching strengthens the Critic** by training it to model the full
+data distribution p(x), not just local denoising directions. This gives:
+1. Absolute quality evaluation (not just relative)
+2. Sample generation capability (new)
+3. Theoretically optimal score function near data
