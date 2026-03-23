@@ -121,7 +121,7 @@ class Stage1Config:
     groupsort_size: int = 2            # Group size (2 = MaxMin)
     spline_num_knots: int = 4          # Knots for lipschitz_spline
     # Training
-    lr: float = 1e-3  # Raised: cosine loss has O(1) gradients (was 5e-5 for MSE)
+    lr: float = 1e-3  # σ-conditioned NCSN + σ²-weighted DSM (was 5e-5 for unconditioned MSE)
     warmup_steps: int = 500            # Linear warmup from 0 to lr
     weight_decay: float = 0.01
     batch_size: int = 32
