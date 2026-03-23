@@ -246,6 +246,7 @@ def main():
                 v_noisy=v_noisy,
                 grid_size=args.grid,
                 grid_range=data.grid_range,  # same range for fair comparison
+                basis=data.basis,  # same 2D plane for fair comparison
             )
             comp_path = output_dir / f"comparison_sample{sample_idx:02d}.png"
             plot_comparison(data_before, data, save_path=comp_path)
