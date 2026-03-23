@@ -132,7 +132,8 @@ def train_epoch_mdsm(
             for pg in optimizer.param_groups:
                 pg["lr"] = pg["initial_lr"] * warmup_factor
 
-        with autocast_ctx():
+        dsm_ctx = nullcontext if config.mdsm_force_fp32 else autocast_ctx
+        with dsm_ctx():
             loss_dsm = multiscale_dsm_loss(
                 energy_fn=model,
                 v_clean=v_clean,
@@ -156,6 +157,17 @@ def train_epoch_mdsm(
                 loss_gp = gradient_penalty(model, v_clean, v_noisy)
 
             loss = loss_dsm + config.gradient_penalty_lambda * loss_gp
+
+        if not torch.isfinite(loss):
+            if config.skip_non_finite_batches:
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                print(
+                    f"  [WARN] non-finite MDSM loss at batch {batch_idx + 1}, "
+                    "batch skipped"
+                )
+                continue
+            raise RuntimeError("Non-finite loss encountered in train_epoch_mdsm")
 
         optimizer.zero_grad(set_to_none=True)
         if scaler.is_enabled():
@@ -232,6 +244,17 @@ def train_epoch_contrastive(
             if config.gradient_penalty_lambda > 0:
                 gp = gradient_penalty(model, v_orig, v_noisy)
             loss = loss_contrastive + config.gradient_penalty_lambda * gp
+
+        if not torch.isfinite(loss):
+            if config.skip_non_finite_batches:
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                print(
+                    f"  [WARN] non-finite contrastive loss at batch {batch_idx + 1}, "
+                    "batch skipped"
+                )
+                continue
+            raise RuntimeError("Non-finite loss encountered in train_epoch_contrastive")
 
         optimizer.zero_grad(set_to_none=True)
         if scaler.is_enabled():
@@ -507,7 +530,7 @@ def main():
     other_params = [
         p for n, p in raw_model.named_parameters() if "log_energy_scale" not in n
     ]
-    scale_lr = config.lr * 100
+    scale_lr = config.lr * config.energy_scale_lr_multiplier
     optimizer = torch.optim.AdamW([
         {"params": other_params, "lr": config.lr, "weight_decay": config.weight_decay},
         {"params": scale_params, "lr": scale_lr, "weight_decay": 0.0},
@@ -559,6 +582,7 @@ def main():
     print(f"Training SimpleEnergy for {config.num_epochs} epochs")
     print(f"  Batch size: {config.batch_size}")
     print(f"  LR: {config.lr} (warmup: {config.warmup_steps} steps)")
+    print(f"  Energy-scale LR multiplier: {config.energy_scale_lr_multiplier}")
     print(f"  Loss: {config.loss_type}")
     if config.loss_type == "mdsm":
         print(f"  MDSM sigma range: [{config.mdsm_sigma_min}, {config.mdsm_sigma_max}]")
@@ -566,6 +590,7 @@ def main():
         print(f"  MDSM sigma weighting: {config.mdsm_sigma_weighting}")
         print(f"  MDSM directional: {config.mdsm_directional}")
         print(f"  MDSM tangent projection: {config.mdsm_tangent_projection}")
+        print(f"  MDSM force FP32 path: {config.mdsm_force_fp32}")
     else:
         print(f"  Margin: {config.margin}")
         print(f"  Train noise scales: {config.train_noise_scales}")

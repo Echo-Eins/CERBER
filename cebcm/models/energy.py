@@ -194,7 +194,10 @@ class SimpleEnergy(nn.Module):
         prod = v_query * v_candidate
         sigma_emb = self._embed_sigma(sigma)  # [B, 8]
         x = torch.cat([v_query, v_candidate, diff, prod, sigma_emb], dim=-1)
-        return self.log_energy_scale.exp() * self.net(x).squeeze(-1)
+        # Guard exponential scaling from numerical blow-up during early training.
+        # This keeps the global scale trainable while preventing inf/nan cascades.
+        scale = torch.exp(self.log_energy_scale.clamp(min=-8.0, max=8.0))
+        return scale * self.net(x).squeeze(-1)
 
     def _estimate_sigma(self, v_query: Tensor, v_candidate: Tensor) -> Tensor:
         """

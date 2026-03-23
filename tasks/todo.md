@@ -14,23 +14,24 @@ Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility 
 - [x] Skip unnecessary GP computation when lambda=0
 - [x] Save full Stage1 config in checkpoints
 - [x] Make evaluate script consume checkpoint Stage1 config to avoid train/eval drift
+- [x] Add NaN hotfixes after first real run feedback
 
 ## Review
 ### Implemented files
 - `configs/base.py`
+- `cebcm/models/energy.py`
 - `cebcm/training/losses.py`
 - `cebcm/inference/langevin.py`
 - `experiments/01_denoising_poc/train.py`
 - `experiments/01_denoising_poc/evaluate.py`
 - `experiments/01_denoising_poc/visualize_landscape.py`
 
-### Major outcomes
-- Main Stage 1 bottlenecks addressed at implementation level:
-  - Bjorck schedule hooks are now available,
-  - training/evaluation are reproducible and config-consistent,
-  - systems acceleration path is integrated,
-  - Langevin and visualization correctness gaps are fixed.
+### NaN hotfixes
+- MDSM second-order path forced to FP32 by default (`mdsm_force_fp32=True`).
+- `log_energy_scale` exponential is clamped in forward to avoid inf/nan cascade.
+- `energy_scale` LR multiplier reduced/configurable (`energy_scale_lr_multiplier=20`).
+- Non-finite batch guard with skip-and-continue (`skip_non_finite_batches=True`).
 
 ### Validation status
-- Runtime execution was not possible in this environment due unavailable Python runtime.
-- Code was validated via static inspection only.
+- Runtime execution is not possible in this environment due unavailable Python runtime.
+- Verification performed via static inspection and user-provided runtime logs.

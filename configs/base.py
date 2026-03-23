@@ -135,8 +135,8 @@ class Stage1Config:
     mdsm_sigma_max: float = 0.5        # Maximum noise scale (global structure)
     mdsm_sigma_sampling: str = "loguniform"  # "loguniform" or "edm"
     mdsm_sigma_weighting: str = "sigma2"  # "sigma2", "uniform", "inv_sigma2"
-    mdsm_directional: bool = False
-    mdsm_magnitude_aux_weight: float = 0.0
+    mdsm_directional: bool = True
+    mdsm_magnitude_aux_weight: float = 0.05
     mdsm_tangent_projection: bool = True
     mdsm_sigma_curriculum: bool = True
     mdsm_sigma_curriculum_start_min: float = 0.1
@@ -168,8 +168,11 @@ class Stage1Config:
     dataloader_prefetch_factor: int = 2
     enable_amp: bool = True
     amp_dtype: str = "bf16"  # "bf16" or "fp16"
+    mdsm_force_fp32: bool = True  # second-order MDSM path is numerically fragile in bf16/fp16
     enable_compile: bool = False
     compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
+    energy_scale_lr_multiplier: float = 20.0
+    skip_non_finite_batches: bool = True
     # Logging
     wandb_project: str = "cebcm-stage1"
     use_wandb: bool = False
