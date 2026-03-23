@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from configs.base import Stage1Config
 from cebcm.models.energy import SimpleEnergy
 from cebcm.models.sonar_wrapper import SONARWrapper
-from cebcm.inference.langevin import langevin_dynamics
+from cebcm.inference.langevin import run_langevin
 from cebcm.data.dataset import SONARVectorDataset
 
 
@@ -60,7 +60,8 @@ def main():
     model = SimpleEnergy(
         dim=model_config.get("energy_dim", config.energy_dim),
         hidden_dims=model_config.get("energy_hidden_dims", config.energy_hidden_dims),
-        spectral_norm=True,
+        norm_mode=model_config.get("norm_mode", config.norm_mode),
+        activation=model_config.get("activation", config.activation),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -80,6 +81,24 @@ def main():
     indices = torch.randperm(len(test_dataset))[: args.num_samples]
     all_results = {}
 
+    # Build method-specific kwargs (same for all samples)
+    method = config.langevin.method
+    method_kwargs = {}
+    if method == "pid":
+        method_kwargs = dict(
+            kp=config.langevin.pid_kp,
+            ki=config.langevin.pid_ki,
+            kd=config.langevin.pid_kd,
+            integral_decay=config.langevin.pid_integral_decay,
+        )
+    elif method == "underdamped":
+        method_kwargs = dict(
+            friction=config.langevin.underdamped_friction,
+            mass=config.langevin.underdamped_mass,
+        )
+    elif method == "overdamped":
+        method_kwargs = dict(momentum_beta=config.langevin.momentum_beta)
+
     for noise_scale in noise_scales:
         print(f"\n{'='*70}")
         print(f"Noise scale: {noise_scale} ({noise_scale*100:.0f}% of norm)")
@@ -96,7 +115,8 @@ def main():
             cos_before = F.cosine_similarity(v_orig, v_noisy, dim=-1).item()
 
             # Langevin denoising (no torch.no_grad — energy_and_grad needs grad computation)
-            result = langevin_dynamics(
+            result = run_langevin(
+                method=method,
                 energy_fn=model,
                 v_query=v_orig,
                 v_init=v_noisy,
@@ -104,7 +124,10 @@ def main():
                 noise_scale=config.langevin.noise_scale,
                 max_steps=config.langevin.max_steps,
                 target_norm=config.langevin.target_norm,
+                plateau_patience=config.langevin.plateau_patience,
+                plateau_delta=config.langevin.plateau_delta,
                 v_target=v_orig,
+                **method_kwargs,
             )
 
             cos_after = F.cosine_similarity(v_orig, result.v_final, dim=-1).item()
