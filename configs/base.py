@@ -173,6 +173,8 @@ class Stage1Config:
     compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
     energy_scale_lr_multiplier: float = 20.0
     skip_non_finite_batches: bool = True
+    max_consecutive_non_finite_batches: int = 20
+    non_finite_lr_backoff: float = 0.5
     # Logging
     wandb_project: str = "cebcm-stage1"
     use_wandb: bool = False

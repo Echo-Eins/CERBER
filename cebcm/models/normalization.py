@@ -32,6 +32,25 @@ import torch.nn as nn
 from torch import Tensor
 
 
+def _power_iteration_sigma_max(W: Tensor, n_steps: int = 2) -> Tensor:
+    """
+    Fast estimate of spectral norm used to keep Bjorck iterations stable.
+
+    Uses a detached estimate, so it does not expand the autograd graph.
+    """
+    with torch.no_grad():
+        rows, cols = W.shape
+        u = torch.randn(rows, 1, device=W.device, dtype=W.dtype)
+        u = u / u.norm().clamp(min=1e-8)
+        for _ in range(max(1, n_steps)):
+            v = W.t() @ u
+            v = v / v.norm().clamp(min=1e-8)
+            u = W @ v
+            u = u / u.norm().clamp(min=1e-8)
+        sigma = (u.t() @ W @ v).abs().squeeze()
+        return sigma.clamp(min=1e-6)
+
+
 def bjorck_orthonormalize(
     W: Tensor,
     n_iters: int = 15,
@@ -54,19 +73,27 @@ def bjorck_orthonormalize(
     Returns:
         Orthonormalized weight matrix with all singular values ≈ 1.
     """
-    # Ensure W has proper shape: (out_features, in_features) with out <= in
-    # If out > in, we work with W^T and transpose back
-    transposed = False
-    if W.shape[0] > W.shape[1]:
-        W = W.t()
-        transposed = True
+    # Pre-normalize by sigma_max to keep Bjorck in a convergence-friendly regime.
+    sigma_max = _power_iteration_sigma_max(W.detach(), n_steps=2)
+    W = W / sigma_max.clamp(min=1.0)
 
-    for _ in range(n_iters):
-        WtW = W.t() @ W
-        W = W @ (1.5 * torch.eye(WtW.shape[0], device=W.device, dtype=W.dtype) - 0.5 * WtW)
-
-    if transposed:
-        W = W.t()
+    rows, cols = W.shape
+    if rows <= cols:
+        # Wide/semi-orthogonal case: enforce W W^T ≈ I_rows (all singular values ≈ 1).
+        eye = torch.eye(rows, device=W.device, dtype=W.dtype)
+        for _ in range(n_iters):
+            WWt = W @ W.t()
+            W = (1.5 * eye - 0.5 * WWt) @ W
+            if not torch.isfinite(W).all():
+                W = torch.nan_to_num(W, nan=0.0, posinf=1e4, neginf=-1e4)
+    else:
+        # Tall case: enforce W^T W ≈ I_cols.
+        eye = torch.eye(cols, device=W.device, dtype=W.dtype)
+        for _ in range(n_iters):
+            WtW = W.t() @ W
+            W = W @ (1.5 * eye - 0.5 * WtW)
+            if not torch.isfinite(W).all():
+                W = torch.nan_to_num(W, nan=0.0, posinf=1e4, neginf=-1e4)
 
     return W
 

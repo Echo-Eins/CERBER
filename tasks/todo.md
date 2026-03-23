@@ -15,6 +15,7 @@ Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility 
 - [x] Save full Stage1 config in checkpoints
 - [x] Make evaluate script consume checkpoint Stage1 config to avoid train/eval drift
 - [x] Add NaN hotfixes after first real run feedback
+- [x] Add finite-gradient guard + fail-fast/backoff + robust Björck update after second run feedback
 
 ## Review
 ### Implemented files
@@ -31,6 +32,9 @@ Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility 
 - `log_energy_scale` exponential is clamped in forward to avoid inf/nan cascade.
 - `energy_scale` LR multiplier reduced/configurable (`energy_scale_lr_multiplier=20`).
 - Non-finite batch guard with skip-and-continue (`skip_non_finite_batches=True`).
+- Added finite-gradient guard before `optimizer.step` to prevent parameter corruption.
+- Added consecutive non-finite fail-fast and LR backoff controls.
+- Corrected Björck update to row/column-consistent form (`WW^T` for wide matrices) with spectral pre-normalization.
 
 ### Validation status
 - Runtime execution is not possible in this environment due unavailable Python runtime.

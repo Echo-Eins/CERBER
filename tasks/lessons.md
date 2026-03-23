@@ -27,3 +27,15 @@ User explicitly asked to read all Stage 1 modules.
 
 ### Rule
 For architecture research tasks, always include code-grounded analysis of all modules in scope before proposing SOTA changes.
+
+## 2026-03-23 - Non-finite handling in training loops
+
+### Pattern
+Guarding only the loss is insufficient: gradients can become non-finite while loss is finite, and one optimizer step can irreversibly corrupt parameters.
+
+### Rule
+For all training loops with second-order paths, always add:
+1) finite-gradient checks before optimizer step,
+2) fail-fast threshold for consecutive non-finite batches,
+3) adaptive LR backoff on non-finite events,
+4) orthonormalization stability guards (spectral pre-normalization + correct rectangular update form).
