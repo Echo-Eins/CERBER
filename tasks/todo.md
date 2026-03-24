@@ -70,3 +70,19 @@ Eliminate remaining math/stability contradictions from `transfer_note`: LR perce
 - `cebcm/training/losses.py`
 - `experiments/01_denoising_poc/train.py`
 - `cebcm/inference/langevin.py`
+
+---
+
+## Actor + Critic Track (2026-03-23)
+
+### Goal
+Implement a full Stage 1 `Actor + EBM Critic` pipeline to reduce training fragility and improve denoising convergence while preserving CERBER's energy-verifier architecture.
+
+### Plan
+- [x] Add dedicated latent denoising Actor model with sigma conditioning
+- [x] Extend Stage1 config for actor_critic training/eval controls
+- [x] Implement joint training loop (single optimizer, dual-network losses for actor and critic)
+- [x] Integrate actor-then-critic evaluation path in train/evaluate scripts
+- [x] Extend checkpoint/resume logic to persist both components
+- [x] Run static validation (compile checks) and document usage
+- [ ] Run full CUDA training/evaluation for actor_critic and tune initial hyperparameters from first logs

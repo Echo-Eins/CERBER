@@ -9,10 +9,12 @@ Improvements in this revision:
 - Bjorck iteration scheduling (15 -> 8 -> 4 by default),
 - sigma curriculum + configurable DSM geometry options,
 - no unnecessary gradient-penalty computation when lambda=0.
+- actor_critic mode: first-order latent actor + EBM critic joint training.
 """
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -28,6 +30,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from configs.base import Stage1Config
+from cebcm.models.actor import LatentDenoiseActor
 from cebcm.models.energy import SimpleEnergy
 from cebcm.models.normalization import OrthoLinear
 from cebcm.training.losses import (
@@ -44,6 +47,38 @@ def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
     norms = v.norm(dim=-1, keepdim=True)
     noise = torch.randn_like(v) * scale * norms
     return v + noise
+
+
+def sample_sigma(
+    batch_size: int,
+    device: torch.device,
+    sigma_min: float,
+    sigma_max: float,
+    sigma_sampling: str,
+    edm_p_mean: float,
+    edm_p_std: float,
+) -> torch.Tensor:
+    if sigma_sampling == "loguniform":
+        log_sigma = torch.rand(batch_size, 1, device=device) * (
+            math.log(sigma_max) - math.log(sigma_min)
+        ) + math.log(sigma_min)
+        return log_sigma.exp()
+    if sigma_sampling == "edm":
+        return torch.exp(
+            torch.randn(batch_size, 1, device=device) * edm_p_std + edm_p_mean
+        ).clamp(min=sigma_min, max=sigma_max)
+    raise ValueError(f"Unknown sigma_sampling: {sigma_sampling}")
+
+
+def project_tangent(update: torch.Tensor, v_current: torch.Tensor) -> torch.Tensor:
+    v_hat = F.normalize(v_current, dim=-1)
+    return update - (update * v_hat).sum(dim=-1, keepdim=True) * v_hat
+
+
+def project_sphere(v: torch.Tensor, target_norm: float | None) -> torch.Tensor:
+    if target_norm is None:
+        return v
+    return F.normalize(v, dim=-1) * target_norm
 
 
 def set_seed(seed: int) -> None:
@@ -115,12 +150,26 @@ def gradients_are_finite(model: torch.nn.Module) -> bool:
     return True
 
 
+def gradients_are_finite_modules(modules: list[torch.nn.Module]) -> bool:
+    for module in modules:
+        for p in module.parameters():
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                return False
+    return True
+
+
 def parameters_are_finite(model: torch.nn.Module) -> bool:
     """Return True if all model parameters are finite."""
     for p in model.parameters():
         if not torch.isfinite(p).all():
             return False
     return True
+
+
+def parameters_are_finite_modules(modules: list[torch.nn.Module]) -> bool:
+    return all(parameters_are_finite(module) for module in modules)
 
 
 def apply_non_finite_backoff(optimizer: torch.optim.Optimizer, factor: float) -> None:
@@ -140,6 +189,14 @@ def apply_warmup_lr(
     for pg in optimizer.param_groups:
         lr_scale = pg.get("non_finite_scale", 1.0)
         pg["lr"] = pg["initial_lr"] * warmup_factor * lr_scale
+
+
+def apply_warmup_lr_dual(
+    optimizers: list[torch.optim.Optimizer],
+    warmup_factor: float,
+) -> None:
+    for optimizer in optimizers:
+        apply_warmup_lr(optimizer, warmup_factor)
 
 
 def train_epoch_mdsm(
@@ -506,8 +563,282 @@ def train_epoch_contrastive(
     }, global_step
 
 
+def train_epoch_actor_critic(
+    critic: SimpleEnergy,
+    actor: LatentDenoiseActor,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    config: Stage1Config,
+    device: torch.device,
+    epoch: int,
+    global_step: int,
+    scaler: torch.amp.GradScaler,
+    autocast_ctx,
+) -> tuple[dict, int]:
+    critic.train()
+    actor.train()
+
+    total_loss = 0.0
+    total_actor_recon = 0.0
+    total_actor_energy = 0.0
+    total_critic = 0.0
+    total_e_clean = 0.0
+    total_e_actor = 0.0
+    total_e_noisy = 0.0
+    num_batches = 0
+    skipped_batches = 0
+    non_finite_streak = 0
+
+    if config.actor_use_sigma_curriculum:
+        sigma_min, sigma_max = get_current_sigma_range(config, epoch)
+    else:
+        sigma_min, sigma_max = config.mdsm_sigma_min, config.mdsm_sigma_max
+
+    for batch_idx, v_clean in enumerate(dataloader):
+        if (batch_idx % 16 == 0) and not parameters_are_finite_modules([critic, actor]):
+            raise RuntimeError(
+                f"Actor/Critic parameters became non-finite before batch {batch_idx + 1}"
+            )
+
+        v_clean = v_clean.to(device, non_blocking=True)
+        batch_size = v_clean.shape[0]
+
+        if global_step < config.warmup_steps:
+            warmup_factor = (global_step + 1) / max(1, config.warmup_steps)
+            apply_warmup_lr(optimizer, warmup_factor)
+
+        sigma = sample_sigma(
+            batch_size=batch_size,
+            device=device,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            sigma_sampling=config.mdsm_sigma_sampling,
+            edm_p_mean=config.mdsm_edm_p_mean,
+            edm_p_std=config.mdsm_edm_p_std,
+        )
+
+        noise = torch.randn_like(v_clean)
+        norms = v_clean.norm(dim=-1, keepdim=True).clamp(min=config.mdsm_norm_floor)
+        v_noisy = v_clean + noise * sigma * norms
+        sigma_eff_sq = ((sigma * norms) ** 2).clamp(min=1e-6)
+        weights = sigma_eff_sq.squeeze(-1)
+        weights = weights / weights.mean().clamp(min=1e-8)
+        weights = torch.nan_to_num(weights, nan=1.0, posinf=1e4, neginf=1.0)
+
+        with autocast_ctx():
+            # Actor rollout (cheap denoising path).
+            v_actor = v_noisy
+            for _ in range(max(1, config.actor_steps_per_sample)):
+                v_actor, _ = actor.predict_step(
+                    v_query=v_clean,
+                    v_current=v_actor,
+                    sigma=sigma.detach(),
+                    step_size=config.actor_step_size,
+                    target_norm=config.langevin.target_norm,
+                    tangent_projection=config.actor_tangent_projection,
+                )
+
+            pred_delta = v_actor - v_noisy
+            target_delta = v_clean - v_noisy
+            if config.actor_tangent_projection and config.langevin.target_norm is not None:
+                pred_delta = project_tangent(pred_delta, v_noisy)
+                target_delta = project_tangent(target_delta, v_noisy)
+
+            dir_loss = 1.0 - F.cosine_similarity(
+                pred_delta,
+                target_delta,
+                dim=-1,
+                eps=config.mdsm_cosine_eps,
+            ).clamp(min=-1.0, max=1.0)
+            vec_loss = ((pred_delta - target_delta) ** 2).mean(dim=-1)
+            pred_norm = pred_delta.norm(dim=-1).clamp(min=config.mdsm_norm_floor, max=1e4)
+            target_norm = target_delta.norm(dim=-1).clamp(min=config.mdsm_norm_floor, max=1e4)
+            mag_loss = F.smooth_l1_loss(
+                torch.log(pred_norm),
+                torch.log(target_norm),
+                reduction="none",
+            )
+
+            actor_per_sample = (
+                config.actor_loss_direction_weight * dir_loss
+                + config.actor_loss_vector_weight * vec_loss
+                + config.actor_loss_magnitude_weight * mag_loss
+            )
+            actor_recon_loss = (weights * actor_per_sample).mean()
+
+            # Critic ranking around clean / actor / noisy points.
+            e_clean = critic(v_clean, v_clean, sigma=sigma.detach())
+            e_actor_detached = critic(v_clean, v_actor.detach(), sigma=sigma.detach())
+            e_noisy = critic(v_clean, v_noisy.detach(), sigma=sigma.detach())
+
+            critic_per_sample = (
+                F.relu(e_clean - e_actor_detached + config.critic_margin_clean_actor)
+                + F.relu(e_actor_detached - e_noisy + config.critic_margin_actor_noisy)
+                + F.relu(e_clean - e_noisy + config.critic_margin_clean_noisy)
+            )
+            critic_loss = config.critic_loss_weight * (weights * critic_per_sample).mean()
+
+            # Couple actor to critic: actor should move toward lower-energy states.
+            e_actor_live = critic(v_clean, v_actor, sigma=sigma.detach())
+            actor_energy_loss = F.softplus(e_actor_live - e_clean.detach()).mean()
+
+            loss = (
+                critic_loss
+                + actor_recon_loss
+                + config.actor_energy_weight * actor_energy_loss
+            )
+
+        if not torch.isfinite(loss):
+            if config.skip_non_finite_batches:
+                optimizer.zero_grad(set_to_none=True)
+                non_finite_streak += 1
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
+                    print(
+                        f"  [WARN] non-finite actor_critic loss at batch {batch_idx + 1}, "
+                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
+                        "batch skipped"
+                    )
+                if non_finite_streak >= config.max_consecutive_non_finite_batches:
+                    raise RuntimeError(
+                        "Too many consecutive non-finite actor_critic losses; stopping to avoid silent stall."
+                    )
+                continue
+            raise RuntimeError("Non-finite loss encountered in train_epoch_actor_critic")
+
+        optimizer.zero_grad(set_to_none=True)
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if not gradients_are_finite_modules([critic, actor]):
+                optimizer.zero_grad(set_to_none=True)
+                non_finite_streak += 1
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                scaler.update()
+                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
+                    print(
+                        f"  [WARN] non-finite actor_critic gradients at batch {batch_idx + 1}, "
+                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
+                        "step skipped"
+                    )
+                if non_finite_streak >= config.max_consecutive_non_finite_batches:
+                    raise RuntimeError(
+                        "Too many consecutive non-finite actor_critic gradients; stopping to avoid silent stall."
+                    )
+                continue
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(critic.parameters()) + list(actor.parameters()),
+                max_norm=1.0,
+            )
+            if not torch.isfinite(grad_norm):
+                optimizer.zero_grad(set_to_none=True)
+                non_finite_streak += 1
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                scaler.update()
+                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
+                    print(
+                        f"  [WARN] non-finite actor_critic clipped grad norm at batch {batch_idx + 1}, "
+                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
+                        "step skipped"
+                    )
+                if non_finite_streak >= config.max_consecutive_non_finite_batches:
+                    raise RuntimeError(
+                        "Too many consecutive non-finite actor_critic clipped grad norms; stopping to avoid silent stall."
+                    )
+                continue
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if not gradients_are_finite_modules([critic, actor]):
+                optimizer.zero_grad(set_to_none=True)
+                non_finite_streak += 1
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
+                    print(
+                        f"  [WARN] non-finite actor_critic gradients at batch {batch_idx + 1}, "
+                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
+                        "step skipped"
+                    )
+                if non_finite_streak >= config.max_consecutive_non_finite_batches:
+                    raise RuntimeError(
+                        "Too many consecutive non-finite actor_critic gradients; stopping to avoid silent stall."
+                    )
+                continue
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(critic.parameters()) + list(actor.parameters()),
+                max_norm=1.0,
+            )
+            if not torch.isfinite(grad_norm):
+                optimizer.zero_grad(set_to_none=True)
+                non_finite_streak += 1
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
+                    print(
+                        f"  [WARN] non-finite actor_critic clipped grad norm at batch {batch_idx + 1}, "
+                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
+                        "step skipped"
+                    )
+                if non_finite_streak >= config.max_consecutive_non_finite_batches:
+                    raise RuntimeError(
+                        "Too many consecutive non-finite actor_critic clipped grad norms; stopping to avoid silent stall."
+                    )
+                continue
+            optimizer.step()
+
+        non_finite_streak = 0
+        total_loss += loss.item()
+        total_actor_recon += actor_recon_loss.item()
+        total_actor_energy += actor_energy_loss.item()
+        total_critic += critic_loss.item()
+        total_e_clean += e_clean.mean().item()
+        total_e_actor += e_actor_detached.mean().item()
+        total_e_noisy += e_noisy.mean().item()
+        num_batches += 1
+        global_step += 1
+
+        if config.log_every > 0 and (batch_idx + 1) % config.log_every == 0:
+            e_scale = torch.exp(critic.log_energy_scale.detach().clamp(min=-8.0, max=8.0)).item()
+            actor_step_scale = torch.exp(actor.log_step_scale.detach().clamp(min=-6.0, max=3.0)).item()
+            print(
+                f"  [{batch_idx + 1}/{len(dataloader)}] "
+                f"loss={loss.item():.4f} actor_recon={actor_recon_loss.item():.4f} "
+                f"actor_energy={actor_energy_loss.item():.4f} critic={critic_loss.item():.4f} "
+                f"E(clean/actor/noisy)=({e_clean.mean().item():.3f}/{e_actor_detached.mean().item():.3f}/{e_noisy.mean().item():.3f}) "
+                f"lr={optimizer.param_groups[0]['lr']:.6f} "
+                f"E_scale={e_scale:.2f} actor_scale={actor_step_scale:.3f} "
+                f"sigma=[{sigma_min:.4f},{sigma_max:.4f}]"
+            )
+
+    return {
+        "loss": total_loss / max(num_batches, 1),
+        "actor_recon_loss": total_actor_recon / max(num_batches, 1),
+        "actor_energy_loss": total_actor_energy / max(num_batches, 1),
+        "critic_loss": total_critic / max(num_batches, 1),
+        "e_clean_mean": total_e_clean / max(num_batches, 1),
+        "e_actor_mean": total_e_actor / max(num_batches, 1),
+        "e_noisy_mean": total_e_noisy / max(num_batches, 1),
+        "critic_gap_noisy_clean": (total_e_noisy - total_e_clean) / max(num_batches, 1),
+        "sigma_min": sigma_min,
+        "sigma_max": sigma_max,
+        "skipped_batches": float(skipped_batches),
+        "skip_rate": skipped_batches / max(len(dataloader), 1),
+    }, global_step
+
+
 def evaluate_denoising(
     model: SimpleEnergy,
+    actor: LatentDenoiseActor | None,
     dataset: SONARVectorDataset,
     config: Stage1Config,
     device: torch.device,
@@ -516,6 +847,8 @@ def evaluate_denoising(
 ) -> dict:
     """Evaluate denoising quality with configured Langevin method."""
     model.eval()
+    if actor is not None:
+        actor.eval()
     results: dict[str, dict] = {}
 
     if eval_indices is None:
@@ -549,30 +882,51 @@ def evaluate_denoising(
         for idx in eval_indices:
             v_orig = dataset[int(idx.item())].unsqueeze(0).to(device)
             v_noisy = add_relative_noise(v_orig, noise_scale)
+            v_init = v_noisy
+
+            if actor is not None:
+                with torch.no_grad():
+                    for _ in range(max(1, config.actor_eval_steps)):
+                        v_init, _ = actor.predict_step(
+                            v_query=v_orig,
+                            v_current=v_init,
+                            sigma=None,
+                            step_size=config.actor_eval_step_size,
+                            target_norm=config.langevin.target_norm,
+                            tangent_projection=config.actor_tangent_projection,
+                        )
 
             cos_before = F.cosine_similarity(v_orig, v_noisy, dim=-1).item()
+            if actor is not None and config.critic_eval_langevin_steps <= 0:
+                v_final = v_init
+            else:
+                max_steps = (
+                    config.critic_eval_langevin_steps
+                    if actor is not None
+                    else config.langevin.max_steps
+                )
+                result = run_langevin(
+                    method=method,
+                    energy_fn=model,
+                    v_query=v_orig,
+                    v_init=v_init,
+                    lr=config.langevin.lr,
+                    noise_scale=config.langevin.noise_scale,
+                    max_steps=max_steps,
+                    target_norm=config.langevin.target_norm,
+                    energy_threshold=config.langevin.energy_threshold,
+                    plateau_patience=config.langevin.plateau_patience,
+                    plateau_delta=config.langevin.plateau_delta,
+                    v_target=v_orig,
+                    **method_kwargs,
+                )
+                v_final = result.v_final
 
-            result = run_langevin(
-                method=method,
-                energy_fn=model,
-                v_query=v_orig,
-                v_init=v_noisy,
-                lr=config.langevin.lr,
-                noise_scale=config.langevin.noise_scale,
-                max_steps=config.langevin.max_steps,
-                target_norm=config.langevin.target_norm,
-                energy_threshold=config.langevin.energy_threshold,
-                plateau_patience=config.langevin.plateau_patience,
-                plateau_delta=config.langevin.plateau_delta,
-                v_target=v_orig,
-                **method_kwargs,
-            )
-
-            cos_after = F.cosine_similarity(v_orig, result.v_final, dim=-1).item()
+            cos_after = F.cosine_similarity(v_orig, v_final, dim=-1).item()
 
             with torch.no_grad():
                 e_before = model(v_orig, v_noisy).item()
-                e_after = model(v_orig, result.v_final).item()
+                e_after = model(v_orig, v_final).item()
 
             cos_before_list.append(cos_before)
             cos_after_list.append(cos_after)
@@ -627,8 +981,8 @@ def main():
     parser.add_argument("--amp_dtype", type=str, default=None, choices=["bf16", "fp16"])
     # Architecture flags
     parser.add_argument("--loss", type=str, default=None,
-                        choices=["mdsm", "margin_contrastive"],
-                        help="Loss type (default: mdsm)")
+                        choices=["actor_critic", "mdsm", "margin_contrastive"],
+                        help="Loss type (default: actor_critic)")
     parser.add_argument("--norm", type=str, default=None,
                         choices=["orthonorm", "spectral_norm", "none"],
                         help="Normalization (default: orthonorm)")
@@ -741,8 +1095,20 @@ def main():
         groupsort_size=config.groupsort_size,
         spline_num_knots=config.spline_num_knots,
     ).to(device)
+    raw_actor: LatentDenoiseActor | None = None
+    if config.loss_type == "actor_critic":
+        raw_actor = LatentDenoiseActor(
+            dim=config.energy_dim,
+            hidden_dims=config.actor_hidden_dims,
+            norm_mode=config.actor_norm_mode,
+            activation=config.actor_activation,
+            ortho_n_iters=config.ortho_n_iters,
+            groupsort_size=config.groupsort_size,
+            spline_num_knots=config.spline_num_knots,
+        ).to(device)
 
     model = raw_model
+    actor = raw_actor
     if config.enable_compile and hasattr(torch, "compile"):
         try:
             model = torch.compile(raw_model, mode=config.compile_mode)
@@ -750,11 +1116,28 @@ def main():
         except Exception as exc:
             print(f"torch.compile failed, fallback to eager: {type(exc).__name__}")
             model = raw_model
+        if raw_actor is not None:
+            try:
+                actor = torch.compile(raw_actor, mode=config.compile_mode)
+                print(f"torch.compile enabled for actor (mode={config.compile_mode})")
+            except Exception as exc:
+                print(f"torch.compile failed for actor, fallback to eager: {type(exc).__name__}")
+                actor = raw_actor
 
     num_params = sum(p.numel() for p in raw_model.parameters())
-    print(f"SimpleEnergy: {num_params:,} parameters")
+    print(f"SimpleEnergy (critic): {num_params:,} parameters")
+    actor_params = 0
+    if raw_actor is not None:
+        actor_params = sum(p.numel() for p in raw_actor.parameters())
+        print(f"LatentDenoiseActor: {actor_params:,} parameters")
     print(f"  Architecture: norm={config.norm_mode}, activation={config.activation}")
     print(f"  Hidden dims: {config.energy_hidden_dims}")
+    if raw_actor is not None:
+        print(
+            "  Actor: "
+            f"norm={config.actor_norm_mode}, activation={config.actor_activation}, "
+            f"hidden_dims={config.actor_hidden_dims}"
+        )
     print(f"  Loss: {config.loss_type}")
     print(f"  Langevin: {config.langevin.method}")
 
@@ -763,10 +1146,19 @@ def main():
         p for n, p in raw_model.named_parameters() if "log_energy_scale" not in n
     ]
     scale_lr = config.lr * config.energy_scale_lr_multiplier
-    optimizer = torch.optim.AdamW([
+    optim_param_groups = [
         {"params": other_params, "lr": config.lr, "weight_decay": config.weight_decay},
         {"params": scale_params, "lr": scale_lr, "weight_decay": 0.0},
-    ])
+    ]
+    if raw_actor is not None:
+        optim_param_groups.append(
+            {
+                "params": list(raw_actor.parameters()),
+                "lr": config.actor_lr,
+                "weight_decay": config.actor_weight_decay,
+            }
+        )
+    optimizer = torch.optim.AdamW(optim_param_groups)
     for pg in optimizer.param_groups:
         pg["initial_lr"] = pg["lr"]
         pg["non_finite_scale"] = 1.0
@@ -783,6 +1175,8 @@ def main():
         print(f"Resuming from {args.resume}...")
         ckpt = torch.load(args.resume, weights_only=False, map_location=device)
         raw_model.load_state_dict(ckpt["model_state"])
+        if raw_actor is not None and ckpt.get("actor_state") is not None:
+            raw_actor.load_state_dict(ckpt["actor_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         for pg in optimizer.param_groups:
@@ -801,6 +1195,7 @@ def main():
             config={
                 "stage1_config": asdict(config),
                 "num_params": num_params,
+                "actor_params": actor_params,
             },
         )
 
@@ -819,8 +1214,32 @@ def main():
     print(f"  Batch size: {config.batch_size}")
     print(f"  LR: {config.lr} (warmup: {config.warmup_steps} steps)")
     print(f"  Energy-scale LR multiplier: {config.energy_scale_lr_multiplier}")
+    if raw_actor is not None:
+        print(f"  Actor LR: {config.actor_lr}")
     print(f"  Loss: {config.loss_type}")
-    if config.loss_type == "mdsm":
+    if config.loss_type == "actor_critic":
+        print(f"  Sigma range: [{config.mdsm_sigma_min}, {config.mdsm_sigma_max}]")
+        print(f"  Sigma sampling: {config.mdsm_sigma_sampling}")
+        print(
+            "  Actor loss mix: "
+            f"direction={config.actor_loss_direction_weight}, "
+            f"vector={config.actor_loss_vector_weight}, "
+            f"magnitude={config.actor_loss_magnitude_weight}"
+        )
+        print(
+            "  Critic margins: "
+            f"clean<actor={config.critic_margin_clean_actor}, "
+            f"actor<noisy={config.critic_margin_actor_noisy}, "
+            f"clean<noisy={config.critic_margin_clean_noisy}"
+        )
+        print(
+            f"  Actor rollout: train_steps={config.actor_steps_per_sample}, "
+            f"eval_steps={config.actor_eval_steps}, "
+            f"step_size(train/eval)=({config.actor_step_size},{config.actor_eval_step_size})"
+        )
+        print(f"  Actor->Critic energy coupling: {config.actor_energy_weight}")
+        print(f"  Critic Langevin eval steps: {config.critic_eval_langevin_steps}")
+    elif config.loss_type == "mdsm":
         print(f"  MDSM sigma range: [{config.mdsm_sigma_min}, {config.mdsm_sigma_max}]")
         print(f"  MDSM sigma sampling: {config.mdsm_sigma_sampling}")
         print(f"  MDSM sigma weighting: {config.mdsm_sigma_weighting}")
@@ -860,8 +1279,30 @@ def main():
             layers_updated = set_ortho_n_iters(raw_model, n_iters)
             if layers_updated > 0:
                 print(f"  Ortho schedule: n_iters={n_iters} on {layers_updated} layers")
+            if raw_actor is not None and config.actor_norm_mode == "orthonorm":
+                actor_layers_updated = set_ortho_n_iters(raw_actor, n_iters)
+                if actor_layers_updated > 0:
+                    print(
+                        f"  Actor Ortho schedule: n_iters={n_iters} "
+                        f"on {actor_layers_updated} layers"
+                    )
 
-        if config.loss_type == "mdsm":
+        if config.loss_type == "actor_critic":
+            if actor is None:
+                raise RuntimeError("actor_critic mode requires actor model")
+            train_metrics, global_step = train_epoch_actor_critic(
+                critic=model,
+                actor=actor,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                config=config,
+                device=device,
+                epoch=epoch,
+                global_step=global_step,
+                scaler=scaler,
+                autocast_ctx=autocast_ctx,
+            )
+        elif config.loss_type == "mdsm":
             train_metrics, global_step = train_epoch_mdsm(
                 model=model,
                 dataloader=train_loader,
@@ -897,6 +1338,7 @@ def main():
             print("  Evaluating denoising...")
             eval_metrics = evaluate_denoising(
                 model=model,
+                actor=actor,
                 dataset=test_dataset,
                 config=config,
                 device=device,
@@ -921,6 +1363,7 @@ def main():
                 torch.save(
                     {
                         "model_state": raw_model.state_dict(),
+                        "actor_state": raw_actor.state_dict() if raw_actor is not None else None,
                         "optimizer_state": optimizer.state_dict(),
                         "scheduler_state": scheduler.state_dict(),
                         "epoch": epoch,
@@ -932,6 +1375,9 @@ def main():
                             "energy_hidden_dims": config.energy_hidden_dims,
                             "norm_mode": config.norm_mode,
                             "activation": config.activation,
+                            "actor_hidden_dims": config.actor_hidden_dims,
+                            "actor_norm_mode": config.actor_norm_mode,
+                            "actor_activation": config.actor_activation,
                             "loss_type": config.loss_type,
                         },
                     },
@@ -957,6 +1403,7 @@ def main():
             torch.save(
                 {
                     "model_state": raw_model.state_dict(),
+                    "actor_state": raw_actor.state_dict() if raw_actor is not None else None,
                     "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(),
                     "epoch": epoch,
@@ -977,6 +1424,7 @@ def main():
 
     final_eval = evaluate_denoising(
         model=model,
+        actor=actor,
         dataset=test_dataset,
         config=config,
         device=device,
@@ -995,6 +1443,7 @@ def main():
     torch.save(
         {
             "model_state": raw_model.state_dict(),
+            "actor_state": raw_actor.state_dict() if raw_actor is not None else None,
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "epoch": config.num_epochs - 1,
@@ -1006,6 +1455,9 @@ def main():
                 "energy_hidden_dims": config.energy_hidden_dims,
                 "norm_mode": config.norm_mode,
                 "activation": config.activation,
+                "actor_hidden_dims": config.actor_hidden_dims,
+                "actor_norm_mode": config.actor_norm_mode,
+                "actor_activation": config.actor_activation,
                 "loss_type": config.loss_type,
             },
         },
@@ -1039,10 +1491,17 @@ def main():
             all_pass = False
 
     if all_pass:
-        print("\n  VERDICT: Stage 1 PASSED - energy function works for denoising")
+        if config.loss_type == "actor_critic":
+            print("\n  VERDICT: Stage 1 PASSED - actor+critic denoising works")
+        else:
+            print("\n  VERDICT: Stage 1 PASSED - energy function works for denoising")
     else:
-        print("\n  VERDICT: Stage 1 FAILED - denoised vectors not closer to originals")
-        print("    -> Energy function does not work. Review architecture or training.")
+        if config.loss_type == "actor_critic":
+            print("\n  VERDICT: Stage 1 FAILED - actor+critic does not denoise effectively")
+            print("    -> Review actor objective, critic coupling, and inference schedule.")
+        else:
+            print("\n  VERDICT: Stage 1 FAILED - denoised vectors not closer to originals")
+            print("    -> Energy function does not work. Review architecture or training.")
 
     if wandb_run is not None:
         wandb_run.finish()

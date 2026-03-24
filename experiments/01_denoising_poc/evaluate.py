@@ -17,6 +17,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from configs.base import Stage1Config
+from cebcm.models.actor import LatentDenoiseActor
 from cebcm.models.energy import SimpleEnergy
 from cebcm.models.sonar_wrapper import SONARWrapper
 from cebcm.inference.langevin import run_langevin
@@ -45,6 +46,26 @@ def update_dataclass(target, updates: dict) -> None:
             update_dataclass(current, value)
         else:
             setattr(target, key, value)
+
+
+def actor_refine(
+    actor: LatentDenoiseActor,
+    v_query: torch.Tensor,
+    v_init: torch.Tensor,
+    config: Stage1Config,
+) -> torch.Tensor:
+    v_current = v_init
+    with torch.no_grad():
+        for _ in range(max(1, config.actor_eval_steps)):
+            v_current, _ = actor.predict_step(
+                v_query=v_query,
+                v_current=v_current,
+                sigma=None,
+                step_size=config.actor_eval_step_size,
+                target_norm=config.langevin.target_norm,
+                tangent_projection=config.actor_tangent_projection,
+            )
+    return v_current
 
 
 def main():
@@ -90,6 +111,21 @@ def main():
     model.eval()
     print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
 
+    actor = None
+    if ckpt.get("actor_state") is not None:
+        actor = LatentDenoiseActor(
+            dim=model_config.get("energy_dim", config.energy_dim),
+            hidden_dims=model_config.get("actor_hidden_dims", config.actor_hidden_dims),
+            norm_mode=model_config.get("actor_norm_mode", config.actor_norm_mode),
+            activation=model_config.get("actor_activation", config.actor_activation),
+            ortho_n_iters=config.ortho_n_iters,
+            groupsort_size=config.groupsort_size,
+            spline_num_knots=config.spline_num_knots,
+        ).to(device)
+        actor.load_state_dict(ckpt["actor_state"])
+        actor.eval()
+        print("Loaded actor state (Actor+Critic checkpoint).")
+
     noise_scales = args.noise_scales or config.eval_noise_scales
 
     sonar = None
@@ -133,26 +169,41 @@ def main():
             sample_idx = int(idx.item())
             v_orig = test_dataset[sample_idx].unsqueeze(0).to(device)
             v_noisy = add_relative_noise(v_orig, noise_scale)
+            v_init = v_noisy
+            if actor is not None:
+                v_init = actor_refine(actor, v_orig, v_noisy, config)
 
             cos_before = F.cosine_similarity(v_orig, v_noisy, dim=-1).item()
+            if actor is not None and config.critic_eval_langevin_steps <= 0:
+                v_final = v_init
+                num_steps = 0
+                early_stopped = False
+            else:
+                max_steps = (
+                    config.critic_eval_langevin_steps
+                    if actor is not None
+                    else config.langevin.max_steps
+                )
+                result = run_langevin(
+                    method=method,
+                    energy_fn=model,
+                    v_query=v_orig,
+                    v_init=v_init,
+                    lr=config.langevin.lr,
+                    noise_scale=config.langevin.noise_scale,
+                    max_steps=max_steps,
+                    target_norm=config.langevin.target_norm,
+                    energy_threshold=config.langevin.energy_threshold,
+                    plateau_patience=config.langevin.plateau_patience,
+                    plateau_delta=config.langevin.plateau_delta,
+                    v_target=v_orig,
+                    **method_kwargs,
+                )
+                v_final = result.v_final
+                num_steps = result.num_steps
+                early_stopped = result.stopped_early
 
-            result = run_langevin(
-                method=method,
-                energy_fn=model,
-                v_query=v_orig,
-                v_init=v_noisy,
-                lr=config.langevin.lr,
-                noise_scale=config.langevin.noise_scale,
-                max_steps=config.langevin.max_steps,
-                target_norm=config.langevin.target_norm,
-                energy_threshold=config.langevin.energy_threshold,
-                plateau_patience=config.langevin.plateau_patience,
-                plateau_delta=config.langevin.plateau_delta,
-                v_target=v_orig,
-                **method_kwargs,
-            )
-
-            cos_after = F.cosine_similarity(v_orig, result.v_final, dim=-1).item()
+            cos_after = F.cosine_similarity(v_orig, v_final, dim=-1).item()
             improved = cos_after > cos_before
 
             cos_before_list.append(cos_before)
@@ -163,22 +214,22 @@ def main():
                 "cos_before": cos_before,
                 "cos_after": cos_after,
                 "improvement": cos_after - cos_before,
-                "steps": result.num_steps,
-                "early_stopped": result.stopped_early,
+                "steps": num_steps,
+                "early_stopped": early_stopped,
                 "original_text": test_dataset.get_text(sample_idx),
             }
 
             if sonar is not None:
                 sample_result["decoded_clean"] = sonar.decode_safe(v_orig.cpu())[0]
                 sample_result["decoded_noisy"] = sonar.decode_safe(v_noisy.cpu())[0]
-                sample_result["decoded_denoised"] = sonar.decode_safe(result.v_final.cpu())[0]
+                sample_result["decoded_denoised"] = sonar.decode_safe(v_final.cpu())[0]
 
             results.append(sample_result)
 
             marker = "OK" if improved else "NO"
             print(
                 f"\n  [{i}] {marker} cos: {cos_before:.4f} -> {cos_after:.4f} "
-                f"(d={cos_after - cos_before:+.4f}, {result.num_steps} steps)"
+                f"(d={cos_after - cos_before:+.4f}, {num_steps} steps)"
             )
             print(f"       orig:     {sample_result['original_text'][:100]}")
             if sonar is not None:

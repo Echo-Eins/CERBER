@@ -114,7 +114,7 @@ class Stage1Config:
     energy_hidden_dims: list[int] = field(
         default_factory=lambda: [2048, 1024, 512]  # Deeper: +1 layer for expressiveness
     )
-    # Architecture choices
+    # Critic architecture choices
     norm_mode: str = "orthonorm"       # "orthonorm" (default) or "spectral_norm"
     activation: str = "groupsort"      # "groupsort" (default), "lipschitz_spline", "relu"
     ortho_n_iters: int = 8             # Bjorck iterations
@@ -123,14 +123,27 @@ class Stage1Config:
     ortho_schedule_boundaries: list[float] = field(default_factory=lambda: [0.34, 0.67])
     groupsort_size: int = 2            # Group size (2 = MaxMin)
     spline_num_knots: int = 4          # Knots for lipschitz_spline
+    # Actor architecture choices (for actor_critic mode)
+    actor_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
+    actor_norm_mode: str = "spectral_norm"  # "orthonorm", "spectral_norm", "none"
+    actor_activation: str = "silu"          # "silu", "gelu", "relu", "groupsort", "lipschitz_spline"
+    actor_lr: float = 3e-4
+    actor_weight_decay: float = 0.01
+    actor_step_size: float = 0.7            # train-time one-step update scale
+    actor_eval_step_size: float = 0.7       # eval-time iterative update scale
+    actor_steps_per_sample: int = 1         # unrolled actor steps in training
+    actor_eval_steps: int = 4               # iterative actor-only steps at eval
+    actor_tangent_projection: bool = True
+
     # Training
     lr: float = 1e-3  # σ-conditioned NCSN + σ²-weighted DSM (was 5e-5 for unconditioned MSE)
     warmup_steps: int = 500            # Linear warmup from 0 to lr
     weight_decay: float = 0.01
     batch_size: int = 32
     num_epochs: int = 50
-    # MDSM (Multi-Scale Denoising Score Matching) — replaces margin contrastive
-    loss_type: str = "mdsm"            # "mdsm" (default) or "margin_contrastive" (legacy)
+    # Objectives
+    loss_type: str = "actor_critic"    # "actor_critic", "mdsm", or "margin_contrastive"
+    # MDSM (Multi-Scale Denoising Score Matching)
     mdsm_sigma_min: float = 0.01       # Minimum noise scale (fine structure)
     mdsm_sigma_max: float = 0.5        # Maximum noise scale (global structure)
     mdsm_sigma_sampling: str = "loguniform"  # "loguniform" or "edm"
@@ -144,6 +157,17 @@ class Stage1Config:
     mdsm_sigma_curriculum_start_min: float = 0.1
     mdsm_edm_p_mean: float = -1.2
     mdsm_edm_p_std: float = 1.2
+    # Actor+Critic coupling losses
+    actor_loss_direction_weight: float = 0.7
+    actor_loss_vector_weight: float = 0.3
+    actor_loss_magnitude_weight: float = 0.1
+    actor_energy_weight: float = 0.05
+    critic_margin_clean_actor: float = 0.05
+    critic_margin_actor_noisy: float = 0.10
+    critic_margin_clean_noisy: float = 0.20
+    critic_loss_weight: float = 1.0
+    critic_eval_langevin_steps: int = 30
+    actor_use_sigma_curriculum: bool = True
     gradient_penalty_lambda: float = 0.0   # Disabled: orthonorm is already 1-Lipschitz
     margin: float = 1.0                # Only used with margin_contrastive loss
     # Noise for training negatives (only used with margin_contrastive loss)

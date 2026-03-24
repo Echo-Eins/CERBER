@@ -92,3 +92,11 @@ Applying `sigma2` weighting without normalization can shrink directional DSM los
 
 ### Rule
 Keep sigma weighting relative, but normalize weights to mean 1 before reduction so loss scale remains interpretable and gradients do not collapse numerically.
+
+## 2026-03-23 - Respect non-minimal refactor requests
+
+### Pattern
+When the user explicitly allows non-minimal changes for architecture-level stability, continuing with incremental patches can delay the right solution.
+
+### Rule
+If user authorizes broad refactoring, prioritize a coherent end-to-end architecture upgrade over local patching; keep compatibility, but do not artificially constrain scope.
