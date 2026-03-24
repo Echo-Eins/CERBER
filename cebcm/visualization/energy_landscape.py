@@ -103,6 +103,7 @@ def scan_energy_landscape(
     v_denoised: Tensor | None = None,
     trajectory: list[Tensor] | None = None,
     basis: tuple[Tensor, Tensor] | None = None,
+    unconditional: bool = False,
 ) -> LandscapeData:
     """
     Scan energy values on a 2D grid slice through 1024d space.
@@ -110,7 +111,8 @@ def scan_energy_landscape(
     The grid is centered at v_clean, with axis1 pointing toward v_noisy.
 
     Args:
-        energy_fn:   E(v_query, v_candidate) → scalar
+        energy_fn:   E(v_query, v_candidate) → scalar  (pairwise)
+                     or E(x) → scalar  (unconditional)
         v_clean:     [1, D] clean embedding (query / anchor)
         v_noisy:     [1, D] noisy embedding
         grid_size:   Number of points per axis (total = grid_size²)
@@ -120,6 +122,7 @@ def scan_energy_landscape(
         trajectory:  List of [1, D] tensors from Langevin steps
         basis:       Optional (axis1, axis2) tuple to reuse the same 2D plane
                      across multiple scans (e.g. before/after comparison).
+        unconditional: If True, call energy_fn(x) instead of energy_fn(v_q, x).
 
     Returns:
         LandscapeData with energy/cosine grids and point coordinates.
@@ -161,9 +164,12 @@ def scan_energy_landscape(
     for start in range(0, len(batch_points), batch_size):
         end = min(start + batch_size, len(batch_points))
         batch = batch_points[start:end]  # [B, D]
-        v_q = v_clean.expand(batch.shape[0], -1)
 
-        e = energy_fn(v_q, batch)  # [B]
+        if unconditional:
+            e = energy_fn(batch)  # [B]
+        else:
+            v_q = v_clean.expand(batch.shape[0], -1)
+            e = energy_fn(v_q, batch)  # [B]
         cos = F.cosine_similarity(v_clean_flat.unsqueeze(0), batch, dim=-1)  # [B]
 
         all_energies.append(e.cpu())

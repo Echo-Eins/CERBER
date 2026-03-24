@@ -1,19 +1,20 @@
 """
-Visualize energy landscape — standalone CLI tool.
+Visualize energy landscape — standalone CLI tool (universal).
 
-Can run in parallel with training: just point it at the latest checkpoint.
+Supports both SimpleEnergy (pairwise, Stage 1) and UnconditionalEnergy (Stage 2)
+checkpoints via auto-detection from state_dict keys.
 
 Usage:
     # Single checkpoint — 3-panel plot (3D surface + contour + cosine map)
     python experiments/01_denoising_poc/visualize_landscape.py \
         --data data/wikitext_sonar_10k.pt \
-        --checkpoint experiments/01_denoising_poc/checkpoints/best.pt
+        --checkpoint experiments/02_energy_matching/checkpoints/final.pt
 
     # Before/after comparison (two checkpoints)
     python experiments/01_denoising_poc/visualize_landscape.py \
         --data data/wikitext_sonar_10k.pt \
-        --checkpoint experiments/01_denoising_poc/checkpoints/best.pt \
-        --checkpoint_before experiments/01_denoising_poc/checkpoints/epoch_001.pt
+        --checkpoint experiments/02_energy_matching/checkpoints/final.pt \
+        --checkpoint_before experiments/02_energy_matching/checkpoints/epoch_010.pt
 
     # Custom settings
     python experiments/01_denoising_poc/visualize_landscape.py \
@@ -38,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from configs.base import Stage1Config
 from cebcm.models.energy import SimpleEnergy
+from cebcm.models.energy_unconditional import UnconditionalEnergy
 from cebcm.inference.langevin import run_langevin
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.visualization.energy_landscape import (
@@ -72,8 +74,27 @@ def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
     return v + torch.randn_like(v) * scale * norms
 
 
-def load_model(checkpoint_path: str | None, config: Stage1Config, device: torch.device) -> SimpleEnergy:
-    """Load model from checkpoint, or create random-init model."""
+def infer_model_type(state_dict: dict) -> str:
+    """Auto-detect model type from state_dict keys.
+
+    SimpleEnergy has a '_sigma_freqs' buffer (sinusoidal σ embedding).
+    UnconditionalEnergy does not.
+    """
+    if "_sigma_freqs" in state_dict:
+        return "simple_energy"
+    return "unconditional_energy"
+
+
+def load_model(
+    checkpoint_path: str | None,
+    config: Stage1Config,
+    device: torch.device,
+) -> tuple[torch.nn.Module, str]:
+    """Load model from checkpoint with auto-detection, or create random-init model.
+
+    Returns:
+        (model, model_type) where model_type is "simple_energy" or "unconditional_energy"
+    """
     if checkpoint_path is None:
         model = SimpleEnergy(
             dim=config.energy_dim,
@@ -82,32 +103,48 @@ def load_model(checkpoint_path: str | None, config: Stage1Config, device: torch.
             activation=config.activation,
         ).to(device)
         print("Created random-init SimpleEnergy (no checkpoint)")
-        return model
+        return model, "simple_energy"
 
     ckpt = torch.load(checkpoint_path, weights_only=False, map_location=device)
     model_config = ckpt.get("config", {})
-    model = SimpleEnergy(
-        dim=model_config.get("energy_dim", config.energy_dim),
-        hidden_dims=model_config.get("energy_hidden_dims", config.energy_hidden_dims),
-        norm_mode=model_config.get("norm_mode", config.norm_mode),
-        activation=model_config.get("activation", config.activation),
-    ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    state_dict = ckpt["model_state"]
+    model_type = infer_model_type(state_dict)
+
+    # Extract architecture params from checkpoint config
+    dim = model_config.get("energy_dim", config.energy_dim)
+    hidden_dims = model_config.get("energy_hidden_dims", config.energy_hidden_dims)
+    norm_mode = model_config.get("norm_mode", config.norm_mode)
+    activation = model_config.get("activation", config.activation)
+
+    if model_type == "simple_energy":
+        model = SimpleEnergy(
+            dim=dim,
+            hidden_dims=hidden_dims,
+            norm_mode=norm_mode,
+            activation=activation,
+        ).to(device)
+    else:
+        model = UnconditionalEnergy(
+            dim=dim,
+            hidden_dims=hidden_dims,
+            norm_mode=norm_mode,
+            activation=activation,
+        ).to(device)
+
+    model.load_state_dict(state_dict)
     epoch = ckpt.get("epoch", "?")
-    print(f"Loaded checkpoint: {checkpoint_path} (epoch {epoch})")
-    return model
+    print(f"Loaded checkpoint: {checkpoint_path} (epoch {epoch}, type={model_type})")
+    return model, model_type
 
 
-def run_langevin_with_trajectory(
+def run_langevin_with_trajectory_pairwise(
     model: SimpleEnergy,
     v_query: torch.Tensor,
     v_noisy: torch.Tensor,
     config: Stage1Config,
     max_steps: int = 100,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """
-    Run Langevin dynamics and collect the full trajectory for visualization.
-    """
+    """Run Langevin dynamics with trajectory for pairwise (SimpleEnergy) models."""
     method = config.langevin.method
     method_kwargs = {}
     if method == "pid":
@@ -140,13 +177,35 @@ def run_langevin_with_trajectory(
         track_vectors=True,
         **method_kwargs,
     )
-    trajectory = result.v_trajectory
+    return result.v_final, result.v_trajectory
 
-    return result.v_final, trajectory
+
+def run_gradient_descent_unconditional(
+    model: UnconditionalEnergy,
+    v_noisy: torch.Tensor,
+    max_steps: int = 100,
+    lr: float = 0.01,
+    target_norm: float | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Follow -∇E for unconditional energy models and collect trajectory."""
+    v_current = v_noisy.clone()
+    trajectory = [v_current.detach().cpu()]
+
+    for _ in range(max_steps):
+        v_grad = v_current.detach().requires_grad_(True)
+        with torch.enable_grad():
+            energy = model(v_grad)
+            grad = torch.autograd.grad(energy.sum(), v_grad)[0]
+        v_current = v_current - lr * grad
+        if target_norm is not None:
+            v_current = F.normalize(v_current, dim=-1) * target_norm
+        trajectory.append(v_current.detach().cpu())
+
+    return v_current, trajectory
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize energy landscape")
+    parser = argparse.ArgumentParser(description="Visualize energy landscape (universal)")
     parser.add_argument("--data", type=str, required=True, help="Path to .pt dataset")
     parser.add_argument("--checkpoint", type=str, default=None, help="Trained model checkpoint")
     parser.add_argument("--checkpoint_before", type=str, default=None,
@@ -184,17 +243,19 @@ def main():
 
     # Load model(s)
     if args.no_checkpoint:
-        model = load_model(None, config, device)
+        model, model_type = load_model(None, config, device)
     elif args.checkpoint:
-        model = load_model(args.checkpoint, config, device)
+        model, model_type = load_model(args.checkpoint, config, device)
     else:
         parser.error("Provide --checkpoint or --no_checkpoint")
 
     model.eval()
+    is_unconditional = model_type == "unconditional_energy"
 
     model_before = None
+    model_before_type = None
     if args.checkpoint_before:
-        model_before = load_model(args.checkpoint_before, config, device)
+        model_before, model_before_type = load_model(args.checkpoint_before, config, device)
         model_before.eval()
 
     output_dir = Path(args.output_dir)
@@ -210,11 +271,27 @@ def main():
         cos_before = F.cosine_similarity(v_clean, v_noisy, dim=-1).item()
         print(f"\nSample {sample_idx} (idx={idx.item()}): cos(clean, noisy)={cos_before:.4f}")
 
-        # Run Langevin and collect trajectory
-        v_denoised, trajectory = run_langevin_with_trajectory(
-            model, v_clean, v_noisy, config, max_steps=args.langevin_steps,
-        )
-        cos_after = F.cosine_similarity(v_clean, v_denoised.unsqueeze(0) if v_denoised.dim() == 1 else v_denoised, dim=-1).item()
+        # Run denoising and collect trajectory
+        if is_unconditional:
+            # For UnconditionalEnergy: follow -∇E(x)
+            # Try to extract target_norm from checkpoint config
+            ckpt = torch.load(args.checkpoint, weights_only=False, map_location=device)
+            ckpt_config = ckpt.get("config", {})
+            target_norm = ckpt_config.get("target_norm", config.langevin.target_norm)
+            v_denoised, trajectory = run_gradient_descent_unconditional(
+                model, v_noisy,
+                max_steps=args.langevin_steps,
+                lr=0.01,
+                target_norm=target_norm,
+            )
+        else:
+            # For SimpleEnergy: use Langevin dynamics
+            v_denoised, trajectory = run_langevin_with_trajectory_pairwise(
+                model, v_clean, v_noisy, config, max_steps=args.langevin_steps,
+            )
+
+        v_denoised_2d = v_denoised.unsqueeze(0) if v_denoised.dim() == 1 else v_denoised
+        cos_after = F.cosine_similarity(v_clean, v_denoised_2d, dim=-1).item()
         print(f"  cos(clean, denoised)={cos_after:.4f} (Δ={cos_after - cos_before:+.4f})")
 
         # Scan landscape
@@ -224,21 +301,23 @@ def main():
             v_clean=v_clean,
             v_noisy=v_noisy,
             grid_size=args.grid,
-            v_denoised=v_denoised.unsqueeze(0) if v_denoised.dim() == 1 else v_denoised,
+            v_denoised=v_denoised_2d,
             trajectory=trajectory,
+            unconditional=is_unconditional,
         )
 
         # Plot
         save_path = output_dir / f"landscape_sample{sample_idx:02d}.png"
         plot_landscape(
             data,
-            title=f"Sample {sample_idx}",
+            title=f"Sample {sample_idx} ({model_type})",
             save_path=save_path,
             show_3d=not args.no_3d,
         )
 
         # Before/after comparison
         if model_before is not None:
+            is_before_unconditional = model_before_type == "unconditional_energy"
             print(f"  Scanning before-training landscape...")
             data_before = scan_energy_landscape(
                 energy_fn=model_before,
@@ -247,6 +326,7 @@ def main():
                 grid_size=args.grid,
                 grid_range=data.grid_range,  # same range for fair comparison
                 basis=data.basis,  # same 2D plane for fair comparison
+                unconditional=is_before_unconditional,
             )
             comp_path = output_dir / f"comparison_sample{sample_idx:02d}.png"
             plot_comparison(data_before, data, save_path=comp_path)
