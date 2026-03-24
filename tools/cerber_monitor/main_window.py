@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, QTimer, QFileSystemWatcher, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon
 import numpy as np
 import torch
+import math
 
 from tools.cerber_monitor.checkpoint_loader import load_checkpoint, load_model_from_checkpoint, CheckpointInfo
 from tools.cerber_monitor.metrics_parser import load_metrics_streaming, TrainingRun
@@ -416,8 +417,8 @@ class MainWindow(QMainWindow):
             )
             
             # Update 3D view
-            x = data.x.numpy()
-            y = data.y.numpy()
+            x = data.grid_x.numpy()
+            y = data.grid_y.numpy()
             z = data.energy.numpy()
             
             self.landscape_view.clear()
@@ -428,9 +429,10 @@ class MainWindow(QMainWindow):
             noisy_z = np.max(z) + 0.5
             
             self.landscape_view.add_point("clean", (0, 0, clean_z), (0.0, 1.0, 0.0, 1.0))
-            self.landscape_view.add_point("noisy", (data.noisy_coords[0][0], data.noisy_coords[1][0], noisy_z), (1.0, 0.0, 0.0, 1.0))
+            self.landscape_view.add_point("noisy", (data.v_noisy_xy[0], data.v_noisy_xy[1], noisy_z), (1.0, 0.0, 0.0, 1.0))
             
-            self.statusBar().showMessage(f"Scan complete. Cos(clean, noisy): {data.cosines[data.grid_size//2, data.grid_size//2]:.4f}")
+            mid = data.cosine_sim.shape[0] // 2
+            self.statusBar().showMessage(f"Scan complete. Cos(clean, noisy): {data.cosine_sim[mid, mid]:.4f}")
         except Exception as e:
             self.statusBar().showMessage(f"Error scanning landscape: {str(e)}")
             import traceback
