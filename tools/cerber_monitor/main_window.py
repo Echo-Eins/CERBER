@@ -425,8 +425,10 @@ class MainWindow(QMainWindow):
             self.landscape_view.set_surface(x, y, z)
             
             # Map points onto surface (using empirical Z height offset to ensure visibility)
-            clean_z = np.max(z) + 0.5  # Just float it above
-            noisy_z = np.max(z) + 0.5
+            # Find the actual scaled Z max from the plotted surface
+            z_scaled = self.landscape_view.surface.zData
+            clean_z = np.max(z_scaled) + (np.max(z_scaled) - np.min(z_scaled)) * 0.05
+            noisy_z = clean_z
             
             self.landscape_view.add_point("clean", (0, 0, clean_z), (0.0, 1.0, 0.0, 1.0))
             self.landscape_view.add_point("noisy", (data.v_noisy_xy[0], data.v_noisy_xy[1], noisy_z), (1.0, 0.0, 0.0, 1.0))
@@ -507,9 +509,11 @@ class MainWindow(QMainWindow):
             props.append(("", ""))
             props.append(("--- EVAL METRICS ---", "---"))
             for noise, m in info.eval_metrics.items():
-                if noise.startswith("noise_"):
-                    props.append((f"{noise} Δ Cos", f"{m['improvement']:+.4f}"))
-                    props.append((f"{noise} Success", f"{m['success_rate']:.0%}"))
+                if noise.startswith("noise_") and isinstance(m, dict):
+                    imp = m.get('improvement', 0.0)
+                    succ = m.get('success_rate', 0.0)
+                    props.append((f"{noise} Δ Cos", f"{imp:+.4f}"))
+                    props.append((f"{noise} Success", f"{succ:.0%}"))
                     
         self.props_table.setRowCount(len(props))
         for r, (k, v) in enumerate(props):
