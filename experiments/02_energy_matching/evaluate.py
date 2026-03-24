@@ -91,8 +91,9 @@ def evaluate_denoising(
         v_current = v_noisy.clone()
         for step in range(denoise_steps):
             v_grad = v_current.detach().requires_grad_(True)
-            energy = model(v_grad)
-            grad = torch.autograd.grad(energy.sum(), v_grad)[0]
+            with torch.enable_grad():
+                energy = model(v_grad)
+                grad = torch.autograd.grad(energy.sum(), v_grad)[0]
             v_current = v_current - denoise_lr * grad
             v_current = F.normalize(v_current, dim=-1) * target_norm
 

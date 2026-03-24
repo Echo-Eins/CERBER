@@ -250,8 +250,9 @@ def generate_samples_ode(
 
     for step in range(num_steps):
         x_grad = x.detach().requires_grad_(True)
-        energy = energy_fn(x_grad)
-        grad = torch.autograd.grad(energy.sum(), x_grad)[0]
+        with torch.enable_grad():
+            energy = energy_fn(x_grad)
+            grad = torch.autograd.grad(energy.sum(), x_grad)[0]
         x = x - dt * grad  # Euler step: dx = -∇E · dt
 
         if target_norm is not None:
@@ -295,8 +296,9 @@ def generate_samples_langevin(
 
     for step in range(num_steps):
         x_grad = x.detach().requires_grad_(True)
-        energy = energy_fn(x_grad)
-        grad = torch.autograd.grad(energy.sum(), x_grad)[0]
+        with torch.enable_grad():
+            energy = energy_fn(x_grad)
+            grad = torch.autograd.grad(energy.sum(), x_grad)[0]
 
         noise = torch.randn_like(x) * noise_scale
         x = x - lr * grad + (2 * lr) ** 0.5 * noise

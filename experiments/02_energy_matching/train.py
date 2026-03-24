@@ -126,7 +126,19 @@ def train_epoch_em(
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        for p in model.parameters():
+            if p.grad is not None:
+                torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        if not torch.isfinite(loss) or not torch.isfinite(grad_norm):
+            optimizer.zero_grad(set_to_none=True)
+            if batch_idx < 5 or (config.log_every > 0 and (batch_idx + 1) % config.log_every == 0):
+                print(f"  [WARN] non-finite EM loss at batch {batch_idx + 1}; step skipped")
+            global_step += 1
+            continue
+
         optimizer.step()
 
         total_loss += loss.item()
@@ -185,7 +197,22 @@ def train_epoch_nce(
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Sanitize gradients: replace inf/nan with 0 so a single
+        # exploding element doesn't corrupt model parameters forever.
+        for p in model.parameters():
+            if p.grad is not None:
+                torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Skip step if loss or clipped grad norm is non-finite
+        if not torch.isfinite(loss) or not torch.isfinite(grad_norm):
+            optimizer.zero_grad(set_to_none=True)
+            if batch_idx < 5 or (config.log_every > 0 and (batch_idx + 1) % config.log_every == 0):
+                print(f"  [WARN] non-finite NCE at batch {batch_idx + 1}; step skipped")
+            global_step += 1
+            continue
+
         optimizer.step()
 
         # Track energies
@@ -258,8 +285,9 @@ def evaluate_energy_matching(
         v_current = v_noisy.clone()
         for _ in range(50):
             v_grad = v_current.detach().requires_grad_(True)
-            energy = model(v_grad)
-            grad = torch.autograd.grad(energy.sum(), v_grad)[0]
+            with torch.enable_grad():
+                energy = model(v_grad)
+                grad = torch.autograd.grad(energy.sum(), v_grad)[0]
             v_current = v_current - 0.01 * grad
             if config.target_norm is not None:
                 v_current = F.normalize(v_current, dim=-1) * config.target_norm
