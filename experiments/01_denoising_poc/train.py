@@ -220,6 +220,10 @@ def train_epoch_mdsm(
     sigma_min, sigma_max = get_current_sigma_range(config, epoch)
     non_finite_streak = 0
 
+    # Reset non-finite LR backoff at epoch start
+    for pg in optimizer.param_groups:
+        pg["non_finite_scale"] = 1.0
+
     for batch_idx, v_clean in enumerate(dataloader):
         if (batch_idx % 16 == 0) and not parameters_are_finite(model):
             raise RuntimeError(
@@ -284,24 +288,10 @@ def train_epoch_mdsm(
         if scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            if not gradients_are_finite(model):
-                optimizer.zero_grad(set_to_none=True)
-                non_finite_streak += 1
-                skipped_batches += 1
-                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
-                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
-                scaler.update()
-                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
-                    print(
-                        f"  [WARN] non-finite MDSM gradients at batch {batch_idx + 1}, "
-                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
-                        "step skipped"
-                    )
-                if non_finite_streak >= config.max_consecutive_non_finite_batches:
-                    raise RuntimeError(
-                        "Too many consecutive non-finite MDSM gradients; stopping to avoid silent stall."
-                    )
-                continue
+            # Sanitize gradients: replace inf/nan with 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
@@ -312,36 +302,23 @@ def train_epoch_mdsm(
                 scaler.update()
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
-                        f"  [WARN] non-finite clipped grad norm at batch {batch_idx + 1}, "
+                        f"  [WARN] non-finite MDSM clipped grad norm at batch {batch_idx + 1}, "
                         f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
                         "step skipped"
                     )
                 if non_finite_streak >= config.max_consecutive_non_finite_batches:
                     raise RuntimeError(
-                        "Too many consecutive non-finite clipped grad norms; stopping to avoid silent stall."
+                        "Too many consecutive non-finite MDSM clipped grad norms; stopping to avoid silent stall."
                     )
                 continue
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            if not gradients_are_finite(model):
-                optimizer.zero_grad(set_to_none=True)
-                non_finite_streak += 1
-                skipped_batches += 1
-                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
-                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
-                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
-                    print(
-                        f"  [WARN] non-finite MDSM gradients at batch {batch_idx + 1}, "
-                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
-                        "step skipped"
-                    )
-                if non_finite_streak >= config.max_consecutive_non_finite_batches:
-                    raise RuntimeError(
-                        "Too many consecutive non-finite MDSM gradients; stopping to avoid silent stall."
-                    )
-                continue
+            # Sanitize gradients: replace inf/nan with 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
@@ -409,6 +386,10 @@ def train_epoch_contrastive(
     skipped_batches = 0
     non_finite_streak = 0
 
+    # Reset non-finite LR backoff at epoch start
+    for pg in optimizer.param_groups:
+        pg["non_finite_scale"] = 1.0
+
     for batch_idx, v_orig in enumerate(dataloader):
         if (batch_idx % 16 == 0) and not parameters_are_finite(model):
             raise RuntimeError(
@@ -459,24 +440,10 @@ def train_epoch_contrastive(
         if scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            if not gradients_are_finite(model):
-                optimizer.zero_grad(set_to_none=True)
-                non_finite_streak += 1
-                skipped_batches += 1
-                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
-                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
-                scaler.update()
-                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
-                    print(
-                        f"  [WARN] non-finite contrastive gradients at batch {batch_idx + 1}, "
-                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
-                        "step skipped"
-                    )
-                if non_finite_streak >= config.max_consecutive_non_finite_batches:
-                    raise RuntimeError(
-                        "Too many consecutive non-finite contrastive gradients; stopping to avoid silent stall."
-                    )
-                continue
+            # Sanitize gradients: replace inf/nan with 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
@@ -487,36 +454,23 @@ def train_epoch_contrastive(
                 scaler.update()
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
-                        f"  [WARN] non-finite clipped grad norm at batch {batch_idx + 1}, "
+                        f"  [WARN] non-finite contrastive clipped grad norm at batch {batch_idx + 1}, "
                         f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
                         "step skipped"
                     )
                 if non_finite_streak >= config.max_consecutive_non_finite_batches:
                     raise RuntimeError(
-                        "Too many consecutive non-finite clipped grad norms; stopping to avoid silent stall."
+                        "Too many consecutive non-finite contrastive clipped grad norms; stopping to avoid silent stall."
                     )
                 continue
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            if not gradients_are_finite(model):
-                optimizer.zero_grad(set_to_none=True)
-                non_finite_streak += 1
-                skipped_batches += 1
-                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
-                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
-                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
-                    print(
-                        f"  [WARN] non-finite contrastive gradients at batch {batch_idx + 1}, "
-                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
-                        "step skipped"
-                    )
-                if non_finite_streak >= config.max_consecutive_non_finite_batches:
-                    raise RuntimeError(
-                        "Too many consecutive non-finite contrastive gradients; stopping to avoid silent stall."
-                    )
-                continue
+            # Sanitize gradients: replace inf/nan with 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
@@ -526,13 +480,13 @@ def train_epoch_contrastive(
                     apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
-                        f"  [WARN] non-finite clipped grad norm at batch {batch_idx + 1}, "
+                        f"  [WARN] non-finite contrastive clipped grad norm at batch {batch_idx + 1}, "
                         f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
                         "step skipped"
                     )
                 if non_finite_streak >= config.max_consecutive_non_finite_batches:
                     raise RuntimeError(
-                        "Too many consecutive non-finite clipped grad norms; stopping to avoid silent stall."
+                        "Too many consecutive non-finite contrastive clipped grad norms; stopping to avoid silent stall."
                     )
                 continue
             optimizer.step()
@@ -588,6 +542,11 @@ def train_epoch_actor_critic(
     num_batches = 0
     skipped_batches = 0
     non_finite_streak = 0
+
+    # Reset non-finite LR backoff at epoch start so it doesn't compound
+    # permanently across epochs — the scheduler sets the correct LR per epoch.
+    for pg in optimizer.param_groups:
+        pg["non_finite_scale"] = 1.0
 
     if config.actor_use_sigma_curriculum:
         sigma_min, sigma_max = get_current_sigma_range(config, epoch)
@@ -712,24 +671,11 @@ def train_epoch_actor_critic(
         if scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            if not gradients_are_finite_modules([critic, actor]):
-                optimizer.zero_grad(set_to_none=True)
-                non_finite_streak += 1
-                skipped_batches += 1
-                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
-                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
-                scaler.update()
-                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
-                    print(
-                        f"  [WARN] non-finite actor_critic gradients at batch {batch_idx + 1}, "
-                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
-                        "step skipped"
-                    )
-                if non_finite_streak >= config.max_consecutive_non_finite_batches:
-                    raise RuntimeError(
-                        "Too many consecutive non-finite actor_critic gradients; stopping to avoid silent stall."
-                    )
-                continue
+            # Sanitize gradients: replace inf/nan with 0
+            for m in [critic, actor]:
+                for p in m.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(critic.parameters()) + list(actor.parameters()),
                 max_norm=1.0,
@@ -756,23 +702,12 @@ def train_epoch_actor_critic(
             scaler.update()
         else:
             loss.backward()
-            if not gradients_are_finite_modules([critic, actor]):
-                optimizer.zero_grad(set_to_none=True)
-                non_finite_streak += 1
-                skipped_batches += 1
-                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
-                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
-                if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
-                    print(
-                        f"  [WARN] non-finite actor_critic gradients at batch {batch_idx + 1}, "
-                        f"streak={non_finite_streak}, lr={optimizer.param_groups[0]['lr']:.6g}; "
-                        "step skipped"
-                    )
-                if non_finite_streak >= config.max_consecutive_non_finite_batches:
-                    raise RuntimeError(
-                        "Too many consecutive non-finite actor_critic gradients; stopping to avoid silent stall."
-                    )
-                continue
+            # Sanitize gradients: replace inf/nan with 0 so a single
+            # exploding element doesn't discard the entire batch.
+            for m in [critic, actor]:
+                for p in m.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(critic.parameters()) + list(actor.parameters()),
                 max_norm=1.0,

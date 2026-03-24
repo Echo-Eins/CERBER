@@ -51,6 +51,7 @@ class LandscapeData:
     trajectory_xy: list[tuple[float, float]] | None  # Langevin path
     noise_scale: float
     grid_range: float
+    basis: tuple[Tensor, Tensor] | None = None  # (axis1, axis2) for reuse
 
 
 def _make_orthogonal_basis(
@@ -101,6 +102,7 @@ def scan_energy_landscape(
     grid_range: float | None = None,
     v_denoised: Tensor | None = None,
     trajectory: list[Tensor] | None = None,
+    basis: tuple[Tensor, Tensor] | None = None,
 ) -> LandscapeData:
     """
     Scan energy values on a 2D grid slice through 1024d space.
@@ -116,6 +118,8 @@ def scan_energy_landscape(
                      If None, auto-set to 1.5× distance(clean, noisy).
         v_denoised:  [1, D] optional denoised result
         trajectory:  List of [1, D] tensors from Langevin steps
+        basis:       Optional (axis1, axis2) tuple to reuse the same 2D plane
+                     across multiple scans (e.g. before/after comparison).
 
     Returns:
         LandscapeData with energy/cosine grids and point coordinates.
@@ -124,7 +128,10 @@ def scan_energy_landscape(
     v_clean_flat = v_clean.squeeze(0)  # [D]
     v_noisy_flat = v_noisy.squeeze(0)  # [D]
 
-    axis1, axis2 = _make_orthogonal_basis(v_clean_flat, v_noisy_flat)
+    if basis is not None:
+        axis1, axis2 = basis
+    else:
+        axis1, axis2 = _make_orthogonal_basis(v_clean_flat, v_noisy_flat)
 
     # Auto grid range: 1.5× the clean-noisy distance
     if grid_range is None:
@@ -196,6 +203,7 @@ def scan_energy_landscape(
         trajectory_xy=trajectory_xy,
         noise_scale=noise_scale,
         grid_range=grid_range,
+        basis=(axis1, axis2),
     )
 
 

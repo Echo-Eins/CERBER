@@ -201,7 +201,7 @@ class Stage1Config:
     skip_non_finite_batches: bool = True
     max_consecutive_non_finite_batches: int = 20
     non_finite_lr_backoff: float = 0.99
-    non_finite_backoff_streak_trigger: int = 1
+    non_finite_backoff_streak_trigger: int = 5  # only backoff on sustained streaks, not every NaN
     # Logging
     wandb_project: str = "cebcm-stage1"
     use_wandb: bool = False
