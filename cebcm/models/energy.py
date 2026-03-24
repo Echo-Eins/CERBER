@@ -195,7 +195,10 @@ class SimpleEnergy(nn.Module):
         # Guard exponential scaling from numerical blow-up during early training.
         # This keeps the global scale trainable while preventing inf/nan cascades.
         scale = torch.exp(self.log_energy_scale.clamp(min=-8.0, max=8.0))
-        return scale * self.net(x).squeeze(-1)
+        raw = scale * self.net(x).squeeze(-1)
+        # Clamp energy output to prevent extreme values from blowing up
+        # backward pass through OrthoLinear layers.
+        return raw.clamp(min=-100.0, max=100.0)
 
     def _estimate_sigma(self, v_query: Tensor, v_candidate: Tensor) -> Tensor:
         """
