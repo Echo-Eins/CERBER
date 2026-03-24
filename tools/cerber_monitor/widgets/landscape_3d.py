@@ -27,18 +27,28 @@ class Landscape3DWidget(QWidget):
         self.trajectory_line = None
         self.points = {}
         
+        # Scaling parameters
+        self._z_min = 0.0
+        self._z_range = 1.0
+        self._xy_span = 1.0
+        
+    def scale_z(self, z_val):
+        """Scale a true Z value to the visual Z space used by the surface plot."""
+        return (z_val - self._z_min) / self._z_range * (self._xy_span * 0.2)
+        
     def set_surface(self, x, y, z):
         if self.surface is not None:
             self.view.removeItem(self.surface)
             
         # Z Scaling: to make the surface appropriately hilly without being flat or needle-thin
         # we scale Z to match the roughly ~1.0 XY range (or half the grid span)
-        xy_span = max(x.max() - x.min(), y.max() - y.min(), 1.0)
-        z_min, z_max = z.min(), z.max()
-        z_range = max(z_max - z_min, 1e-8)
+        self._xy_span = max(x.max() - x.min(), y.max() - y.min(), 1.0)
+        self._z_min = z.min()
+        z_max = z.max()
+        self._z_range = max(z_max - self._z_min, 1e-8)
         
         # Scale Z to be about 20% of the maximum XY span
-        z_scaled = (z - z_min) / z_range * (xy_span * 0.2)
+        z_scaled = self.scale_z(z)
         
         # Use z_scaled for height and color calculations
         z_norm = (z_scaled - z_scaled.min()) / (z_scaled.max() - z_scaled.min() + 1e-8)
@@ -57,7 +67,7 @@ class Landscape3DWidget(QWidget):
         self.view.pan(-x.mean(), -y.mean(), -(z_scaled.max() + z_scaled.min())/2)
         
         # Adjust zoom: higher distance means viewing from further away
-        self.view.setCameraPosition(distance=xy_span * 1.5, elevation=30, azimuth=45)
+        self.view.setCameraPosition(distance=self._xy_span * 1.5, elevation=30, azimuth=45)
         
     def add_point(self, name, pos, color, size=10):
         if name in self.points:

@@ -408,11 +408,36 @@ class MainWindow(QMainWindow):
         # For now, do it synchronously (can be optimized later)
         try:
             is_uncond = self.ckpt_data.model_type == "unconditional_energy"
+            
+            # Run inference to get trajectory
+            from cebcm.inference.langevin import run_langevin, LangevinMethod
+            
+            # Handle unconditional vs conditional
+            if is_uncond:
+                def e_fn(x): return self.model(x)
+            else:
+                def e_fn(x): return self.model(v_clean, x)
+                
+            res = run_langevin(
+                method=LangevinMethod.OVERDAMPED,
+                energy_fn=e_fn,
+                v_query=v_clean,
+                v_init=v_noisy,
+                lr=0.01,
+                noise_scale=0.0,
+                max_steps=50, # Fast for UI
+                track_vectors=True
+            )
+            v_denoised = res.v_final
+            trajectory = res.v_trajectory
+            
             data = scan_energy_landscape(
                 energy_fn=self.model,
                 v_clean=v_clean,
                 v_noisy=v_noisy,
                 grid_size=40,  # Lower res for faster UI response
+                v_denoised=v_denoised,
+                trajectory=trajectory,
                 unconditional=is_uncond
             )
             
@@ -430,8 +455,16 @@ class MainWindow(QMainWindow):
             clean_z = np.max(z_scaled) + (np.max(z_scaled) - np.min(z_scaled)) * 0.05
             noisy_z = clean_z
             
-            self.landscape_view.add_point("clean", (0, 0, clean_z), (0.0, 1.0, 0.0, 1.0))
-            self.landscape_view.add_point("noisy", (data.v_noisy_xy[0], data.v_noisy_xy[1], noisy_z), (1.0, 0.0, 0.0, 1.0))
+            self.landscape_view.add_point("clean (target)", (0, 0, clean_z), (0.0, 1.0, 0.0, 1.0), size=12)
+            self.landscape_view.add_point("noisy (init)", (data.v_noisy_xy[0], data.v_noisy_xy[1], noisy_z), (1.0, 0.0, 0.0, 1.0), size=12)
+            
+            if data.v_denoised_xy is not None:
+                self.landscape_view.add_point("denoised", (data.v_denoised_xy[0], data.v_denoised_xy[1], noisy_z), (1.0, 1.0, 0.0, 1.0), size=15)
+                
+            if data.trajectory_xy is not None and len(data.trajectory_xy) > 1:
+                # Add trajectory line, floating slightly above surface
+                path_pts = [(x, y, noisy_z) for (x, y) in data.trajectory_xy]
+                self.landscape_view.set_trajectory(path_pts, color=(1.0, 1.0, 0.0, 0.8))
             
             mid = data.cosine_sim.shape[0] // 2
             self.statusBar().showMessage(f"Scan complete. Cos(clean, noisy): {data.cosine_sim[mid, mid]:.4f}")
