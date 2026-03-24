@@ -1,0 +1,668 @@
+((.venv) ) EchoEins@rog15 ~/Coding/Python/CERBER $ python experiments/02_energy_matching/train.py     --data data/wikitext_sonar_10k.pt     --mode nce_warmstart_em
+Device: cuda
+Loading dataset from data/wikitext_sonar_10k.pt...
+  Total vectors: 10500, dim: 1024
+  Train: 10000, Test: 500
+UnconditionalEnergy: 4,722,690 parameters
+  Architecture: norm=orthonorm, activation=groupsort
+  Hidden dims: [2048, 1024, 512]
+  Loss: cosine_em
+  NCE warmstart: True (10 epochs)
+  Prior: N(0, 0.00641²I), target_norm=0.2051
+  Negative buffer: 10000 vectors, seeded from data
+
+============================================================
+Energy Matching Training — 100 epochs
+  Phase 1: NCE warmstart (10 epochs)
+  Phase 2: cosine_em (90 epochs)
+  Batch size: 64, LR: 0.001
+  t range: [0.001, 0.999]
+============================================================
+
+Epoch 1/100 (NCE [1/10])
+  [50/156] NCE_loss=1.3612 E_data=-0.0652 E_noise=-0.0131 gap=0.0522
+  [100/156] NCE_loss=1.3520 E_data=-0.0353 E_noise=0.0353 gap=0.0706
+  [150/156] NCE_loss=226404081407623168.0000 E_data=56103.4844 E_noise=18517.1953 gap=-37586.2891
+  loss=21022114784020828.0000 e_data_mean=-168463982913279584.0000 e_noise_mean=-95121560.5660 energy_gap=168463982818158016.0000 lr=0.000310 (47.1s)
+Epoch 2/100 (NCE [2/10])
+  [WARN] non-finite NCE at batch 3; step skipped
+  [WARN] non-finite NCE at batch 4; step skipped
+  [WARN] non-finite NCE at batch 50; step skipped
+  [100/156] NCE_loss=1.3432 E_data=-0.0319 E_noise=0.0558 gap=0.0878
+  [150/156] NCE_loss=1.3386 E_data=-0.1468 E_noise=6371224030996856832.0000 gap=6371224030996856832.0000
+  loss=45275013866783112.0000 e_data_mean=nan e_noise_mean=-inf energy_gap=nan lr=0.000622 (45.3s)
+Epoch 3/100 (NCE [3/10])
+  [50/156] NCE_loss=0.6698 E_data=-0.0616 E_noise=-3872538227143344128.0000 gap=-3872538227143344128.0000
+  [WARN] non-finite NCE at batch 100; step skipped
+  [150/156] NCE_loss=1.2760 E_data=-0.2643 E_noise=-0.0930 gap=0.1713
+  loss=6951.7392 e_data_mean=347853601980345929957376.0000 e_noise_mean=inf energy_gap=inf lr=0.000934 (46.6s)
+Epoch 4/100 (NCE [4/10])
+  [50/156] NCE_loss=1.2689 E_data=-0.2213 E_noise=0.0304 gap=0.2518
+  [100/156] NCE_loss=1.2121 E_data=-0.1793 E_noise=-0.0121 gap=0.1672
+  [150/156] NCE_loss=1.2022 E_data=-0.4584 E_noise=1.5685 gap=2.0270
+  loss=910913533921318.0000 e_data_mean=676570744846555648.0000 e_noise_mean=111410143310798960.0000 energy_gap=-565160601535756608.0000 lr=0.000998 (48.2s)
+Epoch 5/100 (NCE [5/10])
+  [WARN] non-finite NCE at batch 50; step skipped
+  [100/156] NCE_loss=1.0627 E_data=-0.4389 E_noise=0.3195 gap=0.7584
+  [150/156] NCE_loss=1.0176 E_data=-0.4753 E_noise=0.4189 gap=0.8942
+  loss=55170512170243.4062 e_data_mean=-1413406980265187840.0000 e_noise_mean=1081629625126594176.0000 energy_gap=2495036605391781888.0000 lr=0.000997 (48.2s)
+  Evaluating...
+    noise_0.05: cos 0.5308 → 0.4760 (Δ=-0.0548, success=12%)
+    noise_0.1: cos 0.2978 → 0.2850 (Δ=-0.0129, success=43%)
+    noise_0.2: cos 0.1591 → 0.1013 (Δ=-0.0578, success=19%)
+    noise_0.3: cos 0.1119 → 0.1258 (Δ=+0.0138, success=53%)
+    samples: norm=0.2051±0.0000 (data=0.2719), pairwise_cos=1.0000 (data=0.1303)
+    * New best (avg improvement: -0.0279)
+Epoch 6/100 (NCE [6/10])
+  [50/156] NCE_loss=1.0908 E_data=0.0938 E_noise=1.2550 gap=1.1613
+  [100/156] NCE_loss=0.8830 E_data=-0.4994 E_noise=0.8208 gap=1.3202
+  [150/156] NCE_loss=0.7739 E_data=-0.8197 E_noise=0.8367 gap=1.6564
+  loss=28290.2711 e_data_mean=229996388484148992.0000 e_noise_mean=-752411999694725888.0000 energy_gap=-982408388178875008.0000 lr=0.000996 (49.1s)
+Epoch 7/100 (NCE [7/10])
+  [50/156] NCE_loss=0.6687 E_data=-0.8510 E_noise=1.2752 gap=2.1262
+  [100/156] NCE_loss=0.6106 E_data=-1.2031 E_noise=1.1477 gap=2.3508
+  [150/156] NCE_loss=0.5577 E_data=-1.2997 E_noise=1.2566 gap=2.5563
+  loss=418.8235 e_data_mean=11536634621472450.0000 e_noise_mean=-402.6519 energy_gap=-11536634621472852.0000 lr=0.000994 (48.5s)
+Epoch 8/100 (NCE [8/10])
+  [50/156] NCE_loss=0.4998 E_data=-1.5993 E_noise=1.3462 gap=2.9455
+  [100/156] NCE_loss=0.4431 E_data=-1.4521 E_noise=1.7465 gap=3.1986
+  [150/156] NCE_loss=0.4113 E_data=-1.6045 E_noise=1.7958 gap=3.4002
+  loss=0.5248 e_data_mean=424476528663255104.0000 e_noise_mean=35376.4854 energy_gap=-424476528663219712.0000 lr=0.000992 (48.5s)
+Epoch 9/100 (NCE [9/10])
+  [50/156] NCE_loss=0.3903 E_data=-1.5993 E_noise=1.8902 gap=3.4895
+  [100/156] NCE_loss=0.3157 E_data=-1.7970 E_noise=2.1731 gap=3.9701
+  [150/156] NCE_loss=0.3262 E_data=-1.8476 E_noise=4628244663541694464.0000 gap=4628244663541694464.0000
+  loss=193.2098 e_data_mean=31089373593267668.0000 e_noise_mean=-768148092341247360.0000 energy_gap=-799237465934515072.0000 lr=0.000990 (48.5s)
+Epoch 10/100 (NCE [10/10])
+  [50/156] NCE_loss=0.2814 E_data=-1.9079 E_noise=2.3052 gap=4.2131
+  [100/156] NCE_loss=0.2475 E_data=-2.4198 E_noise=2.5388 gap=4.9586
+  [150/156] NCE_loss=0.2533 E_data=-2.1305 E_noise=2.5031 gap=4.6336
+  loss=133.5062 e_data_mean=87118313699239984.0000 e_noise_mean=367975299772419584.0000 energy_gap=280856986073179552.0000 lr=0.000987 (48.3s)
+  Evaluating...
+    noise_0.05: cos 0.5339 → 0.0817 (Δ=-0.4522, success=0%)
+    noise_0.1: cos 0.2980 → 0.0005 (Δ=-0.2975, success=0%)
+    noise_0.2: cos 0.1571 → 0.0118 (Δ=-0.1454, success=3%)
+    noise_0.3: cos 0.1075 → 0.0198 (Δ=-0.0877, success=10%)
+    samples: norm=0.2051±0.0000 (data=0.2712), pairwise_cos=0.2689 (data=0.1264)
+Epoch 11/100 (EM [1])
+  [50/156] loss=1.405890 lr=0.000987 E_scale=3.83
+  [100/156] loss=0.998924 lr=0.000987 E_scale=3.74
+  [150/156] loss=0.893630 lr=0.000987 E_scale=3.68
+  loss=10.9465 lr=0.000984 (18.0s)
+Epoch 12/100 (EM [2])
+  [50/156] loss=0.914249 lr=0.000984 E_scale=3.61
+  [100/156] loss=0.836057 lr=0.000984 E_scale=3.55
+  [150/156] loss=0.880060 lr=0.000984 E_scale=3.49
+  loss=0.8615 lr=0.000980 (17.9s)
+Epoch 13/100 (EM [3])
+  [50/156] loss=0.780390 lr=0.000980 E_scale=3.43
+  [100/156] loss=0.803578 lr=0.000980 E_scale=3.38
+  [150/156] loss=0.790355 lr=0.000980 E_scale=3.33
+  loss=0.8001 lr=0.000976 (17.9s)
+Epoch 14/100 (EM [4])
+  [50/156] loss=0.780879 lr=0.000976 E_scale=3.27
+  [100/156] loss=0.780979 lr=0.000976 E_scale=3.21
+  [150/156] loss=0.741483 lr=0.000976 E_scale=3.14
+  loss=0.9416 lr=0.000971 (17.9s)
+Epoch 15/100 (EM [5])
+  [50/156] loss=0.731073 lr=0.000971 E_scale=3.07
+  [100/156] loss=0.776289 lr=0.000971 E_scale=2.99
+  [150/156] loss=0.761653 lr=0.000971 E_scale=2.91
+  loss=865483116625.1888 lr=0.000966 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5329 → 0.2504 (Δ=-0.2825, success=0%)
+    noise_0.1: cos 0.2994 → 0.3516 (Δ=+0.0522, success=88%)
+    noise_0.2: cos 0.1571 → 0.2095 (Δ=+0.0524, success=84%)
+    noise_0.3: cos 0.1035 → 0.2298 (Δ=+0.1263, success=99%)
+    samples: norm=0.2051±0.0000 (data=0.2699), pairwise_cos=0.4935 (data=0.1327)
+    * New best (avg improvement: -0.0129)
+Epoch 16/100 (EM [6])
+  [50/156] loss=0.893405 lr=0.000966 E_scale=2.83
+  [100/156] loss=0.734897 lr=0.000966 E_scale=2.74
+  [150/156] loss=0.707710 lr=0.000966 E_scale=2.68
+  loss=2183688825301.2256 lr=0.000961 (17.9s)
+Epoch 17/100 (EM [7])
+  [50/156] loss=0.716005 lr=0.000961 E_scale=2.62
+  [100/156] loss=0.707463 lr=0.000961 E_scale=2.56
+  [150/156] loss=0.721319 lr=0.000961 E_scale=2.49
+  loss=486626667884.0749 lr=0.000955 (17.9s)
+Epoch 18/100 (EM [8])
+  [50/156] loss=0.682429 lr=0.000955 E_scale=2.43
+  [100/156] loss=0.735746 lr=0.000955 E_scale=2.38
+  [150/156] loss=0.684966 lr=0.000955 E_scale=2.34
+  loss=296926916582.2620 lr=0.000949 (17.9s)
+Epoch 19/100 (EM [9])
+  [50/156] loss=0.677692 lr=0.000949 E_scale=2.26
+  [100/156] loss=0.682088 lr=0.000949 E_scale=2.19
+  [150/156] loss=8305656725504.000000 lr=0.000949 E_scale=2.13
+  loss=551942622541.1310 lr=0.000942 (17.9s)
+Epoch 20/100 (EM [10])
+  [50/156] loss=0.713291 lr=0.000942 E_scale=2.07
+  [100/156] loss=0.654685 lr=0.000942 E_scale=2.01
+  [150/156] loss=0.673158 lr=0.000942 E_scale=1.97
+  loss=93240685279.8478 lr=0.000935 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5306 → 0.5552 (Δ=+0.0246, success=75%)
+    noise_0.1: cos 0.2973 → 0.4120 (Δ=+0.1147, success=100%)
+    noise_0.2: cos 0.1572 → 0.0839 (Δ=-0.0734, success=3%)
+    noise_0.3: cos 0.1017 → 0.2575 (Δ=+0.1558, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2709), pairwise_cos=0.8328 (data=0.1312)
+    * New best (avg improvement: +0.0554)
+Epoch 21/100 (EM [11])
+  [50/156] loss=0.620932 lr=0.000935 E_scale=1.91
+  [100/156] loss=0.671715 lr=0.000935 E_scale=1.87
+  [150/156] loss=0.629467 lr=0.000935 E_scale=1.83
+  loss=0.6641 lr=0.000928 (18.0s)
+Epoch 22/100 (EM [12])
+  [50/156] loss=0.618772 lr=0.000928 E_scale=1.79
+  [100/156] loss=0.663718 lr=0.000928 E_scale=1.75
+  [150/156] loss=0.669531 lr=0.000928 E_scale=1.72
+  loss=0.6452 lr=0.000920 (18.0s)
+Epoch 23/100 (EM [13])
+  [50/156] loss=0.668463 lr=0.000920 E_scale=1.67
+  [100/156] loss=0.621933 lr=0.000920 E_scale=1.64
+  [150/156] loss=0.694606 lr=0.000920 E_scale=1.61
+  loss=78866818915.0852 lr=0.000912 (18.0s)
+Epoch 24/100 (EM [14])
+  [50/156] loss=0.609196 lr=0.000912 E_scale=1.57
+  [100/156] loss=0.650519 lr=0.000912 E_scale=1.55
+  [150/156] loss=0.618815 lr=0.000912 E_scale=1.51
+  loss=9494422720.2305 lr=0.000904 (18.0s)
+Epoch 25/100 (EM [15])
+  [50/156] loss=0.588278 lr=0.000904 E_scale=1.48
+  [100/156] loss=0.612544 lr=0.000904 E_scale=1.45
+  [150/156] loss=0.645159 lr=0.000904 E_scale=1.42
+  loss=5041346718.1807 lr=0.000895 (18.0s)
+  Evaluating...
+    noise_0.05: cos 0.5312 → 0.5899 (Δ=+0.0586, success=95%)
+    noise_0.1: cos 0.2935 → 0.0652 (Δ=-0.2283, success=0%)
+    noise_0.2: cos 0.1550 → 0.1231 (Δ=-0.0319, success=35%)
+    noise_0.3: cos 0.1040 → 0.2630 (Δ=+0.1590, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2703), pairwise_cos=0.5170 (data=0.1278)
+Epoch 26/100 (EM [16])
+  [50/156] loss=0.648021 lr=0.000895 E_scale=1.38
+  [100/156] loss=0.647302 lr=0.000895 E_scale=1.36
+  [150/156] loss=0.619391 lr=0.000895 E_scale=1.33
+  loss=5788019938.7124 lr=0.000886 (18.0s)
+Epoch 27/100 (EM [17])
+  [50/156] loss=0.616395 lr=0.000886 E_scale=1.31
+  [100/156] loss=0.593011 lr=0.000886 E_scale=1.29
+  [150/156] loss=0.618791 lr=0.000886 E_scale=1.28
+  loss=4767649290.5326 lr=0.000876 (18.1s)
+Epoch 28/100 (EM [18])
+  [50/156] loss=0.605417 lr=0.000876 E_scale=1.25
+  [100/156] loss=0.596062 lr=0.000876 E_scale=1.23
+  [150/156] loss=0.604620 lr=0.000876 E_scale=1.21
+  loss=22795691474.0562 lr=0.000866 (18.1s)
+Epoch 29/100 (EM [19])
+  [50/156] loss=0.592506 lr=0.000866 E_scale=1.20
+  [100/156] loss=0.628064 lr=0.000866 E_scale=1.18
+  [150/156] loss=0.624964 lr=0.000866 E_scale=1.17
+  loss=0.6107 lr=0.000856 (18.1s)
+Epoch 30/100 (EM [20])
+  [50/156] loss=0.613819 lr=0.000856 E_scale=1.16
+  [100/156] loss=0.613771 lr=0.000856 E_scale=1.15
+  [150/156] loss=0.574278 lr=0.000856 E_scale=1.15
+  loss=0.6061 lr=0.000846 (18.1s)
+  Evaluating...
+    noise_0.05: cos 0.5285 → 0.0522 (Δ=-0.4763, success=0%)
+    noise_0.1: cos 0.2968 → 0.1852 (Δ=-0.1116, success=0%)
+    noise_0.2: cos 0.1568 → 0.0627 (Δ=-0.0941, success=4%)
+    noise_0.3: cos 0.0987 → 0.0674 (Δ=-0.0314, success=26%)
+    samples: norm=0.2051±0.0000 (data=0.2775), pairwise_cos=0.5743 (data=0.1243)
+Epoch 31/100 (EM [21])
+  [50/156] loss=0.570232 lr=0.000846 E_scale=1.14
+  [100/156] loss=0.567743 lr=0.000846 E_scale=1.12
+  [150/156] loss=0.561488 lr=0.000846 E_scale=1.11
+  loss=1292945303.5714 lr=0.000835 (18.0s)
+Epoch 32/100 (EM [22])
+  [50/156] loss=0.595621 lr=0.000835 E_scale=1.10
+  [WARN] non-finite EM loss at batch 100; step skipped
+  [150/156] loss=0.574944 lr=0.000835 E_scale=1.08
+  loss=0.6027 lr=0.000824 (18.0s)
+Epoch 33/100 (EM [23])
+  [50/156] loss=0.592494 lr=0.000824 E_scale=1.07
+  [100/156] loss=0.611437 lr=0.000824 E_scale=1.06
+  [150/156] loss=0.623568 lr=0.000824 E_scale=1.05
+  loss=425683225.6951 lr=0.000813 (18.0s)
+Epoch 34/100 (EM [24])
+  [50/156] loss=0.630500 lr=0.000813 E_scale=1.04
+  [100/156] loss=0.607694 lr=0.000813 E_scale=1.02
+  [150/156] loss=0.623054 lr=0.000813 E_scale=1.01
+  loss=149131953395.4516 lr=0.000801 (18.0s)
+Epoch 35/100 (EM [25])
+  [50/156] loss=0.565109 lr=0.000801 E_scale=1.00
+  [100/156] loss=0.594404 lr=0.000801 E_scale=0.99
+  [150/156] loss=0.580623 lr=0.000801 E_scale=0.98
+  loss=0.5948 lr=0.000790 (18.0s)
+  Evaluating...
+    noise_0.05: cos 0.5299 → 0.1054 (Δ=-0.4244, success=0%)
+    noise_0.1: cos 0.2982 → 0.4461 (Δ=+0.1479, success=100%)
+    noise_0.2: cos 0.1474 → 0.3061 (Δ=+0.1587, success=100%)
+    noise_0.3: cos 0.1031 → 0.2566 (Δ=+0.1535, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2714), pairwise_cos=0.4496 (data=0.1282)
+Epoch 36/100 (EM [26])
+  [50/156] loss=0.592939 lr=0.000790 E_scale=0.98
+  [100/156] loss=0.626371 lr=0.000790 E_scale=0.97
+  [150/156] loss=0.591814 lr=0.000790 E_scale=0.97
+  loss=0.5942 lr=0.000778 (18.0s)
+Epoch 37/100 (EM [27])
+  [50/156] loss=0.554126 lr=0.000778 E_scale=0.96
+  [100/156] loss=0.562567 lr=0.000778 E_scale=0.95
+  [150/156] loss=0.545636 lr=0.000778 E_scale=0.95
+  loss=0.5969 lr=0.000765 (18.0s)
+Epoch 38/100 (EM [28])
+  [50/156] loss=0.588472 lr=0.000765 E_scale=0.94
+  [100/156] loss=0.626129 lr=0.000765 E_scale=0.93
+  [150/156] loss=0.576633 lr=0.000765 E_scale=0.92
+  loss=79581521.5187 lr=0.000753 (18.0s)
+Epoch 39/100 (EM [29])
+  [50/156] loss=0.592579 lr=0.000753 E_scale=0.91
+  [100/156] loss=0.543507 lr=0.000753 E_scale=0.91
+  [150/156] loss=0.542327 lr=0.000753 E_scale=0.90
+  loss=0.5884 lr=0.000740 (18.0s)
+Epoch 40/100 (EM [30])
+  [50/156] loss=0.659543 lr=0.000740 E_scale=0.90
+  [100/156] loss=0.549054 lr=0.000740 E_scale=0.89
+  [150/156] loss=0.622832 lr=0.000740 E_scale=0.89
+  loss=20547389.6964 lr=0.000727 (18.0s)
+  Evaluating...
+    noise_0.05: cos 0.5305 → 0.2598 (Δ=-0.2707, success=0%)
+    noise_0.1: cos 0.2997 → 0.4494 (Δ=+0.1497, success=100%)
+    noise_0.2: cos 0.1567 → 0.2001 (Δ=+0.0435, success=83%)
+    noise_0.3: cos 0.1030 → 0.2587 (Δ=+0.1557, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2726), pairwise_cos=0.4001 (data=0.1259)
+Epoch 41/100 (EM [31])
+  [50/156] loss=0.604631 lr=0.000727 E_scale=0.88
+  [100/156] loss=0.622203 lr=0.000727 E_scale=0.88
+  [150/156] loss=0.597888 lr=0.000727 E_scale=0.87
+  loss=0.5900 lr=0.000714 (18.0s)
+Epoch 42/100 (EM [32])
+  [50/156] loss=0.600152 lr=0.000714 E_scale=0.87
+  [100/156] loss=0.580183 lr=0.000714 E_scale=0.86
+  [150/156] loss=0.630689 lr=0.000714 E_scale=0.86
+  loss=0.5904 lr=0.000701 (18.0s)
+Epoch 43/100 (EM [33])
+  [50/156] loss=0.567673 lr=0.000701 E_scale=0.85
+  [100/156] loss=0.609707 lr=0.000701 E_scale=0.85
+  [150/156] loss=0.567660 lr=0.000701 E_scale=0.84
+  loss=0.5916 lr=0.000688 (18.0s)
+Epoch 44/100 (EM [34])
+  [50/156] loss=0.625398 lr=0.000688 E_scale=0.84
+  [100/156] loss=0.607128 lr=0.000688 E_scale=0.83
+  [150/156] loss=0.601924 lr=0.000688 E_scale=0.83
+  loss=32810926.0052 lr=0.000674 (18.0s)
+Epoch 45/100 (EM [35])
+  [50/156] loss=0.632439 lr=0.000674 E_scale=0.82
+  [100/156] loss=0.608747 lr=0.000674 E_scale=0.81
+  [150/156] loss=0.581211 lr=0.000674 E_scale=0.81
+  loss=0.5875 lr=0.000661 (18.0s)
+  Evaluating...
+    noise_0.05: cos 0.5300 → 0.6317 (Δ=+0.1017, success=100%)
+    noise_0.1: cos 0.2982 → 0.4484 (Δ=+0.1502, success=100%)
+    noise_0.2: cos 0.1514 → 0.3014 (Δ=+0.1500, success=100%)
+    noise_0.3: cos 0.1039 → 0.2545 (Δ=+0.1506, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2741), pairwise_cos=0.3678 (data=0.1268)
+    * New best (avg improvement: +0.1381)
+Epoch 46/100 (EM [36])
+  [50/156] loss=0.591743 lr=0.000661 E_scale=0.81
+  [100/156] loss=0.557918 lr=0.000661 E_scale=0.80
+  [150/156] loss=0.593763 lr=0.000661 E_scale=0.80
+  loss=0.5837 lr=0.000647 (18.0s)
+Epoch 47/100 (EM [37])
+  [50/156] loss=0.593069 lr=0.000647 E_scale=0.80
+  [100/156] loss=0.586014 lr=0.000647 E_scale=0.79
+  [150/156] loss=0.545405 lr=0.000647 E_scale=0.79
+  loss=0.5849 lr=0.000633 (18.0s)
+Epoch 48/100 (EM [38])
+  [50/156] loss=0.558979 lr=0.000633 E_scale=0.79
+  [100/156] loss=0.561027 lr=0.000633 E_scale=0.78
+  [150/156] loss=0.556304 lr=0.000633 E_scale=0.78
+  loss=1250649.0925 lr=0.000619 (18.0s)
+Epoch 49/100 (EM [39])
+  [50/156] loss=0.583886 lr=0.000619 E_scale=0.78
+  [100/156] loss=0.564362 lr=0.000619 E_scale=0.77
+  [150/156] loss=0.603745 lr=0.000619 E_scale=0.77
+  loss=0.5829 lr=0.000605 (18.0s)
+Epoch 50/100 (EM [40])
+  [50/156] loss=0.607538 lr=0.000605 E_scale=0.77
+  [100/156] loss=0.580552 lr=0.000605 E_scale=0.76
+  [150/156] loss=0.597044 lr=0.000605 E_scale=0.76
+  loss=0.5846 lr=0.000591 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5301 → 0.6331 (Δ=+0.1029, success=100%)
+    noise_0.1: cos 0.2977 → 0.4486 (Δ=+0.1509, success=100%)
+    noise_0.2: cos 0.1569 → 0.3067 (Δ=+0.1498, success=100%)
+    noise_0.3: cos 0.1046 → 0.2535 (Δ=+0.1489, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2753), pairwise_cos=0.3082 (data=0.1253)
+    * New best (avg improvement: +0.1382)
+Epoch 51/100 (EM [41])
+  [50/156] loss=0.558900 lr=0.000591 E_scale=0.76
+  [100/156] loss=0.578965 lr=0.000591 E_scale=0.76
+  [150/156] loss=0.589496 lr=0.000591 E_scale=0.76
+  loss=1410400.0615 lr=0.000577 (17.9s)
+Epoch 52/100 (EM [42])
+  [50/156] loss=0.560239 lr=0.000577 E_scale=0.76
+  [100/156] loss=0.581152 lr=0.000577 E_scale=0.75
+  [150/156] loss=0.539880 lr=0.000577 E_scale=0.75
+  loss=0.5794 lr=0.000563 (17.9s)
+Epoch 53/100 (EM [43])
+  [50/156] loss=0.571078 lr=0.000563 E_scale=0.75
+  [100/156] loss=0.585779 lr=0.000563 E_scale=0.75
+  [150/156] loss=0.576731 lr=0.000563 E_scale=0.75
+  loss=0.5749 lr=0.000549 (17.9s)
+Epoch 54/100 (EM [44])
+  [50/156] loss=0.587301 lr=0.000549 E_scale=0.75
+  [100/156] loss=0.636872 lr=0.000549 E_scale=0.74
+  [150/156] loss=0.571991 lr=0.000549 E_scale=0.74
+  loss=0.5771 lr=0.000535 (17.9s)
+Epoch 55/100 (EM [45])
+  [50/156] loss=0.574956 lr=0.000535 E_scale=0.74
+  [100/156] loss=0.558220 lr=0.000535 E_scale=0.74
+  [150/156] loss=0.568967 lr=0.000535 E_scale=0.74
+  loss=0.5772 lr=0.000521 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5305 → 0.6327 (Δ=+0.1022, success=100%)
+    noise_0.1: cos 0.2976 → 0.4365 (Δ=+0.1388, success=100%)
+    noise_0.2: cos 0.1493 → 0.2876 (Δ=+0.1383, success=100%)
+    noise_0.3: cos 0.1027 → 0.2342 (Δ=+0.1315, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2678), pairwise_cos=0.4149 (data=0.1271)
+Epoch 56/100 (EM [46])
+  [50/156] loss=0.571240 lr=0.000521 E_scale=0.74
+  [100/156] loss=0.615577 lr=0.000521 E_scale=0.73
+  [150/156] loss=0.613324 lr=0.000521 E_scale=0.73
+  loss=0.5730 lr=0.000507 (18.0s)
+Epoch 57/100 (EM [47])
+  [50/156] loss=0.560526 lr=0.000507 E_scale=0.73
+  [100/156] loss=0.573702 lr=0.000507 E_scale=0.73
+  [150/156] loss=0.566522 lr=0.000507 E_scale=0.73
+  loss=0.5714 lr=0.000493 (18.0s)
+Epoch 58/100 (EM [48])
+  [50/156] loss=0.589681 lr=0.000493 E_scale=0.73
+  [100/156] loss=0.597872 lr=0.000493 E_scale=0.72
+  [150/156] loss=0.557065 lr=0.000493 E_scale=0.72
+  loss=0.5735 lr=0.000479 (17.9s)
+Epoch 59/100 (EM [49])
+  [50/156] loss=0.618337 lr=0.000479 E_scale=0.72
+  [100/156] loss=0.597867 lr=0.000479 E_scale=0.72
+  [150/156] loss=0.564389 lr=0.000479 E_scale=0.72
+  loss=1444721.1855 lr=0.000465 (18.0s)
+Epoch 60/100 (EM [50])
+  [50/156] loss=0.593798 lr=0.000465 E_scale=0.72
+  [100/156] loss=0.568116 lr=0.000465 E_scale=0.72
+  [150/156] loss=0.556354 lr=0.000465 E_scale=0.71
+  loss=0.5706 lr=0.000451 (18.0s)
+  Evaluating...
+    noise_0.05: cos 0.5228 → 0.6247 (Δ=+0.1019, success=100%)
+    noise_0.1: cos 0.2964 → 0.4301 (Δ=+0.1337, success=100%)
+    noise_0.2: cos 0.1472 → 0.2779 (Δ=+0.1307, success=100%)
+    noise_0.3: cos 0.1032 → 0.0228 (Δ=-0.0804, success=7%)
+    samples: norm=0.2051±0.0000 (data=0.2805), pairwise_cos=0.2656 (data=0.1246)
+Epoch 61/100 (EM [51])
+  [50/156] loss=0.497914 lr=0.000451 E_scale=0.71
+  [100/156] loss=0.591438 lr=0.000451 E_scale=0.71
+  [150/156] loss=0.653923 lr=0.000451 E_scale=0.71
+  loss=0.5698 lr=0.000437 (18.0s)
+Epoch 62/100 (EM [52])
+  [50/156] loss=0.606805 lr=0.000437 E_scale=0.71
+  [100/156] loss=0.549698 lr=0.000437 E_scale=0.70
+  [150/156] loss=0.569952 lr=0.000437 E_scale=0.70
+  loss=0.5715 lr=0.000424 (17.9s)
+Epoch 63/100 (EM [53])
+  [50/156] loss=0.554162 lr=0.000424 E_scale=0.70
+  [100/156] loss=0.582934 lr=0.000424 E_scale=0.70
+  [150/156] loss=0.588367 lr=0.000424 E_scale=0.70
+  loss=0.5687 lr=0.000410 (18.0s)
+Epoch 64/100 (EM [54])
+  [50/156] loss=0.591810 lr=0.000410 E_scale=0.70
+  [100/156] loss=0.588020 lr=0.000410 E_scale=0.70
+  [150/156] loss=0.558164 lr=0.000410 E_scale=0.70
+  loss=0.5692 lr=0.000397 (18.0s)
+Epoch 65/100 (EM [55])
+  [50/156] loss=0.562653 lr=0.000397 E_scale=0.70
+  [100/156] loss=0.573771 lr=0.000397 E_scale=0.70
+  [150/156] loss=0.536295 lr=0.000397 E_scale=0.70
+  loss=0.5686 lr=0.000384 (18.0s)
+  Evaluating...
+    noise_0.05: cos 0.5282 → 0.6317 (Δ=+0.1034, success=100%)
+    noise_0.1: cos 0.3012 → 0.4341 (Δ=+0.1329, success=100%)
+    noise_0.2: cos 0.1539 → 0.2869 (Δ=+0.1330, success=100%)
+    noise_0.3: cos 0.1112 → 0.2360 (Δ=+0.1248, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2736), pairwise_cos=0.2412 (data=0.1357)
+Epoch 66/100 (EM [56])
+  [50/156] loss=0.571528 lr=0.000384 E_scale=0.70
+  [100/156] loss=0.546051 lr=0.000384 E_scale=0.69
+  [150/156] loss=0.570308 lr=0.000384 E_scale=0.69
+  loss=0.5686 lr=0.000371 (18.0s)
+Epoch 67/100 (EM [57])
+  [50/156] loss=0.586283 lr=0.000371 E_scale=0.69
+  [100/156] loss=0.534626 lr=0.000371 E_scale=0.69
+  [150/156] loss=0.594737 lr=0.000371 E_scale=0.69
+  loss=0.5674 lr=0.000358 (18.0s)
+Epoch 68/100 (EM [58])
+  [50/156] loss=0.562609 lr=0.000358 E_scale=0.69
+  [100/156] loss=0.580090 lr=0.000358 E_scale=0.69
+  [150/156] loss=0.567042 lr=0.000358 E_scale=0.69
+  loss=0.5629 lr=0.000345 (18.0s)
+Epoch 69/100 (EM [59])
+  [50/156] loss=0.554752 lr=0.000345 E_scale=0.69
+  [100/156] loss=0.536294 lr=0.000345 E_scale=0.69
+  [150/156] loss=0.558348 lr=0.000345 E_scale=0.69
+  loss=0.5662 lr=0.000333 (18.0s)
+Epoch 70/100 (EM [60])
+  [50/156] loss=0.611984 lr=0.000333 E_scale=0.69
+  [100/156] loss=0.591921 lr=0.000333 E_scale=0.69
+  [150/156] loss=0.566802 lr=0.000333 E_scale=0.69
+  loss=0.5645 lr=0.000320 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5275 → 0.1796 (Δ=-0.3479, success=0%)
+    noise_0.1: cos 0.2976 → 0.4249 (Δ=+0.1273, success=100%)
+    noise_0.2: cos 0.1587 → 0.2815 (Δ=+0.1228, success=100%)
+    noise_0.3: cos 0.0998 → 0.2165 (Δ=+0.1168, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2716), pairwise_cos=0.2292 (data=0.1328)
+Epoch 71/100 (EM [61])
+  [50/156] loss=0.585378 lr=0.000320 E_scale=0.69
+  [100/156] loss=0.550189 lr=0.000320 E_scale=0.69
+  [150/156] loss=0.576331 lr=0.000320 E_scale=0.69
+  loss=9698763.2277 lr=0.000308 (17.9s)
+Epoch 72/100 (EM [62])
+  [50/156] loss=0.609280 lr=0.000308 E_scale=0.69
+  [100/156] loss=0.553280 lr=0.000308 E_scale=0.69
+  [150/156] loss=0.550462 lr=0.000308 E_scale=0.69
+  loss=0.5594 lr=0.000297 (17.9s)
+Epoch 73/100 (EM [63])
+  [50/156] loss=0.569056 lr=0.000297 E_scale=0.69
+  [100/156] loss=0.576429 lr=0.000297 E_scale=0.69
+  [150/156] loss=0.518306 lr=0.000297 E_scale=0.69
+  loss=0.5681 lr=0.000285 (18.0s)
+Epoch 74/100 (EM [64])
+  [50/156] loss=0.592018 lr=0.000285 E_scale=0.69
+  [100/156] loss=0.559502 lr=0.000285 E_scale=0.69
+  [150/156] loss=0.597505 lr=0.000285 E_scale=0.69
+  loss=0.5630 lr=0.000274 (17.9s)
+Epoch 75/100 (EM [65])
+  [50/156] loss=0.573402 lr=0.000274 E_scale=0.69
+  [100/156] loss=0.542026 lr=0.000274 E_scale=0.69
+  [150/156] loss=0.569571 lr=0.000274 E_scale=0.69
+  loss=0.5619 lr=0.000263 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5287 → 0.6307 (Δ=+0.1020, success=100%)
+    noise_0.1: cos 0.2965 → 0.4251 (Δ=+0.1286, success=100%)
+    noise_0.2: cos 0.1517 → 0.2779 (Δ=+0.1262, success=100%)
+    noise_0.3: cos 0.1015 → 0.2244 (Δ=+0.1229, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2754), pairwise_cos=0.2427 (data=0.1298)
+Epoch 76/100 (EM [66])
+  [50/156] loss=0.567303 lr=0.000263 E_scale=0.69
+  [100/156] loss=0.556243 lr=0.000263 E_scale=0.69
+  [150/156] loss=0.566157 lr=0.000263 E_scale=0.69
+  loss=0.5627 lr=0.000252 (17.9s)
+Epoch 77/100 (EM [67])
+  [50/156] loss=0.524018 lr=0.000252 E_scale=0.69
+  [100/156] loss=0.552784 lr=0.000252 E_scale=0.69
+  [150/156] loss=0.555963 lr=0.000252 E_scale=0.70
+  loss=0.5591 lr=0.000242 (17.9s)
+Epoch 78/100 (EM [68])
+  [50/156] loss=0.555252 lr=0.000242 E_scale=0.70
+  [100/156] loss=0.531138 lr=0.000242 E_scale=0.70
+  [150/156] loss=0.585568 lr=0.000242 E_scale=0.70
+  loss=0.5605 lr=0.000232 (17.9s)
+Epoch 79/100 (EM [69])
+  [50/156] loss=0.563611 lr=0.000232 E_scale=0.70
+  [100/156] loss=0.545001 lr=0.000232 E_scale=0.70
+  [150/156] loss=0.549151 lr=0.000232 E_scale=0.70
+  loss=0.5569 lr=0.000222 (17.9s)
+Epoch 80/100 (EM [70])
+  [50/156] loss=0.639263 lr=0.000222 E_scale=0.70
+  [100/156] loss=0.584010 lr=0.000222 E_scale=0.70
+  [150/156] loss=0.552527 lr=0.000222 E_scale=0.71
+  loss=0.5565 lr=0.000212 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5319 → 0.6311 (Δ=+0.0992, success=100%)
+    noise_0.1: cos 0.2972 → 0.4228 (Δ=+0.1256, success=100%)
+    noise_0.2: cos 0.1528 → 0.2770 (Δ=+0.1242, success=100%)
+    noise_0.3: cos 0.1028 → 0.2218 (Δ=+0.1190, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2677), pairwise_cos=0.2140 (data=0.1334)
+Epoch 81/100 (EM [71])
+  [50/156] loss=0.551034 lr=0.000212 E_scale=0.71
+  [100/156] loss=0.554101 lr=0.000212 E_scale=0.71
+  [150/156] loss=0.525322 lr=0.000212 E_scale=0.71
+  loss=0.5563 lr=0.000203 (17.9s)
+Epoch 82/100 (EM [72])
+  [50/156] loss=0.558138 lr=0.000203 E_scale=0.71
+  [100/156] loss=0.537056 lr=0.000203 E_scale=0.71
+  [150/156] loss=0.576029 lr=0.000203 E_scale=0.71
+  loss=4826484.6562 lr=0.000194 (17.9s)
+Epoch 83/100 (EM [73])
+  [50/156] loss=0.592148 lr=0.000194 E_scale=0.71
+  [100/156] loss=0.534875 lr=0.000194 E_scale=0.71
+  [150/156] loss=0.525364 lr=0.000194 E_scale=0.71
+  loss=0.5555 lr=0.000186 (17.9s)
+Epoch 84/100 (EM [74])
+  [50/156] loss=0.531954 lr=0.000186 E_scale=0.71
+  [100/156] loss=0.575964 lr=0.000186 E_scale=0.71
+  [150/156] loss=0.551726 lr=0.000186 E_scale=0.72
+  loss=0.5555 lr=0.000178 (17.9s)
+Epoch 85/100 (EM [75])
+  [50/156] loss=0.519545 lr=0.000178 E_scale=0.72
+  [100/156] loss=0.545902 lr=0.000178 E_scale=0.72
+  [150/156] loss=0.562828 lr=0.000178 E_scale=0.72
+  loss=0.5544 lr=0.000170 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5308 → 0.6277 (Δ=+0.0969, success=100%)
+    noise_0.1: cos 0.2992 → -0.1214 (Δ=-0.4206, success=0%)
+    noise_0.2: cos 0.1490 → 0.2653 (Δ=+0.1162, success=100%)
+    noise_0.3: cos 0.1012 → 0.2190 (Δ=+0.1178, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2748), pairwise_cos=0.2056 (data=0.1261)
+Epoch 86/100 (EM [76])
+  [50/156] loss=0.540252 lr=0.000170 E_scale=0.72
+  [100/156] loss=0.582127 lr=0.000170 E_scale=0.72
+  [150/156] loss=0.564114 lr=0.000170 E_scale=0.72
+  loss=0.5543 lr=0.000163 (17.9s)
+Epoch 87/100 (EM [77])
+  [50/156] loss=0.516023 lr=0.000163 E_scale=0.72
+  [100/156] loss=0.557381 lr=0.000163 E_scale=0.72
+  [150/156] loss=0.527189 lr=0.000163 E_scale=0.72
+  loss=0.5512 lr=0.000156 (17.9s)
+Epoch 88/100 (EM [78])
+  [50/156] loss=0.576369 lr=0.000156 E_scale=0.73
+  [100/156] loss=0.596080 lr=0.000156 E_scale=0.73
+  [150/156] loss=0.540015 lr=0.000156 E_scale=0.73
+  loss=0.5523 lr=0.000149 (17.9s)
+Epoch 89/100 (EM [79])
+  [50/156] loss=0.577116 lr=0.000149 E_scale=0.73
+  [100/156] loss=0.574445 lr=0.000149 E_scale=0.73
+  [150/156] loss=0.557972 lr=0.000149 E_scale=0.73
+  loss=0.5535 lr=0.000143 (17.9s)
+Epoch 90/100 (EM [80])
+  [50/156] loss=0.531386 lr=0.000143 E_scale=0.73
+  [100/156] loss=0.507534 lr=0.000143 E_scale=0.74
+  [150/156] loss=0.577142 lr=0.000143 E_scale=0.74
+  loss=0.5517 lr=0.000137 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5306 → 0.6289 (Δ=+0.0983, success=100%)
+    noise_0.1: cos 0.2972 → 0.4188 (Δ=+0.1215, success=100%)
+    noise_0.2: cos 0.1536 → 0.2729 (Δ=+0.1194, success=100%)
+    noise_0.3: cos 0.0991 → 0.2130 (Δ=+0.1140, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2782), pairwise_cos=0.2078 (data=0.1261)
+Epoch 91/100 (EM [81])
+  [50/156] loss=0.543934 lr=0.000137 E_scale=0.74
+  [100/156] loss=0.547938 lr=0.000137 E_scale=0.74
+  [150/156] loss=0.549855 lr=0.000137 E_scale=0.74
+  loss=0.5535 lr=0.000132 (17.9s)
+Epoch 92/100 (EM [82])
+  [50/156] loss=0.540992 lr=0.000132 E_scale=0.74
+  [100/156] loss=0.551827 lr=0.000132 E_scale=0.74
+  [150/156] loss=0.558280 lr=0.000132 E_scale=0.74
+  loss=0.5535 lr=0.000127 (17.9s)
+Epoch 93/100 (EM [83])
+  [50/156] loss=0.516936 lr=0.000127 E_scale=0.74
+  [100/156] loss=0.586044 lr=0.000127 E_scale=0.74
+  [150/156] loss=0.563770 lr=0.000127 E_scale=0.74
+  loss=580994.4501 lr=0.000122 (17.9s)
+Epoch 94/100 (EM [84])
+  [50/156] loss=0.522966 lr=0.000122 E_scale=0.75
+  [100/156] loss=0.545327 lr=0.000122 E_scale=0.75
+  [150/156] loss=0.574000 lr=0.000122 E_scale=0.75
+  loss=0.5504 lr=0.000118 (17.9s)
+Epoch 95/100 (EM [85])
+  [50/156] loss=0.553326 lr=0.000118 E_scale=0.75
+  [100/156] loss=0.546531 lr=0.000118 E_scale=0.75
+  [150/156] loss=0.555634 lr=0.000118 E_scale=0.75
+  loss=0.5510 lr=0.000114 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5300 → 0.6318 (Δ=+0.1018, success=100%)
+    noise_0.1: cos 0.2966 → 0.4214 (Δ=+0.1248, success=100%)
+    noise_0.2: cos 0.1580 → 0.2003 (Δ=+0.0422, success=78%)
+    noise_0.3: cos 0.1073 → 0.2204 (Δ=+0.1131, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2698), pairwise_cos=0.2002 (data=0.1285)
+Epoch 96/100 (EM [86])
+  [50/156] loss=0.512374 lr=0.000114 E_scale=0.75
+  [100/156] loss=0.544387 lr=0.000114 E_scale=0.75
+  [150/156] loss=0.535474 lr=0.000114 E_scale=0.76
+  loss=0.5512 lr=0.000111 (17.9s)
+Epoch 97/100 (EM [87])
+  [50/156] loss=0.558601 lr=0.000111 E_scale=0.76
+  [100/156] loss=0.572635 lr=0.000111 E_scale=0.76
+  [150/156] loss=0.552999 lr=0.000111 E_scale=0.76
+  loss=0.5500 lr=0.000108 (17.9s)
+Epoch 98/100 (EM [88])
+  [50/156] loss=0.554602 lr=0.000108 E_scale=0.76
+  [100/156] loss=0.530339 lr=0.000108 E_scale=0.76
+  [150/156] loss=0.557253 lr=0.000108 E_scale=0.76
+  loss=0.5504 lr=0.000106 (17.9s)
+Epoch 99/100 (EM [89])
+  [50/156] loss=0.575611 lr=0.000106 E_scale=0.76
+  [100/156] loss=0.562356 lr=0.000106 E_scale=0.76
+  [150/156] loss=0.555619 lr=0.000106 E_scale=0.76
+  loss=0.5479 lr=0.000104 (17.9s)
+Epoch 100/100 (EM [90])
+  [50/156] loss=0.540955 lr=0.000104 E_scale=0.77
+  [100/156] loss=0.562705 lr=0.000104 E_scale=0.77
+  [150/156] loss=0.537149 lr=0.000104 E_scale=0.77
+  loss=0.5504 lr=0.000102 (17.9s)
+  Evaluating...
+    noise_0.05: cos 0.5262 → 0.6268 (Δ=+0.1006, success=100%)
+    noise_0.1: cos 0.3012 → 0.4233 (Δ=+0.1221, success=100%)
+    noise_0.2: cos 0.1521 → 0.2674 (Δ=+0.1154, success=100%)
+    noise_0.3: cos 0.1035 → 0.2140 (Δ=+0.1105, success=100%)
+    samples: norm=0.2051±0.0000 (data=0.2703), pairwise_cos=0.1942 (data=0.1315)
+
+Training completed in 2344.8s
+
+Final evaluation...
+  noise_0.05: cos 0.5280 → 0.6226 (Δ=+0.0947, success=100%)
+  noise_0.1: cos 0.3008 → 0.4166 (Δ=+0.1158, success=100%)
+  noise_0.2: cos 0.1530 → 0.2653 (Δ=+0.1122, success=100%)
+  noise_0.3: cos 0.0987 → 0.2062 (Δ=+0.1075, success=100%)
+
+Metrics saved to experiments/02_energy_matching/training_metrics.json
+
+============================================================
+KILL CRITERION CHECK
+============================================================
+  noise_0.05: improvement=+0.0947, success=100% → PASS
+  noise_0.1: improvement=+0.1158, success=100% → PASS
+  noise_0.2: improvement=+0.1122, success=100% → PASS
+  noise_0.3: improvement=+0.1075, success=100% → PASS
+
+  VERDICT: Energy Matching PASSED — gradients improve denoising
