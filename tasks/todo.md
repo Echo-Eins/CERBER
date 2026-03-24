@@ -17,6 +17,7 @@ Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility 
 - [x] Add NaN hotfixes after first real run feedback
 - [x] Add finite-gradient guard + fail-fast/backoff + robust Björck update after second run feedback
 - [x] Fix LR-collapse coupling (backoff vs warmup) and harden MDSM numerics for low-norm outliers
+- [x] Full Stage1 math audit against training logs (`transfer_note`) with contradiction fixes
 
 ## Review
 ### Implemented files
@@ -39,7 +40,33 @@ Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility 
 - Fixed LR-collapse bug: non-finite backoff no longer mutates `initial_lr` (warmup anchor).
 - Backoff now triggers only on short consecutive streaks (default >=3), not on isolated events.
 - Hardened MDSM numerics: norm/sigma floors, safer cosine epsilon, finite sanitization, and skip-rate metrics.
+- Fixed objective/inference sign mismatch: Stage1 MDSM now trains target gradient with the sign consistent to `v <- v - lr * ∇E`.
+- Disabled unsafe default early-stop threshold (`energy_threshold=None`) to prevent no-op Langevin refinement.
+- Warmup/backoff now uses optimizer-update steps only (skipped batches no longer advance warmup), and backoff persists during warmup via per-group LR scale.
 
 ### Validation status
-- Runtime execution is not possible in this environment due unavailable Python runtime.
-- Verification performed via static inspection and user-provided runtime logs.
+- Runtime training execution is still blocked in this environment because `torch` is not installed in the active Python interpreter.
+- Verification performed via static inspection, compile checks, and user-provided runtime logs.
+
+---
+
+## Remediation Pass (2026-03-23, Transfer Log Recheck)
+
+### Goal
+Eliminate remaining math/stability contradictions from `transfer_note`: LR perception under instability, scale-identifiability gap in directional MDSM, and final-state selection in Langevin.
+
+### Checklist
+- [x] Re-audit `transfer_note` and Stage 1 code paths for unresolved contradictions
+- [x] Fix directional MDSM weighting scale collapse (normalize sigma weights to mean 1)
+- [x] Add directional-scale identifiability guard in trainer (`directional=True` + no magnitude auxiliary)
+- [x] Tune Stage 1 default stability profile (Bjorck schedule, magnitude auxiliary, non-finite backoff behavior)
+- [x] Fix Langevin best-state selection to include terminal state
+- [x] Update project lessons with new failure patterns
+- [x] Re-check syntax/compile on edited files
+- [ ] Re-run full Stage 1 train/eval on target CUDA environment and verify denoising improvement
+
+### Files updated in remediation pass
+- `configs/base.py`
+- `cebcm/training/losses.py`
+- `experiments/01_denoising_poc/train.py`
+- `cebcm/inference/langevin.py`

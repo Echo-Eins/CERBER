@@ -106,12 +106,10 @@ class SimpleEnergy(nn.Module):
 
             prev_dim = h_dim
 
-        # Final projection to scalar (no activation, unconstrained).
-        # The hidden layers are 1-Lipschitz (OrthoLinear + GroupSort) for smooth
-        # feature extraction. The final layer is a regular Linear so the energy
-        # magnitude can be learned freely — with σ-conditioning the network can
-        # output scale-appropriate gradients at each noise level.
-        final_linear = nn.Linear(prev_dim, 1)
+        # Final projection to scalar (no activation).
+        # Keep the same normalization regime on the output layer to preserve
+        # the intended Lipschitz geometry end-to-end.
+        final_linear = self._make_linear(prev_dim, 1, norm_mode, ortho_n_iters)
         layers.append(final_linear)
 
         self.net = nn.Sequential(*layers)

@@ -196,6 +196,11 @@ def langevin_dynamics(
         if track_vectors:
             v_trajectory.append(v_current.detach().cpu().clone())
 
+    with torch.no_grad():
+        final_energy = energy_fn(v_query, v_current).mean().item()
+    if final_energy < best_energy:
+        v_best = v_current.clone()
+
     return LangevinResult(
         v_final=v_best, trajectory=trajectory,
         cos_trajectory=cos_trajectory,
@@ -339,6 +344,11 @@ def pid_langevin_dynamics(
         if track_vectors:
             v_trajectory.append(v_current.detach().cpu().clone())
 
+    with torch.no_grad():
+        final_energy = energy_fn(v_query, v_current).mean().item()
+    if final_energy < best_energy:
+        v_best = v_current.clone()
+
     return LangevinResult(
         v_final=v_best, trajectory=trajectory,
         cos_trajectory=cos_trajectory,
@@ -474,6 +484,11 @@ def underdamped_langevin_dynamics(
             )
         if track_vectors:
             v_trajectory.append(v_current.detach().cpu().clone())
+
+    with torch.no_grad():
+        final_energy = energy_fn(v_query, v_current).mean().item()
+    if final_energy < best_energy:
+        v_best = v_current.clone()
 
     return LangevinResult(
         v_final=v_best, trajectory=trajectory,

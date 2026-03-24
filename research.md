@@ -537,3 +537,37 @@ Hard pivot criterion:
 - `torch.utils.checkpoint`: https://docs.pytorch.org/docs/stable/checkpoint.html
 - SDPA API: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
 - bitsandbytes repo: https://github.com/bitsandbytes-foundation/bitsandbytes
+
+---
+
+## 15) Remediation update (2026-03-23)
+
+### 15.1 Code-level math/stability fixes applied in Stage 1
+- Directional MDSM weighting now keeps relative sigma weighting but normalizes weight mean to 1.
+  - Motivation: avoid near-zero scalar losses and weak gradients when `sigma2` weights are tiny.
+- Added explicit trainer guard for directional cosine MDSM scale ambiguity:
+  - if `directional=True` and `magnitude_aux_weight==0`, warn and neutralize aggressive energy-scale LR multiplier.
+- Updated Stage 1 defaults toward stability and lower orthonorm overhead:
+  - Bjorck defaults from `15 -> 8`, schedule `[8,4,2]`,
+  - `mdsm_magnitude_aux_weight=0.05`,
+  - `energy_scale_lr_multiplier=5.0`,
+  - non-finite backoff defaults to mild per-event (`0.99`, trigger `1`).
+- Langevin best-state tracking now evaluates terminal state explicitly before returning.
+
+### 15.2 Why training looked contradictory in `transfer_note`
+- LR increase during early warnings was mostly warmup behavior; with sparse, non-consecutive non-finite events, the old backoff policy rarely activated.
+- `E_scale` staying at `1.00` is expected when directional cosine loss has zero magnitude auxiliary (scale nearly unidentifiable).
+- Tiny reported DSM numbers with no denoising gains were consistent with a low-effective-loss-scale regime, not a reliable sign of useful field learning.
+
+### 15.3 Latest external reality check (is this already solved?)
+- EBT-style energy minimization is still an active frontier, not obsolete:
+  - Energy-Based Transformers (2025) report strong scaling/inference-time-thinking results.
+- Fast alternatives that avoid direct scalar-energy gradient matching are mature:
+  - Flow Matching, Score-SDE, and Consistency Models are well-established high-throughput families.
+- Hybrid latent-language pipelines are emerging:
+  - SONAR-LLM (2025) shows sentence-embedding-space reasoning with token-level likelihood supervision.
+
+### 15.4 Practical implication for CERBER Stage 1
+- Keep current energy path as the main CERBER identity track.
+- In parallel, treat score/flow/consistency-style models as a speed-risk hedge track.
+- For near-term execution, prioritize stabilizing current Stage 1 training (done in code), then run controlled ablations against one fast non-energy baseline.

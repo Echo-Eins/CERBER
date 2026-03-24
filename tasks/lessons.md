@@ -55,3 +55,40 @@ Relative-noise DSM can hit non-finite values on low-norm embedding outliers due 
 
 ### Rule
 For MDSM on real embedding corpora, always enforce norm/sigma floors and a safer cosine epsilon, and sanitize non-finite intermediates before reduction.
+
+## 2026-03-23 - Objective/inference sign consistency
+
+### Pattern
+Energy can train to low loss but inference fails when the target field sign in training is inconsistent with Langevin update direction.
+
+### Rule
+For every new objective, explicitly verify sign consistency end-to-end:
+1) target field definition,
+2) whether model learns `grad(E)` or `score`,
+3) inference update (`v <- v - lr*grad(E)` vs `v <- v + lr*score`).
+
+## 2026-03-23 - Early-stop calibration in energy samplers
+
+### Pattern
+A fixed absolute `energy_threshold` can instantly stop refinement when energy scale changes during model iterations, causing no-op denoising.
+
+### Rule
+Default to `energy_threshold=None` unless the threshold is explicitly calibrated on current checkpoints; prefer plateau-based stopping as the safe default.
+
+## 2026-03-23 - Directional DSM scale identifiability
+
+### Pattern
+With cosine-only directional MDSM (`directional=True`, `magnitude_aux_weight=0`), the loss is nearly invariant to global gradient scale. This makes `log_energy_scale` effectively unidentifiable and can freeze at initialization.
+
+### Rule
+When using directional MDSM, always either:
+1) enable a non-zero magnitude auxiliary term, or
+2) explicitly disable energy-scale optimization and treat inference step size as the only scale control.
+
+## 2026-03-23 - Sigma weighting normalization
+
+### Pattern
+Applying `sigma2` weighting without normalization can shrink directional DSM loss magnitude by orders of magnitude, hiding weak optimization dynamics behind tiny scalar losses.
+
+### Rule
+Keep sigma weighting relative, but normalize weights to mean 1 before reduction so loss scale remains interpretable and gradients do not collapse numerically.

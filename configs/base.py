@@ -37,7 +37,7 @@ class LangevinConfig:
     lr: float = 0.01
     noise_scale: float = 0.005
     max_steps: int = 100
-    energy_threshold: float = 0.5
+    energy_threshold: float | None = None
     plateau_patience: int = 10
     plateau_delta: float = 1e-4
     cruise_ratio: float = 0.0  # 0.0 = pure Langevin, 0.7 = aggressive inertia
@@ -117,9 +117,9 @@ class Stage1Config:
     # Architecture choices
     norm_mode: str = "orthonorm"       # "orthonorm" (default) or "spectral_norm"
     activation: str = "groupsort"      # "groupsort" (default), "lipschitz_spline", "relu"
-    ortho_n_iters: int = 15            # Bjorck iterations
+    ortho_n_iters: int = 8             # Bjorck iterations
     ortho_schedule_enabled: bool = True
-    ortho_schedule_iters: list[int] = field(default_factory=lambda: [15, 8, 4])
+    ortho_schedule_iters: list[int] = field(default_factory=lambda: [8, 4, 2])
     ortho_schedule_boundaries: list[float] = field(default_factory=lambda: [0.34, 0.67])
     groupsort_size: int = 2            # Group size (2 = MaxMin)
     spline_num_knots: int = 4          # Knots for lipschitz_spline
@@ -136,7 +136,7 @@ class Stage1Config:
     mdsm_sigma_sampling: str = "loguniform"  # "loguniform" or "edm"
     mdsm_sigma_weighting: str = "sigma2"  # "sigma2", "uniform", "inv_sigma2"
     mdsm_directional: bool = True
-    mdsm_magnitude_aux_weight: float = 0.0  # Enable after stable baseline only
+    mdsm_magnitude_aux_weight: float = 0.05
     mdsm_cosine_eps: float = 1e-4
     mdsm_norm_floor: float = 1e-4
     mdsm_tangent_projection: bool = True
@@ -173,11 +173,11 @@ class Stage1Config:
     mdsm_force_fp32: bool = True  # second-order MDSM path is numerically fragile in bf16/fp16
     enable_compile: bool = False
     compile_mode: str = "default"  # "default", "reduce-overhead", "max-autotune"
-    energy_scale_lr_multiplier: float = 20.0
+    energy_scale_lr_multiplier: float = 5.0
     skip_non_finite_batches: bool = True
     max_consecutive_non_finite_batches: int = 20
-    non_finite_lr_backoff: float = 0.5
-    non_finite_backoff_streak_trigger: int = 3
+    non_finite_lr_backoff: float = 0.99
+    non_finite_backoff_streak_trigger: int = 1
     # Logging
     wandb_project: str = "cebcm-stage1"
     use_wandb: bool = False

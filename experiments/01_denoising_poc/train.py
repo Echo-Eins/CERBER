@@ -128,7 +128,18 @@ def apply_non_finite_backoff(optimizer: torch.optim.Optimizer, factor: float) ->
     if not (0.0 < factor < 1.0):
         return
     for pg in optimizer.param_groups:
+        pg["non_finite_scale"] = pg.get("non_finite_scale", 1.0) * factor
         pg["lr"] = max(pg["lr"] * factor, 1e-8)
+
+
+def apply_warmup_lr(
+    optimizer: torch.optim.Optimizer,
+    warmup_factor: float,
+) -> None:
+    """Warmup schedule that also preserves persistent non-finite LR backoff."""
+    for pg in optimizer.param_groups:
+        lr_scale = pg.get("non_finite_scale", 1.0)
+        pg["lr"] = pg["initial_lr"] * warmup_factor * lr_scale
 
 
 def train_epoch_mdsm(
@@ -162,8 +173,7 @@ def train_epoch_mdsm(
 
         if global_step < config.warmup_steps:
             warmup_factor = (global_step + 1) / max(1, config.warmup_steps)
-            for pg in optimizer.param_groups:
-                pg["lr"] = pg["initial_lr"] * warmup_factor
+            apply_warmup_lr(optimizer, warmup_factor)
 
         dsm_ctx = nullcontext if config.mdsm_force_fp32 else autocast_ctx
         with dsm_ctx():
@@ -196,7 +206,6 @@ def train_epoch_mdsm(
         if not torch.isfinite(loss):
             if config.skip_non_finite_batches:
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -220,7 +229,6 @@ def train_epoch_mdsm(
             scaler.unscale_(optimizer)
             if not gradients_are_finite(model):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -240,7 +248,6 @@ def train_epoch_mdsm(
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -263,7 +270,6 @@ def train_epoch_mdsm(
             loss.backward()
             if not gradients_are_finite(model):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -282,7 +288,6 @@ def train_epoch_mdsm(
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -357,8 +362,7 @@ def train_epoch_contrastive(
 
         if global_step < config.warmup_steps:
             warmup_factor = (global_step + 1) / max(1, config.warmup_steps)
-            for pg in optimizer.param_groups:
-                pg["lr"] = pg["initial_lr"] * warmup_factor
+            apply_warmup_lr(optimizer, warmup_factor)
 
         scale_idx = torch.randint(0, len(config.train_noise_scales), (1,)).item()
         noise_scale = config.train_noise_scales[scale_idx]
@@ -377,7 +381,6 @@ def train_epoch_contrastive(
         if not torch.isfinite(loss):
             if config.skip_non_finite_batches:
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -401,7 +404,6 @@ def train_epoch_contrastive(
             scaler.unscale_(optimizer)
             if not gradients_are_finite(model):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -421,7 +423,6 @@ def train_epoch_contrastive(
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -444,7 +445,6 @@ def train_epoch_contrastive(
             loss.backward()
             if not gradients_are_finite(model):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -463,7 +463,6 @@ def train_epoch_contrastive(
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
                 non_finite_streak += 1
                 skipped_batches += 1
                 if non_finite_streak >= config.non_finite_backoff_streak_trigger:
@@ -670,6 +669,23 @@ def main():
         config.amp_dtype = args.amp_dtype
     config.use_wandb = args.wandb
 
+    if (
+        config.loss_type == "mdsm"
+        and config.mdsm_directional
+        and config.mdsm_magnitude_aux_weight <= 0.0
+    ):
+        if config.energy_scale_lr_multiplier != 1.0:
+            print(
+                "WARN: directional cosine MDSM with zero magnitude auxiliary is "
+                "scale-invariant; forcing energy-scale LR multiplier to 1.0."
+            )
+            config.energy_scale_lr_multiplier = 1.0
+        else:
+            print(
+                "WARN: directional cosine MDSM with zero magnitude auxiliary is "
+                "scale-invariant; expect log_energy_scale to remain near initialization."
+            )
+
     set_seed(config.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -753,6 +769,7 @@ def main():
     ])
     for pg in optimizer.param_groups:
         pg["initial_lr"] = pg["lr"]
+        pg["non_finite_scale"] = 1.0
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -768,6 +785,9 @@ def main():
         raw_model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
+        for pg in optimizer.param_groups:
+            pg.setdefault("initial_lr", pg["lr"])
+            pg.setdefault("non_finite_scale", 1.0)
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt.get("global_step", 0)
         print(f"  Resumed at epoch {start_epoch}")
@@ -816,6 +836,7 @@ def main():
     print(f"  Eval noise scales: {config.eval_noise_scales}")
     print(f"  Langevin: method={config.langevin.method}, lr={config.langevin.lr}, steps={config.langevin.max_steps}")
     print(f"  Target norm: {config.langevin.target_norm}")
+    print(f"  Energy threshold: {config.langevin.energy_threshold}")
     print(f"  GP lambda: {config.gradient_penalty_lambda}")
     print(
         "  Non-finite handling: "

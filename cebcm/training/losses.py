@@ -90,7 +90,9 @@ def multiscale_dsm_loss(
         create_graph=True,
     )[0]
 
-    target_score = -(v_noisy.detach() - v_clean) / sigma_eff_sq
+    # For energy descent v <- v - lr * grad(E), the target gradient must point
+    # from clean to noisy (opposite to denoising score).
+    target_score = (v_noisy.detach() - v_clean) / sigma_eff_sq
     target_score = torch.nan_to_num(target_score, nan=0.0, posinf=1e4, neginf=-1e4)
     grad_energy = torch.nan_to_num(grad_energy, nan=0.0, posinf=1e4, neginf=-1e4)
 
@@ -134,6 +136,9 @@ def multiscale_dsm_loss(
         raise ValueError(f"Unknown sigma_weighting: {sigma_weighting}")
 
     weights = torch.nan_to_num(weights, nan=1.0, posinf=1e4, neginf=1.0)
+    # Keep weighting relative across sigma scales, but normalize absolute scale
+    # so directional cosine losses do not collapse to near-zero gradient magnitudes.
+    weights = weights / weights.mean().clamp(min=1e-8)
     return (weights * loss_per_sample).mean()
 
 
@@ -168,7 +173,7 @@ def dsm_loss_fixed_sigma(
         create_graph=True,
     )[0]
 
-    target_score = -(v_noisy.detach() - v_clean) / sigma_eff_sq
+    target_score = (v_noisy.detach() - v_clean) / sigma_eff_sq
     target_score = torch.nan_to_num(target_score, nan=0.0, posinf=1e4, neginf=-1e4)
     grad_energy = torch.nan_to_num(grad_energy, nan=0.0, posinf=1e4, neginf=-1e4)
     score_diff = grad_energy - target_score
