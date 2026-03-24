@@ -132,10 +132,12 @@ def train_epoch_em(
                 torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        if not torch.isfinite(loss) or not torch.isfinite(grad_norm):
+        # Skip non-finite OR outlier spikes (finite but huge losses that
+        # push the model in wrong directions despite gradient clipping)
+        if not torch.isfinite(loss) or not torch.isfinite(grad_norm) or loss.item() > 100.0:
             optimizer.zero_grad(set_to_none=True)
             if batch_idx < 5 or (config.log_every > 0 and (batch_idx + 1) % config.log_every == 0):
-                print(f"  [WARN] non-finite EM loss at batch {batch_idx + 1}; step skipped")
+                print(f"  [WARN] bad EM loss={loss.item():.4g} at batch {batch_idx + 1}; step skipped")
             global_step += 1
             continue
 
@@ -205,11 +207,11 @@ def train_epoch_nce(
                 torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        # Skip step if loss or clipped grad norm is non-finite
-        if not torch.isfinite(loss) or not torch.isfinite(grad_norm):
+        # Skip non-finite OR outlier spikes
+        if not torch.isfinite(loss) or not torch.isfinite(grad_norm) or loss.item() > 100.0:
             optimizer.zero_grad(set_to_none=True)
             if batch_idx < 5 or (config.log_every > 0 and (batch_idx + 1) % config.log_every == 0):
-                print(f"  [WARN] non-finite NCE at batch {batch_idx + 1}; step skipped")
+                print(f"  [WARN] bad NCE loss={loss.item():.4g} at batch {batch_idx + 1}; step skipped")
             global_step += 1
             continue
 
