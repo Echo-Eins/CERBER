@@ -16,6 +16,7 @@ Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility 
 - [x] Make evaluate script consume checkpoint Stage1 config to avoid train/eval drift
 - [x] Add NaN hotfixes after first real run feedback
 - [x] Add finite-gradient guard + fail-fast/backoff + robust Björck update after second run feedback
+- [x] Fix LR-collapse coupling (backoff vs warmup) and harden MDSM numerics for low-norm outliers
 
 ## Review
 ### Implemented files
@@ -35,6 +36,9 @@ Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility 
 - Added finite-gradient guard before `optimizer.step` to prevent parameter corruption.
 - Added consecutive non-finite fail-fast and LR backoff controls.
 - Corrected Björck update to row/column-consistent form (`WW^T` for wide matrices) with spectral pre-normalization.
+- Fixed LR-collapse bug: non-finite backoff no longer mutates `initial_lr` (warmup anchor).
+- Backoff now triggers only on short consecutive streaks (default >=3), not on isolated events.
+- Hardened MDSM numerics: norm/sigma floors, safer cosine epsilon, finite sanitization, and skip-rate metrics.
 
 ### Validation status
 - Runtime execution is not possible in this environment due unavailable Python runtime.

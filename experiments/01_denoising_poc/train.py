@@ -129,8 +129,6 @@ def apply_non_finite_backoff(optimizer: torch.optim.Optimizer, factor: float) ->
         return
     for pg in optimizer.param_groups:
         pg["lr"] = max(pg["lr"] * factor, 1e-8)
-        if "initial_lr" in pg:
-            pg["initial_lr"] = max(pg["initial_lr"] * factor, 1e-8)
 
 
 def train_epoch_mdsm(
@@ -149,6 +147,7 @@ def train_epoch_mdsm(
     total_dsm = 0.0
     total_gp = 0.0
     num_batches = 0
+    skipped_batches = 0
 
     sigma_min, sigma_max = get_current_sigma_range(config, epoch)
     non_finite_streak = 0
@@ -183,6 +182,8 @@ def train_epoch_mdsm(
                 ),
                 edm_p_mean=config.mdsm_edm_p_mean,
                 edm_p_std=config.mdsm_edm_p_std,
+                cosine_eps=config.mdsm_cosine_eps,
+                norm_floor=config.mdsm_norm_floor,
             )
 
             loss_gp = torch.tensor(0.0, device=device)
@@ -197,7 +198,9 @@ def train_epoch_mdsm(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
                         f"  [WARN] non-finite MDSM loss at batch {batch_idx + 1}, "
@@ -219,7 +222,9 @@ def train_epoch_mdsm(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 scaler.update()
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
@@ -237,7 +242,9 @@ def train_epoch_mdsm(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 scaler.update()
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
@@ -258,7 +265,9 @@ def train_epoch_mdsm(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
                         f"  [WARN] non-finite MDSM gradients at batch {batch_idx + 1}, "
@@ -275,7 +284,9 @@ def train_epoch_mdsm(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
                         f"  [WARN] non-finite clipped grad norm at batch {batch_idx + 1}, "
@@ -312,6 +323,8 @@ def train_epoch_mdsm(
         "gradient_penalty": total_gp / max(num_batches, 1),
         "sigma_min": sigma_min,
         "sigma_max": sigma_max,
+        "skipped_batches": float(skipped_batches),
+        "skip_rate": skipped_batches / max(len(dataloader), 1),
     }, global_step
 
 
@@ -331,6 +344,7 @@ def train_epoch_contrastive(
     total_e_neg = 0.0
     total_gp = 0.0
     num_batches = 0
+    skipped_batches = 0
     non_finite_streak = 0
 
     for batch_idx, v_orig in enumerate(dataloader):
@@ -365,7 +379,9 @@ def train_epoch_contrastive(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
                         f"  [WARN] non-finite contrastive loss at batch {batch_idx + 1}, "
@@ -387,7 +403,9 @@ def train_epoch_contrastive(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 scaler.update()
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
@@ -405,7 +423,9 @@ def train_epoch_contrastive(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 scaler.update()
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
@@ -426,7 +446,9 @@ def train_epoch_contrastive(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
                         f"  [WARN] non-finite contrastive gradients at batch {batch_idx + 1}, "
@@ -443,7 +465,9 @@ def train_epoch_contrastive(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 non_finite_streak += 1
-                apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
+                skipped_batches += 1
+                if non_finite_streak >= config.non_finite_backoff_streak_trigger:
+                    apply_non_finite_backoff(optimizer, config.non_finite_lr_backoff)
                 if non_finite_streak <= 5 or non_finite_streak % 25 == 0:
                     print(
                         f"  [WARN] non-finite clipped grad norm at batch {batch_idx + 1}, "
@@ -478,6 +502,8 @@ def train_epoch_contrastive(
         "e_neg_mean": total_e_neg / max(num_batches, 1),
         "gradient_penalty": total_gp / max(num_batches, 1),
         "energy_gap": (total_e_neg - total_e_pos) / max(num_batches, 1),
+        "skipped_batches": float(skipped_batches),
+        "skip_rate": skipped_batches / max(len(dataloader), 1),
     }, global_step
 
 
@@ -779,7 +805,10 @@ def main():
         print(f"  MDSM sigma sampling: {config.mdsm_sigma_sampling}")
         print(f"  MDSM sigma weighting: {config.mdsm_sigma_weighting}")
         print(f"  MDSM directional: {config.mdsm_directional}")
+        print(f"  MDSM magnitude aux weight: {config.mdsm_magnitude_aux_weight}")
         print(f"  MDSM tangent projection: {config.mdsm_tangent_projection}")
+        print(f"  MDSM cosine eps: {config.mdsm_cosine_eps}")
+        print(f"  MDSM norm floor: {config.mdsm_norm_floor}")
         print(f"  MDSM force FP32 path: {config.mdsm_force_fp32}")
     else:
         print(f"  Margin: {config.margin}")
@@ -792,7 +821,8 @@ def main():
         "  Non-finite handling: "
         f"skip={config.skip_non_finite_batches}, "
         f"max_streak={config.max_consecutive_non_finite_batches}, "
-        f"lr_backoff={config.non_finite_lr_backoff}"
+        f"lr_backoff={config.non_finite_lr_backoff}, "
+        f"backoff_trigger={config.non_finite_backoff_streak_trigger}"
     )
     print(f"{'='*60}\n")
 

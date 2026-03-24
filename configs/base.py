@@ -136,7 +136,9 @@ class Stage1Config:
     mdsm_sigma_sampling: str = "loguniform"  # "loguniform" or "edm"
     mdsm_sigma_weighting: str = "sigma2"  # "sigma2", "uniform", "inv_sigma2"
     mdsm_directional: bool = True
-    mdsm_magnitude_aux_weight: float = 0.05
+    mdsm_magnitude_aux_weight: float = 0.0  # Enable after stable baseline only
+    mdsm_cosine_eps: float = 1e-4
+    mdsm_norm_floor: float = 1e-4
     mdsm_tangent_projection: bool = True
     mdsm_sigma_curriculum: bool = True
     mdsm_sigma_curriculum_start_min: float = 0.1
@@ -175,6 +177,7 @@ class Stage1Config:
     skip_non_finite_batches: bool = True
     max_consecutive_non_finite_batches: int = 20
     non_finite_lr_backoff: float = 0.5
+    non_finite_backoff_streak_trigger: int = 3
     # Logging
     wandb_project: str = "cebcm-stage1"
     use_wandb: bool = False

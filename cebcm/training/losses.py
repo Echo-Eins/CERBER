@@ -49,6 +49,8 @@ def multiscale_dsm_loss(
     tangent_projection: bool = False,
     edm_p_mean: float = -1.2,
     edm_p_std: float = 1.2,
+    cosine_eps: float = 1e-4,
+    norm_floor: float = 1e-4,
 ) -> Tensor:
     """
     Multi-Scale DSM loss with optional directional mode.
@@ -73,12 +75,12 @@ def multiscale_dsm_loss(
 
     noise = torch.randn_like(v_clean)
     if relative_noise:
-        norms = v_clean.norm(dim=-1, keepdim=True)
+        norms = v_clean.norm(dim=-1, keepdim=True).clamp(min=norm_floor)
         v_noisy = v_clean + noise * sigma * norms
-        sigma_eff_sq = (sigma * norms) ** 2
+        sigma_eff_sq = ((sigma * norms) ** 2).clamp(min=1e-6)
     else:
         v_noisy = v_clean + noise * sigma
-        sigma_eff_sq = sigma ** 2
+        sigma_eff_sq = (sigma ** 2).clamp(min=1e-6)
 
     v_noisy_grad = v_noisy.detach().requires_grad_(True)
     energy = energy_fn(v_clean, v_noisy_grad, sigma=sigma.detach())
@@ -89,6 +91,8 @@ def multiscale_dsm_loss(
     )[0]
 
     target_score = -(v_noisy.detach() - v_clean) / sigma_eff_sq
+    target_score = torch.nan_to_num(target_score, nan=0.0, posinf=1e4, neginf=-1e4)
+    grad_energy = torch.nan_to_num(grad_energy, nan=0.0, posinf=1e4, neginf=-1e4)
 
     if tangent_projection:
         v_hat = F.normalize(v_noisy.detach(), dim=-1)
@@ -100,12 +104,14 @@ def multiscale_dsm_loss(
         )
 
     if directional:
-        cosine = F.cosine_similarity(grad_energy, target_score, dim=-1, eps=1e-8)
+        cosine = F.cosine_similarity(
+            grad_energy, target_score, dim=-1, eps=cosine_eps
+        ).clamp(min=-1.0, max=1.0)
         loss_per_sample = 1.0 - cosine
 
         if magnitude_aux_weight > 0:
-            grad_norm = grad_energy.norm(dim=-1).clamp(min=1e-8)
-            target_norm = target_score.norm(dim=-1).clamp(min=1e-8)
+            grad_norm = grad_energy.norm(dim=-1).clamp(min=norm_floor, max=1e4)
+            target_norm = target_score.norm(dim=-1).clamp(min=norm_floor, max=1e4)
             mag_aux = F.smooth_l1_loss(
                 torch.log(grad_norm),
                 torch.log(target_norm),
@@ -116,6 +122,8 @@ def multiscale_dsm_loss(
         score_diff = grad_energy - target_score
         loss_per_sample = (score_diff ** 2).sum(dim=-1)
 
+    loss_per_sample = torch.nan_to_num(loss_per_sample, nan=1e4, posinf=1e4, neginf=1e4)
+
     if sigma_weighting == "sigma2":
         weights = sigma_eff_sq.squeeze(-1)
     elif sigma_weighting == "uniform":
@@ -125,6 +133,7 @@ def multiscale_dsm_loss(
     else:
         raise ValueError(f"Unknown sigma_weighting: {sigma_weighting}")
 
+    weights = torch.nan_to_num(weights, nan=1.0, posinf=1e4, neginf=1.0)
     return (weights * loss_per_sample).mean()
 
 
@@ -133,6 +142,7 @@ def dsm_loss_fixed_sigma(
     v_clean: Tensor,
     sigma: float,
     relative_noise: bool = True,
+    norm_floor: float = 1e-4,
 ) -> Tensor:
     """Single-scale DSM loss for debugging/ablation."""
     batch_size, _ = v_clean.shape
@@ -141,12 +151,12 @@ def dsm_loss_fixed_sigma(
     noise = torch.randn_like(v_clean)
 
     if relative_noise:
-        norms = v_clean.norm(dim=-1, keepdim=True)
+        norms = v_clean.norm(dim=-1, keepdim=True).clamp(min=norm_floor)
         v_noisy = v_clean + noise * sigma * norms
-        sigma_eff_sq = (sigma * norms) ** 2
+        sigma_eff_sq = ((sigma * norms) ** 2).clamp(min=1e-6)
     else:
         v_noisy = v_clean + noise * sigma
-        sigma_eff_sq = sigma ** 2
+        sigma_eff_sq = torch.full_like(v_noisy[:, :1], sigma**2).clamp(min=1e-6)
 
     sigma_tensor = torch.full((batch_size, 1), sigma, device=device)
 
@@ -159,6 +169,8 @@ def dsm_loss_fixed_sigma(
     )[0]
 
     target_score = -(v_noisy.detach() - v_clean) / sigma_eff_sq
+    target_score = torch.nan_to_num(target_score, nan=0.0, posinf=1e4, neginf=-1e4)
+    grad_energy = torch.nan_to_num(grad_energy, nan=0.0, posinf=1e4, neginf=-1e4)
     score_diff = grad_energy - target_score
     return (score_diff ** 2).sum(dim=-1).mean()
 
