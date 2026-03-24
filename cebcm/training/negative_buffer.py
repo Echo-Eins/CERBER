@@ -110,11 +110,14 @@ class NegativeBuffer:
         indices = [(start_idx + i) % self.buffer_size for i in range(num_refresh)]
         x = self.buffer[indices].to(device)
 
-        # Run Langevin dynamics to find low-energy regions
+        # Run Langevin dynamics to find low-energy regions.
+        # We need enable_grad() because refresh() is decorated with no_grad()
+        # to avoid tracking the outer update, but autograd.grad requires a graph.
         for _ in range(self.langevin_steps):
             x_grad = x.detach().requires_grad_(True)
-            energy = energy_fn(x_grad)
-            grad = torch.autograd.grad(energy.sum(), x_grad)[0]
+            with torch.enable_grad():
+                energy = energy_fn(x_grad)
+                grad = torch.autograd.grad(energy.sum(), x_grad)[0]
 
             noise = torch.randn_like(x) * self.langevin_noise
             x = x - self.langevin_lr * grad + (2 * self.langevin_lr) ** 0.5 * noise
