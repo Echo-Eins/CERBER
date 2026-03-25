@@ -121,6 +121,11 @@ def select_checkpoint_fn(checkpoint_path):
     session_state["current_checkpoint"] = checkpoint_path
 
     # Summary
+    cos_before_str = f"{metrics.cos_sim_before:.4f}" if metrics.cos_sim_before is not None else "N/A"
+    cos_after_str = f"{metrics.cos_sim_after:.4f}" if metrics.cos_sim_after is not None else "N/A"
+    improvement_str = f"{metrics.cos_improvement:.4f}" if metrics.cos_improvement is not None else "N/A"
+    success_rate_str = f"{metrics.success_rate}" if metrics.success_rate is not None else "N/A"
+
     summary = f"""
 **Checkpoint:** {Path(checkpoint_path).name}
 **Epoch:** {metadata.epoch}
@@ -132,10 +137,10 @@ def select_checkpoint_fn(checkpoint_path):
 **Metrics:**
 - Train Loss: {metrics.train_loss}
 - Eval Loss: {metrics.eval_loss}
-- Cosine Before: {metrics.cos_sim_before:.4f}" if metrics.cos_sim_before else "N/A"
-- Cosine After: {metrics.cos_sim_after:.4f}" if metrics.cos_sim_after else "N/A"
-- Improvement: {metrics.cos_improvement:.4f}" if metrics.cos_improvement else "N/A"
-- Success Rate: {metrics.success_rate}" if metrics.success_rate else "N/A"
+- Cosine Before: {cos_before_str}
+- Cosine After: {cos_after_str}
+- Improvement: {improvement_str}
+- Success Rate: {success_rate_str}
 """.strip()
 
     # 3D ландшафт
