@@ -85,7 +85,7 @@ def scan_energy_landscape_3d(
     center = (v_clean_flat + v_noisy_flat) / 2
 
     # Генерация сетки координат
-    coords = torch.linspace(-grid_size // 2, grid_size // 2, grid_size, device=device)
+    coords = torch.linspace(-grid_size // 2, grid_size // 2, grid_size)  # на CPU для numpy
     xx, yy = torch.meshgrid(coords, coords, indexing="ij")
 
     # Генерация точек сетки в пространстве embeddings
@@ -136,7 +136,7 @@ def scan_energy_landscape_3d(
     return {
         "x_range": coords.tolist(),
         "y_range": coords.tolist(),
-        "energy_grid": energy_grid.numpy(),
+        "energy_grid": energy_grid.cpu().numpy(),
         "basis": basis.cpu().numpy(),
         "scale": scale.item(),
         "center": center.cpu().numpy(),
