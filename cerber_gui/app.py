@@ -328,7 +328,7 @@ def export_comparison_fn(checkpoint_paths, output_format):
 
 # === Gradio UI ===
 
-with gr.Blocks(title="CERBER Model Monitor", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="CERBER Model Monitor") as demo:
     gr.Markdown("""
     # CERBER Model Monitor
 
@@ -387,6 +387,7 @@ with gr.Blocks(title="CERBER Model Monitor", theme=gr.themes.Soft()) as demo:
                 compare_plot = gr.Plot(label="Comparison Chart")
 
             export_output = gr.Textbox(label="Export Result")
+            compare_status = gr.Textbox(label="Status", visible=False)
 
         # === Tab 3: Metrics ===
         with gr.TabItem("Training Metrics"):
@@ -443,7 +444,7 @@ with gr.Blocks(title="CERBER Model Monitor", theme=gr.themes.Soft()) as demo:
     compare_btn.click(
         compare_selected_fn,
         inputs=[compare_dropdown],
-        outputs=[compare_output, compare_plot, gr.update()],
+        outputs=[compare_output, compare_plot, compare_status],
     )
 
     # Экспорт
@@ -464,7 +465,7 @@ with gr.Blocks(title="CERBER Model Monitor", theme=gr.themes.Soft()) as demo:
     start_live_btn.click(
         start_live_monitor_fn,
         inputs=[live_path_input],
-        outputs=[live_status, gr.update()],
+        outputs=[live_status, live_plot],
     )
 
     live_timer.tick(
@@ -483,4 +484,5 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         show_error=True,
+        theme=gr.themes.Soft(),
     )
