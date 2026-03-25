@@ -65,7 +65,7 @@ session_state = {
 def load_checkpoints_fn(files):
     """Загрузка чекпоинтов из uploaded файлов."""
     if not files:
-        return "No files uploaded", gr.update(), gr.update()
+        return "No files uploaded", gr.Dropdown(choices=[]), gr.Dropdown(choices=[])
 
     results = []
     errors = []
@@ -152,7 +152,28 @@ def select_checkpoint_fn(checkpoint_path):
     except Exception as e:
         summary += f"\n\n**Landscape Error:** {e}"
 
-    return summary, landscape_fig, gr.update()
+    return summary, landscape_fig, None
+
+
+def extract_hidden_dims_from_state_dict(model_state: dict, model_type: str) -> list[int]:
+    """
+    Извлечение hidden_dims напрямую из state_dict.
+    """
+    hidden_dims = []
+    layer_idx = 0
+
+    while f"net.{layer_idx}.weight" in model_state:
+        weight = model_state[f"net.{layer_idx}.weight"]
+        out_dim = weight.shape[0]
+
+        # Пропускаем финальный слой (выход = 1)
+        if out_dim == 1:
+            break
+
+        hidden_dims.append(out_dim)
+        layer_idx += 2  # Linear + activation
+
+    return hidden_dims
 
 
 def generate_landscape_for_checkpoint(checkpoint_path):
@@ -174,17 +195,24 @@ def generate_landscape_for_checkpoint(checkpoint_path):
     model_type = checkpoint["model_type"]
     config = checkpoint.get("config", {})
 
+    # Извлекаем hidden_dims напрямую из state_dict
+    hidden_dims = extract_hidden_dims_from_state_dict(model_state, model_type)
+    if not hidden_dims:
+        hidden_dims = [2048, 1024, 512]  # fallback
+
+    dim = 1024  # SONAR dim
+
     if model_type == "simple":
         model = SimpleEnergy(
-            dim=config.get("energy_dim", 1024),
-            hidden_dims=config.get("energy_hidden_dims", [2048, 1024, 512]),
+            dim=dim,
+            hidden_dims=hidden_dims,
             norm_mode=config.get("norm_mode", "orthonorm"),
             activation=config.get("activation", "groupsort"),
         ).to(device)
     else:
         model = UnconditionalEnergy(
-            dim=config.get("energy_dim", 1024),
-            hidden_dims=config.get("energy_hidden_dims", [2048, 1024, 512]),
+            dim=dim,
+            hidden_dims=hidden_dims,
             norm_mode=config.get("norm_mode", "orthonorm"),
             activation=config.get("activation", "groupsort"),
         ).to(device)
@@ -259,7 +287,7 @@ def compare_selected_fn(checkpoint_paths):
             yaxis_title="Cosine Similarity",
         )
 
-    return table_md, fig, gr.update()
+    return table_md, fig, None
 
 
 def load_metrics_file_fn(file):
