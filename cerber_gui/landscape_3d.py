@@ -19,6 +19,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import Literal
 
+# Переиспользуем проверенный scan_energy_landscape из cebcm.visualization
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from cebcm.visualization.energy_landscape import scan_energy_landscape as _scan_energy_landscape
+
 
 def scan_energy_landscape_3d(
     energy_fn,
@@ -33,6 +40,8 @@ def scan_energy_landscape_3d(
 ) -> dict:
     """
     Сканирование энергетического ландшафта в 2D плоскости для 3D визуализации.
+
+    Использует проверенную функцию из cebcm.visualization.energy_landscape.
 
     Args:
         energy_fn: Функция энергии (SimpleEnergy или UnconditionalEnergy)
@@ -53,100 +62,29 @@ def scan_energy_landscape_3d(
         - clean_point, noisy_point, denoised_point: координаты в 2D
         - trajectory_2d: траектория в 2D координатах
     """
-    device = v_clean.device
-    v_clean = v_clean.detach()
-    v_noisy = v_noisy.detach()
+    # Используем проверенную функцию из cebcm.visualization
+    landscape_data = _scan_energy_landscape(
+        energy_fn=energy_fn,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+        grid_size=grid_size,
+        v_denoised=v_denoised,
+        trajectory=trajectory,
+    )
 
-    # Ensure [1, D] shape
-    if v_clean.dim() == 1:
-        v_clean = v_clean.unsqueeze(0)
-    if v_noisy.dim() == 1:
-        v_noisy = v_noisy.unsqueeze(0)
-
-    v_clean_flat = v_clean.squeeze(0)  # [D]
-    v_noisy_flat = v_noisy.squeeze(0)  # [D]
-
-    # Нормализация для масштаба
-    norm = v_clean_flat.norm()
-    scale = norm * range_factor / grid_size
-
-    # Построение 2D плоскости между clean и noisy
-    direction = v_noisy_flat - v_clean_flat
-    direction = direction / direction.norm()
-
-    # Перпендикулярное направление (через проекцию)
-    perp = torch.randn_like(v_clean_flat)
-    perp = perp - (perp @ direction) * direction
-    perp = perp / perp.norm()
-
-    basis = torch.stack([direction, perp])  # [2, D]
-
-    # Центр плоскости (между clean и noisy)
-    center = (v_clean_flat + v_noisy_flat) / 2
-
-    # Генерация сетки координат (на том же устройстве что и модель)
-    coords = torch.linspace(-grid_size // 2, grid_size // 2, grid_size, device=device)
-    xx, yy = torch.meshgrid(coords, coords, indexing="ij")
-
-    # Генерация точек сетки в пространстве embeddings
-    # grid_points: [grid_size*grid_size, D]
-    grid_points = center + (xx.flatten().unsqueeze(1) * basis[0] + yy.flatten().unsqueeze(1) * basis[1]) * scale
-
-    # Вычисление энергии для каждой точки
-    energies = []
-    for start in range(0, len(grid_points), batch_size):
-        end = start + batch_size
-        batch = grid_points[start:end].to(device)
-
-        import inspect
-        sig = inspect.signature(energy_fn.forward)
-        if len(sig.parameters) >= 2:
-            # Pairwise model (SimpleEnergy)
-            v_q = v_clean_flat.unsqueeze(0).expand(batch.shape[0], -1)
-            e = energy_fn(v_q, batch)
-        else:
-            # Unconditional model (UnconditionalEnergy)
-            e = energy_fn(batch)
-
-        energies.append(e.detach().cpu())
-
-    energy_grid = torch.cat(energies).reshape(grid_size, grid_size)
-
-    # Проекция точек на 2D плоскость
-    def project_to_2d(v: torch.Tensor) -> tuple[float, float]:
-        v = v.squeeze(0)
-        diff = v - center
-        x = (diff @ basis[0]).item() / scale
-        y = (diff @ basis[1]).item() / scale
-        return x, y
-
-    clean_2d = project_to_2d(v_clean_flat)
-    noisy_2d = project_to_2d(v_noisy_flat)
-    denoised_2d = project_to_2d(v_denoised.squeeze(0)) if v_denoised is not None else None
-
-    # Проекция траектории
-    trajectory_2d = None
-    if trajectory:
-        trajectory_2d = []
-        for v in trajectory:
-            if v.dim() == 1:
-                v = v.unsqueeze(0)
-            trajectory_2d.append(project_to_2d(v))
-
+    # Конвертируем в формат для Plotly
     return {
-        "x_range": coords.cpu().tolist(),
-        "y_range": coords.cpu().tolist(),
-        "energy_grid": energy_grid.cpu().numpy(),
-        "basis": basis.cpu().numpy(),
-        "scale": scale.item(),
-        "center": center.cpu().numpy(),
-        "clean_point": clean_2d,
-        "noisy_point": noisy_2d,
-        "denoised_point": denoised_2d,
-        "trajectory_2d": trajectory_2d,
-        "v_clean": v_clean_flat.cpu().numpy(),
-        "v_noisy": v_noisy_flat.cpu().numpy(),
-        "v_denoised": v_denoised.cpu().numpy() if v_denoised is not None else None,
+        "x_range": landscape_data.grid_x.tolist(),
+        "y_range": landscape_data.grid_y.tolist(),
+        "energy_grid": landscape_data.energy.numpy(),
+        "basis": landscape_data.basis,
+        "clean_point": landscape_data.v_clean_xy,
+        "noisy_point": landscape_data.v_noisy_xy,
+        "denoised_point": landscape_data.v_denoised_xy,
+        "trajectory_2d": landscape_data.trajectory_xy,
+        "v_clean": v_clean.squeeze(0).cpu().numpy(),
+        "v_noisy": v_noisy.squeeze(0).cpu().numpy(),
+        "v_denoised": v_denoised.squeeze(0).cpu().numpy() if v_denoised is not None else None,
     }
 
 

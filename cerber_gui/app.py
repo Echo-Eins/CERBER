@@ -230,11 +230,6 @@ def generate_landscape_for_checkpoint(checkpoint_path):
 
     model.eval()
 
-    # Отладка: вывод архитектуры
-    print(f"Model type: {model_type}")
-    print(f"Model net.0.weight shape: {model_state.get('net.0.weight', torch.zeros(0)).shape}")
-    print(f"Created model with dim={dim}, hidden_dims={hidden_dims}")
-
     # Генерируем тестовые векторы
     v_clean = torch.randn(1, 1024, device=device)
     v_clean = v_clean / v_clean.norm() * 10  # Нормализуем к масштабу SONAR
