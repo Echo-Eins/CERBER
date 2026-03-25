@@ -1,22 +1,18 @@
 """
-CERBER Model Monitor — главное Gradio приложение.
-
-Универсальный GUI для:
-- Загрузки и сравнения N чекпоинтов
-- Визуализации метрик обучения
-- 3D визуализации энергетического ландшафта
-- Реал-тайм мониторинга тренировки
+CERBER Model Monitor - main Gradio application.
 
 Usage:
     python cerber_gui/app.py
 
-    # Откроется http://localhost:7860
+    # Opens http://localhost:7860
 """
 
 import sys
+import re
+from dataclasses import is_dataclass
 from pathlib import Path
 
-# Добавляем корень проекта в path
+# Add project root to import path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
@@ -52,20 +48,124 @@ from cerber_gui.live_monitor import (
     TrainingMetricsWatcher,
     create_live_metrics_plot,
 )
+from configs.base import Stage1Config
+from cebcm.data.dataset import SONARVectorDataset
+from cebcm.inference.langevin import run_langevin
 
 
-# Глобальное состояние сессии
+# ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€œÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€¦Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸
 session_state = {
     "checkpoints": {},  # path -> checkpoint data
     "current_checkpoint": None,
     "metrics_file": None,
     "watcher": None,
     "landscape_cache": {},  # checkpoint_path -> landscape data
+    "dataset_cache": {},  # dataset_path -> SONARVectorDataset
 }
 
 
+def update_dataclass(target, updates: dict) -> None:
+    """Recursively apply dict updates to a dataclass instance."""
+    for key, value in updates.items():
+        if not hasattr(target, key):
+            continue
+        current = getattr(target, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            update_dataclass(current, value)
+        else:
+            setattr(target, key, value)
+
+
+def build_stage1_config(checkpoint: dict) -> Stage1Config:
+    """Build Stage1 config from checkpoint payload with safe defaults."""
+    cfg = Stage1Config()
+    stage1_cfg = checkpoint.get("stage1_config")
+    if isinstance(stage1_cfg, dict):
+        update_dataclass(cfg, stage1_cfg)
+    return cfg
+
+
+def _get_default_dataset_path() -> Path | None:
+    """Resolve a default local dataset for visualization parity with CLI."""
+    candidates = [
+        Path("data/wikitext_sonar_10k.pt"),
+        Path("data/wikitext_sonar_100k.pt"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def _get_dataset(path: Path) -> SONARVectorDataset:
+    key = str(path.resolve())
+    if key not in session_state["dataset_cache"]:
+        session_state["dataset_cache"][key] = SONARVectorDataset(path)
+    return session_state["dataset_cache"][key]
+
+
+def _sample_reference_clean_vector(
+    device: torch.device,
+    target_norm: float | None,
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    Sample a deterministic reference clean vector.
+
+    Priority:
+    1) real SONAR vector from local dataset (CLI parity),
+    2) deterministic synthetic vector with stage-config norm.
+    """
+    dataset_path = _get_default_dataset_path()
+    if dataset_path is not None:
+        try:
+            dataset = _get_dataset(dataset_path)
+            # Deterministic sample index for reproducible landscape previews
+            idx = seed % len(dataset)
+            v_clean = dataset[idx].unsqueeze(0).to(device)
+            return v_clean
+        except Exception:
+            # Fallback to synthetic vector if dataset cannot be loaded.
+            pass
+
+    dim = 1024
+    v_clean = torch.randn(1, dim, device=device)
+    if target_norm is not None:
+        v_clean = torch.nn.functional.normalize(v_clean, dim=-1) * target_norm
+    return v_clean
+
+
+def _add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
+    """Match CLI noise injection semantics for fair GUI-vs-CLI comparison."""
+    norms = v.norm(dim=-1, keepdim=True)
+    return v + torch.randn_like(v) * scale * norms
+
+
+class _UnconditionalEnergyAdapter:
+    """
+    Adapter for run_langevin() to support unconditional E(x) models.
+
+    run_langevin expects energy_fn(v_query, v_candidate) and
+    energy_and_grad(v_query, v_candidate). For unconditional models we ignore
+    v_query and route all computations through x=v_candidate.
+    """
+
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, _v_query: torch.Tensor, v_candidate: torch.Tensor) -> torch.Tensor:
+        return self.model(v_candidate)
+
+    def energy_and_grad(
+        self,
+        _v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.model.energy_and_grad(v_candidate)
+
+
 def load_checkpoints_fn(files):
-    """Загрузка чекпоинтов из uploaded файлов."""
+    """ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â² ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â· uploaded ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²."""
     if not files:
         return "No files uploaded", gr.Dropdown(choices=[]), gr.Dropdown(choices=[])
 
@@ -74,11 +174,12 @@ def load_checkpoints_fn(files):
 
     for file in files:
         try:
-            # Gradio передает файлы как tempfile
+            # Gradio ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº tempfile
             checkpoint = load_checkpoint(file.name)
             metadata = checkpoint["metadata"]
 
             session_state["checkpoints"][file.name] = checkpoint
+            session_state["landscape_cache"].pop(file.name, None)
 
             results.append({
                 "name": Path(file.name).name,
@@ -89,10 +190,10 @@ def load_checkpoints_fn(files):
         except Exception as e:
             errors.append(f"{Path(file.name).name}: {e}")
 
-    # Формируем summary
+    # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¤ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ summary
     if results:
         summary = "\n".join([
-            f"✓ {r['name']} — epoch {r['epoch']}, {r['model_type']}, hidden={r['hidden_dims']}"
+            f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ {r['name']} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â epoch {r['epoch']}, {r['model_type']}, hidden={r['hidden_dims']}"
             for r in results
         ])
     else:
@@ -101,22 +202,16 @@ def load_checkpoints_fn(files):
     if errors:
         summary += "\n\nErrors:\n" + "\n".join(errors)
 
-    # Обновляем dropdown
+    # ÃƒÆ’Ã‚ÂÃƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ dropdown
     dropdown_choices = list(session_state["checkpoints"].keys())
 
     return summary, gr.update(choices=dropdown_choices), gr.update(choices=dropdown_choices)
 
 
 def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
-    """Выбор чекпоинта для анализа."""
+    """ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
-        return (
-            "No checkpoint selected",
-            None,
-            "No metrics available",
-            "",
-            None,
-        )
+        return "No checkpoint selected", None, "No metrics available", None
 
     checkpoint = session_state["checkpoints"][checkpoint_path]
     metadata = checkpoint["metadata"]
@@ -134,7 +229,7 @@ def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
 **Checkpoint:** {Path(checkpoint_path).name}
 **Epoch:** {metadata.epoch}
 **Model Type:** {metadata.model_type}
-**Architecture:** {metadata.energy_dim} → {metadata.energy_hidden_dims} → 1
+**Architecture:** {metadata.energy_dim} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {metadata.energy_hidden_dims} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 1
 **Normalization:** {metadata.norm_mode}
 **Activation:** {metadata.activation}
 
@@ -147,7 +242,7 @@ def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
 - Success Rate: {success_rate_str}
 """.strip()
 
-    # 3D ландшафт
+    # 3D ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã¢â‚¬ËœÃƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡
     landscape_fig = None
     inference_info = ""
     trajectory_plot = None
@@ -156,18 +251,29 @@ def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
         landscape_data = generate_landscape_for_checkpoint(checkpoint_path)
         session_state["landscape_cache"][checkpoint_path] = landscape_data
 
-        # Выбираем backend для визуализации
+        # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ backend ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸
         if vis_backend == "matplotlib":
-            # Matplotlib backend — возвращаем изображение
+            # Matplotlib backend ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¶ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ
             landscape_fig = create_surface_plot_matplotlib(
                 landscape_data,
-                title=f"Energy Landscape — {Path(checkpoint_path).name}",
+                title=f"Energy Landscape ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {Path(checkpoint_path).name}",
             )
         else:
-            # Plotly backend — интерактивный график
-            landscape_fig = create_surface_plot(landscape_data, title=f"Energy Landscape — {Path(checkpoint_path).name}")
+            # Plotly backend ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº
+            try:
+                landscape_fig = create_surface_plot(
+                    landscape_data,
+                    title=f"Energy Landscape ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {Path(checkpoint_path).name}",
+                )
+            except Exception as plotly_err:
+                # Fallback so the UI stays usable even with strict Plotly schema/version mismatch.
+                landscape_fig = create_surface_plot_matplotlib(
+                    landscape_data,
+                    title=f"Energy Landscape ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {Path(checkpoint_path).name} (matplotlib fallback)",
+                )
+                summary += f"\n\n**Plotly Error:** {plotly_err}\nFell back to matplotlib rendering."
 
-        # Информация об инференсе
+        # ÃƒÆ’Ã‚ÂÃƒâ€¹Ã…â€œÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â± ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ
         if landscape_data.get("v_denoised") is not None:
             v_clean = landscape_data["v_clean"]
             v_noisy = landscape_data["v_noisy"]
@@ -184,7 +290,7 @@ def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
 - Improvement: {improvement:+.4f}
 - Trajectory steps: {len(landscape_data.get('trajectory_2d', [])) or 0}
 """
-            # Создаем график траектории (всегда Plotly для интерактивности)
+            # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ (ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° Plotly ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸)
             trajectory_plot = create_trajectory_plot(landscape_data)
 
     except Exception as e:
@@ -193,198 +299,217 @@ def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
     return summary, landscape_fig, inference_info, trajectory_plot
 
 
-def extract_hidden_dims_from_state_dict(model_state: dict, model_type: str) -> list[int]:
+def _extract_hidden_dims_from_state_dict(model_state: dict) -> list[int]:
     """
-    Извлечение hidden_dims напрямую из state_dict.
+    Infer hidden dims from state_dict for both plain and spectral-norm layers.
     """
-    hidden_dims = []
-    layer_idx = 0
+    linear_layers: list[tuple[int, int]] = []
+    for key, value in model_state.items():
+        if not isinstance(value, torch.Tensor) or value.ndim != 2:
+            continue
 
-    while f"net.{layer_idx}.weight" in model_state:
-        weight = model_state[f"net.{layer_idx}.weight"]
-        out_dim = weight.shape[0]
+        m = re.match(r"^net\.(\d+)\.weight$", key)
+        if m is None:
+            m = re.match(r"^net\.(\d+)\.parametrizations\.weight\.original$", key)
+        if m is None:
+            continue
 
-        # Пропускаем финальный слой (выход = 1)
+        layer_idx = int(m.group(1))
+        out_dim = int(value.shape[0])
+        linear_layers.append((layer_idx, out_dim))
+
+    if not linear_layers:
+        return []
+
+    hidden_dims: list[int] = []
+    for _, out_dim in sorted(linear_layers, key=lambda x: x[0]):
         if out_dim == 1:
             break
-
         hidden_dims.append(out_dim)
-        layer_idx += 2  # Linear + activation
-
     return hidden_dims
+
+
+def _resolve_model_hparams(checkpoint: dict) -> tuple[int, list[int], str, str]:
+    model_state = checkpoint["model_state"]
+    cfg = checkpoint.get("config", {}) or {}
+    metadata = checkpoint.get("metadata")
+
+    dim = int(cfg.get("energy_dim", getattr(metadata, "energy_dim", 1024)))
+
+    hidden_dims = cfg.get("energy_hidden_dims")
+    if not isinstance(hidden_dims, list) or not hidden_dims:
+        hidden_dims = getattr(metadata, "energy_hidden_dims", None)
+    if not isinstance(hidden_dims, list) or not hidden_dims:
+        hidden_dims = _extract_hidden_dims_from_state_dict(model_state)
+    if not hidden_dims:
+        hidden_dims = [2048, 1024, 512]
+    hidden_dims = [int(h) for h in hidden_dims if int(h) > 1]
+
+    norm_mode = str(cfg.get("norm_mode", getattr(metadata, "norm_mode", "orthonorm")))
+    activation = str(cfg.get("activation", getattr(metadata, "activation", "groupsort")))
+
+    # Infer norm mode only if checkpoint config is missing/invalid.
+    if norm_mode not in {"orthonorm", "spectral_norm", "none"}:
+        has_spectral = any(".parametrizations.weight.original" in k for k in model_state)
+        norm_mode = "spectral_norm" if has_spectral else "orthonorm"
+
+    return dim, hidden_dims, norm_mode, activation
 
 
 def create_trajectory_plot(landscape_data: dict) -> go.Figure:
     """
-    Создание 2D графика траектории Langevin dynamics.
+    Create 2D Langevin trajectory plot using the same contour semantics as CLI.
     """
-    fig = go.Figure()
-
-    trajectory_2d = landscape_data.get("trajectory_2d")
-    if trajectory_2d:
-        traj_x = [p[0] for p in trajectory_2d]
-        traj_y = [p[1] for p in trajectory_2d]
-
-        # Линия траектории
-        fig.add_trace(go.Scatter(
-            x=traj_x,
-            y=traj_y,
-            mode="lines",
-            line=dict(color="cyan", width=2),
-            name="Trajectory",
-            opacity=0.6,
-        ))
-
-        # Точки вдоль траектории с цветовым градиентом
-        fig.add_trace(go.Scatter(
-            x=traj_x,
-            y=traj_y,
-            mode="markers",
-            marker=dict(
-                size=6,
-                color=list(range(len(traj_x))),
-                colorscale="Viridis",
-                showscale=True,
-                colorbar=dict(title="Step", thickness=10),
-            ),
-            name="Steps",
-        ))
-
-        # Start point (noisy)
-        if trajectory_2d:
-            fig.add_trace(go.Scatter(
-                x=[traj_x[0]],
-                y=[traj_y[0]],
-                mode="markers",
-                marker=dict(size=12, color="red", symbol="x", line=dict(width=2, color="white")),
-                name="Start (Noisy)",
-            ))
-
-            # End point (denoised)
-            fig.add_trace(go.Scatter(
-                x=[traj_x[-1]],
-                y=[traj_y[-1]],
-                mode="markers",
-                marker=dict(size=12, color="green", symbol="circle", line=dict(width=2, color="white")),
-                name="End (Denoised)",
-            ))
-
-    # Clean point
-    clean_point = landscape_data.get("clean_point")
-    if clean_point:
-        fig.add_trace(go.Scatter(
-            x=[clean_point[0]],
-            y=[clean_point[1]],
-            mode="markers",
-            marker=dict(size=15, color="white", symbol="star", line=dict(width=2, color="yellow")),
-            name="Clean (Target)",
-        ))
-
-    # Noisy point
-    noisy_point = landscape_data.get("noisy_point")
-    if noisy_point:
-        fig.add_trace(go.Scatter(
-            x=[noisy_point[0]],
-            y=[noisy_point[1]],
-            mode="markers",
-            marker=dict(size=10, color="red", symbol="x", line=dict(width=2, color="white")),
-            name="Noisy (Start)",
-        ))
-
-    fig.update_layout(
+    return create_contour_plot(
+        landscape_data,
         title="Langevin Dynamics Trajectory",
-        xaxis_title="Direction 1 (noisy → clean)",
-        yaxis_title="Direction 2 (perpendicular)",
-        showlegend=True,
-        legend=dict(x=1.02, y=1, yanchor="top"),
-        width=500,
-        height=500,
+        colorscale="Inferno",
+        show_trajectory=True,
     )
 
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="LightGray")
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="LightGray", scaleanchor="x", scaleratio=1)
-
-    return fig
-
-
-def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
-    """
-    Запуск инференса модели с показом траектории.
-    """
-    if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
-        return "No checkpoint selected", None
-
-    checkpoint = session_state["checkpoints"][checkpoint_path]
-    model_type = checkpoint["model_type"]
-    model_state = checkpoint["model_state"]
-    config = checkpoint.get("config", {})
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Загружаем модель
+def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
+    """Instantiate and load an energy model from checkpoint payload."""
     from cebcm.models.energy import SimpleEnergy
     from cebcm.models.energy_unconditional import UnconditionalEnergy
 
-    hidden_dims = extract_hidden_dims_from_state_dict(model_state, model_type)
-    if not hidden_dims:
-        hidden_dims = [2048, 1024, 512]
-
-    dim = 1024
+    model_type = checkpoint["model_type"]
+    model_state = checkpoint["model_state"]
+    dim, hidden_dims, norm_mode, activation = _resolve_model_hparams(checkpoint)
 
     if model_type == "simple":
         model = SimpleEnergy(
             dim=dim,
             hidden_dims=hidden_dims,
-            norm_mode=config.get("norm_mode", "orthonorm"),
-            activation=config.get("activation", "groupsort"),
+            norm_mode=norm_mode,
+            activation=activation,
+            energy_output_clamp=None,  # keep true energy scale for visualization/debugging
         ).to(device)
-        model.load_state_dict(model_state, strict=False)
-        if "_sigma_freqs" in model_state:
-            model._sigma_freqs = model_state["_sigma_freqs"].to(device)
     else:
         model = UnconditionalEnergy(
             dim=dim,
             hidden_dims=hidden_dims,
-            norm_mode=config.get("norm_mode", "orthonorm"),
-            activation=config.get("activation", "groupsort"),
+            norm_mode=norm_mode,
+            activation=activation,
         ).to(device)
-        model.load_state_dict(model_state)
+
+    load_result = model.load_state_dict(model_state, strict=False)
+    missing = [k for k in load_result.missing_keys if k != "_sigma_freqs"]
+    unexpected = [k for k in load_result.unexpected_keys]
+    if missing or unexpected:
+        missing_preview = ", ".join(missing[:8])
+        unexpected_preview = ", ".join(unexpected[:8])
+        raise RuntimeError(
+            "Checkpoint/model mismatch while loading GUI model. "
+            f"model_type={model_type}, dim={dim}, hidden_dims={hidden_dims}, "
+            f"norm_mode={norm_mode}, activation={activation}. "
+            f"Missing({len(missing)}): {missing_preview}. "
+            f"Unexpected({len(unexpected)}): {unexpected_preview}."
+        )
 
     model.eval()
+    return model, model_type
 
-    # Генерируем тестовые векторы
-    torch.manual_seed(42)
-    v_clean = torch.randn(1, 1024, device=device)
-    v_clean = v_clean / v_clean.norm() * 10
 
-    v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * v_clean.norm()
+def run_langevin_denoise(
+    model,
+    v_clean: torch.Tensor,
+    v_noisy: torch.Tensor,
+    model_type: str,
+    stage1_cfg: Stage1Config,
+    max_steps: int,
+    lr_override: float | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """
+    Run Langevin denoising with Stage1-consistent math and trajectory capture.
+    """
+    method = stage1_cfg.langevin.method
+    method_kwargs = {}
+    if method == "pid":
+        method_kwargs = dict(
+            kp=stage1_cfg.langevin.pid_kp,
+            ki=stage1_cfg.langevin.pid_ki,
+            kd=stage1_cfg.langevin.pid_kd,
+            integral_decay=stage1_cfg.langevin.pid_integral_decay,
+        )
+    elif method == "underdamped":
+        method_kwargs = dict(
+            friction=stage1_cfg.langevin.underdamped_friction,
+            mass=stage1_cfg.langevin.underdamped_mass,
+        )
+    elif method == "overdamped":
+        method_kwargs = dict(momentum_beta=stage1_cfg.langevin.momentum_beta)
 
-    # Запускаем Langevin и сканируем ландшафт
+    lr = float(lr_override) if lr_override is not None else float(stage1_cfg.langevin.lr)
+    max_steps = int(max_steps)
+
+    if model_type == "unconditional":
+        energy_fn = _UnconditionalEnergyAdapter(model)
+        v_query = torch.zeros_like(v_clean)
+    else:
+        energy_fn = model
+        v_query = v_clean
+
+    result = run_langevin(
+        method=method,
+        energy_fn=energy_fn,
+        v_query=v_query,
+        v_init=v_noisy,
+        lr=lr,
+        noise_scale=stage1_cfg.langevin.noise_scale,
+        max_steps=max_steps,
+        target_norm=stage1_cfg.langevin.target_norm,
+        energy_threshold=stage1_cfg.langevin.energy_threshold,
+        plateau_patience=stage1_cfg.langevin.plateau_patience,
+        plateau_delta=stage1_cfg.langevin.plateau_delta,
+        v_target=v_clean,
+        track_vectors=True,
+        **method_kwargs,
+    )
+    return result.v_final, result.v_trajectory
+
+
+def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
+    """
+    Run denoising inference and return trajectory plot.
+    """
+    if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
+        return "No checkpoint selected", None
+
+    checkpoint = session_state["checkpoints"][checkpoint_path]
+    stage1_cfg = build_stage1_config(checkpoint)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
+
+    # Match CLI semantics: real SONAR sample when available, else deterministic fallback.
+    v_clean = _sample_reference_clean_vector(
+        device=device,
+        target_norm=stage1_cfg.langevin.target_norm,
+        seed=42,
+    )
+    v_noisy = _add_relative_noise(v_clean, float(noise_scale))
+
     v_denoised, trajectory = run_langevin_denoise(
         model=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
         model_type=model_type,
-        device=device,
-        max_steps=num_steps,
-        lr=learning_rate,
+        stage1_cfg=stage1_cfg,
+        max_steps=int(num_steps),
+        lr_override=float(learning_rate),
     )
-
-    # Сканируем ландшафт с траекторией
-    from cerber_gui.landscape_3d import scan_energy_landscape_3d
 
     landscape_data = scan_energy_landscape_3d(
         energy_fn=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
         grid_size=40,
-        range_factor=1.0,
+        range_factor=1.5,
         v_denoised=v_denoised,
         trajectory=trajectory,
         model_type=model_type,
     )
 
-    # Вычисляем метрики
     v_clean_np = v_clean.squeeze(0).cpu().numpy()
     v_noisy_np = v_noisy.squeeze(0).cpu().numpy()
     v_denoised_np = v_denoised.squeeze(0).cpu().numpy()
@@ -393,12 +518,16 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
     cos_after = float(np.dot(v_clean_np, v_denoised_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_denoised_np)))
     improvement = cos_after - cos_before
 
+    energy_min = float(landscape_data.get("energy_min", np.nan))
+    energy_max = float(landscape_data.get("energy_max", np.nan))
+
     info = f"""
 **Inference Results:**
-- Noise scale: {noise_scale}
+- Initial noise scale (relative): {noise_scale}
+- Langevin method: {stage1_cfg.langevin.method}
 - Steps: {num_steps}
 - Learning rate: {learning_rate}
-- Energy range: [{landscape_data.get('energy_min', 'N/A'):.2f}, {landscape_data.get('energy_max', 'N/A'):.2f}]
+- Energy range: [{energy_min:.4f}, {energy_max:.4f}]
 
 - Cosine (clean, noisy): {cos_before:.4f}
 - Cosine (clean, denoised): {cos_after:.4f}
@@ -406,83 +535,12 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
 - Trajectory steps: {len(trajectory)}
 """
 
-    # Создаем данные для графика траектории
-    trajectory_data = {
-        "clean_point": landscape_data.get("clean_point"),
-        "noisy_point": landscape_data.get("noisy_point"),
-        "denoised_point": landscape_data.get("denoised_point"),
-        "trajectory_2d": landscape_data.get("trajectory_2d"),
-    }
-
-    trajectory_fig = create_trajectory_plot(trajectory_data)
-
+    trajectory_fig = create_trajectory_plot(landscape_data)
     return info, trajectory_fig
 
 
-def run_langevin_denoise(
-    model,
-    v_clean: torch.Tensor,
-    v_noisy: torch.Tensor,
-    model_type: str,
-    device: torch.device,
-    max_steps: int = 50,
-    lr: float = 0.01,
-    noise_scale: float = 0.005,
-    target_norm: float = 10.0,
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """
-    Запуск Langevin dynamics для денуазинга с сохранением траектории.
-
-    Args:
-        model: Энергетическая модель
-        v_clean: [1, D] чистый вектор (целевой)
-        v_noisy: [1, D] зашумленный вектор (стартовый)
-        model_type: "simple" или "unconditional"
-        device: torch device
-        max_steps: Количество шагов Langevin
-        lr: Learning rate
-        noise_scale: Множитель шума
-        target_norm: Целевая норма векторов
-
-    Returns:
-        (v_denoised, trajectory) — финальный вектор и список векторов траектории
-    """
-    trajectory = []
-    v_current = v_noisy.clone().detach()
-
-    for step in range(max_steps):
-        # Сохраняем текущую позицию в траекторию (на device для совместимости)
-        trajectory.append(v_current.detach().clone())
-
-        if model_type == "unconditional":
-            # UnconditionalEnergy: E(x) → scalar
-            energy, grad = model.energy_and_grad(v_current)
-            # Langevin step
-            langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
-            v_current = v_current - lr * grad + langevin_noise
-        else:
-            # SimpleEnergy: E(v_query, v_candidate) → scalar
-            # Для денуазинга используем v_clean как query и v_current как candidate
-            v_current = v_current.requires_grad_(True)
-            energy = model(v_clean, v_current)
-            grad = torch.autograd.grad(energy.sum(), v_current, create_graph=False)[0]
-            v_current = v_current.detach()
-            # Langevin step
-            langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
-            v_current = v_current - lr * grad + langevin_noise
-
-        # Projection на сферу с target_norm
-        if target_norm is not None:
-            v_current = torch.nn.functional.normalize(v_current, dim=-1) * target_norm
-
-    # Добавляем финальную позицию
-    trajectory.append(v_current.detach().clone())
-
-    return v_current, trajectory
-
-
 def generate_landscape_for_checkpoint(checkpoint_path):
-    """Генерация ландшафта для чекпоинта."""
+    """Generate deterministic landscape preview for the selected checkpoint."""
     if checkpoint_path in session_state["landscape_cache"]:
         return session_state["landscape_cache"][checkpoint_path]
 
@@ -491,76 +549,32 @@ def generate_landscape_for_checkpoint(checkpoint_path):
         raise ValueError("Checkpoint not loaded")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
+    stage1_cfg = build_stage1_config(checkpoint)
 
-    # Загружаем модель из чекпоинта
-    from cebcm.models.energy import SimpleEnergy
-    from cebcm.models.energy_unconditional import UnconditionalEnergy
+    v_clean = _sample_reference_clean_vector(
+        device=device,
+        target_norm=stage1_cfg.langevin.target_norm,
+        seed=42,
+    )
+    v_noisy = _add_relative_noise(v_clean, 0.15)
 
-    model_state = checkpoint["model_state"]
-    model_type = checkpoint["model_type"]
-    config = checkpoint.get("config", {})
-
-    # Извлекаем hidden_dims напрямую из state_dict
-    hidden_dims = extract_hidden_dims_from_state_dict(model_state, model_type)
-    if not hidden_dims:
-        hidden_dims = [2048, 1024, 512]  # fallback
-
-    dim = 1024  # SONAR dim
-
-    if model_type == "simple":
-        # Для SimpleEnergy создаем модель и загружаем state_dict с strict=False
-        # чтобы избежать конфликта буферов (_sigma_freqs)
-        model = SimpleEnergy(
-            dim=dim,
-            hidden_dims=hidden_dims,
-            norm_mode=config.get("norm_mode", "orthonorm"),
-            activation=config.get("activation", "groupsort"),
-        ).to(device)
-
-        # Загружаем только параметры, игнорируя буферы
-        model.load_state_dict(model_state, strict=False)
-
-        # Если в state_dict есть _sigma_freqs, загружаем его вручную
-        if "_sigma_freqs" in model_state:
-            model._sigma_freqs = model_state["_sigma_freqs"].to(device)
-
-    else:
-        model = UnconditionalEnergy(
-            dim=dim,
-            hidden_dims=hidden_dims,
-            norm_mode=config.get("norm_mode", "orthonorm"),
-            activation=config.get("activation", "groupsort"),
-        ).to(device)
-        model.load_state_dict(model_state)
-
-    model.eval()
-
-    # Генерируем тестовые векторы
-    v_clean = torch.randn(1, 1024, device=device)
-    v_clean = v_clean / v_clean.norm() * 10  # Нормализуем к масштабу SONAR
-
-    noise_scale = 0.15
-    v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * v_clean.norm()
-
-    # Запускаем Langevin dynamics для получения траектории и denoised вектора
     v_denoised, trajectory = run_langevin_denoise(
         model=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
         model_type=model_type,
-        device=device,
+        stage1_cfg=stage1_cfg,
         max_steps=50,
+        lr_override=None,
     )
-
-    # Сканирование ландшафта
-    from cerber_gui.landscape_3d import scan_energy_landscape_3d
 
     landscape_data = scan_energy_landscape_3d(
         energy_fn=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
-        grid_size=40,  # Уменьшено для скорости
-        range_factor=1.0,
+        grid_size=40,
+        range_factor=1.5,
         v_denoised=v_denoised,
         trajectory=trajectory,
         model_type=model_type,
@@ -568,13 +582,12 @@ def generate_landscape_for_checkpoint(checkpoint_path):
 
     return landscape_data
 
-
 def compare_selected_fn(checkpoint_paths):
-    """Сравнение выбранных чекпоинтов."""
+    """ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²."""
     if not checkpoint_paths or len(checkpoint_paths) < 2:
         return "Select at least 2 checkpoints", None, None
 
-    # Загружаем чекпоинты если еще не загружены
+    # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¶ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¶ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹
     for path in checkpoint_paths:
         if path not in session_state["checkpoints"]:
             try:
@@ -583,13 +596,13 @@ def compare_selected_fn(checkpoint_paths):
             except Exception as e:
                 return f"Error loading {Path(path).name}: {e}", None, None
 
-    # Сравниваем
+    # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼
     df = compare_checkpoints(checkpoint_paths)
 
-    # Таблица
+    # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
     table_md = df.to_markdown(index=False)
 
-    # График сравнения
+    # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€œÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â
     fig = None
     if "cos_after" in df.columns and "epoch" in df.columns:
         fig = go.Figure()
@@ -618,7 +631,7 @@ def compare_selected_fn(checkpoint_paths):
 
 
 def load_metrics_file_fn(file):
-    """Загрузка файла training_metrics.json."""
+    """ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° training_metrics.json."""
     if not file:
         return "No file selected", None
 
@@ -626,7 +639,7 @@ def load_metrics_file_fn(file):
         session_state["metrics_file"] = file.name
         df = metrics_to_dataframe(file.name)
 
-        # Создаем dashboard
+        # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ dashboard
         fig = create_metrics_dashboard(df, title="Training Metrics")
 
         # Statistics
@@ -639,7 +652,7 @@ def load_metrics_file_fn(file):
 
 
 def start_live_monitor_fn(metrics_path):
-    """Запуск live мониторинга."""
+    """ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº live ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°."""
     if not metrics_path:
         return "No path specified", None
 
@@ -648,7 +661,7 @@ def start_live_monitor_fn(metrics_path):
         return f"File not found: {path}", None
 
     try:
-        # Создаем watcher
+        # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ watcher
         watcher = TrainingMetricsWatcher(path)
         watcher.start()
         session_state["watcher"] = watcher
@@ -659,7 +672,7 @@ def start_live_monitor_fn(metrics_path):
 
 
 def update_live_plot_fn():
-    """Обновление live графика (вызывается по таймеру)."""
+    """ÃƒÆ’Ã‚ÂÃƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ live ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° (ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢)."""
     watcher = session_state.get("watcher")
     if not watcher:
         return None
@@ -672,7 +685,7 @@ def update_live_plot_fn():
 
 
 def export_comparison_fn(checkpoint_paths, output_format):
-    """Экспорт сравнения чекпоинтов."""
+    """ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â­ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²."""
     if not checkpoint_paths:
         return "No checkpoints selected"
 
@@ -689,16 +702,18 @@ def export_comparison_fn(checkpoint_paths, output_format):
 # === Gradio UI ===
 
 with gr.Blocks(title="CERBER Model Monitor") as demo:
-    gr.Markdown("""
+    gr.Markdown(
+        """
     # CERBER Model Monitor
 
-    Универсальный инструмент для анализа чекпоинтов, визуализации метрик и 3D ландшафта энергии.
-    """)
+    Unified tool for checkpoint analysis, training metrics, and 3D energy landscape inspection.
+    """
+    )
 
     with gr.Tabs():
         # === Tab 1: Checkpoint Analysis ===
         with gr.TabItem("Checkpoint Analysis"):
-            gr.Markdown("### Загрузка чекпоинтов")
+            gr.Markdown("### Upload Checkpoints")
 
             with gr.Row():
                 with gr.Column(scale=1):
@@ -712,7 +727,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 with gr.Column(scale=2):
                     load_output = gr.Textbox(label="Load Results", lines=5)
 
-            gr.Markdown("### Выбор чекпоинта для анализа")
+            gr.Markdown("### Select Checkpoint")
 
             with gr.Row():
                 checkpoint_dropdown = gr.Dropdown(
@@ -726,7 +741,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     choices=["plotly", "matplotlib"],
                     value="plotly",
                     label="Visualization Backend",
-                    info="Plotly: интерактивный 3D, Matplotlib: статичный рендер"
+                    info="Plotly: interactive 3D; Matplotlib: static fallback renderer.",
                 )
 
             with gr.Row():
@@ -740,16 +755,25 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
             with gr.Row():
                 noise_scale_slider = gr.Slider(
-                    minimum=0.05, maximum=0.5, value=0.15, step=0.01,
-                    label="Noise Scale"
+                    minimum=0.05,
+                    maximum=0.5,
+                    value=0.15,
+                    step=0.01,
+                    label="Noise Scale",
                 )
                 num_steps_slider = gr.Slider(
-                    minimum=10, maximum=200, value=50, step=10,
-                    label="Langevin Steps"
+                    minimum=10,
+                    maximum=200,
+                    value=50,
+                    step=10,
+                    label="Langevin Steps",
                 )
                 lr_slider = gr.Slider(
-                    minimum=0.001, maximum=0.1, value=0.01, step=0.001,
-                    label="Learning Rate"
+                    minimum=0.001,
+                    maximum=0.1,
+                    value=0.01,
+                    step=0.001,
+                    label="Learning Rate",
                 )
                 run_inference_btn = gr.Button("Run Inference", variant="primary")
 
@@ -758,7 +782,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
         # === Tab 2: Comparison ===
         with gr.TabItem("Comparison"):
-            gr.Markdown("### Сравнение чекпоинтов")
+            gr.Markdown("### Checkpoint Comparison")
 
             with gr.Row():
                 compare_dropdown = gr.Dropdown(
@@ -782,7 +806,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
         # === Tab 3: Metrics ===
         with gr.TabItem("Training Metrics"):
-            gr.Markdown("### Загрузка training_metrics.json")
+            gr.Markdown("### Upload training_metrics.json")
 
             with gr.Row():
                 metrics_upload = gr.File(
@@ -796,11 +820,13 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
         # === Tab 4: Live Monitor ===
         with gr.TabItem("Live Monitor"):
-            gr.Markdown("""
-            ### Реал-тайм мониторинг тренировки
+            gr.Markdown(
+                """
+            ### Real-time Training Monitor
 
-            Укажите путь к `training_metrics.json` который обновляется во время тренировки.
-            """)
+            Provide a path to a `training_metrics.json` file that is being updated during training.
+            """
+            )
 
             with gr.Row():
                 live_path_input = gr.Textbox(
@@ -812,61 +838,60 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             live_status = gr.Textbox(label="Status")
             live_plot = gr.Plot(label="Live Metrics")
 
-            # Auto-refresh каждые 5 секунд
+            # Auto-refresh every 5 seconds
             live_timer = gr.Timer(value=5, active=True)
-
     # === Event Handlers ===
 
-    # Загрузка чекпоинтов
+    # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²
     load_btn.click(
         load_checkpoints_fn,
         inputs=[file_upload],
         outputs=[load_output, checkpoint_dropdown, compare_dropdown],
     )
 
-    # Выбор чекпоинта
+    # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
     checkpoint_dropdown.change(
         select_checkpoint_fn,
         inputs=[checkpoint_dropdown, vis_backend_radio],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
-    # Обновление при смене backend
+    # ÃƒÆ’Ã‚ÂÃƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ backend
     vis_backend_radio.change(
         select_checkpoint_fn,
         inputs=[checkpoint_dropdown, vis_backend_radio],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
-    # Запуск инференса
+    # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
     run_inference_btn.click(
         run_inference_fn,
         inputs=[checkpoint_dropdown, noise_scale_slider, num_steps_slider, lr_slider],
         outputs=[inference_output, trajectory_plot],
     )
 
-    # Сравнение
+    # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ
     compare_btn.click(
         compare_selected_fn,
         inputs=[compare_dropdown],
         outputs=[compare_output, compare_plot, compare_status],
     )
 
-    # Экспорт
+    # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â­ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡
     export_btn.click(
         export_comparison_fn,
         inputs=[compare_dropdown, export_format],
         outputs=[export_output],
     )
 
-    # Загрузка метрик
+    # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº
     metrics_upload.change(
         load_metrics_file_fn,
         inputs=[metrics_upload],
         outputs=[metrics_stats, metrics_plot],
     )
 
-    # Live мониторинг
+    # Live ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³
     start_live_btn.click(
         start_live_monitor_fn,
         inputs=[live_path_input],
@@ -880,7 +905,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
 
 if __name__ == "__main__":
-    # Создаем директорию для экспорта
+    # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒâ€¦Ã‚Â½ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
     (Path(__file__).parent / "exports").mkdir(exist_ok=True)
 
     demo.queue(max_size=10)
@@ -891,3 +916,6 @@ if __name__ == "__main__":
         show_error=True,
         theme=gr.themes.Soft(),
     )
+
+
+

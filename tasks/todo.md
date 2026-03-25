@@ -1,4 +1,35 @@
-﻿# Stage 1 Improvement Plan (2026-03-23)
+# CERBER GUI Web Debug Plan (2026-03-25)
+
+## Goal
+Bring `cerber_gui` math and visualization behavior into parity with the CLI landscape tool and fix Plotly backend failures.
+
+## Checklist
+- [x] Reproduce/analyze Plotly trace error path in `cerber_gui`
+- [x] Diff GUI math vs CLI (`visualize_landscape.py`) for vector scale, noise model, and Langevin path
+- [x] Refactor GUI inference/landscape generation to reuse Stage1-consistent Langevin logic and target norm
+- [x] Fix Plotly trace construction robustness and remove invalid/fragile properties
+- [x] Align GUI trajectory panel semantics with CLI contour + trajectory behavior
+- [x] Validate by static checks and code-path walkthrough; document remaining runtime checks for local CUDA env
+
+## Review (to fill after fixes)
+- Findings:
+  - GUI used synthetic vectors with norm `10.0` and custom Langevin, while CLI used real SONAR vectors and shared Stage1 Langevin. This caused major geometry drift.
+  - GUI model loading used permissive `strict=False` with inferred dims fallback, allowing silent architecture/checkpoint mismatches and invalid landscapes.
+  - `SimpleEnergy.forward()` had hard clamp `[-100, 100]`; this flattened real energy ranges (e.g. `-367..-297`) into a plateau in visualization.
+  - Plotly path could fail hard on schema/version mismatch; GUI had no graceful fallback.
+- Files changed:
+  - `cerber_gui/app.py`
+  - `cerber_gui/checkpoint_analyzer.py`
+  - `cerber_gui/landscape_3d.py`
+  - `cebcm/models/energy.py`
+  - `experiments/01_denoising_poc/visualize_landscape.py`
+- Verification:
+  - `python -m py_compile cerber_gui/app.py cerber_gui/landscape_3d.py cebcm/models/energy.py experiments/01_denoising_poc/visualize_landscape.py`
+  - Code-path audit confirms GUI now uses Stage1 config + shared `run_langevin()` + dataset-based clean sample + relative noise semantics.
+  - Runtime UI validation on target CUDA environment remains to be executed locally (this environment has no `torch` runtime).
+
+---
+# Stage 1 Improvement Plan (2026-03-23)
 
 ## Goal
 Implement the agreed Stage 1 upgrades for speed, stability, and reproducibility while preserving current architecture semantics.
@@ -288,3 +319,4 @@ data distribution p(x), not just local denoising directions. This gives:
 1. Absolute quality evaluation (not just relative)
 2. Sample generation capability (new)
 3. Theoretically optimal score function near data
+

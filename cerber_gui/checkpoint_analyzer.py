@@ -12,6 +12,7 @@ Checkpoint Analyzer — ядро системы анализа чекпоинт�
 
 import json
 import csv
+import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Any
@@ -61,8 +62,12 @@ def detect_model_type_from_state_dict(state_dict: dict) -> str:
         "simple" для SimpleEnergy (pairwise, 4104 входа)
         "unconditional" для UnconditionalEnergy (1024 входа)
     """
-    if "net.0.weight" in state_dict:
-        input_dim = state_dict["net.0.weight"].shape[1]
+    first_weight = state_dict.get("net.0.weight")
+    if first_weight is None:
+        first_weight = state_dict.get("net.0.parametrizations.weight.original")
+
+    if first_weight is not None:
+        input_dim = first_weight.shape[1]
         # SimpleEnergy: 4*dim + 8 = 4104 для dim=1024
         # UnconditionalEnergy: dim = 1024
         if input_dim > 2048:
@@ -86,25 +91,48 @@ def extract_model_config(state_dict: dict, checkpoint_config: dict | None) -> di
     config = {}
 
     # Определение размерности входа
-    if "net.0.weight" in state_dict:
-        input_dim = state_dict["net.0.weight"].shape[1]
-        hidden_dim = state_dict["net.0.weight"].shape[0]
-        config["energy_dim"] = 1024 if input_dim < 2048 else 1024  # SONAR dim
+    first_weight = state_dict.get("net.0.weight")
+    if first_weight is None:
+        first_weight = state_dict.get("net.0.parametrizations.weight.original")
+
+    if first_weight is not None:
+        input_dim = first_weight.shape[1]
+        hidden_dim = first_weight.shape[0]
+        if input_dim > 2048:
+            # SimpleEnergy input is 4 * dim + 8 sigma features.
+            inferred_dim = (int(input_dim) - 8) // 4
+            if inferred_dim > 0 and 4 * inferred_dim + 8 == int(input_dim):
+                config["energy_dim"] = inferred_dim
+            else:
+                config["energy_dim"] = 1024
+        else:
+            config["energy_dim"] = int(input_dim)
         config["first_hidden_dim"] = hidden_dim
     else:
         config["energy_dim"] = 1024  # default
         config["first_hidden_dim"] = 2048  # default
 
-    # Подсчет скрытых слоев
+    # Подсчет скрытых слоев (поддержка plain и spectral-norm state_dict)
+    linear_layers: list[tuple[int, int]] = []
+    for key, value in state_dict.items():
+        if not isinstance(value, torch.Tensor) or value.ndim != 2:
+            continue
+
+        m = re.match(r"^net\.(\d+)\.weight$", key)
+        if m is None:
+            m = re.match(r"^net\.(\d+)\.parametrizations\.weight\.original$", key)
+        if m is None:
+            continue
+
+        layer_idx = int(m.group(1))
+        out_dim = int(value.shape[0])
+        linear_layers.append((layer_idx, out_dim))
+
     hidden_dims = []
-    layer_idx = 0
-    while f"net.{layer_idx}.weight" in state_dict:
-        weight = state_dict[f"net.{layer_idx}.weight"]
-        # Пропускаем финальный Linear (выход = 1)
-        if weight.shape[0] == 1:
+    for _, out_dim in sorted(linear_layers, key=lambda x: x[0]):
+        if out_dim == 1:
             break
-        hidden_dims.append(weight.shape[0])
-        layer_idx += 2  # Linear + activation
+        hidden_dims.append(out_dim)
 
     config["energy_hidden_dims"] = hidden_dims
 

@@ -54,6 +54,8 @@ class SimpleEnergy(nn.Module):
         ortho_n_iters: Number of Bjorck iterations for orthonormalization.
         groupsort_size: Group size for GroupSort activation (2 = MaxMin).
         spline_num_knots: Number of knots for LipschitzLinearSpline.
+        energy_output_clamp: Optional symmetric clamp radius for output energy.
+            Set to None to disable clipping (recommended for visualization/debug).
     """
 
     def __init__(
@@ -66,6 +68,7 @@ class SimpleEnergy(nn.Module):
         ortho_n_iters: int = 15,
         groupsort_size: int = 2,
         spline_num_knots: int = 4,
+        energy_output_clamp: float | None = 100.0,
     ):
         super().__init__()
 
@@ -81,6 +84,7 @@ class SimpleEnergy(nn.Module):
 
         self.norm_mode = norm_mode
         self.activation_name = activation
+        self.energy_output_clamp = energy_output_clamp
 
         # [V_q; V_c; V_q - V_c; V_q * V_c; σ_embed]
         input_dim = dim * 4 + _SIGMA_EMBED_DIM
@@ -196,9 +200,12 @@ class SimpleEnergy(nn.Module):
         # This keeps the global scale trainable while preventing inf/nan cascades.
         scale = torch.exp(self.log_energy_scale.clamp(min=-8.0, max=8.0))
         raw = scale * self.net(x).squeeze(-1)
-        # Clamp energy output to prevent extreme values from blowing up
-        # backward pass through OrthoLinear layers.
-        return raw.clamp(min=-100.0, max=100.0)
+        # Optional guardrail for unstable training runs. Keep disabled in
+        # visualization/debugging paths to preserve real energy ranges.
+        if self.energy_output_clamp is not None:
+            clip = float(self.energy_output_clamp)
+            raw = raw.clamp(min=-clip, max=clip)
+        return raw
 
     def _estimate_sigma(self, v_query: Tensor, v_candidate: Tensor) -> Tensor:
         """

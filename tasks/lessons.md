@@ -100,3 +100,14 @@ When the user explicitly allows non-minimal changes for architecture-level stabi
 
 ### Rule
 If user authorizes broad refactoring, prioritize a coherent end-to-end architecture upgrade over local patching; keep compatibility, but do not artificially constrain scope.
+
+## 2026-03-25 - GUI/CLI parity and energy-range integrity
+
+### Pattern
+Web visualization diverged from CLI because GUI had its own denoising math, synthetic vector scaling, and permissive checkpoint loading (`strict=False` with fallback dims). This produced fake landscapes and hid real energy ranges behind hard clipping.
+
+### Rule
+For any visualization/debug path:
+1) reuse the same inference core (`run_langevin`) and data/noise semantics as CLI,
+2) never silently accept model/checkpoint mismatch; fail fast with explicit missing/unexpected keys,
+3) avoid hard energy clipping in analysis paths; preserve real energy values unless user explicitly requests clipping.

@@ -113,6 +113,7 @@ def load_model(checkpoint_path: str | None, config: Stage1Config, device: torch.
             hidden_dims=config.energy_hidden_dims,
             norm_mode=config.norm_mode,
             activation=config.activation,
+            energy_output_clamp=None,
         ).to(device)
         print("Created random-init SimpleEnergy (no checkpoint)")
         return model, "simple"
@@ -131,6 +132,7 @@ def load_model(checkpoint_path: str | None, config: Stage1Config, device: torch.
             hidden_dims=model_config.get("energy_hidden_dims", config.energy_hidden_dims),
             norm_mode=model_config.get("norm_mode", config.norm_mode),
             activation=model_config.get("activation", config.activation),
+            energy_output_clamp=None,
         ).to(device)
     else:  # unconditional
         model = UnconditionalEnergy(
