@@ -43,6 +43,7 @@ from cerber_gui.metrics_viewer import (
 from cerber_gui.landscape_3d import (
     scan_energy_landscape_3d,
     create_surface_plot,
+    create_surface_plot_matplotlib,
     create_contour_plot,
     create_comparison_plot,
     export_figure_to_html,
@@ -106,7 +107,7 @@ def load_checkpoints_fn(files):
     return summary, gr.update(choices=dropdown_choices), gr.update(choices=dropdown_choices)
 
 
-def select_checkpoint_fn(checkpoint_path):
+def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
     """Выбор чекпоинта для анализа."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
         return (
@@ -153,8 +154,18 @@ def select_checkpoint_fn(checkpoint_path):
 
     try:
         landscape_data = generate_landscape_for_checkpoint(checkpoint_path)
-        landscape_fig = create_surface_plot(landscape_data, title=f"Energy Landscape — {Path(checkpoint_path).name}")
         session_state["landscape_cache"][checkpoint_path] = landscape_data
+
+        # Выбираем backend для визуализации
+        if vis_backend == "matplotlib":
+            # Matplotlib backend — возвращаем изображение
+            landscape_fig = create_surface_plot_matplotlib(
+                landscape_data,
+                title=f"Energy Landscape — {Path(checkpoint_path).name}",
+            )
+        else:
+            # Plotly backend — интерактивный график
+            landscape_fig = create_surface_plot(landscape_data, title=f"Energy Landscape — {Path(checkpoint_path).name}")
 
         # Информация об инференсе
         if landscape_data.get("v_denoised") is not None:
@@ -173,7 +184,7 @@ def select_checkpoint_fn(checkpoint_path):
 - Improvement: {improvement:+.4f}
 - Trajectory steps: {len(landscape_data.get('trajectory_2d', [])) or 0}
 """
-            # Создаем график траектории
+            # Создаем график траектории (всегда Plotly для интерактивности)
             trajectory_plot = create_trajectory_plot(landscape_data)
 
     except Exception as e:
@@ -711,6 +722,14 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 )
 
             with gr.Row():
+                vis_backend_radio = gr.Radio(
+                    choices=["plotly", "matplotlib"],
+                    value="plotly",
+                    label="Visualization Backend",
+                    info="Plotly: интерактивный 3D, Matplotlib: статичный рендер"
+                )
+
+            with gr.Row():
                 checkpoint_summary = gr.Markdown()
 
             with gr.Row():
@@ -808,7 +827,14 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
     # Выбор чекпоинта
     checkpoint_dropdown.change(
         select_checkpoint_fn,
-        inputs=[checkpoint_dropdown],
+        inputs=[checkpoint_dropdown, vis_backend_radio],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+    )
+
+    # Обновление при смене backend
+    vis_backend_radio.change(
+        select_checkpoint_fn,
+        inputs=[checkpoint_dropdown, vis_backend_radio],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 

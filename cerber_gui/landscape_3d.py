@@ -94,6 +94,32 @@ def scan_energy_landscape_3d(
     }
 
 
+def _get_energy_at_point(data: dict, x: float, y: float) -> float:
+    """
+    Interpolate energy value at arbitrary (x, y) coordinates using nearest neighbor.
+
+    Args:
+        data: Landscape data with energy_grid, x_range, y_range
+        x, y: Coordinates in the 2D plane
+
+    Returns:
+        Energy value at the specified point
+    """
+    energy_grid = data["energy_grid"]
+    x_range = np.array(data["x_range"])
+    y_range = np.array(data["y_range"])
+
+    # Find nearest grid indices
+    ix = np.argmin(np.abs(x_range - x))
+    iy = np.argmin(np.abs(y_range - y))
+
+    # Clamp to valid range
+    ix = np.clip(ix, 0, energy_grid.shape[0] - 1)
+    iy = np.clip(iy, 0, energy_grid.shape[1] - 1)
+
+    return float(energy_grid[ix, iy])
+
+
 def create_surface_plot(
     data: dict,
     title: str = "Energy Landscape",
@@ -114,20 +140,23 @@ def create_surface_plot(
     """
     fig = go.Figure()
 
-    # Получаем честный диапазон энергий
+    # Получаем честный диапазон энергий — БЕЗ какого-либо clamping
     energy_min = data.get("energy_min", float(data["energy_grid"].min()))
     energy_max = data.get("energy_max", float(data["energy_grid"].max()))
 
     # Добавляем диапазон энергий в заголовок
     full_title = f"{title}<br>Energy Range: [{energy_min:.2f}, {energy_max:.2f}]"
 
-    # 3D поверхность с честными значениями
+    # 3D поверхность с честными значениями и явным zmin/zmax для правильного масштабирования
     fig.add_trace(go.Surface(
         x=data["x_range"],
         y=data["y_range"],
         z=data["energy_grid"],
         colorscale=colorscale,
         opacity=0.9,
+        # Явно устанавливаем диапазон для корректного отображения экстремальных значений
+        zmin=energy_min,
+        zmax=energy_max,
         colorbar=dict(
             title="Energy",
             thickness=20,
@@ -136,55 +165,84 @@ def create_surface_plot(
         hovertemplate="X: %{x:.2f}<br>Y: %{y:.2f}<br>Energy: %{z:.4f}<extra></extra>",
     ))
 
-    # Точки clean/noisy/denoised
+    # Вычисляем энергии для ключевых точек для правильного z-позиционирования
+    clean_energy = _get_energy_at_point(data, data["clean_point"][0], data["clean_point"][1]) if data["clean_point"] else 0
+    noisy_energy = _get_energy_at_point(data, data["noisy_point"][0], data["noisy_point"][1]) if data["noisy_point"] else 0
+    denoised_energy = _get_energy_at_point(data, data["denoised_point"][0], data["denoised_point"][1]) if data["denoised_point"] else 0
+
+    # Точки clean/noisy/denoised — УВЕЛИЧЕННЫЙ размер, размещены на поверхности (не на z=0)
     if data["clean_point"]:
         fig.add_trace(go.Scatter3d(
             x=[data["clean_point"][0]],
             y=[data["clean_point"][1]],
-            z=[0],
+            z=[clean_energy],  # Размещаем на поверхности энергии, а не на z=0
             mode="markers",
-            marker=dict(size=8, color="green", symbol="circle"),
+            marker=dict(
+                size=15,  # Увеличено с 8 до 15 для лучшей видимости
+                color="green",
+                symbol="circle",
+                opacity=1.0,
+                line=dict(width=2, color="white"),  # Белая обводка для контраста
+            ),
             name="Clean",
-            hovertemplate="Clean vector<extra></extra>",
+            hovertemplate=f"Clean vector<br>X: {data['clean_point'][0]:.2f}<br>Y: {data['clean_point'][1]:.2f}<br>Energy: {clean_energy:.4f}<extra></extra>",
         ))
 
     if data["noisy_point"]:
         fig.add_trace(go.Scatter3d(
             x=[data["noisy_point"][0]],
             y=[data["noisy_point"][1]],
-            z=[0],
+            z=[noisy_energy],
             mode="markers",
-            marker=dict(size=8, color="red", symbol="circle"),
+            marker=dict(
+                size=15,
+                color="red",
+                symbol="circle",
+                opacity=1.0,
+                line=dict(width=2, color="white"),
+            ),
             name="Noisy",
-            hovertemplate="Noisy vector<extra></extra>",
+            hovertemplate=f"Noisy vector<br>X: {data['noisy_point'][0]:.2f}<br>Y: {data['noisy_point'][1]:.2f}<br>Energy: {noisy_energy:.4f}<extra></extra>",
         ))
 
     if data["denoised_point"]:
         fig.add_trace(go.Scatter3d(
             x=[data["denoised_point"][0]],
             y=[data["denoised_point"][1]],
-            z=[0],
+            z=[denoised_energy],
             mode="markers",
-            marker=dict(size=8, color="blue", symbol="circle"),
+            marker=dict(
+                size=15,
+                color="blue",
+                symbol="circle",
+                opacity=1.0,
+                line=dict(width=2, color="white"),
+            ),
             name="Denoised",
-            hovertemplate="Denoised vector<extra></extra>",
+            hovertemplate=f"Denoised vector<br>X: {data['denoised_point'][0]:.2f}<br>Y: {data['denoised_point'][1]:.2f}<br>Energy: {denoised_energy:.4f}<extra></extra>",
         ))
 
-    # Траектория Langevin
+    # Траектория Langevin — на поверхности энергии
     if data["trajectory_2d"]:
         traj_x = [p[0] for p in data["trajectory_2d"]]
         traj_y = [p[1] for p in data["trajectory_2d"]]
-        traj_z = [0] * len(traj_x)
+        # Вычисляем энергию для каждой точки траектории
+        traj_z = [_get_energy_at_point(data, x, y) for x, y in zip(traj_x, traj_y)]
 
         fig.add_trace(go.Scatter3d(
             x=traj_x,
             y=traj_y,
             z=traj_z,
             mode="lines+markers",
-            line=dict(color="yellow", width=4),
-            marker=dict(size=3, color="yellow"),
+            line=dict(color="yellow", width=6),  # Увеличена ширина с 4 до 6
+            marker=dict(
+                size=8,  # Увеличено с 3 до 8
+                color="yellow",
+                symbol="circle",
+                line=dict(width=1, color="black"),  # Чёрная обводка для видимости
+            ),
             name="Langevin Trajectory",
-            hovertemplate="Trajectory step<extra></extra>",
+            hovertemplate="Trajectory step<br>X: %{x:.2f}<br>Y: %{y:.2f}<br>Energy: %{z:.4f}<extra></extra>",
         ))
 
     fig.update_layout(
@@ -228,12 +286,18 @@ def create_contour_plot(
     """
     fig = go.Figure()
 
-    # Контуры
+    # Получаем честный диапазон энергий
+    energy_min = data.get("energy_min", float(data["energy_grid"].min()))
+    energy_max = data.get("energy_max", float(data["energy_grid"].max()))
+
+    # Контуры с явным диапазоном
     fig.add_trace(go.Contour(
         z=data["energy_grid"],
         x=data["x_range"],
         y=data["y_range"],
         colorscale=colorscale,
+        zmin=energy_min,
+        zmax=energy_max,
         contours=dict(
             coloring="heatmap",
             showlabels=True,
@@ -242,14 +306,20 @@ def create_contour_plot(
         hovertemplate="X: %{x:.2f}<br>Y: %{y:.2f}<br>Energy: %{z:.4f}<extra></extra>",
     ))
 
-    # Точки
+    # Вычисляем энергии для ключевых точек
+    clean_energy = _get_energy_at_point(data, data["clean_point"][0], data["clean_point"][1]) if data["clean_point"] else 0
+    noisy_energy = _get_energy_at_point(data, data["noisy_point"][0], data["noisy_point"][1]) if data["noisy_point"] else 0
+    denoised_energy = _get_energy_at_point(data, data["denoised_point"][0], data["denoised_point"][1]) if data["denoised_point"] else 0
+
+    # Точки с увеличенным размером и hover-информацией
     if data["clean_point"]:
         fig.add_trace(go.Scatter(
             x=[data["clean_point"][0]],
             y=[data["clean_point"][1]],
             mode="markers",
-            marker=dict(size=12, color="green", line=dict(width=2, color="white")),
+            marker=dict(size=15, color="green", line=dict(width=2, color="white")),
             name="Clean",
+            hovertemplate=f"Clean vector<br>X: {data['clean_point'][0]:.2f}<br>Y: {data['clean_point'][1]:.2f}<br>Energy: {clean_energy:.4f}<extra></extra>",
         ))
 
     if data["noisy_point"]:
@@ -257,8 +327,9 @@ def create_contour_plot(
             x=[data["noisy_point"][0]],
             y=[data["noisy_point"][1]],
             mode="markers",
-            marker=dict(size=12, color="red", line=dict(width=2, color="white")),
+            marker=dict(size=15, color="red", line=dict(width=2, color="white")),
             name="Noisy",
+            hovertemplate=f"Noisy vector<br>X: {data['noisy_point'][0]:.2f}<br>Y: {data['noisy_point'][1]:.2f}<br>Energy: {noisy_energy:.4f}<extra></extra>",
         ))
 
     if data["denoised_point"]:
@@ -266,22 +337,25 @@ def create_contour_plot(
             x=[data["denoised_point"][0]],
             y=[data["denoised_point"][1]],
             mode="markers",
-            marker=dict(size=12, color="blue", line=dict(width=2, color="white")),
+            marker=dict(size=15, color="blue", line=dict(width=2, color="white")),
             name="Denoised",
+            hovertemplate=f"Denoised vector<br>X: {data['denoised_point'][0]:.2f}<br>Y: {data['denoised_point'][1]:.2f}<br>Energy: {denoised_energy:.4f}<extra></extra>",
         ))
 
     # Траектория
     if show_trajectory and data["trajectory_2d"]:
         traj_x = [p[0] for p in data["trajectory_2d"]]
         traj_y = [p[1] for p in data["trajectory_2d"]]
+        traj_z = [_get_energy_at_point(data, x, y) for x, y in zip(traj_x, traj_y)]
 
         fig.add_trace(go.Scatter(
             x=traj_x,
             y=traj_y,
             mode="lines+markers",
-            line=dict(color="yellow", width=3),
-            marker=dict(size=5, color="yellow"),
+            line=dict(color="yellow", width=4),
+            marker=dict(size=8, color="yellow", line=dict(width=1, color="black")),
             name="Trajectory",
+            hovertemplate="Trajectory step<br>X: %{x:.2f}<br>Y: %{y:.2f}<br>Energy: %{z:.4f}<extra></extra>",
         ))
 
     fig.update_layout(
@@ -467,6 +541,161 @@ def create_animation(
         width=900,
         height=700,
     )
+
+    return fig
+
+
+def create_surface_plot_matplotlib(
+    data: dict,
+    title: str = "Energy Landscape",
+    save_path: str | None = None,
+    show_trajectory: bool = True,
+) -> "plt.Figure":
+    """
+    Создание 3D поверхности энергии через matplotlib.
+
+    Альтернатива Plotly для случаев, когда требуется более точное контроль
+    над визуализацией или когда Plotly не справляется с экстремальными значениями.
+
+    Args:
+        data: Результат scan_energy_landscape_3d
+        title: Заголовок графика
+        save_path: Путь для сохранения (опционально)
+        show_trajectory: Показывать ли траекторию
+
+    Returns:
+        matplotlib Figure с 3D поверхностью
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        from matplotlib import cm
+    except ImportError:
+        raise ImportError("matplotlib is required for this function. pip install matplotlib")
+
+    # Получаем честный диапазон энергий
+    energy_min = data.get("energy_min", float(data["energy_grid"].min()))
+    energy_max = data.get("energy_max", float(data["energy_grid"].max()))
+
+    # Создаем фигуру с тёмным фоном (как в reference implementation)
+    fig = plt.figure(figsize=(14, 10), facecolor="#0a0a0a")
+    ax = fig.add_subplot(111, projection="3d", facecolor="#0a0a0a")
+
+    # Создаем сетку
+    X, Y = np.meshgrid(data["x_range"], data["y_range"], indexing="ij")
+    Z = data["energy_grid"]
+
+    # 3D поверхность
+    surf = ax.plot_surface(
+        X, Y, Z,
+        cmap="inferno",
+        alpha=0.95,
+        edgecolor="none",
+        rcount=100,
+        ccount=100,
+        vmin=energy_min,
+        vmax=energy_max,
+    )
+
+    # Вычисляем энергии для ключевых точек
+    clean_energy = _get_energy_at_point(data, data["clean_point"][0], data["clean_point"][1]) if data["clean_point"] else 0
+    noisy_energy = _get_energy_at_point(data, data["noisy_point"][0], data["noisy_point"][1]) if data["noisy_point"] else 0
+    denoised_energy = _get_energy_at_point(data, data["denoised_point"][0], data["denoised_point"][1]) if data["denoised_point"] else 0
+
+    # Clean point (зелёная звезда)
+    if data["clean_point"]:
+        ax.scatter(
+            [data["clean_point"][0]], [data["clean_point"][1]], [clean_energy],
+            color="lime", s=200, marker="*", zorder=10,
+            label="Clean",
+            edgecolors="white",
+            linewidths=2,
+        )
+
+    # Noisy point (красный X)
+    if data["noisy_point"]:
+        ax.scatter(
+            [data["noisy_point"][0]], [data["noisy_point"][1]], [noisy_energy],
+            color="red", s=150, marker="X", zorder=10,
+            label="Noisy",
+            edgecolors="white",
+            linewidths=2,
+        )
+
+    # Denoised point (синий круг)
+    if data["denoised_point"]:
+        ax.scatter(
+            [data["denoised_point"][0]], [data["denoised_point"][1]], [denoised_energy],
+            color="blue", s=150, marker="o", zorder=10,
+            label="Denoised",
+            edgecolors="white",
+            linewidths=2,
+        )
+
+    # Траектория
+    if show_trajectory and data["trajectory_2d"]:
+        traj_x = [p[0] for p in data["trajectory_2d"]]
+        traj_y = [p[1] for p in data["trajectory_2d"]]
+        traj_z = [_get_energy_at_point(data, x, y) for x, y in zip(traj_x, traj_y)]
+
+        # Линия траектории
+        ax.plot(traj_x, traj_y, traj_z, color="cyan", linewidth=3, alpha=0.9, zorder=9, label="Trajectory")
+
+        # Точки вдоль траектории
+        ax.scatter(traj_x, traj_y, traj_z, c=range(len(traj_x)), cmap="viridis",
+                   s=50, alpha=0.8, zorder=9, edgecolors="white", linewidths=0.5)
+
+    # Добавляем colorbar
+    cbar = fig.colorbar(surf, ax=ax, shrink=0.6, aspect=20, pad=0.1)
+    cbar.set_label("Energy", color="white", fontsize=12)
+    cbar.ax.yaxis.set_tick_params(color="gray", labelcolor="gray")
+    for tick in cbar.ax.get_yticklabels():
+        tick.set_color("gray")
+
+    # Заголовок с диапазоном энергий
+    full_title = f"{title}\nEnergy Range: [{energy_min:.2f}, {energy_max:.2f}]"
+    ax.set_title(full_title, color="white", fontsize=14, pad=20)
+
+    # Подписи осей
+    ax.set_xlabel("Direction 1 (noisy → clean)", color="white", fontsize=10, labelpad=10)
+    ax.set_ylabel("Direction 2 (perpendicular)", color="white", fontsize=10, labelpad=10)
+    ax.set_zlabel("Energy", color="white", fontsize=10, labelpad=10)
+
+    # Настройка цвета осей и тиков
+    ax.tick_params(colors="gray", labelsize=9)
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    ax.xaxis.pane.set_edgecolor("gray")
+    ax.yaxis.pane.set_edgecolor("gray")
+    ax.zaxis.pane.set_edgecolor("gray")
+
+    # Легенда
+    ax.legend(
+        loc="upper left",
+        facecolor="#1a1a1a",
+        edgecolor="gray",
+        labelcolor="white",
+        fontsize=9,
+    )
+
+    # Настройка камеры
+    ax.view_init(elev=25, azim=45)
+
+    plt.tight_layout()
+
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(
+            save_path,
+            dpi=150,
+            bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+            edgecolor="none",
+        )
 
     return fig
 
