@@ -348,7 +348,7 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
 
     v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * v_clean.norm()
 
-    # Запускаем Langevin
+    # Запускаем Langevin и сканируем ландшафт
     v_denoised, trajectory = run_langevin_denoise(
         model=model,
         v_clean=v_clean,
@@ -357,6 +357,20 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
         device=device,
         max_steps=num_steps,
         lr=learning_rate,
+    )
+
+    # Сканируем ландшафт с траекторией
+    from cerber_gui.landscape_3d import scan_energy_landscape_3d
+
+    landscape_data = scan_energy_landscape_3d(
+        energy_fn=model,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+        grid_size=40,
+        range_factor=1.0,
+        v_denoised=v_denoised,
+        trajectory=trajectory,
+        model_type=model_type,
     )
 
     # Вычисляем метрики
@@ -373,6 +387,7 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
 - Noise scale: {noise_scale}
 - Steps: {num_steps}
 - Learning rate: {learning_rate}
+- Energy range: [{landscape_data.get('energy_min', 'N/A'):.2f}, {landscape_data.get('energy_max', 'N/A'):.2f}]
 
 - Cosine (clean, noisy): {cos_before:.4f}
 - Cosine (clean, denoised): {cos_after:.4f}
@@ -380,29 +395,15 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
 - Trajectory steps: {len(trajectory)}
 """
 
-    # Создаем данные для траектории в 2D
-    # Используем ту же логику что и в scan_energy_landscape
-    from cebcm.visualization.energy_landscape import _make_orthogonal_basis
-
-    v_clean_flat = v_clean.squeeze(0)
-    v_noisy_flat = v_noisy.squeeze(0)
-    axis1, axis2 = _make_orthogonal_basis(v_clean_flat, v_noisy_flat)
-    center = v_clean_flat
-
-    def project(v):
-        diff = v - center
-        return (float(diff @ axis1), float(diff @ axis2))
-
-    trajectory_2d = [project(v.squeeze(0)) for v in trajectory]
-
-    landscape_data = {
-        "clean_point": project(v_clean_flat),
-        "noisy_point": project(v_noisy_flat),
-        "denoised_point": project(v_denoised.squeeze(0)),
-        "trajectory_2d": trajectory_2d,
+    # Создаем данные для графика траектории
+    trajectory_data = {
+        "clean_point": landscape_data.get("clean_point"),
+        "noisy_point": landscape_data.get("noisy_point"),
+        "denoised_point": landscape_data.get("denoised_point"),
+        "trajectory_2d": landscape_data.get("trajectory_2d"),
     }
 
-    trajectory_fig = create_trajectory_plot(landscape_data)
+    trajectory_fig = create_trajectory_plot(trajectory_data)
 
     return info, trajectory_fig
 
@@ -439,8 +440,8 @@ def run_langevin_denoise(
     v_current = v_noisy.clone().detach()
 
     for step in range(max_steps):
-        # Сохраняем текущую позицию в траекторию
-        trajectory.append(v_current.detach().cpu().clone())
+        # Сохраняем текущую позицию в траекторию (на device для совместимости)
+        trajectory.append(v_current.detach().clone())
 
         if model_type == "unconditional":
             # UnconditionalEnergy: E(x) → scalar
@@ -464,7 +465,7 @@ def run_langevin_denoise(
             v_current = torch.nn.functional.normalize(v_current, dim=-1) * target_norm
 
     # Добавляем финальную позицию
-    trajectory.append(v_current.detach().cpu().clone())
+    trajectory.append(v_current.detach().clone())
 
     return v_current, trajectory
 

@@ -72,28 +72,22 @@ def scan_energy_landscape_3d(
         trajectory=trajectory,
     )
 
-    # Конвертируем в формат для Plotly
+    # Конвертируем в формат для Plotly — ЧЕСТНЫЕ значения без масштабирования
     energy_np = landscape_data.energy.numpy()
-
-    # Нормализуем энергию для лучшей визуализации (центрируем и масштабируем)
-    energy_min = energy_np.min()
-    energy_max = energy_np.max()
-    energy_range = energy_max - energy_min
-    if energy_range > 0:
-        # Центрируем вокруг нуля и масштабируем для лучшей видимости
-        energy_np = (energy_np - energy_min) / energy_range * 10  # Scale to [0, 10]
+    energy_min = float(energy_np.min())
+    energy_max = float(energy_np.max())
 
     return {
         "x_range": landscape_data.grid_x.tolist(),
         "y_range": landscape_data.grid_y.tolist(),
-        "energy_grid": energy_np,
-        "energy_raw": landscape_data.energy.numpy(),  # Сохраняем сырые значения
-        "energy_range": (float(energy_min), float(energy_max)),
+        "energy_grid": energy_np,  # Честные значения энергии
+        "energy_min": energy_min,
+        "energy_max": energy_max,
         "basis": landscape_data.basis,
         "clean_point": landscape_data.v_clean_xy,
         "noisy_point": landscape_data.v_noisy_xy,
         "denoised_point": landscape_data.v_denoised_xy,
-        "trajectory_2d": landscape_data.trajectory_xy,
+        "trajectory_2d": landscape_data.trajectory_xy,  # Уже спроецировано в _scan_energy_landscape
         "v_clean": v_clean.squeeze(0).cpu().numpy(),
         "v_noisy": v_noisy.squeeze(0).cpu().numpy(),
         "v_denoised": v_denoised.squeeze(0).cpu().numpy() if v_denoised is not None else None,
@@ -120,14 +114,25 @@ def create_surface_plot(
     """
     fig = go.Figure()
 
-    # 3D поверхность
+    # Получаем честный диапазон энергий
+    energy_min = data.get("energy_min", float(data["energy_grid"].min()))
+    energy_max = data.get("energy_max", float(data["energy_grid"].max()))
+
+    # Добавляем диапазон энергий в заголовок
+    full_title = f"{title}<br>Energy Range: [{energy_min:.2f}, {energy_max:.2f}]"
+
+    # 3D поверхность с честными значениями
     fig.add_trace(go.Surface(
         x=data["x_range"],
         y=data["y_range"],
         z=data["energy_grid"],
         colorscale=colorscale,
         opacity=0.9,
-        colorbar=dict(title="Energy", thickness=20),
+        colorbar=dict(
+            title="Energy",
+            thickness=20,
+            tickformat=".2f",
+        ),
         hovertemplate="X: %{x:.2f}<br>Y: %{y:.2f}<br>Energy: %{z:.4f}<extra></extra>",
     ))
 
@@ -183,7 +188,7 @@ def create_surface_plot(
         ))
 
     fig.update_layout(
-        title=dict(text=title, font=dict(size=20)),
+        title=dict(text=full_title, font=dict(size=20)),
         scene=dict(
             xaxis_title="Direction 1 (noisy → clean)",
             yaxis_title="Direction 2 (perpendicular)",
