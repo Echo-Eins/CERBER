@@ -54,33 +54,43 @@ def scan_energy_landscape_3d(
         - trajectory_2d: траектория в 2D координатах
     """
     device = v_clean.device
-    v_clean = v_clean.detach().squeeze(0)
-    v_noisy = v_noisy.detach().squeeze(0)
+    v_clean = v_clean.detach()
+    v_noisy = v_noisy.detach()
+
+    # Ensure [1, D] shape
+    if v_clean.dim() == 1:
+        v_clean = v_clean.unsqueeze(0)
+    if v_noisy.dim() == 1:
+        v_noisy = v_noisy.unsqueeze(0)
+
+    v_clean_flat = v_clean.squeeze(0)  # [D]
+    v_noisy_flat = v_noisy.squeeze(0)  # [D]
 
     # Нормализация для масштаба
-    norm = v_clean.norm()
+    norm = v_clean_flat.norm()
     scale = norm * range_factor / grid_size
 
     # Построение 2D плоскости между clean и noisy
-    direction = v_noisy - v_clean
+    direction = v_noisy_flat - v_clean_flat
     direction = direction / direction.norm()
 
     # Перпендикулярное направление (через проекцию)
-    perp = torch.randn_like(v_clean)
+    perp = torch.randn_like(v_clean_flat)
     perp = perp - (perp @ direction) * direction
     perp = perp / perp.norm()
 
     basis = torch.stack([direction, perp])  # [2, D]
 
     # Центр плоскости (между clean и noisy)
-    center = (v_clean + v_noisy) / 2
+    center = (v_clean_flat + v_noisy_flat) / 2
 
     # Генерация сетки координат
-    coords = torch.linspace(-grid_size // 2, grid_size // 2, grid_size)
+    coords = torch.linspace(-grid_size // 2, grid_size // 2, grid_size, device=device)
     xx, yy = torch.meshgrid(coords, coords, indexing="ij")
 
     # Генерация точек сетки в пространстве embeddings
-    grid_points = center.unsqueeze(0) + (xx.flatten() * basis[0] + yy.flatten() * basis[1]).unsqueeze(0) * scale
+    # grid_points: [grid_size*grid_size, D]
+    grid_points = center + (xx.flatten().unsqueeze(1) * basis[0] + yy.flatten().unsqueeze(1) * basis[1]) * scale
 
     # Вычисление энергии для каждой точки
     energies = []
@@ -92,7 +102,7 @@ def scan_energy_landscape_3d(
         sig = inspect.signature(energy_fn.forward)
         if len(sig.parameters) >= 2:
             # Pairwise model (SimpleEnergy)
-            v_q = v_clean.unsqueeze(0).expand(batch.shape[0], -1).to(device)
+            v_q = v_clean_flat.unsqueeze(0).expand(batch.shape[0], -1)
             e = energy_fn(v_q, batch)
         else:
             # Unconditional model (UnconditionalEnergy)
@@ -110,8 +120,8 @@ def scan_energy_landscape_3d(
         y = (diff @ basis[1]).item() / scale
         return x, y
 
-    clean_2d = project_to_2d(v_clean)
-    noisy_2d = project_to_2d(v_noisy)
+    clean_2d = project_to_2d(v_clean_flat)
+    noisy_2d = project_to_2d(v_noisy_flat)
     denoised_2d = project_to_2d(v_denoised.squeeze(0)) if v_denoised is not None else None
 
     # Проекция траектории
@@ -134,8 +144,8 @@ def scan_energy_landscape_3d(
         "noisy_point": noisy_2d,
         "denoised_point": denoised_2d,
         "trajectory_2d": trajectory_2d,
-        "v_clean": v_clean.cpu().numpy(),
-        "v_noisy": v_noisy.cpu().numpy(),
+        "v_clean": v_clean_flat.cpu().numpy(),
+        "v_noisy": v_noisy_flat.cpu().numpy(),
         "v_denoised": v_denoised.cpu().numpy() if v_denoised is not None else None,
     }
 

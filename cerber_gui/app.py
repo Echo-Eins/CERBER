@@ -203,12 +203,22 @@ def generate_landscape_for_checkpoint(checkpoint_path):
     dim = 1024  # SONAR dim
 
     if model_type == "simple":
+        # Для SimpleEnergy создаем модель и загружаем state_dict с strict=False
+        # чтобы избежать конфликта буферов (_sigma_freqs)
         model = SimpleEnergy(
             dim=dim,
             hidden_dims=hidden_dims,
             norm_mode=config.get("norm_mode", "orthonorm"),
             activation=config.get("activation", "groupsort"),
         ).to(device)
+
+        # Загружаем только параметры, игнорируя буферы
+        model.load_state_dict(model_state, strict=False)
+
+        # Если в state_dict есть _sigma_freqs, загружаем его вручную
+        if "_sigma_freqs" in model_state:
+            model._sigma_freqs = model_state["_sigma_freqs"].to(device)
+
     else:
         model = UnconditionalEnergy(
             dim=dim,
@@ -216,9 +226,14 @@ def generate_landscape_for_checkpoint(checkpoint_path):
             norm_mode=config.get("norm_mode", "orthonorm"),
             activation=config.get("activation", "groupsort"),
         ).to(device)
+        model.load_state_dict(model_state)
 
-    model.load_state_dict(model_state)
     model.eval()
+
+    # Отладка: вывод архитектуры
+    print(f"Model type: {model_type}")
+    print(f"Model net.0.weight shape: {model_state.get('net.0.weight', torch.zeros(0)).shape}")
+    print(f"Created model with dim={dim}, hidden_dims={hidden_dims}")
 
     # Генерируем тестовые векторы
     v_clean = torch.randn(1, 1024, device=device)
