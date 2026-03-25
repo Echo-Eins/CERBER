@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from configs.base import Stage1Config
 from cebcm.models.energy import SimpleEnergy
+from cebcm.models.energy_unconditional import UnconditionalEnergy
 from cebcm.inference.langevin import run_langevin
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.visualization.energy_landscape import (
@@ -72,8 +73,40 @@ def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
     return v + torch.randn_like(v) * scale * norms
 
 
-def load_model(checkpoint_path: str | None, config: Stage1Config, device: torch.device) -> SimpleEnergy:
-    """Load model from checkpoint, or create random-init model."""
+def detect_model_type(state_dict: dict) -> str:
+    """
+    Detect model type from state_dict keys.
+
+    Returns: "simple" for SimpleEnergy (pairwise), "unconditional" for UnconditionalEnergy
+    """
+    first_key = next(iter(state_dict.keys()), "")
+
+    # SimpleEnergy has pairwise features: net.0.weight shape [H, 4D+8]
+    # UnconditionalEnergy has single input: net.0.weight shape [H, D]
+    if "net.0.weight" in state_dict:
+        input_dim = state_dict["net.0.weight"].shape[1]
+        # SimpleEnergy: 4*dim + 8 (sigma_embed) = 4104 for dim=1024
+        # UnconditionalEnergy: dim = 1024
+        if input_dim > 2048:  # Has pairwise features + sigma embedding
+            return "simple"
+        else:
+            return "unconditional"
+
+    # Fallback: check for _sigma_freqs buffer (SimpleEnergy specific)
+    if "_sigma_freqs" in state_dict:
+        return "simple"
+
+    return "unconditional"
+
+
+def load_model(checkpoint_path: str | None, config: Stage1Config, device: torch.device):
+    """
+    Load model from checkpoint, or create random-init model.
+    Auto-detects model type (SimpleEnergy vs UnconditionalEnergy) from checkpoint.
+
+    Returns:
+        Tuple of (model, model_type) where model_type is "simple" or "unconditional"
+    """
     if checkpoint_path is None:
         model = SimpleEnergy(
             dim=config.energy_dim,
@@ -82,31 +115,55 @@ def load_model(checkpoint_path: str | None, config: Stage1Config, device: torch.
             activation=config.activation,
         ).to(device)
         print("Created random-init SimpleEnergy (no checkpoint)")
-        return model
+        return model, "simple"
 
     ckpt = torch.load(checkpoint_path, weights_only=False, map_location=device)
+    model_state = ckpt["model_state"]
+
+    # Auto-detect model type from state_dict
+    model_type = detect_model_type(model_state)
+
     model_config = ckpt.get("config", {})
-    model = SimpleEnergy(
-        dim=model_config.get("energy_dim", config.energy_dim),
-        hidden_dims=model_config.get("energy_hidden_dims", config.energy_hidden_dims),
-        norm_mode=model_config.get("norm_mode", config.norm_mode),
-        activation=model_config.get("activation", config.activation),
-    ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+
+    if model_type == "simple":
+        model = SimpleEnergy(
+            dim=model_config.get("energy_dim", config.energy_dim),
+            hidden_dims=model_config.get("energy_hidden_dims", config.energy_hidden_dims),
+            norm_mode=model_config.get("norm_mode", config.norm_mode),
+            activation=model_config.get("activation", config.activation),
+        ).to(device)
+    else:  # unconditional
+        model = UnconditionalEnergy(
+            dim=model_config.get("energy_dim", config.energy_dim),
+            hidden_dims=model_config.get("energy_hidden_dims", config.energy_hidden_dims),
+            norm_mode=model_config.get("norm_mode", config.norm_mode),
+            activation=model_config.get("activation", config.activation),
+        ).to(device)
+
+    model.load_state_dict(model_state)
     epoch = ckpt.get("epoch", "?")
-    print(f"Loaded checkpoint: {checkpoint_path} (epoch {epoch})")
-    return model
+    print(f"Loaded checkpoint: {checkpoint_path} (epoch {epoch}, model_type={model_type})")
+    return model, model_type
 
 
 def run_langevin_with_trajectory(
-    model: SimpleEnergy,
+    model,
     v_query: torch.Tensor,
     v_noisy: torch.Tensor,
     config: Stage1Config,
+    model_type: str = "simple",
     max_steps: int = 100,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """
     Run Langevin dynamics and collect the full trajectory for visualization.
+
+    Args:
+        model: Energy model (SimpleEnergy or UnconditionalEnergy)
+        v_query: Query/target vector (clean)
+        v_noisy: Starting noisy vector
+        config: Langevin configuration
+        model_type: "simple" for pairwise, "unconditional" for scalar energy
+        max_steps: Number of Langevin steps
     """
     method = config.langevin.method
     method_kwargs = {}
@@ -125,24 +182,52 @@ def run_langevin_with_trajectory(
     elif method == "overdamped":
         method_kwargs = dict(momentum_beta=config.langevin.momentum_beta)
 
-    result = run_langevin(
-        method=method,
-        energy_fn=model,
-        v_query=v_query,
-        v_init=v_noisy,
-        lr=config.langevin.lr,
-        noise_scale=config.langevin.noise_scale,
-        max_steps=max_steps,
-        target_norm=config.langevin.target_norm,
-        plateau_patience=config.langevin.plateau_patience,
-        plateau_delta=config.langevin.plateau_delta,
-        v_target=v_query,
-        track_vectors=True,
-        **method_kwargs,
-    )
-    trajectory = result.v_trajectory
+    # For UnconditionalEnergy, use the model's built-in Langevin with manual trajectory tracking
+    if model_type == "unconditional":
+        # Manual trajectory tracking for unconditional model
+        trajectory = []
+        v_trajectory = []
+        v_current = v_noisy.clone().detach()
+        target_norm = config.langevin.target_norm
 
-    return result.v_final, trajectory
+        lr = config.langevin.lr
+        noise_scale = config.langevin.noise_scale
+
+        for step in range(max_steps):
+            energy, grad = model.energy_and_grad(v_current)
+            e_mean = energy.mean().item()
+            trajectory.append(e_mean)
+            v_trajectory.append(v_current.detach().cpu().clone())
+
+            # Langevin step
+            langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
+            v_current = v_current - lr * grad + langevin_noise
+
+            # OOD projection
+            if target_norm is not None:
+                v_current = torch.nn.functional.normalize(v_current, dim=-1) * target_norm
+
+        v_trajectory.append(v_current.detach().cpu().clone())
+        return v_current, v_trajectory
+
+    else:
+        result = run_langevin(
+            method=method,
+            energy_fn=model,
+            v_query=v_query,
+            v_init=v_noisy,
+            lr=config.langevin.lr,
+            noise_scale=config.langevin.noise_scale,
+            max_steps=max_steps,
+            target_norm=config.langevin.target_norm,
+            plateau_patience=config.langevin.plateau_patience,
+            plateau_delta=config.langevin.plateau_delta,
+            v_target=v_query,
+            track_vectors=True,
+            **method_kwargs,
+        )
+        trajectory = result.v_trajectory
+        return result.v_final, trajectory
 
 
 def main():
@@ -184,17 +269,18 @@ def main():
 
     # Load model(s)
     if args.no_checkpoint:
-        model = load_model(None, config, device)
+        model, model_type = load_model(None, config, device)
     elif args.checkpoint:
-        model = load_model(args.checkpoint, config, device)
+        model, model_type = load_model(args.checkpoint, config, device)
     else:
         parser.error("Provide --checkpoint or --no_checkpoint")
 
     model.eval()
 
     model_before = None
+    model_before_type = None
     if args.checkpoint_before:
-        model_before = load_model(args.checkpoint_before, config, device)
+        model_before, model_before_type = load_model(args.checkpoint_before, config, device)
         model_before.eval()
 
     output_dir = Path(args.output_dir)
@@ -212,7 +298,7 @@ def main():
 
         # Run Langevin and collect trajectory
         v_denoised, trajectory = run_langevin_with_trajectory(
-            model, v_clean, v_noisy, config, max_steps=args.langevin_steps,
+            model, v_clean, v_noisy, config, model_type=model_type, max_steps=args.langevin_steps,
         )
         cos_after = F.cosine_similarity(v_clean, v_denoised.unsqueeze(0) if v_denoised.dim() == 1 else v_denoised, dim=-1).item()
         print(f"  cos(clean, denoised)={cos_after:.4f} (Δ={cos_after - cos_before:+.4f})")
@@ -250,6 +336,7 @@ def main():
             )
             comp_path = output_dir / f"comparison_sample{sample_idx:02d}.png"
             plot_comparison(data_before, data, save_path=comp_path)
+            print(f"  Saved comparison: {comp_path}")
 
     print(f"\nAll plots saved to {output_dir}/")
 

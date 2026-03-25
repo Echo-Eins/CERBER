@@ -156,14 +156,24 @@ def scan_energy_landscape(
     batch_size = 256
     all_energies = []
     all_cosines = []
-    v_query_expanded = v_clean.expand(batch_size, -1)  # [batch_size, D]
 
     for start in range(0, len(batch_points), batch_size):
         end = min(start + batch_size, len(batch_points))
         batch = batch_points[start:end]  # [B, D]
-        v_q = v_clean.expand(batch.shape[0], -1)
 
-        e = energy_fn(v_q, batch)  # [B]
+        # Support both pairwise (SimpleEnergy) and unconditional (UnconditionalEnergy) models
+        # SimpleEnergy: energy_fn(v_query, v_candidate) -> [B]
+        # UnconditionalEnergy: energy_fn(v_candidate) -> [B]
+        import inspect
+        sig = inspect.signature(energy_fn.forward)
+        if len(sig.parameters) >= 2:
+            # Pairwise model (SimpleEnergy)
+            v_q = v_clean.expand(batch.shape[0], -1)
+            e = energy_fn(v_q, batch)  # [B]
+        else:
+            # Unconditional model (UnconditionalEnergy)
+            e = energy_fn(batch)  # [B]
+
         cos = F.cosine_similarity(v_clean_flat.unsqueeze(0), batch, dim=-1)  # [B]
 
         all_energies.append(e.cpu())
