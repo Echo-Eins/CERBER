@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import gradio as gr
 import plotly.graph_objects as go
+import numpy as np
 
 from cerber_gui.checkpoint_analyzer import (
     load_checkpoint,
@@ -112,6 +113,8 @@ def select_checkpoint_fn(checkpoint_path):
             "No checkpoint selected",
             None,
             "No metrics available",
+            "",
+            None,
         )
 
     checkpoint = session_state["checkpoints"][checkpoint_path]
@@ -145,14 +148,38 @@ def select_checkpoint_fn(checkpoint_path):
 
     # 3D ландшафт
     landscape_fig = None
+    inference_info = ""
+    trajectory_plot = None
+
     try:
         landscape_data = generate_landscape_for_checkpoint(checkpoint_path)
         landscape_fig = create_surface_plot(landscape_data, title=f"Energy Landscape — {Path(checkpoint_path).name}")
         session_state["landscape_cache"][checkpoint_path] = landscape_data
+
+        # Информация об инференсе
+        if landscape_data.get("v_denoised") is not None:
+            v_clean = landscape_data["v_clean"]
+            v_noisy = landscape_data["v_noisy"]
+            v_denoised = landscape_data["v_denoised"]
+
+            cos_before = float(np.dot(v_clean, v_noisy) / (np.linalg.norm(v_clean) * np.linalg.norm(v_noisy)))
+            cos_after = float(np.dot(v_clean, v_denoised) / (np.linalg.norm(v_clean) * np.linalg.norm(v_denoised)))
+            improvement = cos_after - cos_before
+
+            inference_info = f"""
+**Inference Results:**
+- Cosine (clean, noisy): {cos_before:.4f}
+- Cosine (clean, denoised): {cos_after:.4f}
+- Improvement: {improvement:+.4f}
+- Trajectory steps: {len(landscape_data.get('trajectory_2d', [])) or 0}
+"""
+            # Создаем график траектории
+            trajectory_plot = create_trajectory_plot(landscape_data)
+
     except Exception as e:
         summary += f"\n\n**Landscape Error:** {e}"
 
-    return summary, landscape_fig, None
+    return summary, landscape_fig, inference_info, trajectory_plot
 
 
 def extract_hidden_dims_from_state_dict(model_state: dict, model_type: str) -> list[int]:
@@ -174,6 +201,272 @@ def extract_hidden_dims_from_state_dict(model_state: dict, model_type: str) -> l
         layer_idx += 2  # Linear + activation
 
     return hidden_dims
+
+
+def create_trajectory_plot(landscape_data: dict) -> go.Figure:
+    """
+    Создание 2D графика траектории Langevin dynamics.
+    """
+    fig = go.Figure()
+
+    trajectory_2d = landscape_data.get("trajectory_2d")
+    if trajectory_2d:
+        traj_x = [p[0] for p in trajectory_2d]
+        traj_y = [p[1] for p in trajectory_2d]
+
+        # Линия траектории
+        fig.add_trace(go.Scatter(
+            x=traj_x,
+            y=traj_y,
+            mode="lines",
+            line=dict(color="cyan", width=2),
+            name="Trajectory",
+            opacity=0.6,
+        ))
+
+        # Точки вдоль траектории с цветовым градиентом
+        fig.add_trace(go.Scatter(
+            x=traj_x,
+            y=traj_y,
+            mode="markers",
+            marker=dict(
+                size=6,
+                color=list(range(len(traj_x))),
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="Step", thickness=10),
+            ),
+            name="Steps",
+        ))
+
+        # Start point (noisy)
+        if trajectory_2d:
+            fig.add_trace(go.Scatter(
+                x=[traj_x[0]],
+                y=[traj_y[0]],
+                mode="markers",
+                marker=dict(size=12, color="red", symbol="x", line=dict(width=2, color="white")),
+                name="Start (Noisy)",
+            ))
+
+            # End point (denoised)
+            fig.add_trace(go.Scatter(
+                x=[traj_x[-1]],
+                y=[traj_y[-1]],
+                mode="markers",
+                marker=dict(size=12, color="green", symbol="circle", line=dict(width=2, color="white")),
+                name="End (Denoised)",
+            ))
+
+    # Clean point
+    clean_point = landscape_data.get("clean_point")
+    if clean_point:
+        fig.add_trace(go.Scatter(
+            x=[clean_point[0]],
+            y=[clean_point[1]],
+            mode="markers",
+            marker=dict(size=15, color="white", symbol="star", line=dict(width=2, color="yellow")),
+            name="Clean (Target)",
+        ))
+
+    # Noisy point
+    noisy_point = landscape_data.get("noisy_point")
+    if noisy_point:
+        fig.add_trace(go.Scatter(
+            x=[noisy_point[0]],
+            y=[noisy_point[1]],
+            mode="markers",
+            marker=dict(size=10, color="red", symbol="x", line=dict(width=2, color="white")),
+            name="Noisy (Start)",
+        ))
+
+    fig.update_layout(
+        title="Langevin Dynamics Trajectory",
+        xaxis_title="Direction 1 (noisy → clean)",
+        yaxis_title="Direction 2 (perpendicular)",
+        showlegend=True,
+        legend=dict(x=1.02, y=1, yanchor="top"),
+        width=500,
+        height=500,
+    )
+
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="LightGray")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="LightGray", scaleanchor="x", scaleratio=1)
+
+    return fig
+
+
+def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
+    """
+    Запуск инференса модели с показом траектории.
+    """
+    if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
+        return "No checkpoint selected", None
+
+    checkpoint = session_state["checkpoints"][checkpoint_path]
+    model_type = checkpoint["model_type"]
+    model_state = checkpoint["model_state"]
+    config = checkpoint.get("config", {})
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Загружаем модель
+    from cebcm.models.energy import SimpleEnergy
+    from cebcm.models.energy_unconditional import UnconditionalEnergy
+
+    hidden_dims = extract_hidden_dims_from_state_dict(model_state, model_type)
+    if not hidden_dims:
+        hidden_dims = [2048, 1024, 512]
+
+    dim = 1024
+
+    if model_type == "simple":
+        model = SimpleEnergy(
+            dim=dim,
+            hidden_dims=hidden_dims,
+            norm_mode=config.get("norm_mode", "orthonorm"),
+            activation=config.get("activation", "groupsort"),
+        ).to(device)
+        model.load_state_dict(model_state, strict=False)
+        if "_sigma_freqs" in model_state:
+            model._sigma_freqs = model_state["_sigma_freqs"].to(device)
+    else:
+        model = UnconditionalEnergy(
+            dim=dim,
+            hidden_dims=hidden_dims,
+            norm_mode=config.get("norm_mode", "orthonorm"),
+            activation=config.get("activation", "groupsort"),
+        ).to(device)
+        model.load_state_dict(model_state)
+
+    model.eval()
+
+    # Генерируем тестовые векторы
+    torch.manual_seed(42)
+    v_clean = torch.randn(1, 1024, device=device)
+    v_clean = v_clean / v_clean.norm() * 10
+
+    v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * v_clean.norm()
+
+    # Запускаем Langevin
+    v_denoised, trajectory = run_langevin_denoise(
+        model=model,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+        model_type=model_type,
+        device=device,
+        max_steps=num_steps,
+        lr=learning_rate,
+    )
+
+    # Вычисляем метрики
+    v_clean_np = v_clean.squeeze(0).cpu().numpy()
+    v_noisy_np = v_noisy.squeeze(0).cpu().numpy()
+    v_denoised_np = v_denoised.squeeze(0).cpu().numpy()
+
+    cos_before = float(np.dot(v_clean_np, v_noisy_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_noisy_np)))
+    cos_after = float(np.dot(v_clean_np, v_denoised_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_denoised_np)))
+    improvement = cos_after - cos_before
+
+    info = f"""
+**Inference Results:**
+- Noise scale: {noise_scale}
+- Steps: {num_steps}
+- Learning rate: {learning_rate}
+
+- Cosine (clean, noisy): {cos_before:.4f}
+- Cosine (clean, denoised): {cos_after:.4f}
+- Improvement: {improvement:+.4f}
+- Trajectory steps: {len(trajectory)}
+"""
+
+    # Создаем данные для траектории в 2D
+    # Используем ту же логику что и в scan_energy_landscape
+    from cebcm.visualization.energy_landscape import _make_orthogonal_basis
+
+    v_clean_flat = v_clean.squeeze(0)
+    v_noisy_flat = v_noisy.squeeze(0)
+    axis1, axis2 = _make_orthogonal_basis(v_clean_flat, v_noisy_flat)
+    center = v_clean_flat
+
+    def project(v):
+        diff = v - center
+        return (float(diff @ axis1), float(diff @ axis2))
+
+    trajectory_2d = [project(v.squeeze(0)) for v in trajectory]
+
+    landscape_data = {
+        "clean_point": project(v_clean_flat),
+        "noisy_point": project(v_noisy_flat),
+        "denoised_point": project(v_denoised.squeeze(0)),
+        "trajectory_2d": trajectory_2d,
+    }
+
+    trajectory_fig = create_trajectory_plot(landscape_data)
+
+    return info, trajectory_fig
+
+
+def run_langevin_denoise(
+    model,
+    v_clean: torch.Tensor,
+    v_noisy: torch.Tensor,
+    model_type: str,
+    device: torch.device,
+    max_steps: int = 50,
+    lr: float = 0.01,
+    noise_scale: float = 0.005,
+    target_norm: float = 10.0,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """
+    Запуск Langevin dynamics для денуазинга с сохранением траектории.
+
+    Args:
+        model: Энергетическая модель
+        v_clean: [1, D] чистый вектор (целевой)
+        v_noisy: [1, D] зашумленный вектор (стартовый)
+        model_type: "simple" или "unconditional"
+        device: torch device
+        max_steps: Количество шагов Langevin
+        lr: Learning rate
+        noise_scale: Множитель шума
+        target_norm: Целевая норма векторов
+
+    Returns:
+        (v_denoised, trajectory) — финальный вектор и список векторов траектории
+    """
+    trajectory = []
+    v_current = v_noisy.clone().detach()
+
+    for step in range(max_steps):
+        # Сохраняем текущую позицию в траекторию
+        trajectory.append(v_current.detach().cpu().clone())
+
+        if model_type == "unconditional":
+            # UnconditionalEnergy: E(x) → scalar
+            energy, grad = model.energy_and_grad(v_current)
+            # Langevin step
+            langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
+            v_current = v_current - lr * grad + langevin_noise
+        else:
+            # SimpleEnergy: E(v_query, v_candidate) → scalar
+            # Для денуазинга используем v_clean как query и v_current как candidate
+            v_current = v_current.requires_grad_(True)
+            energy = model(v_clean, v_current)
+            grad = torch.autograd.grad(energy.sum(), v_current, create_graph=False)[0]
+            v_current = v_current.detach()
+            # Langevin step
+            langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
+            v_current = v_current - lr * grad + langevin_noise
+
+        # Projection на сферу с target_norm
+        if target_norm is not None:
+            v_current = torch.nn.functional.normalize(v_current, dim=-1) * target_norm
+
+    # Добавляем финальную позицию
+    trajectory.append(v_current.detach().cpu().clone())
+
+    return v_current, trajectory
 
 
 def generate_landscape_for_checkpoint(checkpoint_path):
@@ -237,6 +530,16 @@ def generate_landscape_for_checkpoint(checkpoint_path):
     noise_scale = 0.15
     v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * v_clean.norm()
 
+    # Запускаем Langevin dynamics для получения траектории и denoised вектора
+    v_denoised, trajectory = run_langevin_denoise(
+        model=model,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+        model_type=model_type,
+        device=device,
+        max_steps=50,
+    )
+
     # Сканирование ландшафта
     from cerber_gui.landscape_3d import scan_energy_landscape_3d
 
@@ -246,6 +549,8 @@ def generate_landscape_for_checkpoint(checkpoint_path):
         v_noisy=v_noisy,
         grid_size=40,  # Уменьшено для скорости
         range_factor=1.0,
+        v_denoised=v_denoised,
+        trajectory=trajectory,
         model_type=model_type,
     )
 
@@ -406,7 +711,30 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
             with gr.Row():
                 checkpoint_summary = gr.Markdown()
-                landscape_plot = gr.Plot(label="3D Energy Landscape")
+
+            with gr.Row():
+                landscape_plot = gr.Plot(label="3D Energy Landscape", scale=2)
+                trajectory_plot = gr.Plot(label="Langevin Trajectory", scale=1)
+
+            gr.Markdown("### Inference Settings")
+
+            with gr.Row():
+                noise_scale_slider = gr.Slider(
+                    minimum=0.05, maximum=0.5, value=0.15, step=0.01,
+                    label="Noise Scale"
+                )
+                num_steps_slider = gr.Slider(
+                    minimum=10, maximum=200, value=50, step=10,
+                    label="Langevin Steps"
+                )
+                lr_slider = gr.Slider(
+                    minimum=0.001, maximum=0.1, value=0.01, step=0.001,
+                    label="Learning Rate"
+                )
+                run_inference_btn = gr.Button("Run Inference", variant="primary")
+
+            with gr.Row():
+                inference_output = gr.Markdown()
 
         # === Tab 2: Comparison ===
         with gr.TabItem("Comparison"):
@@ -480,7 +808,14 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
     checkpoint_dropdown.change(
         select_checkpoint_fn,
         inputs=[checkpoint_dropdown],
-        outputs=[checkpoint_summary, landscape_plot, metrics_stats],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+    )
+
+    # Запуск инференса
+    run_inference_btn.click(
+        run_inference_fn,
+        inputs=[checkpoint_dropdown, noise_scale_slider, num_steps_slider, lr_slider],
+        outputs=[inference_output, trajectory_plot],
     )
 
     # Сравнение

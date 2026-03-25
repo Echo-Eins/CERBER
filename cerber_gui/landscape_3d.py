@@ -73,10 +73,22 @@ def scan_energy_landscape_3d(
     )
 
     # Конвертируем в формат для Plotly
+    energy_np = landscape_data.energy.numpy()
+
+    # Нормализуем энергию для лучшей визуализации (центрируем и масштабируем)
+    energy_min = energy_np.min()
+    energy_max = energy_np.max()
+    energy_range = energy_max - energy_min
+    if energy_range > 0:
+        # Центрируем вокруг нуля и масштабируем для лучшей видимости
+        energy_np = (energy_np - energy_min) / energy_range * 10  # Scale to [0, 10]
+
     return {
         "x_range": landscape_data.grid_x.tolist(),
         "y_range": landscape_data.grid_y.tolist(),
-        "energy_grid": landscape_data.energy.numpy(),
+        "energy_grid": energy_np,
+        "energy_raw": landscape_data.energy.numpy(),  # Сохраняем сырые значения
+        "energy_range": (float(energy_min), float(energy_max)),
         "basis": landscape_data.basis,
         "clean_point": landscape_data.v_clean_xy,
         "noisy_point": landscape_data.v_noisy_xy,
