@@ -49,6 +49,11 @@ from cerber_gui.live_monitor import (
     TrainingMetricsWatcher,
     create_live_metrics_plot,
 )
+from cerber_gui.sota_eval import (
+    SOTAEvalConfig,
+    compute_distribution_suite,
+    compute_manifold_knn_metrics,
+)
 from configs.base import Stage1Config
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.inference.langevin import run_langevin
@@ -63,6 +68,7 @@ session_state = {
     "landscape_cache": {},  # (checkpoint, grid, range, noise, steps, seed) -> landscape data
     "dataset_cache": {},  # dataset_path -> SONARVectorDataset
     "runtime_metrics": {},  # checkpoint_path -> latest live inference metrics
+    "sota_eval_cache": {},  # (checkpoint, noise, steps, lr, batch, bank) -> dict
 }
 
 
@@ -166,6 +172,8 @@ def _make_landscape_cache_key(
     noise_scale: float,
     steps: int,
     seed: int,
+    eval_batch_size: int,
+    eval_bank_size: int,
 ) -> tuple:
     return (
         checkpoint_path,
@@ -174,6 +182,26 @@ def _make_landscape_cache_key(
         round(float(noise_scale), 5),
         int(steps),
         int(seed),
+        int(eval_batch_size),
+        int(eval_bank_size),
+    )
+
+
+def _make_sota_eval_cache_key(
+    checkpoint_path: str,
+    noise_scale: float,
+    steps: int,
+    learning_rate: float,
+    eval_batch_size: int,
+    eval_bank_size: int,
+) -> tuple:
+    return (
+        checkpoint_path,
+        round(float(noise_scale), 5),
+        int(steps),
+        round(float(learning_rate), 8),
+        int(eval_batch_size),
+        int(eval_bank_size),
     )
 
 
@@ -188,6 +216,12 @@ def _invalidate_checkpoint_cache(checkpoint_path: str) -> None:
             to_remove.append(key)
     for key in to_remove:
         session_state["landscape_cache"].pop(key, None)
+    to_remove_sota = []
+    for key in session_state["sota_eval_cache"].keys():
+        if isinstance(key, tuple) and key and key[0] == checkpoint_path:
+            to_remove_sota.append(key)
+    for key in to_remove_sota:
+        session_state["sota_eval_cache"].pop(key, None)
 
 
 class _UnconditionalEnergyAdapter:
@@ -354,6 +388,35 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                 f"- Displacement ||x_T - x_0||: `{runtime['displacement']:.6f}`",
             ]
         )
+        sota = runtime.get("sota")
+        if isinstance(sota, dict):
+            if bool(sota.get("available", False)):
+                lines.extend(
+                    [
+                        "",
+                        "**SOTA Batch Eval (latest run):**",
+                        f"- Eval batch / bank: `{int(sota['eval_batch_size'])}` / `{int(sota['eval_bank_size'])}`",
+                        f"- Cosine before/after: `{float(sota['cos_before_mean']):.6f}` -> `{float(sota['cos_after_mean']):.6f}`",
+                        f"- Cosine improvement mean: `{float(sota['cos_improvement_mean']):+.6f}`",
+                        f"- Cosine success rate: `{float(sota['cos_success_rate']):.2%}`",
+                        f"- Energy improvement mean: `{float(sota['energy_improvement_mean']):+.6f}`",
+                        f"- Energy success rate: `{float(sota['energy_success_rate']):.2%}`",
+                        f"- MMD (RBF): `{float(sota['mmd_rbf']):.6f}`",
+                        f"- C2ST accuracy: `{float(sota['c2st_acc']):.2%}`",
+                        f"- PRDC precision/recall: `{float(sota['prdc_precision']):.4f}` / `{float(sota['prdc_recall']):.4f}`",
+                        f"- PRDC density/coverage: `{float(sota['prdc_density']):.4f}` / `{float(sota['prdc_coverage']):.4f}`",
+                        f"- kNN cosine top1 improvement: `{float(sota.get('knn_cos_improvement', float('nan'))):+.6f}`",
+                        f"- kNN L2 improvement: `{float(sota.get('knn_l2_improvement', float('nan'))):+.6f}`",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "",
+                        "**SOTA Batch Eval (latest run):**",
+                        f"- Unavailable: `{sota.get('reason', 'unknown')}`",
+                    ]
+                )
     else:
         lines.extend(
             [
@@ -377,6 +440,8 @@ def select_checkpoint_fn(
     vis_backend="plotly",
     grid_size=40,
     range_factor=1.5,
+    sota_eval_batch_size=32,
+    sota_eval_bank_size=512,
 ):
     """Render checkpoint summary and default landscape preview."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
@@ -397,11 +462,14 @@ def select_checkpoint_fn(
             checkpoint_path=checkpoint_path,
             grid_size=grid,
             range_factor=rf,
+            sota_eval_batch_size=int(sota_eval_batch_size),
+            sota_eval_bank_size=int(sota_eval_bank_size),
         )
         runtime = landscape_data.get("runtime_metrics")
         if runtime is not None:
             session_state["runtime_metrics"][checkpoint_path] = runtime
             summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
+            info = "Preview inference and SOTA batch eval completed."
         landscape_fig = _render_landscape_figure(checkpoint_path, landscape_data, vis_backend)
         trajectory_plot = create_trajectory_plot(landscape_data)
     except Exception as e:
@@ -530,6 +598,7 @@ def run_langevin_denoise(
     max_steps: int,
     lr_override: float | None = None,
     force_full_steps: bool = True,
+    track_vectors: bool = True,
 ) -> tuple[torch.Tensor, list[torch.Tensor], object]:
     """
     Run Langevin denoising with Stage1-consistent math and trajectory capture.
@@ -576,14 +645,19 @@ def run_langevin_denoise(
         plateau_patience=plateau_patience,
         plateau_delta=stage1_cfg.langevin.plateau_delta,
         v_target=v_clean,
-        track_vectors=True,
+        track_vectors=track_vectors,
         **method_kwargs,
     )
-    trajectory = result.v_trajectory if result.v_trajectory else [v_noisy.detach().cpu().clone()]
-    # GUI should report and render the actually reached final state (last executed step),
-    # not the internal "best energy" fallback, otherwise metrics and trajectory disagree.
-    v_last = trajectory[-1].to(v_noisy.device)
-    return v_last, trajectory, result
+    if result.v_trajectory:
+        trajectory = result.v_trajectory
+        # GUI should report and render the actually reached final state (last executed step),
+        # not the internal "best energy" fallback, otherwise metrics and trajectory disagree.
+        v_out = trajectory[-1].to(v_noisy.device)
+        return v_out, trajectory, result
+
+    # Fallback for non-tracking runs (for example batch SOTA eval).
+    trajectory = [v_noisy.detach().cpu().clone(), result.v_final.detach().cpu().clone()]
+    return result.v_final, trajectory, result
 
 
 
@@ -600,6 +674,143 @@ def _sample_clean_noisy_pair(
     )
     v_noisy = _add_relative_noise(v_clean, float(noise_scale), seed=seed + 1)
     return v_clean, v_noisy, reference_source
+
+
+def _sample_dataset_vectors(
+    device: torch.device,
+    batch_size: int,
+    seed: int,
+) -> tuple[torch.Tensor | None, str]:
+    dataset_path = _get_default_dataset_path()
+    if dataset_path is None:
+        return None, "unavailable"
+
+    try:
+        dataset = _get_dataset(dataset_path)
+    except Exception:
+        return None, "unavailable"
+
+    n = len(dataset)
+    if n == 0:
+        return None, "unavailable"
+
+    bs = max(1, min(int(batch_size), n))
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    indices = torch.randperm(n, generator=gen)[:bs]
+    vectors = dataset.embeddings[indices].to(device)
+    return vectors, "dataset"
+
+
+@torch.no_grad()
+def _compute_energy_batch(
+    model,
+    model_type: str,
+    v_clean: torch.Tensor,
+    v_candidate: torch.Tensor,
+) -> torch.Tensor:
+    if model_type == "simple":
+        return model(v_clean, v_candidate).detach()
+    return model(v_candidate).detach()
+
+
+def _compute_sota_eval_metrics(
+    checkpoint_path: str,
+    model,
+    model_type: str,
+    stage1_cfg: Stage1Config,
+    noise_scale: float,
+    num_steps: int,
+    learning_rate: float,
+    eval_batch_size: int,
+    eval_bank_size: int,
+) -> dict:
+    key = _make_sota_eval_cache_key(
+        checkpoint_path=checkpoint_path,
+        noise_scale=float(noise_scale),
+        steps=int(num_steps),
+        learning_rate=float(learning_rate),
+        eval_batch_size=int(eval_batch_size),
+        eval_bank_size=int(eval_bank_size),
+    )
+    if key in session_state["sota_eval_cache"]:
+        return session_state["sota_eval_cache"][key]
+
+    device = next(model.parameters()).device
+    v_clean_batch, source = _sample_dataset_vectors(device, int(eval_batch_size), seed=31415)
+    if v_clean_batch is None:
+        out = {"available": False, "reason": "dataset_unavailable"}
+        session_state["sota_eval_cache"][key] = out
+        return out
+
+    v_noisy_batch = _add_relative_noise(v_clean_batch, float(noise_scale), seed=31416)
+    v_denoised_batch, _, batch_result = run_langevin_denoise(
+        model=model,
+        v_clean=v_clean_batch,
+        v_noisy=v_noisy_batch,
+        model_type=model_type,
+        stage1_cfg=stage1_cfg,
+        max_steps=int(num_steps),
+        lr_override=float(learning_rate),
+        force_full_steps=True,
+        track_vectors=False,
+    )
+
+    cos_before = F.cosine_similarity(v_clean_batch, v_noisy_batch, dim=-1)
+    cos_after = F.cosine_similarity(v_clean_batch, v_denoised_batch, dim=-1)
+
+    e_noisy = _compute_energy_batch(
+        model=model,
+        model_type=model_type,
+        v_clean=v_clean_batch,
+        v_candidate=v_noisy_batch,
+    )
+    e_final = _compute_energy_batch(
+        model=model,
+        model_type=model_type,
+        v_clean=v_clean_batch,
+        v_candidate=v_denoised_batch,
+    )
+
+    ref_bank, _ = _sample_dataset_vectors(device, int(eval_bank_size), seed=27182)
+    cfg = SOTAEvalConfig(
+        prdc_k=max(3, min(10, int(eval_batch_size) // 4)),
+        manifold_k=max(5, min(20, int(eval_bank_size) // 16)),
+        c2st_steps=100,
+        c2st_lr=0.05,
+        c2st_train_frac=0.8,
+        mmd_subsample=min(256, int(eval_batch_size)),
+    )
+    suite = compute_distribution_suite(v_clean_batch, v_denoised_batch, cfg=cfg)
+    if ref_bank is not None:
+        suite.update(
+            compute_manifold_knn_metrics(
+                ref_bank=ref_bank,
+                noisy=v_noisy_batch,
+                denoised=v_denoised_batch,
+                k=cfg.manifold_k,
+            )
+        )
+
+    out = {
+        "available": True,
+        "reference_source": source,
+        "eval_batch_size": int(v_clean_batch.shape[0]),
+        "eval_bank_size": int(0 if ref_bank is None else ref_bank.shape[0]),
+        "steps_executed_mean": float(batch_result.num_steps),
+        "cos_before_mean": float(cos_before.mean().item()),
+        "cos_after_mean": float(cos_after.mean().item()),
+        "cos_improvement_mean": float((cos_after - cos_before).mean().item()),
+        "cos_success_rate": float((cos_after > cos_before).float().mean().item()),
+        "energy_before_mean": float(e_noisy.mean().item()),
+        "energy_after_mean": float(e_final.mean().item()),
+        "energy_improvement_mean": float((e_noisy - e_final).mean().item()),
+        "energy_success_rate": float((e_final < e_noisy).float().mean().item()),
+    }
+    out.update(suite)
+
+    session_state["sota_eval_cache"][key] = out
+    return out
 
 
 @torch.no_grad()
@@ -708,6 +919,7 @@ def _format_inference_info(
     stopped_early: bool,
     force_full_steps: bool,
     reference_source: str,
+    sota_metrics: dict | None = None,
 ) -> str:
     energy_min = float(landscape_data.get("energy_min", np.nan))
     energy_max = float(landscape_data.get("energy_max", np.nan))
@@ -753,6 +965,45 @@ def _format_inference_info(
     if displacement < 1e-8:
         lines.append("- Warning: final state equals start state (no-op). Check LR/noise/steps or model gradients.")
 
+    if isinstance(sota_metrics, dict):
+        lines.append("")
+        lines.append("**SOTA Batch Eval:**")
+        if bool(sota_metrics.get("available", False)):
+            lines.append(
+                f"- Eval batch / bank: `{int(sota_metrics['eval_batch_size'])}` / `{int(sota_metrics['eval_bank_size'])}`"
+            )
+            lines.append(
+                f"- Cosine before/after: `{float(sota_metrics['cos_before_mean']):.6f}` -> `{float(sota_metrics['cos_after_mean']):.6f}`"
+            )
+            lines.append(
+                f"- Cosine improvement mean: `{float(sota_metrics['cos_improvement_mean']):+.6f}`"
+            )
+            lines.append(
+                f"- Cosine success rate: `{float(sota_metrics['cos_success_rate']):.2%}`"
+            )
+            lines.append(
+                f"- Energy improvement mean: `{float(sota_metrics['energy_improvement_mean']):+.6f}`"
+            )
+            lines.append(
+                f"- Energy success rate: `{float(sota_metrics['energy_success_rate']):.2%}`"
+            )
+            lines.append(f"- MMD (RBF): `{float(sota_metrics['mmd_rbf']):.6f}`")
+            lines.append(f"- C2ST accuracy: `{float(sota_metrics['c2st_acc']):.2%}`")
+            lines.append(
+                f"- PRDC (P/R/D/C): `{float(sota_metrics['prdc_precision']):.4f}` / `{float(sota_metrics['prdc_recall']):.4f}` / "
+                f"`{float(sota_metrics['prdc_density']):.4f}` / `{float(sota_metrics['prdc_coverage']):.4f}`"
+            )
+            if "knn_cos_improvement" in sota_metrics:
+                lines.append(
+                    f"- kNN cosine top1 improvement: `{float(sota_metrics['knn_cos_improvement']):+.6f}`"
+                )
+            if "knn_l2_improvement" in sota_metrics:
+                lines.append(
+                    f"- kNN L2 improvement: `{float(sota_metrics['knn_l2_improvement']):+.6f}`"
+                )
+        else:
+            lines.append(f"- Unavailable: `{sota_metrics.get('reason', 'unknown')}`")
+
     return "\n".join(lines)
 
 
@@ -764,6 +1015,8 @@ def run_inference_fn(
     vis_backend,
     grid_size,
     range_factor,
+    sota_eval_batch_size,
+    sota_eval_bank_size,
 ):
     """Run denoising/refinement inference and refresh both surface + trajectory plots."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
@@ -821,6 +1074,17 @@ def run_inference_fn(
         stopped_early=bool(langevin_result.stopped_early),
         reference_source=reference_source,
     )
+    runtime_metrics["sota"] = _compute_sota_eval_metrics(
+        checkpoint_path=checkpoint_path,
+        model=model,
+        model_type=model_type,
+        stage1_cfg=stage1_cfg,
+        noise_scale=float(noise_scale),
+        num_steps=int(num_steps),
+        learning_rate=float(learning_rate),
+        eval_batch_size=int(sota_eval_batch_size),
+        eval_bank_size=int(sota_eval_bank_size),
+    )
     session_state["runtime_metrics"][checkpoint_path] = runtime_metrics
 
     alignment = _compute_alignment_diagnostic(
@@ -852,6 +1116,7 @@ def run_inference_fn(
         stopped_early=bool(langevin_result.stopped_early),
         force_full_steps=True,
         reference_source=reference_source,
+        sota_metrics=runtime_metrics.get("sota"),
     )
 
     summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
@@ -864,6 +1129,8 @@ def generate_landscape_for_checkpoint(
     range_factor=1.5,
     preview_noise=0.15,
     preview_steps=50,
+    sota_eval_batch_size=32,
+    sota_eval_bank_size=512,
 ):
     """Generate deterministic landscape preview for the selected checkpoint."""
     grid, rf = _resolve_scan_params(grid_size, range_factor)
@@ -874,6 +1141,8 @@ def generate_landscape_for_checkpoint(
         noise_scale=float(preview_noise),
         steps=int(preview_steps),
         seed=42,
+        eval_batch_size=int(sota_eval_batch_size),
+        eval_bank_size=int(sota_eval_bank_size),
     )
     if cache_key in session_state["landscape_cache"]:
         return session_state["landscape_cache"][cache_key]
@@ -925,6 +1194,17 @@ def generate_landscape_for_checkpoint(
         steps_executed=int(result.num_steps),
         stopped_early=bool(result.stopped_early),
         reference_source=reference_source,
+    )
+    landscape_data["runtime_metrics"]["sota"] = _compute_sota_eval_metrics(
+        checkpoint_path=checkpoint_path,
+        model=model,
+        model_type=model_type,
+        stage1_cfg=stage1_cfg,
+        noise_scale=float(preview_noise),
+        num_steps=int(preview_steps),
+        learning_rate=float(stage1_cfg.langevin.lr),
+        eval_batch_size=int(sota_eval_batch_size),
+        eval_bank_size=int(sota_eval_bank_size),
     )
 
     session_state["landscape_cache"][cache_key] = landscape_data
@@ -1143,6 +1423,24 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 run_inference_btn = gr.Button("Run Inference", variant="primary")
 
             with gr.Row():
+                sota_eval_batch_size_slider = gr.Slider(
+                    minimum=8,
+                    maximum=256,
+                    value=32,
+                    step=8,
+                    label="SOTA Eval Batch Size",
+                    info="Number of clean/noisy pairs for batched distribution evaluation.",
+                )
+                sota_eval_bank_size_slider = gr.Slider(
+                    minimum=64,
+                    maximum=4096,
+                    value=512,
+                    step=64,
+                    label="SOTA Eval Reference Bank Size",
+                    info="Reference manifold bank size for kNN-based distribution diagnostics.",
+                )
+
+            with gr.Row():
                 inference_output = gr.Markdown()
 
         # === Tab 2: Comparison ===
@@ -1217,26 +1515,80 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
     # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
     checkpoint_dropdown.change(
         select_checkpoint_fn,
-        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
+        inputs=[
+            checkpoint_dropdown,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
+        ],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
     # ÃƒÆ’Ã‚ÂÃƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ backend
     vis_backend_radio.change(
         select_checkpoint_fn,
-        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
+        inputs=[
+            checkpoint_dropdown,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
+        ],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
     grid_size_slider.change(
         select_checkpoint_fn,
-        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
+        inputs=[
+            checkpoint_dropdown,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
+        ],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
     range_factor_slider.change(
         select_checkpoint_fn,
-        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
+        inputs=[
+            checkpoint_dropdown,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
+        ],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+    )
+
+    sota_eval_batch_size_slider.change(
+        select_checkpoint_fn,
+        inputs=[
+            checkpoint_dropdown,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
+        ],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+    )
+
+    sota_eval_bank_size_slider.change(
+        select_checkpoint_fn,
+        inputs=[
+            checkpoint_dropdown,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
+        ],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
@@ -1251,6 +1603,8 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
         ],
         outputs=[inference_output, landscape_plot, trajectory_plot, checkpoint_summary],
     )

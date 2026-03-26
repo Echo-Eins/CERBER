@@ -435,10 +435,30 @@ Implement full SOTA-grade GUI evaluation for Stage1/Unconditional checks, so mod
   - avoid accidental no-grad on input-gradient diagnostics.
 
 ## Checklist
-- [ ] Add `cerber_gui/sota_eval.py` with stable batched metric implementations
-- [ ] Extend runtime metric payload and formatting to include SOTA metric block
-- [ ] Batch-run Langevin on evaluation sample set and compute post-denoise distribution metrics
-- [ ] Wire new GUI controls (eval batch size, eval bank size) into both preview/manual callbacks
-- [ ] Refresh checkpoint summary after each inference with updated SOTA metrics
-- [ ] Validate with py_compile + quick synthetic invariants (metrics finite / ranges sane)
+- [x] Add `cerber_gui/sota_eval.py` with stable batched metric implementations
+- [x] Extend runtime metric payload and formatting to include SOTA metric block
+- [x] Batch-run Langevin on evaluation sample set and compute post-denoise distribution metrics
+- [x] Wire new GUI controls (eval batch size, eval bank size) into both preview/manual callbacks
+- [x] Refresh checkpoint summary after each inference with updated SOTA metrics
+- [x] Validate with py_compile + quick synthetic invariants (metrics finite / ranges sane)
+
+## Review
+- Implemented:
+  - Added `cerber_gui/sota_eval.py` with batched metric suite:
+    - MMD (RBF + median heuristic),
+    - C2ST (linear probe),
+    - PRDC (precision/recall/density/coverage),
+    - manifold kNN proximity improvements.
+  - Added `sota_eval_cache` in GUI session state and cache invalidation per checkpoint.
+  - Added SOTA batch evaluation computation inside both:
+    - checkpoint preview landscape generation,
+    - manual inference callback.
+  - Extended checkpoint summary and inference report to render SOTA block from latest runtime metrics.
+  - Added explicit GUI controls:
+    - `SOTA Eval Batch Size`,
+    - `SOTA Eval Reference Bank Size`,
+    and wired them into all preview refresh triggers + manual inference.
+- Validation:
+  - `python -m py_compile cerber_gui/app.py cerber_gui/sota_eval.py cerber_gui/landscape_3d.py cebcm/visualization/energy_landscape.py`
+  - Quick runtime synthetic invariants could not be executed in this shell because active Python environment has no `torch`.
 

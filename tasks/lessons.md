@@ -156,3 +156,14 @@ For checkpoints without embedded metrics, GUI summary showed only `N/A`, hiding 
 
 ### Rule
 Persist and display latest runtime inference metrics per checkpoint, update them on preview inference and every manual inference, and refresh summary in the same UI callback.
+
+## 2026-03-25 - Callback wiring completeness for GUI feature extensions
+
+### Pattern
+Function signatures were extended (SOTA eval parameters), but not all Gradio event handlers passed new inputs. This left the feature partially integrated and behavior inconsistent.
+
+### Rule
+After changing any callback/function signature in GUI code:
+1) update every event binding (`.click`, `.change`, `.submit`) that calls it,
+2) add/verify matching UI controls exist for each new argument,
+3) run compile checks and inspect handler arity end-to-end before considering integration complete.
