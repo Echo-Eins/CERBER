@@ -368,7 +368,7 @@ def gradient_direction_loss(
     noisy = pos + noise * sigma * nrm
     noisy_req = noisy.detach().requires_grad_(True)
     e = critic(q, noisy_req, sigma=sigma.detach())
-    # First-order gradient only — no create_graph needed since this is a direct target
+    # create_graph=True needed: backprop through g to update critic params θ
     g = torch.autograd.grad(e.sum(), noisy_req, create_graph=True)[0]
     g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
     # Target direction: from noisy toward clean
@@ -413,9 +413,13 @@ def inbatch_cross_negative_nce(
     # Expand q: [B, 1, D] -> [B, B, D], pos: [1, B, D] -> [B, B, D]
     q_exp = q.unsqueeze(1).expand(bsz, bsz, -1).reshape(bsz * bsz, -1)
     pos_exp = pos.unsqueeze(0).expand(bsz, bsz, -1).reshape(bsz * bsz, -1)
-    sigma_exp = sigma.unsqueeze(1).expand(bsz, bsz).reshape(bsz * bsz).unsqueeze(-1) if sigma.dim() == 1 else sigma.repeat(bsz, 1)
-    if sigma_exp.dim() == 1:
-        sigma_exp = sigma_exp.unsqueeze(-1)
+    # sigma shape: [B, 1] from sample_sigma. Each q_i needs its sigma_i for all B pos_j.
+    # q_exp layout: [q_0]*B, [q_1]*B, ... so sigma must follow same interleave pattern.
+    if sigma.dim() == 1:
+        sigma_exp = sigma.unsqueeze(1).expand(bsz, bsz).reshape(bsz * bsz, 1)
+    else:
+        # sigma: [B, 1] → repeat_interleave to get [B*B, 1] matching q_exp layout
+        sigma_exp = sigma.repeat_interleave(bsz, dim=0)
     e_all = critic(q_exp, pos_exp, sigma=sigma_exp.detach()).view(bsz, bsz)
     # Logits: lower energy = higher probability
     logits = -e_all / temp
