@@ -748,3 +748,69 @@ Do **not** advance until:
 - Plan created from `research3.md` findings
 - Awaiting CUDA runtime for implementation and validation
 
+---
+
+# Stage1.5 Hard Validation + Repair (2026-03-26, Pass 12)
+
+## Goal
+Run a strict code-and-math validation of Stage 1.5 and harden it to match research3 P0/P1 constraints:
+- objective sign consistency,
+- noise/sampler semantics consistency,
+- anti-instability guards (non-finite, gradient sanitation, clipping),
+- truthful strict success criteria during training.
+
+## Checklist
+- [x] Re-read `AGENTS.md`, `CLAUDE.md`, `research3.md` and map required checks to code paths
+- [x] Full static audit of `train_stage1_5.py` for runtime blockers and math contradictions
+- [x] Fix Stage1.5 P0 correctness blockers (type/config/API mismatches, missing eval/kill hooks)
+- [x] Verify critic/actor gradient signs and ranking consistency vs inference update direction
+- [x] Verify noise semantics and Langevin navigation consistency with shared sampler (`cebcm/inference/langevin.py`)
+- [x] Implement strict Stage1.5 eval + kill criteria integration using shared `kill_criteria.py`
+- [x] Add/verify training stabilizers: non-finite guards, gradient sanitation, clipping, clean-min violation telemetry
+- [x] Run compile validation on all changed files and document residual runtime limits
+- [x] Compare current Stage1.5 to proposed pairwise conditional critic + actor(refinement) design and list exact deltas
+
+## Review
+- Replaced non-runnable `train_stage1_5.py` with executable Stage1.5 pipeline:
+  - strict config parsing,
+  - consistent critic/actor objectives,
+  - shared Langevin-based eval,
+  - strict kill criteria via `summarize_conditional_eval`.
+- Corrected false implementation assumptions from Pass 11:
+  - previous script declared features that were not actually runnable due API/type/signature mismatches.
+- Updated Stage1.5 config schema:
+  - `configs/base.py::Stage1_5Config`,
+  - `configs/stage1_5_config.json`.
+- Added unconditional prior scale guard:
+  - `cebcm/models/energy_unconditional.py` now clamps `log_energy_scale` before `exp` (parity with pairwise critic stability guard).
+- Fixed Stage1.5 optimizer semantics for hybrid critic:
+  - separate parameter groups now apply both `critic_lr` and `prior_critic_lr` (no silent LR override when prior critic is enabled).
+- Validation:
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py`
+  - `python -m py_compile configs/base.py`
+  - `python -m py_compile experiments/01_denoising_poc/train.py`
+  - `python -m py_compile cebcm/inference/langevin.py cebcm/training/losses.py cebcm/training/kill_criteria.py`
+- Remaining limitation:
+  - full CUDA runtime check still required in target environment with installed `torch`.
+
+---
+
+# Stage1.5 Completion Pass (2026-03-26, Pass 13)
+
+## Goal
+Close remaining Stage1.5 architectural gaps identified by user:
+- implement real `critic_steps_per_actor > 1`,
+- remove teacher-forced training semantics (`query != clean target`),
+- implement full twin-critic conditional training with retrieval/hard-negative conditioning.
+
+## Checklist
+- [ ] Implement non-teacher-forced pair sampling in Stage1.5 (query/positive from retrieval protocol)
+- [ ] Implement retrieval-conditioned hard negatives for critic ranking loss
+- [ ] Implement actual twin conditional critics in Stage1.5 (`E1_cond`, `E2_cond`) plus optional prior
+- [ ] Implement real alternating schedule `critic_steps_per_actor`
+- [ ] Align actor/refinement update with twin hybrid energy and verify sign consistency (`v <- v - lr * ∇E`)
+- [ ] Add explicit Stage1.5 metrics for retrieval/ranking quality and clean-min violations
+- [ ] Update Stage1.5 config schema/json for new retrieval+twin parameters
+- [ ] Run static validation (`py_compile`) for all changed files
+- [ ] Update `research3.md` and `tasks/lessons.md` with findings and anti-regression rules
+

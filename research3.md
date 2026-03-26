@@ -767,3 +767,66 @@ metrics = {
 12. MMD reference:  
     https://www.jmlr.org/papers/v13/gretton12a.html
 
+---
+
+## 14) Stage1.5 Hard Validation (Pass 12, 2026-03-26)
+
+### 14.1 Critical runtime blockers found in previous `train_stage1_5.py`
+
+1. Non-runnable API mismatches:
+   - `Stage1Config` type used in Stage1.5 function signature.
+   - `config.get(...)` used on dataclass object.
+   - `evaluate_denoising(...)` called but not defined/imported.
+   - `check_conditional_kill(...)` imported but absent in `kill_criteria.py`.
+2. Incorrect model API usage:
+   - `UnconditionalEnergy` called as `prior_critic(v, sigma=...)` (unsupported).
+3. Data path mismatch:
+   - Loop expected `batch["v"]`, but `SONARVectorDataset` returns tensor.
+4. Loss API mismatch:
+   - `multiscale_dsm_loss(...)` called with unsupported args (`v_noisy`, `sigma`, `force_fp32`).
+   - `gradient_penalty(...)` called with unsupported signature (`lambda_gp=` kwarg).
+5. Config/schema mismatch:
+   - JSON carried metadata + nested kill block + fields absent in dataclass.
+
+### 14.2 Fixes implemented
+
+1. Replaced Stage1.5 training script with a runnable and internally consistent pipeline:
+   - `experiments/01_denoising_poc/train_stage1_5.py`
+2. Added strict config normalization for legacy JSON:
+   - metadata stripping (`_comment`, `_version`, ...),
+   - nested `kill_criteria` mapping,
+   - `sigma_weighting` bool -> string normalization.
+3. Enforced objective consistency:
+   - critic: `MDSM + ranking + optional CQL/GP/shell`,
+   - actor: geodesic + alignment + BC + clean-barrier (`softplus(E_clean - E_actor)`),
+   - no contradictory `E(actor) < E(clean)` actor term.
+4. Unified evaluation semantics with shared Langevin:
+   - uses `run_langevin(...)`,
+   - reports terminal endpoint (`v_last` if present),
+   - strict pass/fail from `summarize_conditional_eval(...)`.
+5. Hardened training safety:
+   - non-finite guards,
+   - gradient sanitation (`nan_to_num`),
+   - grad clipping,
+   - LR backoff on bad-batch streaks,
+   - fail-fast after max consecutive bad batches,
+   - optional loss-spike guard.
+6. Updated config schema to match code:
+   - `configs/base.py::Stage1_5Config`
+   - `configs/stage1_5_config.json`
+7. Added stability parity for prior critic:
+   - `UnconditionalEnergy.forward()` now clamps `log_energy_scale` before exponentiation.
+8. Fixed optimizer parameter-group semantics:
+   - Stage1.5 now uses separate LR groups for conditional critic and optional prior critic
+     (`critic_lr` and `prior_critic_lr` both become effective, no silent override).
+
+### 14.3 Remaining architectural gap vs target pairwise proposal/refinement design
+
+Current Stage1.5 is now internally consistent and debuggable, but still not full Stage2 pairwise semantics:
+
+1. Stage1.5 still uses teacher-forced denoising setup (`v_query == v_clean`) for supervision.
+2. True proposal/refinement path for Stage2 requires:
+   - query/context-driven actor proposals without direct clean exposure,
+   - batchwise/hard negative conditioning,
+   - support-aware trust region and retrieval-grounded metrics.
+3. Hybrid prior (`E_prior`) exists as optional branch and should remain auxiliary, not primary relevance signal.

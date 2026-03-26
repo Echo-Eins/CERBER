@@ -1,5 +1,17 @@
 # Lessons
 
+## 2026-03-26 - Do not claim proposal/refinement when training is still teacher-forced
+
+### Pattern
+User pointed out that Stage1.5 still had `query == clean` semantics, `critic_steps_per_actor` effectively disabled, and only partial twin-critic behavior despite claims of fuller architecture.
+
+### Rule
+Before marking Stage1.5+ as "proposal/refinement":
+1) verify `query != positive target` in the actual batch construction,
+2) verify `critic_steps_per_actor > 1` changes runtime behavior (not just config),
+3) verify twin-critic aggregation is actually used in actor/inference paths,
+4) verify hard-retrieval negatives are part of critic loss, not only Gaussian OOD.
+
 ## 2026-03-23 - User requested repeated AGENTS reread and restart from scratch
 
 ### Pattern
@@ -317,3 +329,15 @@ For unconditional energy training:
 2) maintain persistent MCMC chains across batches (short-run MCMC),
 3) add negative buffer replay for hard negatives,
 4) monitor PRDC/C2ST as primary manifold quality indicators.
+
+## 2026-03-26 - Stage-level claims must be runtime-validated, not just “implemented” on paper
+
+### Pattern
+`train_stage1_5.py` previously claimed SOTA completion but contained unresolved runtime/API mismatches (wrong config access, missing functions, incompatible loss/model signatures). The code compiled but was not executable as a coherent training path.
+
+### Rule
+Before marking any stage implementation as complete:
+1) run a strict runtime-readiness audit (config schema, dataloader shape contract, model/loss signatures, eval hooks),
+2) verify that declared features are actually reachable in code paths,
+3) treat “py_compile passes” as syntax-only check, never as execution proof,
+4) record unresolved runtime blockers explicitly in `tasks/todo.md`.

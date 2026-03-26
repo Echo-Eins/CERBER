@@ -211,7 +211,7 @@ class Stage1Config:
 
 @dataclass
 class Stage1_5Config:
-    """Stage 1.5: Hybrid Actor-Critic with SOTA Stabilization."""
+    """Stage 1.5: hybrid conditional critic + actor proposal/refinement."""
     sonar: SONARConfig = field(default_factory=SONARConfig)
     langevin: LangevinConfig = field(default_factory=lambda: LangevinConfig(
         lr=0.001,
@@ -231,48 +231,52 @@ class Stage1_5Config:
     norm_mode: str = "orthonorm"
     activation: str = "groupsort"
     ortho_n_iters: int = 8
+    twin_aggregate: str = "max"  # "max" (conservative) or "mean"
 
-    # Learning rates
+    # Optimizer
     critic_lr: float = 1e-4
     actor_lr: float = 5e-5
     prior_critic_lr: float = 1e-4
     weight_decay: float = 0.01
-
-    # Alternating training ratio
-    critic_steps_per_actor: int = 2
+    clip_grad_norm: float = 1.0
+    critic_steps_per_actor: int = 1
 
     # Loss weights
     lambda_mdsm: float = 1.0
     lambda_rank: float = 0.25
     lambda_cql: float = 0.1
+    lambda_shell: float = 0.1
     lambda_geo: float = 1.0
     lambda_align: float = 0.1
     lambda_bc_reg: float = 0.5
     lambda_prior: float = 0.1
+    lambda_actor_barrier: float = 0.1
 
     # Feature flags
     use_cql: bool = True
     use_bc: bool = True
     use_grad_align: bool = True
     use_prior_critic: bool = False
+    use_gradient_penalty: bool = False
+    use_shell_barrier: bool = False
 
-    # CQL parameters
+    # Regularization params
     cql_noise_scale: float = 0.5
+    gradient_penalty_lambda: float = 0.05
+    shell_barrier_margin: float = 0.1
 
-    # Sigma curriculum
+    # Noise and MDSM
     sigma_curriculum_start: float = 0.01
     sigma_curriculum_end: float = 0.5
     sigma_min: float = 0.001
     sigma_max: float = 1.0
     sigma_sampling: str = "loguniform"
+    sigma_weighting: str = "sigma2"
     edm_p_mean: float = -1.2
     edm_p_std: float = 1.2
-
-    # MDSM parameters
     mdsm_tangent_projection: bool = True
     mdsm_directional: bool = True
     mdsm_magnitude_aux_weight: float = 0.05
-    sigma_weighting: bool = True
     mdsm_cosine_eps: float = 1e-6
     mdsm_norm_floor: float = 1e-6
     mdsm_force_fp32: bool = True
@@ -282,9 +286,21 @@ class Stage1_5Config:
     critic_margin_actor_noisy: float = 0.3
     critic_margin_clean_noisy: float = 0.8
 
-    # Actor parameters
+    # Actor/inference rollout
     actor_step_size: float = 1.0
     actor_tangent_projection: bool = True
+    actor_seed_mix_query: float = 0.5
+    actor_seed_noise_scale: float = 1.0
+    actor_eval_steps: int = 1
+    critic_eval_langevin_steps: int = 20
+    eval_noise_scales: list[float] = field(default_factory=lambda: [0.05, 0.1, 0.2, 0.3])
+
+    # Retrieval conditioning
+    retrieval_bank_size: int = 4096
+    retrieval_topk_pos: int = 8
+    retrieval_hard_start: int = 8
+    retrieval_hard_end: int = 32
+    retrieval_self_sim_exclude: float = 0.9995
 
     # AMP
     amp_enabled: bool = True
@@ -296,23 +312,29 @@ class Stage1_5Config:
     batch_size: int = 64
     num_workers: int = 4
     log_every: int = 50
-
-    # Evaluation
     eval_num_samples: int = 256
 
-    # Kill criteria
+    # Kill criteria thresholds
     min_cosine_improvement: float = 0.05
+    min_cosine_success_rate: float = 0.6
+    min_geodesic_improvement: float = 0.01
+    min_l2_improvement: float = 0.0
     min_energy_success_rate: float = 0.5
     max_clean_min_violation_rate: float = 0.1
-    min_geodesic_improvement: float = 0.01
+    min_step_norm: float = 1e-6
 
     # Stability
     skip_non_finite_batches: bool = True
     non_finite_backoff_streak_trigger: int = 3
     non_finite_lr_backoff: float = 0.5
     max_consecutive_non_finite_batches: int = 10
+    guard_loss_spikes: bool = True
+    loss_spike_factor: float = 20.0
+    loss_spike_warmup_steps: int = 25
 
     # Paths
-    train_data_path: str = "data/sonar_train.npy"
-    val_data_path: str = "data/sonar_val.npy"
-    output_dir: str = "experiments/01_denoising_poc/stage1_5"
+    train_data_path: str = "data/wikitext_sonar_10k.pt"
+    val_data_path: str = ""
+    output_dir: str = "experiments/03_Stage_1.5"
+    checkpoint_dir: str = "experiments/03_Stage_1.5/checkpoints"
+    logs_dir: str = "experiments/03_Stage_1.5/logs"

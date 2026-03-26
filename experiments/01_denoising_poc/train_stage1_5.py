@@ -1,20 +1,4 @@
-"""
-Stage1.5: Hybrid Actor-Critic with SOTA Stabilization
-
-Key changes from Stage1:
-1. P0: Removed actor_energy_loss contradiction - actor no longer pushed E(actor) < E(clean)
-2. P0: Added MDSM to critic for gradient field validity
-3. P1: Hybrid critic E_total = E_cond(q,v) + λ*E_prior(v)
-4. P1: Alternating training (2 critic steps : 1 actor step)
-5. P2: CQL regularization for OOD prevention
-6. P2: BC regularization for embedding anchor
-7. P2: Added gradient penalty for smooth landscape
-8. P2: Shell barrier penalty for norm control
-9. P3: Comprehensive metrics telemetry (energy stats, grad norms, etc.)
-10. Full SOTA eval metrics + stability guards
-
-Implements all items from research3.md Phase P0-P2 and todo.md Stage1.5 Pass 11.
-"""
+from __future__ import annotations
 
 import argparse
 import json
@@ -23,7 +7,7 @@ import random
 import sys
 import time
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import torch
@@ -32,65 +16,15 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from configs.base import Stage1_5Config
+from cebcm.data.dataset import SONARVectorDataset
+from cebcm.inference.langevin import run_langevin
 from cebcm.models.actor import LatentDenoiseActor
 from cebcm.models.energy import SimpleEnergy
 from cebcm.models.energy_unconditional import UnconditionalEnergy
 from cebcm.models.normalization import OrthoLinear
-from cebcm.training.losses import (
-    multiscale_dsm_loss,
-    margin_contrastive_loss,
-    gradient_penalty,
-)
-from cebcm.training.kill_criteria import (
-    summarize_conditional_eval,
-    check_conditional_kill,
-)
-from cebcm.inference.langevin import run_langevin
-from cebcm.data.dataset import SONARVectorDataset
-
-
-def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
-    """Add Gaussian noise relative to embedding norm."""
-    norms = v.norm(dim=-1, keepdim=True)
-    noise = torch.randn_like(v) * scale * norms
-    return v + noise
-
-
-def cosine_to_geodesic(cos_value: float) -> float:
-    return math.acos(max(-1.0, min(1.0, float(cos_value))))
-
-
-def sample_sigma(
-    batch_size: int,
-    device: torch.device,
-    sigma_min: float,
-    sigma_max: float,
-    sigma_sampling: str,
-    edm_p_mean: float,
-    edm_p_std: float,
-) -> torch.Tensor:
-    if sigma_sampling == "loguniform":
-        log_sigma = torch.rand(batch_size, 1, device=device) * (
-            math.log(sigma_max) - math.log(sigma_min)
-        ) + math.log(sigma_min)
-        return log_sigma.exp()
-    if sigma_sampling == "edm":
-        return torch.exp(
-            torch.randn(batch_size, 1, device=device) * edm_p_std + edm_p_mean
-        ).clamp(min=sigma_min, max=sigma_max)
-    raise ValueError(f"Unknown sigma_sampling: {sigma_sampling}")
-
-
-def project_tangent(update: torch.Tensor, v_current: torch.Tensor) -> torch.Tensor:
-    v_hat = F.normalize(v_current, dim=-1)
-    return update - (update * v_hat).sum(dim=-1, keepdim=True) * v_hat
-
-
-def project_sphere(v: torch.Tensor, target_norm: float | None) -> torch.Tensor:
-    if target_norm is None:
-        return v
-    return F.normalize(v, dim=-1) * target_norm
+from cebcm.training.kill_criteria import ConditionalThresholds, summarize_conditional_eval
+from cebcm.training.losses import gradient_penalty
+from configs.base import LangevinConfig, Stage1_5Config
 
 
 def set_seed(seed: int) -> None:
@@ -100,569 +34,479 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
-    if amp_dtype == "bf16":
-        return torch.bfloat16
-    if amp_dtype == "fp16":
-        return torch.float16
-    return torch.float32
+def resolve_amp_dtype(name: str) -> torch.dtype:
+    return torch.bfloat16 if name == "bf16" else torch.float16
 
 
-def apply_non_finite_backoff(optimizer, backoff_factor: float = 0.5) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = max(group["lr"] * backoff_factor, 1e-7)
+def add_relative_noise(v: torch.Tensor, scale: float | torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(scale):
+        scale = torch.tensor(scale, device=v.device, dtype=v.dtype)
+    scale = scale.to(device=v.device, dtype=v.dtype)
+    if scale.ndim == 0:
+        scale = scale.view(1, 1)
+    elif scale.ndim == 1:
+        scale = scale.unsqueeze(-1)
+    return v + torch.randn_like(v) * scale * v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
 
-# =============================================================================
-# Stage1.5 Training: Hybrid Critic + Actor with Alternating Updates
-# =============================================================================
+def sample_sigma(cfg: Stage1_5Config, batch: int, device: torch.device) -> torch.Tensor:
+    if cfg.sigma_sampling == "loguniform":
+        lo, hi = math.log(cfg.sigma_curriculum_start), math.log(cfg.sigma_curriculum_end)
+        return (torch.rand(batch, 1, device=device) * (hi - lo) + lo).exp()
+    if cfg.sigma_sampling == "edm":
+        return torch.exp(
+            torch.randn(batch, 1, device=device) * cfg.edm_p_std + cfg.edm_p_mean
+        ).clamp(min=cfg.sigma_curriculum_start, max=cfg.sigma_curriculum_end)
+    raise ValueError(f"Unknown sigma sampling: {cfg.sigma_sampling}")
 
-def train_epoch_stage1_5(
-    critic: SimpleEnergy,
-    prior_critic: UnconditionalEnergy | None,
-    actor: LatentDenoiseActor,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
-    config: Stage1Config,
-    device: torch.device,
-    epoch: int,
-    global_step: int,
-) -> tuple[dict, int]:
-    """
-    Stage1.5 training loop with:
-    - Hybrid critic: E_total = E_cond(q,v) + λ*E_prior(v)
-    - MDSM + ranking loss for critic
-    - Actor with final-state geometry loss
-    - Alternating updates (2 critic : 1 actor)
-    - CQL regularization
-    - BC regularization
-    """
-    critic.train()
-    actor.train()
-    if prior_critic is not None:
-        prior_critic.train()
 
-    total_loss = 0.0
-    total_critic_loss = 0.0
-    total_actor_loss = 0.0
-    total_mdsm_loss = 0.0
-    total_rank_loss = 0.0
-    total_cql_loss = 0.0
-    total_bc_loss = 0.0
-
-    e_clean_sum = 0.0
-    e_actor_sum = 0.0
-    e_noisy_sum = 0.0
-
-    total_gp_loss = 0.0
-    total_shell_loss = 0.0
-
-    num_batches = 0
-    skipped_batches = 0
-    non_finite_streak = 0
-
-    sigma_min = config.sigma_curriculum_start
-    sigma_max = config.sigma_curriculum_end
-
-    for batch_idx, batch in enumerate(dataloader):
-        v_clean = batch["v"].to(device)  # [B, D]
-        batch_size = v_clean.shape[0]
-        weights = batch.get("weight", torch.ones(batch_size, device=device))
-
-        # Sample sigma for this batch
-        sigma = sample_sigma(
-            batch_size,
-            device,
-            sigma_min,
-            sigma_max,
-            config.sigma_sampling,
-            config.edm_p_mean,
-            config.edm_p_std,
-        )
-
-        # Create noisy samples with RELATIVE noise (SONAR convention)
-        v_noisy = add_relative_noise(v_clean, sigma.squeeze(-1))
-
-        # ============ CRITIC TRAINING (2 steps per 1 actor step) ============
-        critic_steps = config.get("critic_steps_per_actor", 2)
-
-        for _ in range(critic_steps):
-            with torch.autocast(device_type="cuda", dtype=resolve_amp_dtype(config.amp_dtype), enabled=config.amp_enabled):
-                # MDSM loss for gradient field validity
-                v_noisy_mdsm = v_noisy.detach().requires_grad_(True)
-                mdsm_loss_val = multiscale_dsm_loss(
-                    critic,
-                    v_clean,
-                    v_noisy=v_noisy_mdsm,
-                    sigma=sigma.detach(),
-                    sigma_min=config.sigma_min,
-                    sigma_max=config.sigma_max,
-                    tangent_projection=config.mdsm_tangent_projection,
-                    directional=config.mdsm_directional,
-                    magnitude_aux_weight=config.mdsm_magnitude_aux_weight,
-                    sigma_weighting=config.sigma_weighting,
-                    cosine_eps=config.mdsm_cosine_eps,
-                    norm_floor=config.mdsm_norm_floor,
-                    force_fp32=config.mdsm_force_fp32,
-                )
-
-                # Ranking loss for scalar ordering
-                v_actor = actor(
-                    v_query=v_clean,
-                    v_current=v_noisy,
-                    sigma=sigma.detach(),
-                )
-                v_actor = project_sphere(
-                    v_noisy + actor.predict_step(
-                        v_query=v_clean,
-                        v_current=v_noisy,
-                        sigma=sigma.detach(),
-                        step_size=config.actor_step_size,
-                        target_norm=config.langevin.target_norm,
-                        tangent_projection=config.actor_tangent_projection,
-                    )[0],
-                    config.langevin.target_norm,
-                )
-
-                e_clean = critic(v_clean, v_clean, sigma=sigma.detach())
-                e_actor_detached = critic(v_clean, v_actor.detach(), sigma=sigma.detach())
-                e_noisy = critic(v_clean, v_noisy.detach(), sigma=sigma.detach())
-
-                # Add prior critic if available (hybrid critic)
-                if prior_critic is not None:
-                    lambda_prior = config.get("lambda_prior", 0.1)
-                    e_clean = e_clean + lambda_prior * prior_critic(v_clean, sigma=sigma.detach())
-                    e_actor_detached = e_actor_detached + lambda_prior * prior_critic(v_actor.detach(), sigma=sigma.detach())
-                    e_noisy = e_noisy + lambda_prior * prior_critic(v_noisy.detach(), sigma=sigma.detach())
-
-                ranking_loss_val = (
-                    F.relu(e_clean - e_actor_detached + config.critic_margin_clean_actor)
-                    + F.relu(e_actor_detached - e_noisy + config.critic_margin_actor_noisy)
-                    + F.relu(e_clean - e_noisy + config.critic_margin_clean_noisy)
-                ).mean()
-
-                # CQL regularization (prevent OOD embeddings)
-                cql_loss_val = torch.tensor(0.0, device=device)
-                if config.get("use_cql", False):
-                    # Sample OOD negatives
-                    ood_noise = torch.randn_like(v_clean) * config.get("cql_noise_scale", 0.5)
-                    v_ood = project_sphere(v_clean + ood_noise, config.langevin.target_norm)
-
-                    e_ood = critic(v_clean, v_ood, sigma=sigma.detach())
-                    if prior_critic is not None:
-                        e_ood = e_ood + lambda_prior * prior_critic(v_ood, sigma=sigma.detach())
-
-                    # CQL term: penalize low energy for OOD
-                    cql_loss_val = F.softplus(e_ood).mean()
-
-                # Gradient penalty for smooth landscape (research3.md P1)
-                gp_loss_val = torch.tensor(0.0, device=device)
-                if config.get("use_gradient_penalty", False) and config.get("gradient_penalty_lambda", 0.0) > 0:
-                    gp_loss_val = gradient_penalty(
-                        lambda x: critic(v_clean, x, sigma=sigma.detach()).sum(),
-                        v_actor,
-                        lambda_gp=config.get("gradient_penalty_lambda", 0.05)
-                    )
-
-                # Shell barrier penalty for norm control (research3.md P2)
-                shell_loss_val = torch.tensor(0.0, device=device)
-                if config.get("use_shell_barrier", False):
-                    target_norm = config.langevin.target_norm or 0.2051
-                    margin = config.get("shell_barrier_margin", 0.1)
-                    actor_norm = v_actor.norm(dim=-1)
-                    lower = target_norm * (1 - margin)
-                    upper = target_norm * (1 + margin)
-                    shell_loss_val = (
-                        F.relu(lower - actor_norm) ** 2 +
-                        F.relu(actor_norm - upper) ** 2
-                    ).mean()
-
-                # Total critic loss
-                lambda_mdsm = config.get("lambda_mdsm", 1.0)
-                lambda_rank = config.get("lambda_rank", 0.25)
-                lambda_cql = config.get("lambda_cql", 0.1)
-                lambda_gp = config.get("gradient_penalty_lambda", 0.05) if config.get("use_gradient_penalty", False) else 0.0
-                lambda_shell = config.get("lambda_shell", 0.1) if config.get("use_shell_barrier", False) else 0.0
-
-                critic_loss_val = (
-                    lambda_mdsm * mdsm_loss_val
-                    + lambda_rank * ranking_loss_val
-                    + lambda_cql * cql_loss_val
-                    + lambda_gp * gp_loss_val
-                    + lambda_shell * shell_loss_val
-                )
-
-            # Critic optimizer step
-            optimizer.zero_grad(set_to_none=True)
-            if scaler.is_enabled():
-                scaler.scale(critic_loss_val).backward()
-                scaler.unscale_(optimizer)
-                for p in critic.parameters():
-                    if p.grad is not None:
-                        torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                critic_loss_val.backward()
-                for p in critic.parameters():
-                    if p.grad is not None:
-                        torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
-                optimizer.step()
-
-            total_mdsm_loss += mdsm_loss_val.item()
-            total_rank_loss += ranking_loss_val.item()
-            total_cql_loss += cql_loss_val.item()
-
-        # ============ ACTOR TRAINING (1 step) ============
-        with torch.autocast(device_type="cuda", dtype=resolve_amp_dtype(config.amp_dtype), enabled=config.amp_enabled):
-            # Actor forward
-            v_actor = actor(
-                v_query=v_clean,
-                v_current=v_noisy,
-                sigma=sigma.detach(),
-            )
-
-            # Actor step with projection
-            delta, v_actor_projected = actor.predict_step(
-                v_query=v_clean,
-                v_current=v_noisy,
-                sigma=sigma.detach(),
-                step_size=config.actor_step_size,
-                target_norm=config.langevin.target_norm,
-                tangent_projection=config.actor_tangent_projection,
-            )
-
-            # BC Regularization (anchor to clean)
-            bc_loss_val = torch.tensor(0.0, device=device)
-            if config.get("use_bc", False):
-                lambda_bc = config.get("lambda_bc", 0.5)
-                bc_loss_val = lambda_bc * F.mse_loss(v_actor_projected, v_clean)
-
-            # Final-state geometry loss (cosine/geodesic on projected state)
-            cosine_final = F.cosine_similarity(v_actor_projected, v_clean, dim=-1)
-            geo_loss_val = (1.0 - cosine_final.clamp(min=-1.0, max=1.0)).mean()
-
-            # Gradient alignment loss (optional)
-            align_loss_val = torch.tensor(0.0, device=device)
-            if config.get("use_grad_align", False):
-                with torch.enable_grad():
-                    v_actor.requires_grad_(True)
-                    _, grad = critic(v_clean, v_actor, sigma=sigma.detach())
-                    grad_direction = -grad.detach()
-                    actual_direction = (v_actor_projected - v_noisy).detach()
-                    align_loss_val = (1.0 - F.cosine_similarity(
-                        actual_direction, grad_direction, dim=-1
-                    )).mean()
-
-            # Total actor loss
-            lambda_geo = config.get("lambda_geo", 1.0)
-            lambda_align = config.get("lambda_align", 0.1)
-            lambda_bc_reg = config.get("lambda_bc_reg", 0.5)
-
-            actor_loss_val = (
-                lambda_geo * geo_loss_val
-                + lambda_align * align_loss_val
-                + lambda_bc_reg * bc_loss_val
-            )
-
-        # Actor optimizer step
-        optimizer.zero_grad(set_to_none=True)
-        if scaler.is_enabled():
-            scaler.scale(actor_loss_val).backward()
-            scaler.unscale_(optimizer)
-            for p in actor.parameters():
-                if p.grad is not None:
-                    torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            actor_loss_val.backward()
-            for p in actor.parameters():
-                if p.grad is not None:
-                    torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
-            optimizer.step()
-
-        # ============ METRICS TRACKING (research3.md P3) ============
-        e_clean_sum += e_clean.mean().item()
-        e_actor_sum += e_actor_detached.mean().item()
-        e_noisy_sum += e_noisy.mean().item()
-
-        total_loss += critic_loss_val.item() + actor_loss_val.item()
-        total_critic_loss += critic_loss_val.item()
-        total_actor_loss += actor_loss_val.item()
-        total_gp_loss += gp_loss_val.item()
-        total_shell_loss += shell_loss_val.item()
-
-        # Energy statistics (research3.md §7)
-        energy_stats = {
-            "mean": e_actor_detached.mean().item(),
-            "std": e_actor_detached.std().item(),
-            "min": e_actor_detached.min().item(),
-            "max": e_actor_detached.max().item(),
-        }
-
-        # Gradient norm statistics (research3.md P3)
-        grad_norms = []
-        for p in critic.parameters():
+def sanitize_grads(mods: list[torch.nn.Module]) -> None:
+    for m in mods:
+        for p in m.parameters():
             if p.grad is not None:
-                grad_norms.append(p.grad.norm().item())
-        grad_norm_mean = sum(grad_norms) / len(grad_norms) if grad_norms else 0.0
-        grad_norm_max = max(grad_norms) if grad_norms else 0.0
+                torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0, out=p.grad)
 
-        # Clean-minimum violation rate (research3.md §7)
-        clean_min_violation = (e_actor_detached < e_clean).float().mean().item()
 
-        num_batches += 1
-        global_step += 1
-        non_finite_streak = 0
+def clip_grads(mods: list[torch.nn.Module], max_norm: float) -> torch.Tensor:
+    params: list[torch.nn.Parameter] = []
+    for m in mods:
+        params.extend([p for p in m.parameters() if p.requires_grad])
+    return torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
 
-        if config.log_every > 0 and (batch_idx + 1) % config.log_every == 0:
-            e_scale = torch.exp(critic.log_energy_scale.detach().clamp(min=-8.0, max=8.0)).item()
-            actor_step_scale = torch.exp(actor.log_step_scale.detach().clamp(min=-6.0, max=3.0)).item()
-            print(
-                f"  [{batch_idx + 1}/{len(dataloader)}] "
-                f"loss={total_loss / num_batches:.4f} "
-                f"critic={total_critic_loss / num_batches:.4f} "
-                f"actor={total_actor_loss / num_batches:.4f} "
-                f"MDSM={total_mdsm_loss / num_batches:.4f} "
-                f"Rank={total_rank_loss / num_batches:.4f} "
-                f"CQL={total_cql_loss / num_batches:.4f} "
-                f"GP={total_gp_loss / num_batches:.4f} "
-                f"Shell={total_shell_loss / num_batches:.4f} "
-                f"E(clean/actor/noisy)=({e_clean_sum / num_batches:.3f}/"
-                f"{e_actor_sum / num_batches:.3f}/{e_noisy_sum / num_batches:.3f}) "
-                f"clean_min_viol={clean_min_violation:.3f} "
-                f"grad_norm(mean/max)={grad_norm_mean:.4f}/{grad_norm_max:.4f} "
-                f"lr={optimizer.param_groups[0]['lr']:.6f} "
-                f"E_scale={e_scale:.2f} actor_scale={actor_step_scale:.3f}"
+
+def set_ortho_n_iters(model: torch.nn.Module, n_iters: int) -> None:
+    for module in model.modules():
+        if isinstance(module, OrthoLinear):
+            module.n_iters = n_iters
+
+
+def build_bank(ds: SONARVectorDataset, device: torch.device, bank_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    emb = ds.embeddings
+    if 0 < bank_size < len(emb):
+        idx = torch.randperm(len(emb))[:bank_size]
+        emb = emb[idx]
+    bank = emb.to(device)
+    bank_n = F.normalize(bank, dim=-1)
+    return bank, bank_n
+
+
+def retrieve_pos_hard(
+    q: torch.Tensor,
+    bank: torch.Tensor,
+    bank_n: torch.Tensor,
+    topk_pos: int,
+    hard_start: int,
+    hard_end: int,
+    self_sim_exclude: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    qn = F.normalize(q, dim=-1)
+    k = min(bank.shape[0], max(2, topk_pos, hard_end))
+    sim = qn @ bank_n.T
+    vals, idx = torch.topk(sim, k=k, dim=-1)
+    pos_ids, hard_ids = [], []
+    for r in range(q.shape[0]):
+        cand_idx, cand_val = idx[r], vals[r]
+        pos = int(cand_idx[0].item())
+        for j in range(k):
+            if float(cand_val[j].item()) < self_sim_exclude:
+                pos = int(cand_idx[j].item())
+                break
+        hs, he = min(max(0, hard_start), k - 1), min(max(hard_start + 1, hard_end), k)
+        win = cand_idx[hs:he]
+        if win.numel() == 0:
+            hard = int(cand_idx[-1].item())
+        else:
+            hard = int(win[torch.randint(0, win.numel(), (1,), device=q.device)].item())
+        if hard == pos:
+            for j in range(k - 1, -1, -1):
+                alt = int(cand_idx[j].item())
+                if alt != pos:
+                    hard = alt
+                    break
+        pos_ids.append(pos)
+        hard_ids.append(hard)
+    return bank[torch.tensor(pos_ids, device=q.device)], bank[torch.tensor(hard_ids, device=q.device)]
+
+
+def seed_actor(q: torch.Tensor, hard: torch.Tensor, sigma: torch.Tensor, cfg: Stage1_5Config) -> torch.Tensor:
+    mix = cfg.actor_seed_mix_query * q + (1.0 - cfg.actor_seed_mix_query) * hard
+    return add_relative_noise(mix, sigma * cfg.actor_seed_noise_scale)
+
+
+def conditional_mdsm(
+    critic: SimpleEnergy,
+    q: torch.Tensor,
+    pos: torch.Tensor,
+    sigma: torch.Tensor,
+    cfg: Stage1_5Config,
+) -> torch.Tensor:
+    noise = torch.randn_like(pos)
+    nrm = pos.norm(dim=-1, keepdim=True).clamp(min=cfg.mdsm_norm_floor)
+    noisy = pos + noise * sigma * nrm
+    sigma_eff_sq = ((sigma * nrm) ** 2).clamp(min=1e-6)
+    noisy_req = noisy.detach().requires_grad_(True)
+    e = critic(q, noisy_req, sigma=sigma.detach())
+    g = torch.autograd.grad(e.sum(), noisy_req, create_graph=True)[0]
+    tgt = (noisy.detach() - pos) / sigma_eff_sq
+    if cfg.mdsm_tangent_projection:
+        vh = F.normalize(noisy.detach(), dim=-1)
+        g = g - (g * vh).sum(dim=-1, keepdim=True) * vh
+        tgt = tgt - (tgt * vh).sum(dim=-1, keepdim=True) * vh
+    if cfg.mdsm_directional:
+        c = F.cosine_similarity(g, tgt, dim=-1, eps=cfg.mdsm_cosine_eps).clamp(-1.0, 1.0)
+        loss = 1.0 - c
+        if cfg.mdsm_magnitude_aux_weight > 0:
+            gn = g.norm(dim=-1).clamp(min=cfg.mdsm_norm_floor, max=1e4)
+            tn = tgt.norm(dim=-1).clamp(min=cfg.mdsm_norm_floor, max=1e4)
+            loss = loss + cfg.mdsm_magnitude_aux_weight * F.smooth_l1_loss(
+                torch.log(gn), torch.log(tn), reduction="none"
             )
-
-    return {
-        # Core losses
-        "loss": total_loss / max(num_batches, 1),
-        "critic_loss": total_critic_loss / max(num_batches, 1),
-        "actor_loss": total_actor_loss / max(num_batches, 1),
-        "mdsm_loss": total_mdsm_loss / max(num_batches, 1),
-        "ranking_loss": total_rank_loss / max(num_batches, 1),
-        "cql_loss": total_cql_loss / max(num_batches, 1),
-        "gp_loss": total_gp_loss / max(num_batches, 1),
-        "shell_loss": total_shell_loss / max(num_batches, 1),
-        "bc_loss": total_bc_loss / max(num_batches, 1),
-        # Energy statistics (research3.md §7)
-        "e_clean_mean": e_clean_sum / max(num_batches, 1),
-        "e_actor_mean": e_actor_sum / max(num_batches, 1),
-        "e_noisy_mean": e_noisy_sum / max(num_batches, 1),
-        "critic_gap_clean_actor": (e_clean_sum - e_actor_sum) / max(num_batches, 1),
-        "critic_gap_clean_noisy": (e_clean_sum - e_noisy_sum) / max(num_batches, 1),
-        # Stability metrics
-        "clean_min_violation_rate": clean_min_violation,
-        "grad_norm_mean": grad_norm_mean,
-        "grad_norm_max": grad_norm_max,
-        "skipped_batches": float(skipped_batches),
-    }, global_step
+    else:
+        loss = ((g - tgt) ** 2).sum(dim=-1)
+    if cfg.sigma_weighting == "sigma2":
+        w = sigma_eff_sq.squeeze(-1)
+    elif cfg.sigma_weighting == "inv_sigma2":
+        w = 1.0 / sigma_eff_sq.squeeze(-1).clamp(min=1e-8)
+    else:
+        w = torch.ones_like(loss)
+    w = w / w.mean().clamp(min=1e-8)
+    return (w * loss).mean()
 
 
-# =============================================================================
-# Main training orchestration
-# =============================================================================
+class TwinHybridEnergy:
+    def __init__(
+        self,
+        c1: SimpleEnergy,
+        c2: SimpleEnergy,
+        prior: UnconditionalEnergy | None,
+        lambda_prior: float,
+        aggregate: str,
+    ):
+        self.c1 = c1
+        self.c2 = c2
+        self.prior = prior
+        self.lambda_prior = lambda_prior
+        self.aggregate = aggregate
 
-def main():
-    parser = argparse.ArgumentParser(description="Stage1.5 Hybrid Actor-Critic Training")
-    parser.add_argument("--config", type=str, required=True, help="Path to config JSON")
-    parser.add_argument("--output", type=str, default="output/stage1_5", help="Output directory")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
+    def cond(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
+        e1, e2 = self.c1(q, v, sigma=sigma), self.c2(q, v, sigma=sigma)
+        return 0.5 * (e1 + e2) if self.aggregate == "mean" else torch.maximum(e1, e2)
+
+    def __call__(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
+        e = self.cond(q, v, sigma=sigma)
+        if self.prior is not None and self.lambda_prior > 0:
+            e = e + self.lambda_prior * self.prior(v)
+        return e
+
+    def energy_and_grad(
+        self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        v_req = v.detach().requires_grad_(True)
+        e = self(q, v_req, sigma=sigma)
+        g = torch.autograd.grad(e.sum(), v_req, create_graph=False)[0]
+        return e.detach(), g.detach()
+
+
+def make_thresholds(cfg: Stage1_5Config) -> ConditionalThresholds:
+    return ConditionalThresholds(
+        min_cos_improvement=cfg.min_cosine_improvement,
+        min_cos_success_rate=cfg.min_cosine_success_rate,
+        min_geodesic_improvement=cfg.min_geodesic_improvement,
+        min_l2_improvement=cfg.min_l2_improvement,
+        min_energy_success_rate=cfg.min_energy_success_rate,
+        max_clean_min_violation=cfg.max_clean_min_violation_rate,
+        min_step_norm=cfg.min_step_norm,
+    )
+
+
+def eval_model(
+    ef: TwinHybridEnergy,
+    actor: LatentDenoiseActor,
+    ds: SONARVectorDataset,
+    bank: torch.Tensor,
+    bank_n: torch.Tensor,
+    cfg: Stage1_5Config,
+    device: torch.device,
+) -> dict:
+    ef.c1.eval()
+    ef.c2.eval()
+    if ef.prior is not None:
+        ef.prior.eval()
+    actor.eval()
+    ids = torch.randperm(len(ds))[: min(cfg.eval_num_samples, len(ds))]
+    kw = {}
+    if cfg.langevin.method == "pid":
+        kw = dict(
+            kp=cfg.langevin.pid_kp,
+            ki=cfg.langevin.pid_ki,
+            kd=cfg.langevin.pid_kd,
+            integral_decay=cfg.langevin.pid_integral_decay,
+        )
+    elif cfg.langevin.method == "underdamped":
+        kw = dict(friction=cfg.langevin.underdamped_friction, mass=cfg.langevin.underdamped_mass)
+    else:
+        kw = dict(momentum_beta=cfg.langevin.momentum_beta)
+    out = {}
+    for ns in cfg.eval_noise_scales:
+        cb, ca, lb, la, eb, ea, ep, step, succ, viol, rcos = [], [], [], [], [], [], [], [], [], [], []
+        for i in ids:
+            q = ds[int(i.item())].unsqueeze(0).to(device)
+            pos, hard = retrieve_pos_hard(
+                q, bank, bank_n, cfg.retrieval_topk_pos, cfg.retrieval_hard_start, cfg.retrieval_hard_end, cfg.retrieval_self_sim_exclude
+            )
+            rcos.append(float(F.cosine_similarity(q, pos, dim=-1).item()))
+            sigma = torch.full((1, 1), float(ns), device=device)
+            noisy = seed_actor(q, hard, sigma, cfg)
+            with torch.no_grad():
+                v = noisy
+                for _ in range(max(1, cfg.actor_eval_steps)):
+                    v, _ = actor.predict_step(q, v, sigma=sigma, step_size=cfg.actor_step_size, target_norm=cfg.langevin.target_norm, tangent_projection=cfg.actor_tangent_projection)
+            if cfg.critic_eval_langevin_steps > 0:
+                res = run_langevin(
+                    method=cfg.langevin.method, energy_fn=ef, v_query=q, v_init=v,
+                    lr=cfg.langevin.lr, noise_scale=cfg.langevin.noise_scale, max_steps=cfg.critic_eval_langevin_steps,
+                    target_norm=cfg.langevin.target_norm, energy_threshold=cfg.langevin.energy_threshold,
+                    plateau_patience=cfg.langevin.plateau_patience, plateau_delta=cfg.langevin.plateau_delta, v_target=pos, **kw
+                )
+                final = res.v_last if res.v_last is not None else res.v_final
+            else:
+                final = v
+            cb.append(float(F.cosine_similarity(pos, noisy, dim=-1).item()))
+            ca.append(float(F.cosine_similarity(pos, final, dim=-1).item()))
+            lb.append(float(torch.norm(pos - noisy, dim=-1).item()))
+            la.append(float(torch.norm(pos - final, dim=-1).item()))
+            with torch.no_grad():
+                ep_i = float(ef(q, pos).item()); eb_i = float(ef(q, noisy).item()); ea_i = float(ef(q, final).item())
+            ep.append(ep_i); eb.append(eb_i); ea.append(ea_i)
+            step.append(float(torch.norm(final - noisy, dim=-1).item()))
+            succ.append(1.0 if ea_i < eb_i else 0.0)
+            viol.append(1.0 if ea_i < ep_i else 0.0)
+        n = float(len(cb))
+        out[f"noise_{ns}"] = {
+            "cos_before_mean": sum(cb) / n,
+            "cos_after_mean": sum(ca) / n,
+            "improvement": (sum(ca) - sum(cb)) / n,
+            "geodesic_before_mean": sum(math.acos(max(-1.0, min(1.0, x))) for x in cb) / n,
+            "geodesic_after_mean": sum(math.acos(max(-1.0, min(1.0, x))) for x in ca) / n,
+            "geodesic_improvement": (
+                sum(math.acos(max(-1.0, min(1.0, x))) for x in cb)
+                - sum(math.acos(max(-1.0, min(1.0, x))) for x in ca)
+            ) / n,
+            "l2_before_mean": sum(lb) / n,
+            "l2_after_mean": sum(la) / n,
+            "l2_improvement": (sum(lb) - sum(la)) / n,
+            "energy_clean_mean": sum(ep) / n,
+            "energy_before_mean": sum(eb) / n,
+            "energy_after_mean": sum(ea) / n,
+            "energy_improvement": (sum(eb) - sum(ea)) / n,
+            "energy_success_rate": sum(succ) / n,
+            "clean_min_violation_rate": sum(viol) / n,
+            "step_norm_mean": sum(step) / n,
+            "success_rate": sum(1.0 for b, a in zip(cb, ca) if a > b) / n,
+            "retrieval_cosine_mean": sum(rcos) / n,
+        }
+    return out
+
+
+def load_config(path: str) -> Stage1_5Config:
+    raw = json.load(open(path, "r", encoding="utf-8"))
+    raw = {k: v for k, v in raw.items() if not str(k).startswith("_")}
+    kill = raw.pop("kill_criteria", None)
+    if isinstance(raw.get("langevin"), dict):
+        allowed = {f.name for f in fields(LangevinConfig)}
+        raw["langevin"] = LangevinConfig(**{k: v for k, v in raw["langevin"].items() if k in allowed})
+    if isinstance(raw.get("sigma_weighting"), bool):
+        raw["sigma_weighting"] = "sigma2" if raw["sigma_weighting"] else "uniform"
+    allowed = {f.name for f in fields(Stage1_5Config)}
+    cfg = Stage1_5Config(**{k: v for k, v in raw.items() if k in allowed})
+    if isinstance(kill, dict):
+        cfg.min_cosine_improvement = float(kill.get("min_cosine_improvement", cfg.min_cosine_improvement))
+        cfg.min_cosine_success_rate = float(kill.get("min_cosine_success_rate", cfg.min_cosine_success_rate))
+        cfg.min_energy_success_rate = float(kill.get("min_energy_success_rate", cfg.min_energy_success_rate))
+        cfg.max_clean_min_violation_rate = float(kill.get("max_clean_min_violation_rate", cfg.max_clean_min_violation_rate))
+    return cfg
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/stage1_5_config.json")
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
-
-    # Load config
-    with open(args.config, "r") as f:
-        config_dict = json.load(f)
-    config = Stage1_5Config(**config_dict)
-
-    # Set seed
-    set_seed(config.seed)
-
-    # Device
+    cfg = load_config(args.config)
+    set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    use_amp = cfg.amp_enabled and device.type == "cuda"
+    autocast = (lambda: torch.amp.autocast("cuda", dtype=resolve_amp_dtype(cfg.amp_dtype))) if use_amp else nullcontext
+    ds = SONARVectorDataset(cfg.train_data_path)
+    if cfg.val_data_path and Path(cfg.val_data_path).exists():
+        ds_val = SONARVectorDataset(cfg.val_data_path)
+    else:
+        n_val = max(1, min(cfg.eval_num_samples * 2, len(ds) // 10))
+        ds, ds_val = ds.subset(0, max(1, len(ds) - n_val)), ds.subset(max(1, len(ds) - n_val), len(ds))
+    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=(device.type == "cuda"))
+    bank_tr, bankn_tr = build_bank(ds, device, cfg.retrieval_bank_size)
+    bank_va, bankn_va = build_bank(ds_val, device, cfg.retrieval_bank_size)
 
-    # Create output directory structure
-    output_dir = Path(config_dict.get("output_dir", args.output))
-    checkpoint_dir = Path(config_dict.get("checkpoint_dir", output_dir / "checkpoints"))
-    logs_dir = Path(config_dict.get("logs_dir", output_dir / "logs"))
+    c1 = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
+    c2 = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
+    actor = LatentDenoiseActor(cfg.energy_dim, cfg.actor_hidden_dims, cfg.norm_mode, "silu", ortho_n_iters=cfg.ortho_n_iters).to(device)
+    prior = UnconditionalEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters).to(device) if cfg.use_prior_critic else None
+    for m in [c1, c2, actor] + ([prior] if prior is not None else []):
+        set_ortho_n_iters(m, cfg.ortho_n_iters)
+    ef = TwinHybridEnergy(c1, c2, prior, cfg.lambda_prior if cfg.use_prior_critic else 0.0, cfg.twin_aggregate)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\n=== Stage1.5 Training ===")
-    print(f"Output directory: {output_dir.resolve()}")
-    print(f"Checkpoints: {checkpoint_dir.resolve()}")
-    print(f"Logs: {logs_dir.resolve()}\n")
-
-    # Initialize models
-    critic = SimpleEnergy(
-        dim=config.energy_dim,
-        hidden_dims=config.energy_hidden_dims,
-        norm_mode=config.norm_mode,
-        activation=config.activation,
-    ).to(device)
-
-    prior_critic = None
-    if config.get("use_prior_critic", False):
-        prior_critic = UnconditionalEnergy(
-            dim=config.energy_dim,
-            hidden_dims=config.energy_hidden_dims,
-            norm_mode=config.norm_mode,
-            activation=config.activation,
-        ).to(device)
-
-    actor = LatentDenoiseActor(
-        dim=config.energy_dim,
-        hidden_dims=config.actor_hidden_dims,
-        norm_mode=config.norm_mode,
-        activation=config.activation,
-    ).to(device)
-
-    # Optimizer
-    optimizer = torch.optim.AdamW([
-        {"params": critic.parameters(), "lr": config.critic_lr},
-        {"params": actor.parameters(), "lr": config.actor_lr},
-    ], weight_decay=config.weight_decay)
-
-    if prior_critic is not None:
-        optimizer.add_param_group({"params": prior_critic.parameters(), "lr": config.get("prior_critic_lr", config.critic_lr)})
-
-    # Scaler for AMP
-    scaler = torch.cuda.amp.GradScaler(enabled=config.amp_enabled)
-
-    # Resume from checkpoint
-    start_epoch = 0
-    global_step = 0
+    groups = [{"params": list(c1.parameters()), "lr": cfg.critic_lr}, {"params": list(c2.parameters()), "lr": cfg.critic_lr}]
+    if prior is not None:
+        groups.append({"params": list(prior.parameters()), "lr": cfg.prior_critic_lr})
+    opt_c = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
+    opt_a = torch.optim.AdamW(actor.parameters(), lr=cfg.actor_lr, weight_decay=cfg.weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    ckpt_dir, log_dir = Path(cfg.checkpoint_dir), Path(cfg.logs_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True); log_dir.mkdir(parents=True, exist_ok=True)
+    best_score, start_epoch, global_step = float("-inf"), 0, 0
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        critic.load_state_dict(checkpoint["critic"])
-        actor.load_state_dict(checkpoint["actor"])
-        if prior_critic is not None and "prior_critic" in checkpoint:
-            prior_critic.load_state_dict(checkpoint["prior_critic"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scaler.load_state_dict(checkpoint["scaler"])
-        start_epoch = checkpoint.get("epoch", 0) + 1
-        global_step = checkpoint.get("global_step", 0)
-        print(f"Resumed from epoch {start_epoch}, step {global_step}")
+        ck = torch.load(args.resume, weights_only=False, map_location=device)
+        c1.load_state_dict(ck["critic1_state"]); c2.load_state_dict(ck["critic2_state"]); actor.load_state_dict(ck["actor_state"])
+        if prior is not None and ck.get("prior_state") is not None: prior.load_state_dict(ck["prior_state"])
+        opt_c.load_state_dict(ck["opt_c_state"]); opt_a.load_state_dict(ck["opt_a_state"]); scaler.load_state_dict(ck["scaler_state"])
+        best_score, start_epoch, global_step = float(ck.get("best_score", best_score)), int(ck.get("epoch", 0)) + 1, int(ck.get("global_step", 0))
 
-    # Data
-    train_dataset = SONARVectorDataset(config.train_data_path)
-    val_dataset = SONARVectorDataset(config.val_data_path)
+    th = make_thresholds(cfg)
+    print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)}")
+    for ep in range(start_epoch, cfg.num_epochs):
+        t0 = time.time(); c1.train(); c2.train(); actor.train(); prior.train() if prior is not None else None
+        sums = {"loss": 0.0, "critic": 0.0, "actor": 0.0, "rank_success": 0.0, "retrieval_cosine": 0.0, "clean_viol": 0.0}
+        n_ok, n_skip, bad_streak = 0, 0, 0
+        ema_c, ema_a = None, None
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-    )
+        def on_bad() -> None:
+            nonlocal n_skip, bad_streak
+            n_skip += 1; bad_streak += 1; opt_c.zero_grad(set_to_none=True); opt_a.zero_grad(set_to_none=True)
+            if bad_streak >= cfg.non_finite_backoff_streak_trigger:
+                for opt in (opt_c, opt_a):
+                    for g in opt.param_groups: g["lr"] = max(float(g["lr"]) * cfg.non_finite_lr_backoff, 1e-8)
+            if bad_streak >= cfg.max_consecutive_non_finite_batches:
+                raise RuntimeError("Too many consecutive bad batches.")
 
-    # Training loop
-    best_composite_score = float("-inf")
+        for bi, q in enumerate(loader):
+            q = q.to(device, non_blocking=True)
+            pos, hard = retrieve_pos_hard(q, bank_tr, bankn_tr, cfg.retrieval_topk_pos, cfg.retrieval_hard_start, cfg.retrieval_hard_end, cfg.retrieval_self_sim_exclude)
+            retrieval_cos = float(F.cosine_similarity(q, pos, dim=-1).mean().item())
 
-    for epoch in range(start_epoch, config.num_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{config.num_epochs} ===")
-        start_time = time.time()
+            c_loss_acc, rank_ok_acc, viol_acc = 0.0, 0.0, 0.0
+            critic_failed = False
+            for _ in range(max(1, cfg.critic_steps_per_actor)):
+                sigma = sample_sigma(cfg, q.shape[0], device); seed = seed_actor(q, hard, sigma, cfg)
+                with torch.no_grad():
+                    a_init, _ = actor.predict_step(q, seed, sigma=sigma, step_size=cfg.actor_step_size, target_norm=cfg.langevin.target_norm, tangent_projection=cfg.actor_tangent_projection)
+                with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
+                    mdsm = 0.5 * (conditional_mdsm(c1, q, pos, sigma, cfg) + conditional_mdsm(c2, q, pos, sigma, cfg))
+                with autocast():
+                    ep1, ea1, eh1 = c1(q, pos, sigma=sigma.detach()), c1(q, a_init.detach(), sigma=sigma.detach()), c1(q, hard.detach(), sigma=sigma.detach())
+                    ep2, ea2, eh2 = c2(q, pos, sigma=sigma.detach()), c2(q, a_init.detach(), sigma=sigma.detach()), c2(q, hard.detach(), sigma=sigma.detach())
+                    rank = 0.5 * (
+                        (F.relu(ep1 - ea1 + cfg.critic_margin_clean_actor) + F.relu(ea1 - eh1 + cfg.critic_margin_actor_noisy) + F.relu(ep1 - eh1 + cfg.critic_margin_clean_noisy)).mean()
+                        + (F.relu(ep2 - ea2 + cfg.critic_margin_clean_actor) + F.relu(ea2 - eh2 + cfg.critic_margin_actor_noisy) + F.relu(ep2 - eh2 + cfg.critic_margin_clean_noisy)).mean()
+                    )
+                    cql = torch.tensor(0.0, device=device)
+                    if cfg.use_cql:
+                        ood = add_relative_noise(hard.detach(), cfg.cql_noise_scale)
+                        if cfg.langevin.target_norm is not None: ood = F.normalize(ood, dim=-1) * cfg.langevin.target_norm
+                        cql = 0.5 * (F.softplus(-c1(q, ood, sigma=sigma.detach())).mean() + F.softplus(-c2(q, ood, sigma=sigma.detach())).mean())
+                    gp = torch.tensor(0.0, device=device)
+                    if cfg.use_gradient_penalty:
+                        gp = 0.5 * (gradient_penalty(c1, q, a_init.detach()) + gradient_penalty(c2, q, a_init.detach()))
+                    loss_c = cfg.lambda_mdsm * mdsm + cfg.lambda_rank * rank + cfg.lambda_cql * cql + cfg.gradient_penalty_lambda * gp
+                    if prior is not None and cfg.lambda_prior > 0:
+                        loss_c = loss_c + cfg.lambda_prior * F.relu(prior(pos) - prior(hard.detach()) + cfg.critic_margin_clean_noisy).mean()
 
-        train_metrics, global_step = train_epoch_stage1_5(
-            critic, prior_critic, actor, train_loader,
-            optimizer, scaler, config, device, epoch, global_step,
-        )
+                lc = float(loss_c.detach().item())
+                if (not math.isfinite(lc)) or (cfg.guard_loss_spikes and ema_c is not None and global_step >= cfg.loss_spike_warmup_steps and lc > cfg.loss_spike_factor * max(ema_c, 1e-8)):
+                    on_bad(); critic_failed = True; break
+                ema_c = lc if ema_c is None else 0.98 * ema_c + 0.02 * lc
+                mods_c = [c1, c2] + ([prior] if prior is not None else [])
+                opt_c.zero_grad(set_to_none=True)
+                if scaler.is_enabled():
+                    scaler.scale(loss_c).backward(); scaler.unscale_(opt_c); sanitize_grads(mods_c); gn = clip_grads(mods_c, cfg.clip_grad_norm)
+                    if not torch.isfinite(gn): on_bad(); scaler.update(); critic_failed = True; break
+                    scaler.step(opt_c); scaler.update()
+                else:
+                    loss_c.backward(); sanitize_grads(mods_c); gn = clip_grads(mods_c, cfg.clip_grad_norm)
+                    if not torch.isfinite(gn): on_bad(); critic_failed = True; break
+                    opt_c.step()
+                c_loss_acc += lc
+                rank_ok_acc += 0.5 * (((ep1 < eh1).float().mean().item()) + ((ep2 < eh2).float().mean().item()))
+                viol_acc += 0.5 * (((ea1 < ep1).float().mean().item()) + ((ea2 < ep2).float().mean().item()))
+            if critic_failed:
+                continue
 
-        # Evaluation
-        eval_metrics = evaluate_denoising(
-            critic, actor, val_dataset, config, device,
-            num_samples=config.eval_num_samples,
-        )
+            sigma_a = sample_sigma(cfg, q.shape[0], device); seed_a = seed_actor(q, hard, sigma_a, cfg)
+            with autocast():
+                nxt, delta = actor.predict_step(q, seed_a, sigma=sigma_a.detach(), step_size=cfg.actor_step_size, target_norm=cfg.langevin.target_norm, tangent_projection=cfg.actor_tangent_projection)
+                l_geo = (1.0 - F.cosine_similarity(nxt, pos, dim=-1).clamp(-1.0, 1.0)).mean()
+                l_bc = F.mse_loss(nxt, pos) if cfg.use_bc else torch.tensor(0.0, device=device)
+                if cfg.use_grad_align:
+                    with torch.enable_grad():
+                        _, g_seed = ef.energy_and_grad(q, seed_a, sigma=sigma_a.detach())
+                    l_align = (1.0 - F.cosine_similarity(delta, -g_seed, dim=-1, eps=cfg.mdsm_cosine_eps).clamp(-1.0, 1.0)).mean()
+                else:
+                    l_align = torch.tensor(0.0, device=device)
+                l_bar = torch.tensor(0.0, device=device)
+                if cfg.lambda_actor_barrier > 0:
+                    l_bar = F.softplus(ef(q, pos, sigma=sigma_a.detach()).detach() - ef(q, nxt, sigma=sigma_a.detach())).mean()
+                loss_a = cfg.lambda_geo * l_geo + cfg.lambda_align * l_align + cfg.lambda_bc_reg * l_bc + cfg.lambda_actor_barrier * l_bar
+            la = float(loss_a.detach().item())
+            if (not math.isfinite(la)) or (cfg.guard_loss_spikes and ema_a is not None and global_step >= cfg.loss_spike_warmup_steps and la > cfg.loss_spike_factor * max(ema_a, 1e-8)):
+                on_bad(); continue
+            ema_a = la if ema_a is None else 0.98 * ema_a + 0.02 * la
+            opt_a.zero_grad(set_to_none=True)
+            if scaler.is_enabled():
+                scaler.scale(loss_a).backward(); scaler.unscale_(opt_a); sanitize_grads([actor]); gn = clip_grads([actor], cfg.clip_grad_norm)
+                if not torch.isfinite(gn): on_bad(); scaler.update(); continue
+                scaler.step(opt_a); scaler.update()
+            else:
+                loss_a.backward(); sanitize_grads([actor]); gn = clip_grads([actor], cfg.clip_grad_norm)
+                if not torch.isfinite(gn): on_bad(); continue
+                opt_a.step()
+            n_ok += 1; global_step += 1; bad_streak = 0
+            c_avg = c_loss_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["critic"] += c_avg; sums["actor"] += la; sums["loss"] += c_avg + la
+            sums["rank_success"] += rank_ok_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["clean_viol"] += viol_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["retrieval_cosine"] += retrieval_cos
+            if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
+                print(f"  [{bi+1}/{len(loader)}] loss={sums['loss']/n_ok:.4f} critic={sums['critic']/n_ok:.4f} actor={sums['actor']/n_ok:.4f} rank={sums['rank_success']/n_ok:.3f} viol={sums['clean_viol']/n_ok:.3f}")
 
-        # Composite score for checkpoint selection
-        composite_score = (
-            eval_metrics.get("cosine_improvement", 0) * 0.4
-            + eval_metrics.get("geodesic_improvement", 0) * 0.3
-            + (1.0 if eval_metrics.get("clean_min_violation_rate", 1.0) < 0.05 else 0.0) * 0.2
-            + eval_metrics.get("energy_success_rate", 0) * 0.1
-        )
-
-        epoch_time = time.time() - start_time
-        print(f"\nEpoch {epoch + 1} completed in {epoch_time:.2f}s")
-        print(f"  Train loss: {train_metrics['loss']:.4f}")
-        print(f"  Cosine improvement: {eval_metrics.get('cosine_improvement', 0):.4f}")
-        print(f"  Composite score: {composite_score:.4f}")
-
-        # Save checkpoint
-        checkpoint = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "critic": critic.state_dict(),
-            "actor": actor.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "config": asdict(config),
-            "train_metrics": train_metrics,
-            "eval_metrics": eval_metrics,
-            "composite_score": composite_score,
+        train = {k: (v / max(n_ok, 1)) for k, v in sums.items()}; train["skip_rate"] = n_skip / max(len(loader), 1)
+        eval_m = eval_model(ef, actor, ds_val, bank_va, bankn_va, cfg, device)
+        kill = summarize_conditional_eval(eval_m, th); eval_m["kill_criteria"] = kill; score = float(kill["score"])
+        print(f"Epoch {ep+1}: train={train['loss']:.4f} score={score:+.6f} strict_pass={kill['passed']} skip={train['skip_rate']:.2%} ({time.time()-t0:.1f}s)")
+        payload = {
+            "epoch": ep, "global_step": global_step, "best_score": best_score,
+            "critic1_state": c1.state_dict(), "critic2_state": c2.state_dict(), "actor_state": actor.state_dict(),
+            "prior_state": prior.state_dict() if prior is not None else None,
+            "opt_c_state": opt_c.state_dict(), "opt_a_state": opt_a.state_dict(), "scaler_state": scaler.state_dict(),
+            "train_metrics": train, "eval_metrics": eval_m, "config": asdict(cfg),
         }
+        torch.save(payload, ckpt_dir / f"epoch_{ep+1}.pt")
+        if score > best_score:
+            best_score = score; payload["best_score"] = best_score; torch.save(payload, ckpt_dir / "best.pt")
+        with open(log_dir / "training_metrics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"epoch": ep + 1, "score": score, "train_metrics": train, "kill_criteria": kill}) + "\n")
 
-        # Save epoch checkpoint
-        epoch_ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"
-        torch.save(checkpoint, epoch_ckpt_path)
-        print(f"  Checkpoint saved: {epoch_ckpt_path.name}")
-
-        # Save best checkpoint
-        if composite_score > best_composite_score:
-            best_composite_score = composite_score
-            best_ckpt_path = checkpoint_dir / "best.pt"
-            torch.save(checkpoint, best_ckpt_path)
-            print(f"  [BEST] New best checkpoint saved (score: {composite_score:.4f}): {best_ckpt_path.name}")
-
-        # Save training metrics to logs
-        metrics_log = {
-            "epoch": epoch + 1,
-            "train_metrics": train_metrics,
-            "eval_metrics": eval_metrics,
-            "composite_score": composite_score,
-            "epoch_time_sec": epoch_time,
-        }
-        with open(logs_dir / "training_metrics.jsonl", "a") as f:
-            f.write(json.dumps(metrics_log) + "\n")
-
-        # Kill criteria check
-        kill_verdict = check_conditional_kill(eval_metrics, config)
-        if kill_verdict["should_stop"]:
-            print(f"\n!!! Kill criteria triggered: {kill_verdict['reason']}")
-            # Save final checkpoint before stopping
-            final_ckpt_path = checkpoint_dir / "checkpoint_killed.pt"
-            torch.save(checkpoint, final_ckpt_path)
-            print(f"  Final checkpoint saved: {final_ckpt_path.name}")
-            break
-
-    print(f"\n=== Training completed ===")
-    print(f"Best composite score: {best_composite_score:.4f}")
-    print(f"Checkpoints directory: {checkpoint_dir}")
-    print(f"Logs directory: {logs_dir}")
-
-    # Save final summary
-    summary = {
-        "best_composite_score": best_composite_score,
-        "total_epochs": epoch + 1,
-        "final_global_step": global_step,
-        "config": asdict(config),
-    }
-    with open(logs_dir / "training_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    final_eval = eval_model(ef, actor, ds_val, bank_va, bankn_va, cfg, device)
+    final_kill = summarize_conditional_eval(final_eval, th); final_eval["kill_criteria"] = final_kill
+    torch.save(
+        {
+            "critic1_state": c1.state_dict(), "critic2_state": c2.state_dict(), "actor_state": actor.state_dict(),
+            "prior_state": prior.state_dict() if prior is not None else None,
+            "eval_metrics": final_eval, "config": asdict(cfg), "best_score": best_score,
+        },
+        ckpt_dir / "final.pt",
+    )
+    with open(log_dir / "training_summary.json", "w", encoding="utf-8") as f:
+        json.dump({"best_score": best_score, "final_kill": final_kill, "config": asdict(cfg)}, f, indent=2)
+    print(f"Final strict pass: {final_kill['passed']} | best_score={best_score:+.6f}")
 
 
 if __name__ == "__main__":

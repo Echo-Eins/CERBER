@@ -128,7 +128,9 @@ class UnconditionalEnergy(nn.Module):
         Returns:
             [B] scalar energies.
         """
-        return self.log_energy_scale.exp() * self.net(x).squeeze(-1)
+        # Keep the global scale trainable but prevent inf/nan cascades.
+        scale = torch.exp(self.log_energy_scale.clamp(min=-8.0, max=8.0))
+        return scale * self.net(x).squeeze(-1)
 
     def energy_and_grad(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """
