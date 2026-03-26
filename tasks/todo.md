@@ -517,3 +517,102 @@ Resolve user-reported mismatch between visual "near-target" behavior and zero/ne
 - Validation:
   - `python -m py_compile cerber_gui/app.py cerber_gui/landscape_3d.py cerber_gui/sota_eval.py`
 
+---
+
+# Endpoint/Best-State Desync Closure (2026-03-25, Pass 7)
+
+## Goal
+Eliminate metric desynchronization between live inference and SOTA batch evaluation by enforcing a single endpoint semantics (last executed state) while preserving `best-energy` state for optional analysis.
+
+## Checklist
+- [x] Extend `LangevinResult` to carry both states explicitly (`v_final` best-energy, `v_last` last executed)
+- [x] Update all Langevin variants (overdamped/pid/underdamped) to populate `v_last` on early-stop and full-run exits
+- [x] Update GUI `run_langevin_denoise` fallback (`track_vectors=False`) to return `v_last` instead of `v_final`
+- [x] Keep trajectory and reported endpoint consistent in non-tracking mode
+- [x] Run compile validation
+
+## Review
+- Implemented:
+  - Added `v_last` to `LangevinResult`.
+  - Filled `v_last` in every return path of all three Langevin methods.
+  - Batch/SOTA pathway now uses actually reached terminal state (`v_last`) instead of best-energy fallback.
+  - This removes live-vs-batch endpoint mismatch and stabilizes interpretation of step norm / cosine / L2 improvements.
+  - Bumped `SOTA_EVAL_CACHE_VERSION` to `3` so post-fix metrics are recomputed (no stale pre-fix cache artifacts).
+- Validation:
+  - `python -m py_compile cebcm/inference/langevin.py cerber_gui/app.py cerber_gui/sota_eval.py cerber_gui/landscape_3d.py`
+
+---
+
+# Stage1 Pipeline Re-Research: Unconditional vs Simple (2026-03-25, Pass 8)
+
+## Goal
+Perform a full re-research of Stage1 training pipelines:
+- `unconditional` energy pipeline,
+- `simple` / actor+critic-aligned pairwise pipeline,
+and produce SOTA-grounded upgrade options with concrete implementation tracks.
+
+## Checklist
+- [x] Re-read AGENTS/spec/implementation plan constraints for Stage1 role in CERBER architecture
+- [x] Audit current code paths end-to-end for both pipelines (objective, sampling, OOD controls, metrics, inference semantics)
+- [ ] Run parallel subagent research:
+  - [x] unconditional pipeline deep audit
+  - [x] simple/actor-critic pipeline deep audit
+  - [x] external SOTA methods + papers + practical recipes
+- [x] Produce `research3.md` with agent-attributed findings and source links
+- [x] Build prioritized improvement matrix (immediate / near-term / long-term)
+- [x] Validate recommendations against current implementation constraints and Stage2/Stage3 integration goals
+
+## Review
+- Completed full three-track parallel audit:
+  - `research3_agent_unconditional.md`
+  - `research3_agent_simple.md`
+  - `research3_agent_sota.md`
+- Added consolidated synthesis file: `research3.md`.
+- Code-verified key contradictions and risks before synthesis:
+  - `actor_critic` objective conflict (`E(clean)<E(actor)` ranking vs actor term minimizing `E(actor)-E(clean)`),
+  - unconditional Langevin noise-semantics mismatch across sampler paths,
+  - unconditional `best.pt` selection by paired cosine improvement,
+  - training eval endpoint mismatch (`v_final` usage in Stage1 eval path).
+- Output includes prioritized implementation roadmap (P0-P3), experiment matrix, Stage2/3 readiness gates, and SOTA-backed architecture direction (conditional critic mainline + unconditional prior auxiliary).
+
+---
+
+# Stage1 Kill Criteria + Eval Rewrite (2026-03-25, Pass 9)
+
+## Goal
+Eliminate false-positive training verdicts by replacing weak single-metric pass checks with strict SOTA-aligned multi-metric evaluation and kill criteria during training.
+
+## Checklist
+- [x] Add unified evaluation/kill-criteria utilities for:
+  - conditional Stage1 (`simple`/`actor_critic`)
+  - unconditional Energy Matching
+- [x] Rewrite `experiments/01_denoising_poc/train.py` evaluation:
+  - use reached endpoint semantics (`v_last`)
+  - add geodesic/L2/energy/clean-min-violation metrics
+  - compute composite score + strict gates
+- [x] Rewrite `experiments/02_energy_matching/train.py` evaluation:
+  - keep cosine as diagnostic only
+  - add distribution/manifold metrics (MMD/C2ST/PRDC/kNN)
+  - replace best-checkpoint selection criterion with unconditional composite score
+  - enforce strict unconditional kill criteria gates
+- [x] Align standalone evaluation scripts with same kill-criteria logic
+- [x] Run static validation (`py_compile`) on changed files
+- [x] Document resulting behavior and remaining calibration knobs
+
+## Review
+- Added shared strict criteria module: `cebcm/training/kill_criteria.py`.
+- Stage1 conditional training now evaluates with:
+  - cosine + geodesic + L2 + energy success + clean-min violation + step norm,
+  - `v_last` endpoint semantics,
+  - strict multi-gate verdict and composite score checkpoint selection.
+- Unconditional training now evaluates with:
+  - energy-descent diagnostics across noise scales,
+  - distribution/manifold suite (`MMD`, `C2ST`, `PRDC`, kNN),
+  - strict unconditional gates and composite score checkpoint selection.
+- Replaced legacy weak criteria:
+  - old: `improvement > 0 && success_rate > 0.5`,
+  - new: model-type-specific multi-gate SOTA criteria.
+- Standalone evaluators were aligned with strict criteria output for consistency.
+- Static validation passed:
+  - `python -m py_compile cebcm/training/kill_criteria.py experiments/01_denoising_poc/train.py experiments/01_denoising_poc/evaluate.py experiments/02_energy_matching/train.py experiments/02_energy_matching/evaluate.py`
+

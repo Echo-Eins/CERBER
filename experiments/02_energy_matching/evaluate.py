@@ -1,4 +1,4 @@
-"""
+﻿"""
 Evaluate a trained Energy Matching model.
 
 Standalone evaluation script — can run on any checkpoint from
@@ -45,7 +45,9 @@ from cebcm.training.energy_matching import (
     generate_samples_ode,
     generate_samples_langevin,
 )
+from cebcm.training.kill_criteria import summarize_unconditional_eval
 from cebcm.data.dataset import SONARVectorDataset
+from cerber_gui.sota_eval import SOTAEvalConfig, compute_distribution_suite
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> UnconditionalEnergy:
@@ -75,7 +77,7 @@ def evaluate_denoising(
     denoise_lr: float = 0.01,
     target_norm: float = 0.2051,
 ) -> dict:
-    """Evaluate denoising via gradient following."""
+    """Evaluate denoising via deterministic gradient following."""
     model.eval()
     results = {}
 
@@ -86,10 +88,13 @@ def evaluate_denoising(
         norms = v_clean.norm(dim=-1, keepdim=True)
         v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * norms
         cos_before = F.cosine_similarity(v_clean, v_noisy, dim=-1)
+        geo_before = torch.acos(cos_before.clamp(min=-1.0, max=1.0))
+        l2_before = torch.norm(v_clean - v_noisy, dim=-1)
+        e_before = model(v_noisy).detach()
 
         # Gradient following (deterministic)
         v_current = v_noisy.clone()
-        for step in range(denoise_steps):
+        for _ in range(denoise_steps):
             v_grad = v_current.detach().requires_grad_(True)
             with torch.enable_grad():
                 energy = model(v_grad)
@@ -98,6 +103,10 @@ def evaluate_denoising(
             v_current = F.normalize(v_current, dim=-1) * target_norm
 
         cos_after = F.cosine_similarity(v_clean, v_current, dim=-1)
+        geo_after = torch.acos(cos_after.clamp(min=-1.0, max=1.0))
+        l2_after = torch.norm(v_clean - v_current, dim=-1)
+        e_after = model(v_current).detach()
+        step_norm = torch.norm(v_current - v_noisy, dim=-1)
 
         results[f"noise_{noise_scale}"] = {
             "cos_before_mean": cos_before.mean().item(),
@@ -106,11 +115,20 @@ def evaluate_denoising(
             "cos_after_std": cos_after.std().item(),
             "improvement": (cos_after - cos_before).mean().item(),
             "success_rate": (cos_after > cos_before).float().mean().item(),
+            "geodesic_before_mean": geo_before.mean().item(),
+            "geodesic_after_mean": geo_after.mean().item(),
+            "geodesic_improvement": (geo_before - geo_after).mean().item(),
+            "l2_before_mean": l2_before.mean().item(),
+            "l2_after_mean": l2_after.mean().item(),
+            "l2_improvement": (l2_before - l2_after).mean().item(),
+            "energy_before_mean": e_before.mean().item(),
+            "energy_after_mean": e_after.mean().item(),
+            "energy_improvement": (e_before - e_after).mean().item(),
+            "energy_success_rate": (e_after < e_before).float().mean().item(),
+            "step_norm_mean": step_norm.mean().item(),
         }
 
     return results
-
-
 @torch.no_grad()
 def evaluate_samples(
     model: UnconditionalEnergy,
@@ -247,6 +265,57 @@ def main():
         print(f"    cross_cos_mean={stats['cross_cos_mean']:.4f}, max_per_sample={stats['cross_cos_max_per_sample']:.4f}")
         print(f"    energy={stats['energy_mean']:.4f}±{stats['energy_std']:.4f} (data={stats['data_energy_mean']:.4f})")
 
+    # 2.1 Distribution suite for strict unconditional kill criteria.
+    n_dist = min(max(64, args.generate), 512, len(test_dataset))
+    dist_indices = torch.randperm(len(test_dataset))[:n_dist]
+    real = torch.stack([test_dataset[i.item()] for i in dist_indices]).to(device)
+    fake = generate_samples_ode(
+        energy_fn=model,
+        num_samples=n_dist,
+        dim=1024,
+        num_steps=100,
+        prior_std=config.prior_std,
+        target_norm=config.target_norm,
+        device=device,
+    )
+    dist_cfg = SOTAEvalConfig()
+    distribution = compute_distribution_suite(real, fake, dist_cfg)
+    results["distribution"] = distribution
+    print(
+        "  distribution: "
+        f"mmd={distribution.get('mmd_rbf', float('nan')):.6f}, "
+        f"c2st={distribution.get('c2st_acc', float('nan')):.4f}, "
+        f"prdc(P/C)={distribution.get('prdc_precision', float('nan')):.4f}/"
+        f"{distribution.get('prdc_coverage', float('nan')):.4f}"
+    )
+
+    strict_eval_payload = dict(denoise_results)
+    strict_eval_payload["distribution"] = distribution
+    kill_report = summarize_unconditional_eval(strict_eval_payload)
+    results["kill_criteria"] = kill_report
+    print("\n--- STRICT KILL CRITERIA (SOTA) ---")
+    for noise_key, block in kill_report["per_noise"].items():
+        m = block["metrics"]
+        print(
+            f"  {noise_key}: "
+            f"energy_improvement={m['energy_improvement']:+.4f}, "
+            f"energy_success={m['energy_success_rate']:.0%}, "
+            f"step={m['step_norm_mean']:.6f}, "
+            f"cos_diag={m['cos_improvement']:+.4f} -> "
+            f"{'PASS' if block['passed'] else 'FAIL'}"
+        )
+    print("  Global gates:")
+    for name, ok in kill_report["global_gates"].items():
+        print(f"    - {name}: {'PASS' if ok else 'FAIL'}")
+    print("  Distribution gates:")
+    for name, ok in kill_report["distribution_gates"].items():
+        print(f"    - {name}: {'PASS' if ok else 'FAIL'}")
+    print(f"  Composite score: {kill_report['score']:+.6f}")
+    print(
+        f"  VERDICT: {'PASS' if kill_report['passed'] else 'FAIL'} "
+        "(strict unconditional criteria)"
+    )
+
     # 3. Decode samples (optional)
     if args.decode:
         print("\n--- Decoding Generated Samples ---")
@@ -288,3 +357,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

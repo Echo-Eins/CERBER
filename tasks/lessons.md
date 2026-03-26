@@ -190,3 +190,38 @@ Always expose two independent controls in landscape UI:
 1) resolution control (`grid size`) for sampling detail,
 2) span control (absolute half-range or factor) for explored domain size.
 When adding new scan parameters, propagate them through all callbacks and cache keys.
+
+## 2026-03-25 - Keep endpoint semantics identical across live and batch evaluation
+
+### Pattern
+Live diagnostics used the trajectory endpoint, while batch SOTA evaluation could use `best-energy` fallback. This produced contradictory metrics (e.g., visible movement in live run but near-zero batch step norm).
+
+### Rule
+Store and propagate both states from samplers:
+1) `v_last` = actually reached terminal state (default for user-facing/live/batch comparisons),
+2) `v_best`/`v_final` = best-energy state (optional analytical metric).
+Never mix these semantics across reporting paths.
+
+## 2026-03-25 - Subagent synthesis must be code-verified before consolidation
+
+### Pattern
+Parallel subagent reports can be directionally correct but still require hard verification against the live codebase before they are promoted to project-level recommendations.
+
+### Rule
+Before writing a consolidated research artifact (`research*.md`) from subagent outputs:
+1) verify every P0/P1 claim against concrete code lines,
+2) separate "code-verified" findings from "external/SOTA hypotheses",
+3) only then publish the final prioritized roadmap.
+
+## 2026-03-25 - Kill criteria must be multi-gate and model-type aware
+
+### Pattern
+Single-threshold checks like `improvement > 0` and `success_rate > 50%` produced false-positive PASS verdicts and masked real model failures.
+
+### Rule
+For Stage1/Stage2 training verdicts:
+1) never use one-metric kill criteria,
+2) use strict multi-gate checks with model-type semantics:
+   - conditional models: angular/geodesic + L2 + energy + clean-min violation gates,
+   - unconditional models: energy descent + distribution/manifold gates (MMD/C2ST/PRDC),
+3) select `best.pt` by composite score aligned to objective, not by paired cosine alone.

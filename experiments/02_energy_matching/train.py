@@ -1,4 +1,4 @@
-"""
+﻿"""
 Stage 2: Energy Matching â€” Train UnconditionalEnergy on SONAR embeddings.
 
 Pipeline:
@@ -64,7 +64,13 @@ from cebcm.training.negative_buffer import (
     nce_loss,
     nce_loss_simple,
 )
+from cebcm.training.kill_criteria import summarize_unconditional_eval
 from cebcm.data.dataset import SONARVectorDataset
+from cerber_gui.sota_eval import (
+    SOTAEvalConfig,
+    compute_distribution_suite,
+    compute_manifold_knn_metrics,
+)
 
 
 # ============================================================
@@ -261,31 +267,42 @@ def evaluate_energy_matching(
     num_samples: int = 100,
 ) -> dict:
     """
-    Evaluate the energy model:
-    1. Energy statistics on real data
-    2. Denoising quality via gradient following
-    3. Sample quality (if enough epochs have passed)
+    Strict SOTA-aligned evaluation for unconditional energy models.
+
+    Primary:
+    - energy descent under perturbation,
+    - distribution/manifold quality.
+
+    Secondary diagnostics:
+    - paired cosine/geodesic movement relative to clean.
     """
     model.eval()
-    results = {}
+    results: dict[str, dict | float] = {}
 
-    # --- 1. Energy statistics on real data ---
+    # --- 1) Energy statistics on real data ---
     indices = torch.randperm(len(dataset))[:num_samples]
     v_clean = torch.stack([dataset[i.item()] for i in indices]).to(device)
 
     energies = model(v_clean)
     results["energy_data_mean"] = energies.mean().item()
     results["energy_data_std"] = energies.std().item()
+    results["energy_data_min"] = energies.min().item()
+    results["energy_data_max"] = energies.max().item()
 
-    # --- 2. Denoising quality (gradient following) ---
+    noisy_bank: list[torch.Tensor] = []
+    refined_bank: list[torch.Tensor] = []
+
+    # --- 2) Local refinement diagnostics by noise scale ---
     for noise_scale in config.eval_noise_scales:
         norms = v_clean.norm(dim=-1, keepdim=True)
         v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * norms
 
         cos_before = F.cosine_similarity(v_clean, v_noisy, dim=-1)
+        geo_before = torch.acos(cos_before.clamp(min=-1.0, max=1.0))
+        l2_before = torch.norm(v_clean - v_noisy, dim=-1)
         energy_before = model(v_noisy).detach()
 
-        # Follow -âˆ‡E for 50 steps (no stochastic noise)
+        # Deterministic gradient following for local field diagnostics.
         v_current = v_noisy.clone()
         for _ in range(50):
             v_grad = v_current.detach().requires_grad_(True)
@@ -297,21 +314,34 @@ def evaluate_energy_matching(
                 v_current = F.normalize(v_current, dim=-1) * config.target_norm
 
         cos_after = F.cosine_similarity(v_clean, v_current, dim=-1)
+        geo_after = torch.acos(cos_after.clamp(min=-1.0, max=1.0))
+        l2_after = torch.norm(v_clean - v_current, dim=-1)
         energy_after = model(v_current).detach()
+        step_norm = torch.norm(v_current - v_noisy, dim=-1)
+
+        noisy_bank.append(v_noisy.detach())
+        refined_bank.append(v_current.detach())
 
         results[f"noise_{noise_scale}"] = {
             "cos_before_mean": cos_before.mean().item(),
             "cos_after_mean": cos_after.mean().item(),
             "improvement": (cos_after - cos_before).mean().item(),
             "success_rate": (cos_after > cos_before).float().mean().item(),
+            "geodesic_before_mean": geo_before.mean().item(),
+            "geodesic_after_mean": geo_after.mean().item(),
+            "geodesic_improvement": (geo_before - geo_after).mean().item(),
+            "l2_before_mean": l2_before.mean().item(),
+            "l2_after_mean": l2_after.mean().item(),
+            "l2_improvement": (l2_before - l2_after).mean().item(),
             "energy_before_mean": energy_before.mean().item(),
             "energy_after_mean": energy_after.mean().item(),
             "energy_improvement": (energy_before - energy_after).mean().item(),
             "energy_success_rate": (energy_after < energy_before).float().mean().item(),
+            "step_norm_mean": step_norm.mean().item(),
         }
 
-    # --- 3. Sample quality (generate and measure statistics) ---
-    n_gen = min(config.eval_generate_samples, 200)
+    # --- 3) Distribution / manifold quality ---
+    n_gen = min(config.eval_generate_samples, 512)
     samples = generate_samples_ode(
         energy_fn=model,
         num_samples=n_gen,
@@ -322,30 +352,63 @@ def evaluate_energy_matching(
         device=device,
     )
 
-    # Measure sample statistics
     sample_norms = samples.norm(dim=-1)
     data_norms = v_clean.norm(dim=-1)
-
-    # Pairwise cosine similarity within samples
     samples_norm = F.normalize(samples, dim=-1)
     pairwise_cos = (samples_norm @ samples_norm.T).fill_diagonal_(0)
     n = samples_norm.shape[0]
 
-    # Pairwise cosine within data
     data_norm = F.normalize(v_clean, dim=-1)
     data_pairwise_cos = (data_norm @ data_norm.T).fill_diagonal_(0)
-
     results["samples"] = {
         "norm_mean": sample_norms.mean().item(),
         "norm_std": sample_norms.std().item(),
         "data_norm_mean": data_norms.mean().item(),
-        "pairwise_cos_mean": pairwise_cos.sum().item() / (n * (n - 1)),
-        "data_pairwise_cos_mean": data_pairwise_cos.sum().item() / (num_samples * (num_samples - 1)),
+        "pairwise_cos_mean": pairwise_cos.sum().item() / max(1, n * (n - 1)),
+        "data_pairwise_cos_mean": data_pairwise_cos.sum().item() / max(1, num_samples * (num_samples - 1)),
         "energy_mean": model(samples).mean().item(),
+        "energy_std": model(samples).std().item(),
     }
 
-    return results
+    ref_bank_size = min(len(dataset), max(512, num_samples * 4))
+    ref_indices = torch.randperm(len(dataset))[:ref_bank_size]
+    ref_bank = torch.stack([dataset[i.item()] for i in ref_indices]).to(device)
 
+    real = ref_bank[: min(ref_bank.shape[0], samples.shape[0])]
+    fake = samples[: real.shape[0]]
+
+    dist_cfg = SOTAEvalConfig()
+    distribution = compute_distribution_suite(real, fake, dist_cfg)
+
+    if noisy_bank and refined_bank:
+        noisy_diag = torch.cat(noisy_bank, dim=0)
+        refined_diag = torch.cat(refined_bank, dim=0)
+        knn = compute_manifold_knn_metrics(
+            ref_bank=ref_bank,
+            noisy=noisy_diag,
+            denoised=refined_diag,
+            k=dist_cfg.manifold_k,
+        )
+    else:
+        knn = {}
+
+    distribution.update(knn)
+    results["distribution"] = distribution
+
+    noise_keys = [k for k in results.keys() if k.startswith("noise_")]
+    if noise_keys:
+        denom = float(len(noise_keys))
+        results["summary"] = {
+            "mean_cos_improvement": sum(results[k]["improvement"] for k in noise_keys) / denom,
+            "mean_cos_success_rate": sum(results[k]["success_rate"] for k in noise_keys) / denom,
+            "mean_geodesic_improvement": sum(results[k]["geodesic_improvement"] for k in noise_keys) / denom,
+            "mean_l2_improvement": sum(results[k]["l2_improvement"] for k in noise_keys) / denom,
+            "mean_energy_improvement": sum(results[k]["energy_improvement"] for k in noise_keys) / denom,
+            "mean_energy_success_rate": sum(results[k]["energy_success_rate"] for k in noise_keys) / denom,
+            "mean_step_norm": sum(results[k]["step_norm_mean"] for k in noise_keys) / denom,
+        }
+
+    return results
 
 # ============================================================
 # Main
@@ -515,7 +578,7 @@ def main():
     print(f"{'='*60}\n")
 
     all_metrics: list[dict] = []
-    best_improvement = -float("inf")
+    best_eval_score = -float("inf")
     start_time = time.time()
 
     for epoch in range(start_epoch, config.num_epochs):
@@ -560,14 +623,17 @@ def main():
                 num_samples=config.eval_num_samples,
             )
 
-            # Print denoising results
+            # Print local diagnostics
             for key, val in eval_metrics.items():
                 if key.startswith("noise_"):
                     print(
-                        f"    {key}: cos {val['cos_before_mean']:.4f} â†’ "
-                        f"{val['cos_after_mean']:.4f} "
-                        f"(Î”={val['improvement']:+.4f}, "
-                        f"success={val['success_rate']:.0%})"
+                        f"    {key}: "
+                        f"energy_improvement={val['energy_improvement']:+.4f}, "
+                        f"energy_success={val['energy_success_rate']:.0%}, "
+                        f"d_cos={val['improvement']:+.4f}, "
+                        f"d_geo={val['geodesic_improvement']:+.4f}, "
+                        f"d_l2={val['l2_improvement']:+.4f}, "
+                        f"step={val['step_norm_mean']:.6f}"
                     )
 
             # Print sample quality
@@ -579,14 +645,26 @@ def main():
                     f"pairwise_cos={s['pairwise_cos_mean']:.4f} "
                     f"(data={s['data_pairwise_cos_mean']:.4f})"
                 )
+            if "distribution" in eval_metrics:
+                d = eval_metrics["distribution"]
+                print(
+                    f"    distribution: mmd={d.get('mmd_rbf', float('nan')):.6f}, "
+                    f"c2st={d.get('c2st_acc', float('nan')):.4f}, "
+                    f"prdc(P/C)={d.get('prdc_precision', float('nan')):.4f}/"
+                    f"{d.get('prdc_coverage', float('nan')):.4f}, "
+                    f"knn_l2_impr={d.get('knn_l2_improvement', float('nan')):+.4e}"
+                )
 
-            # Check best
-            avg_improvement = sum(
-                v["improvement"] for k, v in eval_metrics.items() if k.startswith("noise_")
-            ) / max(1, sum(1 for k in eval_metrics if k.startswith("noise_")))
+            kill_report = summarize_unconditional_eval(eval_metrics)
+            eval_metrics["kill_criteria"] = kill_report
+            print(
+                f"    composite_score={kill_report['score']:+.6f}, "
+                f"noise_pass_rate={kill_report['aggregate'].get('noise_pass_rate', float('nan')):.0%}, "
+                f"strict_pass={kill_report['passed']}"
+            )
 
-            if avg_improvement > best_improvement:
-                best_improvement = avg_improvement
+            if kill_report["score"] > best_eval_score:
+                best_eval_score = kill_report["score"]
                 torch.save(
                     {
                         "model_state": model.state_dict(),
@@ -605,7 +683,7 @@ def main():
                     },
                     checkpoint_dir / "best.pt",
                 )
-                print(f"    * New best (avg improvement: {avg_improvement:+.4f})")
+                print(f"    * New best (composite score: {best_eval_score:+.6f})")
 
         # Log
         epoch_record = {"epoch": epoch + 1, "train": train_metrics, "phase": "nce" if in_nce_phase else "em"}
@@ -621,7 +699,8 @@ def main():
                 for key, val in eval_metrics.items():
                     if isinstance(val, dict):
                         for mk, mv in val.items():
-                            log_dict[f"eval/{key}/{mk}"] = mv
+                            if isinstance(mv, (int, float, bool)):
+                                log_dict[f"eval/{key}/{mk}"] = float(mv)
                     else:
                         log_dict[f"eval/{key}"] = val
             wandb_run.log(log_dict, step=epoch + 1)
@@ -649,14 +728,19 @@ def main():
         model, test_dataset, config, device,
         num_samples=min(200, len(test_dataset)),
     )
+    final_kill_report = summarize_unconditional_eval(final_eval)
+    final_eval["kill_criteria"] = final_kill_report
 
     for key, val in final_eval.items():
         if key.startswith("noise_"):
             print(
-                f"  {key}: cos {val['cos_before_mean']:.4f} â†’ "
-                f"{val['cos_after_mean']:.4f} "
-                f"(Î”={val['improvement']:+.4f}, "
-                f"success={val['success_rate']:.0%})"
+                f"  {key}: "
+                f"energy_improvement={val['energy_improvement']:+.4f}, "
+                f"energy_success={val['energy_success_rate']:.0%}, "
+                f"d_cos={val['improvement']:+.4f}, "
+                f"d_geo={val['geodesic_improvement']:+.4f}, "
+                f"d_l2={val['l2_improvement']:+.4f}, "
+                f"step={val['step_norm_mean']:.6f}"
             )
 
     # Save final
@@ -683,7 +767,8 @@ def main():
     summary = {
         "total_time_seconds": total_time,
         "num_epochs": config.num_epochs,
-        "best_improvement": best_improvement,
+        "best_eval_score": best_eval_score,
+        "best_improvement": best_eval_score,
         "final_eval": final_eval,
         "config": {
             "lr": config.lr,
@@ -702,29 +787,36 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"\nMetrics saved to {output_dir / 'training_metrics.json'}")
 
-    # â”€â”€ Kill criterion â”€â”€
+    # â”€â”€ Strict kill criterion â”€â”€
     print(f"\n{'='*60}")
-    print("KILL CRITERION CHECK")
+    print("STRICT KILL CRITERION CHECK (SOTA)")
     print(f"{'='*60}")
-    all_pass = True
-    for key, val in final_eval.items():
-        if key.startswith("noise_"):
-            passed = val.get("energy_improvement", 0.0) > 0 and val.get("energy_success_rate", 0.0) > 0.5
-            status = "PASS" if passed else "FAIL"
-            print(
-                f"  {key}: "
-                f"energy_improvement={val.get('energy_improvement', float('nan')):+.4f}, "
-                f"energy_success={val.get('energy_success_rate', float('nan')):.0%}, "
-                f"cos_improvement={val.get('improvement', float('nan')):+.4f}, "
-                f"cos_success={val.get('success_rate', float('nan')):.0%} -> {status}"
-            )
-            if not passed:
-                all_pass = False
+    for key, block in final_kill_report["per_noise"].items():
+        status = "PASS" if block["passed"] else "FAIL"
+        m = block["metrics"]
+        print(
+            f"  {key}: "
+            f"energy_improvement={m['energy_improvement']:+.4f}, "
+            f"energy_success={m['energy_success_rate']:.0%}, "
+            f"step={m['step_norm_mean']:.6f}, "
+            f"cos_diag={m['cos_improvement']:+.4f} -> {status}"
+        )
 
-    if all_pass:
-        print("\n  VERDICT: Energy Matching PASSED - gradients reduce energy on noisy samples")
+    print("  Global gates:")
+    for gate_name, gate_ok in final_kill_report["global_gates"].items():
+        print(f"    - {gate_name}: {'PASS' if gate_ok else 'FAIL'}")
+    print("  Distribution gates:")
+    for gate_name, gate_ok in final_kill_report["distribution_gates"].items():
+        print(f"    - {gate_name}: {'PASS' if gate_ok else 'FAIL'}")
+    print(
+        f"  Composite score: {final_kill_report['score']:+.6f} "
+        f"(noise_pass_rate={final_kill_report['aggregate'].get('noise_pass_rate', float('nan')):.0%})"
+    )
+
+    if final_kill_report["passed"]:
+        print("\n  VERDICT: Energy Matching PASSED (strict) - unconditional quality gates satisfied")
     else:
-        print("\n  VERDICT: Energy Matching FAILED - review architecture or hyperparameters")
+        print("\n  VERDICT: Energy Matching FAILED (strict) - review objective/regularization/sampler")
 
     if wandb_run is not None:
         wandb_run.finish()
@@ -732,4 +824,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

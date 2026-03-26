@@ -70,7 +70,7 @@ session_state = {
     "runtime_metrics": {},  # checkpoint_path -> latest live inference metrics
     "sota_eval_cache": {},  # (checkpoint, noise, steps, lr, batch, bank) -> dict
 }
-SOTA_EVAL_CACHE_VERSION = 2
+SOTA_EVAL_CACHE_VERSION = 3
 
 
 def update_dataclass(target, updates: dict) -> None:
@@ -771,8 +771,9 @@ def run_langevin_denoise(
         return v_out, trajectory, result
 
     # Fallback for non-tracking runs (for example batch SOTA eval).
-    trajectory = [v_noisy.detach().cpu().clone(), result.v_final.detach().cpu().clone()]
-    return result.v_final, trajectory, result
+    v_last = result.v_last if result.v_last is not None else result.v_final
+    trajectory = [v_noisy.detach().cpu().clone(), v_last.detach().cpu().clone()]
+    return v_last, trajectory, result
 
 
 

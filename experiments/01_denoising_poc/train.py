@@ -38,6 +38,7 @@ from cebcm.training.losses import (
     margin_contrastive_loss,
     gradient_penalty,
 )
+from cebcm.training.kill_criteria import summarize_conditional_eval
 from cebcm.inference.langevin import run_langevin
 from cebcm.data.dataset import SONARVectorDataset
 
@@ -47,6 +48,10 @@ def add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
     norms = v.norm(dim=-1, keepdim=True)
     noise = torch.randn_like(v) * scale * norms
     return v + noise
+
+
+def cosine_to_geodesic(cos_value: float) -> float:
+    return math.acos(max(-1.0, min(1.0, float(cos_value))))
 
 
 def sample_sigma(
@@ -811,8 +816,17 @@ def evaluate_denoising(
     for noise_scale in config.eval_noise_scales:
         cos_before_list = []
         cos_after_list = []
+        geo_before_list = []
+        geo_after_list = []
+        l2_before_list = []
+        l2_after_list = []
         energy_before_list = []
         energy_after_list = []
+        energy_clean_list = []
+        energy_improvement_list = []
+        step_norm_list = []
+        clean_min_violation_flags = []
+        energy_success_flags = []
 
         for idx in eval_indices:
             v_orig = dataset[int(idx.item())].unsqueeze(0).to(device)
@@ -855,29 +869,62 @@ def evaluate_denoising(
                     v_target=v_orig,
                     **method_kwargs,
                 )
-                v_final = result.v_final
+                v_final = result.v_last
 
             cos_after = F.cosine_similarity(v_orig, v_final, dim=-1).item()
+            geo_before = cosine_to_geodesic(cos_before)
+            geo_after = cosine_to_geodesic(cos_after)
+            l2_before = torch.norm(v_orig - v_noisy, dim=-1).item()
+            l2_after = torch.norm(v_orig - v_final, dim=-1).item()
+            step_norm = torch.norm(v_final - v_noisy, dim=-1).item()
 
             with torch.no_grad():
+                e_clean = model(v_orig, v_orig).item()
                 e_before = model(v_orig, v_noisy).item()
                 e_after = model(v_orig, v_final).item()
+            energy_improvement = e_before - e_after
 
             cos_before_list.append(cos_before)
             cos_after_list.append(cos_after)
+            geo_before_list.append(geo_before)
+            geo_after_list.append(geo_after)
+            l2_before_list.append(l2_before)
+            l2_after_list.append(l2_after)
+            energy_clean_list.append(e_clean)
             energy_before_list.append(e_before)
             energy_after_list.append(e_after)
+            energy_improvement_list.append(energy_improvement)
+            step_norm_list.append(step_norm)
+            clean_min_violation_flags.append(1.0 if e_after < e_clean else 0.0)
+            energy_success_flags.append(1.0 if e_after < e_before else 0.0)
 
         cos_before_mean = sum(cos_before_list) / len(cos_before_list)
         cos_after_mean = sum(cos_after_list) / len(cos_after_list)
+        geo_before_mean = sum(geo_before_list) / len(geo_before_list)
+        geo_after_mean = sum(geo_after_list) / len(geo_after_list)
+        l2_before_mean = sum(l2_before_list) / len(l2_before_list)
+        l2_after_mean = sum(l2_after_list) / len(l2_after_list)
         improvement = cos_after_mean - cos_before_mean
+        geodesic_improvement = geo_before_mean - geo_after_mean
+        l2_improvement = l2_before_mean - l2_after_mean
 
         results[f"noise_{noise_scale}"] = {
             "cos_before_mean": cos_before_mean,
             "cos_after_mean": cos_after_mean,
             "improvement": improvement,
+            "geodesic_before_mean": geo_before_mean,
+            "geodesic_after_mean": geo_after_mean,
+            "geodesic_improvement": geodesic_improvement,
+            "l2_before_mean": l2_before_mean,
+            "l2_after_mean": l2_after_mean,
+            "l2_improvement": l2_improvement,
+            "energy_clean_mean": sum(energy_clean_list) / len(energy_clean_list),
             "energy_before_mean": sum(energy_before_list) / len(energy_before_list),
             "energy_after_mean": sum(energy_after_list) / len(energy_after_list),
+            "energy_improvement": sum(energy_improvement_list) / len(energy_improvement_list),
+            "energy_success_rate": sum(energy_success_flags) / len(energy_success_flags),
+            "step_norm_mean": sum(step_norm_list) / len(step_norm_list),
+            "clean_min_violation_rate": sum(clean_min_violation_flags) / len(clean_min_violation_flags),
             "success_rate": sum(
                 1 for a, b in zip(cos_after_list, cos_before_list) if a > b
             ) / len(cos_after_list),
@@ -1211,7 +1258,7 @@ def main():
     print(f"{'='*60}\n")
 
     all_metrics: list[dict] = []
-    best_improvement = -float("inf")
+    best_eval_score = -float("inf")
     start_time = time.time()
 
     for epoch in range(start_epoch, config.num_epochs):
@@ -1296,16 +1343,23 @@ def main():
                     f"    {noise_key}: "
                     f"cos_before={metrics['cos_before_mean']:.4f} -> "
                     f"cos_after={metrics['cos_after_mean']:.4f} "
-                    f"(d={metrics['improvement']:+.4f}, "
+                    f"(d_cos={metrics['improvement']:+.4f}, "
+                    f"d_geo={metrics['geodesic_improvement']:+.4f}, "
+                    f"d_l2={metrics['l2_improvement']:+.4f}, "
+                    f"energy_success={metrics['energy_success_rate']:.0%}, "
                     f"success={metrics['success_rate']:.0%})"
                 )
 
-            avg_improvement = sum(
-                m["improvement"] for m in eval_metrics.values()
-            ) / len(eval_metrics)
+            kill_report = summarize_conditional_eval(eval_metrics)
+            eval_metrics["kill_criteria"] = kill_report
+            print(
+                f"    composite_score={kill_report['score']:+.6f}, "
+                f"noise_pass_rate={kill_report['aggregate'].get('noise_pass_rate', float('nan')):.0%}, "
+                f"strict_pass={kill_report['passed']}"
+            )
 
-            if avg_improvement > best_improvement:
-                best_improvement = avg_improvement
+            if kill_report["score"] > best_eval_score:
+                best_eval_score = kill_report["score"]
                 torch.save(
                     {
                         "model_state": raw_model.state_dict(),
@@ -1329,7 +1383,7 @@ def main():
                     },
                     checkpoint_dir / "best.pt",
                 )
-                print(f"    * New best (avg improvement: {avg_improvement:+.4f})")
+                print(f"    * New best (composite score: {best_eval_score:+.6f})")
 
         epoch_record = {"epoch": epoch + 1, "train": train_metrics}
         if eval_metrics is not None:
@@ -1341,8 +1395,13 @@ def main():
             log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
             if eval_metrics is not None:
                 for noise_key, metrics in eval_metrics.items():
+                    if not noise_key.startswith("noise_"):
+                        continue
                     for mk, mv in metrics.items():
                         log_dict[f"eval/{noise_key}/{mk}"] = mv
+                if "kill_criteria" in eval_metrics:
+                    log_dict["eval/kill_criteria/score"] = eval_metrics["kill_criteria"]["score"]
+                    log_dict["eval/kill_criteria/passed"] = float(bool(eval_metrics["kill_criteria"]["passed"]))
             wandb_run.log(log_dict, step=epoch + 1)
 
         if (epoch + 1) % 10 == 0:
@@ -1382,9 +1441,15 @@ def main():
             f"  {noise_key}: "
             f"cos_before={metrics['cos_before_mean']:.4f} -> "
             f"cos_after={metrics['cos_after_mean']:.4f} "
-            f"(d={metrics['improvement']:+.4f}, "
+            f"(d_cos={metrics['improvement']:+.4f}, "
+            f"d_geo={metrics['geodesic_improvement']:+.4f}, "
+            f"d_l2={metrics['l2_improvement']:+.4f}, "
+            f"energy_success={metrics['energy_success_rate']:.0%}, "
             f"success={metrics['success_rate']:.0%})"
         )
+
+    final_kill_report = summarize_conditional_eval(final_eval)
+    final_eval["kill_criteria"] = final_kill_report
 
     torch.save(
         {
@@ -1413,7 +1478,8 @@ def main():
     summary = {
         "total_time_seconds": total_time,
         "num_epochs": config.num_epochs,
-        "best_improvement": best_improvement,
+        "best_eval_score": best_eval_score,
+        "best_improvement": best_eval_score,
         "final_eval": final_eval,
         "stage1_config": asdict(config),
         "epoch_metrics": all_metrics,
@@ -1423,31 +1489,41 @@ def main():
     print(f"\nMetrics saved to {output_dir / 'training_metrics.json'}")
 
     print(f"\n{'='*60}")
-    print("KILL CRITERION CHECK")
+    print("STRICT KILL CRITERION CHECK (SOTA)")
     print(f"{'='*60}")
-    all_pass = True
-    for noise_key, metrics in final_eval.items():
-        passed = metrics["improvement"] > 0 and metrics["success_rate"] > 0.5
-        status = "PASS" if passed else "FAIL"
+    for noise_key, block in final_kill_report["per_noise"].items():
+        status = "PASS" if block["passed"] else "FAIL"
+        m = block["metrics"]
         print(
-            f"  {noise_key}: improvement={metrics['improvement']:+.4f}, "
-            f"success={metrics['success_rate']:.0%} -> {status}"
+            f"  {noise_key}: d_cos={m['cos_improvement']:+.4f}, "
+            f"d_geo={m['geodesic_improvement']:+.4f}, "
+            f"d_l2={m['l2_improvement']:+.4f}, "
+            f"energy_success={m['energy_success_rate']:.0%}, "
+            f"clean_violation={m['clean_min_violation_rate']:.0%}, "
+            f"step={m['step_norm_mean']:.6f} -> {status}"
         )
-        if not passed:
-            all_pass = False
 
-    if all_pass:
+    print("  Global gates:")
+    for gate_name, gate_ok in final_kill_report["global_gates"].items():
+        print(f"    - {gate_name}: {'PASS' if gate_ok else 'FAIL'}")
+
+    print(
+        f"  Composite score: {final_kill_report['score']:+.6f} "
+        f"(noise_pass_rate={final_kill_report['aggregate'].get('noise_pass_rate', float('nan')):.0%})"
+    )
+
+    if final_kill_report["passed"]:
         if config.loss_type == "actor_critic":
-            print("\n  VERDICT: Stage 1 PASSED - actor+critic denoising works")
+            print("\n  VERDICT: Stage 1 PASSED (strict) - actor+critic denoising is acceptable")
         else:
-            print("\n  VERDICT: Stage 1 PASSED - energy function works for denoising")
+            print("\n  VERDICT: Stage 1 PASSED (strict) - denoising energy behavior is acceptable")
     else:
         if config.loss_type == "actor_critic":
-            print("\n  VERDICT: Stage 1 FAILED - actor+critic does not denoise effectively")
-            print("    -> Review actor objective, critic coupling, and inference schedule.")
+            print("\n  VERDICT: Stage 1 FAILED (strict) - actor+critic not ready")
+            print("    -> Fix objective alignment, manifold constraints, and inference consistency.")
         else:
-            print("\n  VERDICT: Stage 1 FAILED - denoised vectors not closer to originals")
-            print("    -> Energy function does not work. Review architecture or training.")
+            print("\n  VERDICT: Stage 1 FAILED (strict) - denoising behavior not reliable")
+            print("    -> Rework training objective/regularization before Stage2 promotion.")
 
     if wandb_run is not None:
         wandb_run.finish()

@@ -45,6 +45,7 @@ class LangevinMethod(str, Enum):
 class LangevinResult:
     """Result of a Langevin dynamics run."""
     v_final: Tensor          # [B, D] refined vectors
+    v_last: Tensor | None = None  # [B, D] actually reached state at the last executed step
     trajectory: list[float] = field(default_factory=list)  # energy at each step
     cos_trajectory: list[float] = field(default_factory=list)  # cos_sim to target at each step
     v_trajectory: list[Tensor] = field(default_factory=list)  # optional vector trajectory
@@ -169,7 +170,9 @@ def langevin_dynamics(
             v_best = v_current.clone()
         if should_stop:
             return LangevinResult(
-                v_final=v_best, trajectory=trajectory,
+                v_final=v_best,
+                v_last=v_current.clone(),
+                trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
                 num_steps=step + 1, stopped_early=True,
@@ -202,7 +205,9 @@ def langevin_dynamics(
         v_best = v_current.clone()
 
     return LangevinResult(
-        v_final=v_best, trajectory=trajectory,
+        v_final=v_best,
+        v_last=v_current.clone(),
+        trajectory=trajectory,
         cos_trajectory=cos_trajectory,
         v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
@@ -306,7 +311,9 @@ def pid_langevin_dynamics(
             v_best = v_current.clone()
         if should_stop:
             return LangevinResult(
-                v_final=v_best, trajectory=trajectory,
+                v_final=v_best,
+                v_last=v_current.clone(),
+                trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
                 num_steps=step + 1, stopped_early=True,
@@ -350,7 +357,9 @@ def pid_langevin_dynamics(
         v_best = v_current.clone()
 
     return LangevinResult(
-        v_final=v_best, trajectory=trajectory,
+        v_final=v_best,
+        v_last=v_current.clone(),
+        trajectory=trajectory,
         cos_trajectory=cos_trajectory,
         v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
@@ -452,7 +461,9 @@ def underdamped_langevin_dynamics(
             v_best = v_current.clone()
         if should_stop:
             return LangevinResult(
-                v_final=v_best, trajectory=trajectory,
+                v_final=v_best,
+                v_last=v_current.clone(),
+                trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
                 num_steps=step + 1, stopped_early=True,
@@ -491,7 +502,9 @@ def underdamped_langevin_dynamics(
         v_best = v_current.clone()
 
     return LangevinResult(
-        v_final=v_best, trajectory=trajectory,
+        v_final=v_best,
+        v_last=v_current.clone(),
+        trajectory=trajectory,
         cos_trajectory=cos_trajectory,
         v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
