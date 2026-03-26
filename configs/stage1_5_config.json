@@ -1,0 +1,108 @@
+{
+  "_comment": "Stage1.5 SOTA Hybrid Actor-Critic Configuration",
+  "_version": "1.0.0",
+  "_date": "2026-03-26",
+
+  "seed": 42,
+  "num_epochs": 50,
+  "batch_size": 64,
+  "num_workers": 4,
+
+  "train_data_path": "data/sonar_train.npy",
+  "val_data_path": "data/sonar_val.npy",
+  "output_dir": "experiments/03_Stage_1.5",
+  "checkpoint_dir": "experiments/03_Stage_1.5/checkpoints",
+  "logs_dir": "experiments/03_Stage_1.5/logs",
+
+  "energy_dim": 1024,
+  "energy_hidden_dims": [2048, 1024, 512],
+  "actor_hidden_dims": [2048, 1024, 512],
+
+  "norm_mode": "orthonorm",
+  "activation": "groupsort",
+  "ortho_n_iters": 8,
+
+  "critic_lr": 1e-4,
+  "actor_lr": 5e-5,
+  "prior_critic_lr": 1e-4,
+  "weight_decay": 0.01,
+
+  "critic_steps_per_actor": 2,
+
+  "lambda_mdsm": 1.0,
+  "lambda_rank": 0.25,
+  "lambda_cql": 0.1,
+  "lambda_gp": 0.05,
+  "lambda_shell": 0.1,
+  "lambda_geo": 1.0,
+  "lambda_align": 0.1,
+  "lambda_bc_reg": 0.5,
+  "lambda_prior": 0.1,
+
+  "use_cql": true,
+  "use_bc": true,
+  "use_grad_align": true,
+  "use_prior_critic": false,
+  "use_gradient_penalty": false,
+  "use_shell_barrier": false,
+
+  "gradient_penalty_lambda": 0.05,
+  "shell_barrier_margin": 0.1,
+  "cql_noise_scale": 0.5,
+
+  "sigma_curriculum_start": 0.01,
+  "sigma_curriculum_end": 0.5,
+  "sigma_min": 0.001,
+  "sigma_max": 1.0,
+  "sigma_sampling": "loguniform",
+
+  "edm_p_mean": -1.2,
+  "edm_p_std": 1.2,
+
+  "mdsm_tangent_projection": true,
+  "mdsm_directional": true,
+  "mdsm_magnitude_aux_weight": 0.05,
+  "sigma_weighting": true,
+  "mdsm_cosine_eps": 1e-6,
+  "mdsm_norm_floor": 1e-6,
+  "mdsm_force_fp32": true,
+
+  "critic_margin_clean_actor": 0.5,
+  "critic_margin_actor_noisy": 0.3,
+  "critic_margin_clean_noisy": 0.8,
+
+  "actor_step_size": 1.0,
+
+  "langevin": {
+    "method": "pid",
+    "target_norm": 0.2051,
+    "lr": 0.001,
+    "noise_scale": 0.05,
+    "max_steps": 100,
+    "pid_kp": 0.1,
+    "pid_ki": 0.01,
+    "pid_kd": 0.05,
+    "track_vectors": true
+  },
+
+  "actor_tangent_projection": true,
+
+  "amp_enabled": true,
+  "amp_dtype": "bf16",
+
+  "log_every": 50,
+
+  "eval_num_samples": 256,
+
+  "kill_criteria": {
+    "min_cosine_improvement": 0.05,
+    "min_energy_success_rate": 0.5,
+    "max_clean_min_violation_rate": 0.1,
+    "min_geodesic_improvement": 0.01
+  },
+
+  "skip_non_finite_batches": true,
+  "non_finite_backoff_streak_trigger": 3,
+  "non_finite_lr_backoff": 0.5,
+  "max_consecutive_non_finite_batches": 10
+}

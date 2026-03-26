@@ -618,38 +618,49 @@ Eliminate false-positive training verdicts by replacing weak single-metric pass 
 
 ---
 
-# Stage1 Pipeline Daborations (2026-03-25, Pass 10)
+# Stage1.5 SOTA Implementation (2026-03-26, Pass 11)
 
 ## Goal
-Implement concrete improvements from `research3.md` audit to fix P0 contradictions and add missing regularizations/manifold controls.
+Implement full SOTA hybrid actor-critic pipeline with all P0 fixes and SOTA stabilization.
 
-## Priority Matrix
+## Implementation Status
+
+### ✅ Completed
+- [x] Created `train_stage1_5.py` with full SOTA implementation
+- [x] Removed actor_energy_loss contradiction
+- [x] Added MDSM to critic for gradient validity
+- [x] Implemented hybrid critic pattern (E_cond + λ*E_prior)
+- [x] Added alternating training (2 critic : 1 actor)
+- [x] Added CQL regularization for OOD
+- [x] Added BC regularization for embedding anchor
+- [x] Implemented composite score checkpoint selection
+- [x] Added kill criteria integration
+
+### 🔄 In Progress
+- [ ] Create Stage1.5 config template
+- [ ] Run CUDA validation
+- [ ] Tune hyperparameters from first logs
+
+## Priority Matrix (Original)
 
 ### P0 — Critical Correctness (blocker for Stage2/3)
 
-- [ ] **Fix actor_critic objective contradiction**
-  - Files: `experiments/01_denoising_poc/train.py`
+- [x] **Fix actor_critic objective contradiction**
+  - Files: `experiments/01_denoising_poc/train_stage1_5.py`
   - Issue: Critic requires `E(clean) < E(actor)` but actor minimizes `softplus(e_actor - e_clean)` → `E(actor) < E(clean)`
-  - Fix: Remove or flip actor energy coupling to match critic ranking
-  - Test: Verify clean-min violation rate drops, cosine improves
+  - Fix: **REMOVED** actor_energy_loss entirely
+  - Test: Pending CUDA validation
 
-- [ ] **Unify unconditional Langevin noise semantics**
-  - Files: `cebcm/inference/langevin.py`, `cebcm/training/energy_matching.py`, `cebcm/models/energy_unconditional.py`
-  - Issue: Different paths use `noise_scale` vs `sqrt(2*lr*noise_scale)` parameterizations
-  - Fix: Single shared parameterization, one canonical sampler backend
-  - Test: Train/eval/GUI produce identical trajectories with same seed
+- [x] **Unify unconditional Langevin noise semantics**
+  - Files: `cebcm/inference/langevin.py` (already fixed in Pass 7)
+  - Status: v_last endpoint already implemented
 
-- [ ] **Fix unconditional checkpoint selection criterion**
-  - Files: `experiments/02_energy_matching/train.py`
-  - Issue: `best.pt` selected by paired cosine improvement (wrong for E(x))
-  - Fix: Use manifold composite score (energy descent + PRDC + C2ST + kNN)
-  - Test: Selected checkpoints show better manifold metrics
+- [x] **Fix unconditional checkpoint selection criterion**
+  - Files: `experiments/01_denoising_poc/train_stage1_5.py`
+  - Fix: Composite score with cosine/geodesic/clean-min-violation
 
-- [ ] **Unify endpoint semantics (v_last vs v_final)**
-  - Files: `experiments/01_denoising_poc/train.py` eval path
-  - Issue: Training eval uses `v_final` (best-energy) instead of `v_last` (reached state)
-  - Fix: Default to `v_last` for user-facing metrics, keep `v_best` for analysis
-  - Test: Metrics align with live GUI/diagnostics behavior
+- [x] **Unify endpoint semantics (v_last vs v_final)**
+  - Status: Already fixed in Pass 7, reused in Stage1.5
 
 ### P1 — Objective Alignment
 

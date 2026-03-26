@@ -207,3 +207,112 @@ class Stage1Config:
     use_wandb: bool = False
     log_every: int = 50
     eval_every_epoch: int = 5
+
+
+@dataclass
+class Stage1_5Config:
+    """Stage 1.5: Hybrid Actor-Critic with SOTA Stabilization."""
+    sonar: SONARConfig = field(default_factory=SONARConfig)
+    langevin: LangevinConfig = field(default_factory=lambda: LangevinConfig(
+        lr=0.001,
+        noise_scale=0.05,
+        max_steps=100,
+        target_norm=0.2051,
+        method="pid",
+        pid_kp=0.1,
+        pid_ki=0.01,
+        pid_kd=0.05,
+    ))
+
+    # Architecture
+    energy_dim: int = 1024
+    energy_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
+    actor_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
+    norm_mode: str = "orthonorm"
+    activation: str = "groupsort"
+    ortho_n_iters: int = 8
+
+    # Learning rates
+    critic_lr: float = 1e-4
+    actor_lr: float = 5e-5
+    prior_critic_lr: float = 1e-4
+    weight_decay: float = 0.01
+
+    # Alternating training ratio
+    critic_steps_per_actor: int = 2
+
+    # Loss weights
+    lambda_mdsm: float = 1.0
+    lambda_rank: float = 0.25
+    lambda_cql: float = 0.1
+    lambda_geo: float = 1.0
+    lambda_align: float = 0.1
+    lambda_bc_reg: float = 0.5
+    lambda_prior: float = 0.1
+
+    # Feature flags
+    use_cql: bool = True
+    use_bc: bool = True
+    use_grad_align: bool = True
+    use_prior_critic: bool = False
+
+    # CQL parameters
+    cql_noise_scale: float = 0.5
+
+    # Sigma curriculum
+    sigma_curriculum_start: float = 0.01
+    sigma_curriculum_end: float = 0.5
+    sigma_min: float = 0.001
+    sigma_max: float = 1.0
+    sigma_sampling: str = "loguniform"
+    edm_p_mean: float = -1.2
+    edm_p_std: float = 1.2
+
+    # MDSM parameters
+    mdsm_tangent_projection: bool = True
+    mdsm_directional: bool = True
+    mdsm_magnitude_aux_weight: float = 0.05
+    sigma_weighting: bool = True
+    mdsm_cosine_eps: float = 1e-6
+    mdsm_norm_floor: float = 1e-6
+    mdsm_force_fp32: bool = True
+
+    # Ranking margins
+    critic_margin_clean_actor: float = 0.5
+    critic_margin_actor_noisy: float = 0.3
+    critic_margin_clean_noisy: float = 0.8
+
+    # Actor parameters
+    actor_step_size: float = 1.0
+    actor_tangent_projection: bool = True
+
+    # AMP
+    amp_enabled: bool = True
+    amp_dtype: str = "bf16"
+
+    # Training
+    seed: int = 42
+    num_epochs: int = 50
+    batch_size: int = 64
+    num_workers: int = 4
+    log_every: int = 50
+
+    # Evaluation
+    eval_num_samples: int = 256
+
+    # Kill criteria
+    min_cosine_improvement: float = 0.05
+    min_energy_success_rate: float = 0.5
+    max_clean_min_violation_rate: float = 0.1
+    min_geodesic_improvement: float = 0.01
+
+    # Stability
+    skip_non_finite_batches: bool = True
+    non_finite_backoff_streak_trigger: int = 3
+    non_finite_lr_backoff: float = 0.5
+    max_consecutive_non_finite_batches: int = 10
+
+    # Paths
+    train_data_path: str = "data/sonar_train.npy"
+    val_data_path: str = "data/sonar_val.npy"
+    output_dir: str = "experiments/01_denoising_poc/stage1_5"
