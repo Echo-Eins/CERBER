@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -80,14 +81,37 @@ def set_ortho_n_iters(model: torch.nn.Module, n_iters: int) -> None:
             module.n_iters = n_iters
 
 
-def build_bank(ds: SONARVectorDataset, device: torch.device, bank_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def resolve_ortho_n_iters(cfg: Stage1_5Config, epoch_idx: int, total_epochs: int) -> int:
+    base = max(1, int(cfg.ortho_n_iters))
+    if not cfg.ortho_schedule_enabled:
+        return base
+    if not cfg.ortho_schedule_iters:
+        return base
+
+    iters = [max(1, int(v)) for v in cfg.ortho_schedule_iters]
+    bounds = [float(v) for v in cfg.ortho_schedule_boundaries]
+    progress = float(epoch_idx + 1) / float(max(1, total_epochs))
+    stage = 0
+    for b in bounds:
+        if progress > b:
+            stage += 1
+    stage = min(stage, len(iters) - 1)
+    return int(iters[stage])
+
+
+def build_bank(
+    ds: SONARVectorDataset,
+    device: torch.device,
+    bank_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     emb = ds.embeddings
+    idx = torch.arange(len(emb), dtype=torch.long)
     if 0 < bank_size < len(emb):
         idx = torch.randperm(len(emb))[:bank_size]
         emb = emb[idx]
     bank = emb.to(device)
     bank_n = F.normalize(bank, dim=-1)
-    return bank, bank_n
+    return bank, bank_n, idx.to(device=device, dtype=torch.long)
 
 
 def retrieve_pos_hard(
@@ -98,34 +122,63 @@ def retrieve_pos_hard(
     hard_start: int,
     hard_end: int,
     self_sim_exclude: float,
+    q_indices: torch.Tensor | None = None,
+    bank_indices: torch.Tensor | None = None,
+    strict_index_exclusion: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     qn = F.normalize(q, dim=-1)
     k = min(bank.shape[0], max(2, topk_pos, hard_end))
     sim = qn @ bank_n.T
     vals, idx = torch.topk(sim, k=k, dim=-1)
-    pos_ids, hard_ids = [], []
-    for r in range(q.shape[0]):
-        cand_idx, cand_val = idx[r], vals[r]
-        pos = int(cand_idx[0].item())
-        for j in range(k):
-            if float(cand_val[j].item()) < self_sim_exclude:
-                pos = int(cand_idx[j].item())
-                break
-        hs, he = min(max(0, hard_start), k - 1), min(max(hard_start + 1, hard_end), k)
-        win = cand_idx[hs:he]
-        if win.numel() == 0:
-            hard = int(cand_idx[-1].item())
-        else:
-            hard = int(win[torch.randint(0, win.numel(), (1,), device=q.device)].item())
-        if hard == pos:
-            for j in range(k - 1, -1, -1):
-                alt = int(cand_idx[j].item())
-                if alt != pos:
-                    hard = alt
-                    break
-        pos_ids.append(pos)
-        hard_ids.append(hard)
-    return bank[torch.tensor(pos_ids, device=q.device)], bank[torch.tensor(hard_ids, device=q.device)]
+    bsz = q.shape[0]
+    batch = torch.arange(bsz, device=q.device)
+
+    same_index = torch.zeros_like(idx, dtype=torch.bool)
+    strict_has_index = (
+        strict_index_exclusion
+        and q_indices is not None
+        and bank_indices is not None
+    )
+    if strict_has_index:
+        same_index = bank_indices[idx] == q_indices.unsqueeze(1)
+
+    valid_pos = (~same_index) & (vals < float(self_sim_exclude))
+    has_valid_pos = valid_pos.any(dim=1)
+    first_valid_col = valid_pos.to(torch.int64).argmax(dim=1)
+    pos = idx[batch, first_valid_col]
+
+    # If there is no < self_sim_exclude candidate, fall back to first non-self candidate.
+    fallback_mask = ~same_index if strict_has_index else torch.ones_like(idx, dtype=torch.bool)
+    fallback_col = fallback_mask.to(torch.int64).argmax(dim=1)
+    pos_fallback = idx[batch, fallback_col]
+    pos = torch.where(has_valid_pos, pos, pos_fallback)
+
+    hs = min(max(0, hard_start), k - 1)
+    he = min(max(hard_start + 1, hard_end), k)
+    win = idx[:, hs:he]
+    if win.shape[1] == 0:
+        win = idx[:, -1:]
+    rand_col = torch.randint(0, win.shape[1], (bsz,), device=q.device)
+    hard = win[batch, rand_col]
+
+    if strict_has_index:
+        hard_same = bank_indices[hard] == q_indices
+    else:
+        hard_same = torch.zeros_like(hard, dtype=torch.bool)
+    need_fix = (hard == pos) | hard_same
+
+    rev_idx = idx.flip(dims=[1])
+    rev_same = same_index.flip(dims=[1])
+    rev_is_pos = rev_idx == pos.unsqueeze(1)
+    valid_alt = ~rev_is_pos
+    if strict_has_index:
+        valid_alt = valid_alt & (~rev_same)
+    has_alt = valid_alt.any(dim=1)
+    alt_col = valid_alt.to(torch.int64).argmax(dim=1)
+    alt = rev_idx[batch, alt_col]
+    hard = torch.where(need_fix & has_alt, alt, hard)
+
+    return bank[pos], bank[hard]
 
 
 def seed_actor(q: torch.Tensor, hard: torch.Tensor, sigma: torch.Tensor, cfg: Stage1_5Config) -> torch.Tensor:
@@ -145,9 +198,16 @@ def conditional_mdsm(
     noisy = pos + noise * sigma * nrm
     sigma_eff_sq = ((sigma * nrm) ** 2).clamp(min=1e-6)
     noisy_req = noisy.detach().requires_grad_(True)
-    e = critic(q, noisy_req, sigma=sigma.detach())
+    if cfg.mdsm_gradient_checkpointing:
+        def _forward(inp: torch.Tensor) -> torch.Tensor:
+            return critic(q, inp, sigma=sigma.detach())
+        e = grad_checkpoint(_forward, noisy_req, use_reentrant=False)
+    else:
+        e = critic(q, noisy_req, sigma=sigma.detach())
     g = torch.autograd.grad(e.sum(), noisy_req, create_graph=True)[0]
     tgt = (noisy.detach() - pos) / sigma_eff_sq
+    g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
+    tgt = torch.nan_to_num(tgt, nan=0.0, posinf=1e4, neginf=-1e4)
     if cfg.mdsm_tangent_projection:
         vh = F.normalize(noisy.detach(), dim=-1)
         g = g - (g * vh).sum(dim=-1, keepdim=True) * vh
@@ -169,8 +229,64 @@ def conditional_mdsm(
         w = 1.0 / sigma_eff_sq.squeeze(-1).clamp(min=1e-8)
     else:
         w = torch.ones_like(loss)
+    loss = torch.nan_to_num(loss, nan=1e4, posinf=1e4, neginf=1e4)
     w = w / w.mean().clamp(min=1e-8)
     return (w * loss).mean()
+
+
+def conditional_nce_loss(
+    critic: SimpleEnergy,
+    q: torch.Tensor,
+    pos: torch.Tensor,
+    hard: torch.Tensor,
+    bank: torch.Tensor,
+    sigma: torch.Tensor,
+    cfg: Stage1_5Config,
+) -> torch.Tensor:
+    bsz = q.shape[0]
+    num_neg = max(0, int(cfg.nce_num_random_negatives))
+    temp = max(1e-6, float(cfg.nce_temperature))
+
+    e_pos = critic(q, pos, sigma=sigma.detach())
+    e_hard = critic(q, hard, sigma=sigma.detach())
+
+    logits_parts = [(-e_pos / temp).unsqueeze(1), (-e_hard / temp).unsqueeze(1)]
+    if num_neg > 0:
+        ridx = torch.randint(0, bank.shape[0], (bsz, num_neg), device=q.device)
+        rand_neg = bank[ridx]  # [B, K, D]
+        q_rep = q.unsqueeze(1).expand(-1, num_neg, -1).reshape(bsz * num_neg, -1)
+        neg_flat = rand_neg.reshape(bsz * num_neg, -1)
+        sigma_rep = sigma.repeat_interleave(num_neg, dim=0).detach()
+        e_rand = critic(q_rep, neg_flat, sigma=sigma_rep).view(bsz, num_neg)
+        logits_parts.append(-e_rand / temp)
+
+    logits = torch.cat(logits_parts, dim=1)
+    labels = torch.zeros(bsz, dtype=torch.long, device=q.device)
+    return F.cross_entropy(logits, labels)
+
+
+def prior_nce_loss(
+    prior: UnconditionalEnergy,
+    pos: torch.Tensor,
+    hard: torch.Tensor,
+    bank: torch.Tensor,
+    cfg: Stage1_5Config,
+) -> torch.Tensor:
+    bsz = pos.shape[0]
+    num_neg = max(0, int(cfg.nce_num_random_negatives))
+    temp = max(1e-6, float(cfg.nce_temperature))
+
+    e_pos = prior(pos)
+    e_hard = prior(hard)
+    logits_parts = [(-e_pos / temp).unsqueeze(1), (-e_hard / temp).unsqueeze(1)]
+    if num_neg > 0:
+        ridx = torch.randint(0, bank.shape[0], (bsz, num_neg), device=pos.device)
+        rand_neg = bank[ridx].reshape(bsz * num_neg, -1)
+        e_rand = prior(rand_neg).view(bsz, num_neg)
+        logits_parts.append(-e_rand / temp)
+    logits = torch.cat(logits_parts, dim=1)
+    labels = torch.zeros(bsz, dtype=torch.long, device=pos.device)
+    return F.cross_entropy(logits, labels)
 
 
 class TwinHybridEnergy:
@@ -181,16 +297,24 @@ class TwinHybridEnergy:
         prior: UnconditionalEnergy | None,
         lambda_prior: float,
         aggregate: str,
+        softmax_temperature: float,
     ):
         self.c1 = c1
         self.c2 = c2
         self.prior = prior
         self.lambda_prior = lambda_prior
         self.aggregate = aggregate
+        self.softmax_temperature = softmax_temperature
 
     def cond(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
         e1, e2 = self.c1(q, v, sigma=sigma), self.c2(q, v, sigma=sigma)
-        return 0.5 * (e1 + e2) if self.aggregate == "mean" else torch.maximum(e1, e2)
+        if self.aggregate == "mean":
+            return 0.5 * (e1 + e2)
+        if self.aggregate == "softmax":
+            tau = max(1e-6, float(self.softmax_temperature))
+            stacked = torch.stack([e1, e2], dim=0)
+            return tau * torch.logsumexp(stacked / tau, dim=0)
+        return torch.maximum(e1, e2)
 
     def __call__(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
         e = self.cond(q, v, sigma=sigma)
@@ -225,15 +349,20 @@ def eval_model(
     ds: SONARVectorDataset,
     bank: torch.Tensor,
     bank_n: torch.Tensor,
+    bank_idx: torch.Tensor,
     cfg: Stage1_5Config,
     device: torch.device,
+    eval_ids: torch.Tensor | None = None,
 ) -> dict:
     ef.c1.eval()
     ef.c2.eval()
     if ef.prior is not None:
         ef.prior.eval()
     actor.eval()
-    ids = torch.randperm(len(ds))[: min(cfg.eval_num_samples, len(ds))]
+    if eval_ids is None:
+        ids = torch.randperm(len(ds))[: min(cfg.eval_num_samples, len(ds))]
+    else:
+        ids = eval_ids.to(dtype=torch.long).cpu()
     kw = {}
     if cfg.langevin.method == "pid":
         kw = dict(
@@ -247,40 +376,82 @@ def eval_model(
     else:
         kw = dict(momentum_beta=cfg.langevin.momentum_beta)
     out = {}
+    eval_batch = max(1, int(cfg.eval_langevin_batch_size))
     for ns in cfg.eval_noise_scales:
         cb, ca, lb, la, eb, ea, ep, step, succ, viol, rcos = [], [], [], [], [], [], [], [], [], [], []
-        for i in ids:
-            q = ds[int(i.item())].unsqueeze(0).to(device)
+        for start in range(0, len(ids), eval_batch):
+            batch_ids = ids[start:start + eval_batch]
+            q_idx = batch_ids.to(device=device, dtype=torch.long)
+            q = ds.embeddings[batch_ids].to(device=device, dtype=bank.dtype)
             pos, hard = retrieve_pos_hard(
-                q, bank, bank_n, cfg.retrieval_topk_pos, cfg.retrieval_hard_start, cfg.retrieval_hard_end, cfg.retrieval_self_sim_exclude
+                q,
+                bank,
+                bank_n,
+                cfg.retrieval_topk_pos,
+                cfg.retrieval_hard_start,
+                cfg.retrieval_hard_end,
+                cfg.retrieval_self_sim_exclude,
+                q_indices=q_idx,
+                bank_indices=bank_idx,
+                strict_index_exclusion=cfg.retrieval_strict_index_exclusion,
             )
-            rcos.append(float(F.cosine_similarity(q, pos, dim=-1).item()))
-            sigma = torch.full((1, 1), float(ns), device=device)
+            rcos.extend(F.cosine_similarity(q, pos, dim=-1).detach().cpu().tolist())
+            sigma = torch.full((q.shape[0], 1), float(ns), device=device, dtype=q.dtype)
             noisy = seed_actor(q, hard, sigma, cfg)
             with torch.no_grad():
                 v = noisy
                 for _ in range(max(1, cfg.actor_eval_steps)):
-                    v, _ = actor.predict_step(q, v, sigma=sigma, step_size=cfg.actor_step_size, target_norm=cfg.langevin.target_norm, tangent_projection=cfg.actor_tangent_projection)
+                    v, _ = actor.predict_step(
+                        q,
+                        v,
+                        sigma=sigma,
+                        step_size=cfg.actor_step_size,
+                        target_norm=cfg.langevin.target_norm,
+                        tangent_projection=cfg.actor_tangent_projection,
+                    )
             if cfg.critic_eval_langevin_steps > 0:
+                # Keep eval math sample-independent when batched: fixed-step rollout,
+                # no batch-coupled early stop by mean energy.
                 res = run_langevin(
-                    method=cfg.langevin.method, energy_fn=ef, v_query=q, v_init=v,
-                    lr=cfg.langevin.lr, noise_scale=cfg.langevin.noise_scale, max_steps=cfg.critic_eval_langevin_steps,
-                    target_norm=cfg.langevin.target_norm, energy_threshold=cfg.langevin.energy_threshold,
-                    plateau_patience=cfg.langevin.plateau_patience, plateau_delta=cfg.langevin.plateau_delta, v_target=pos, **kw
+                    method=cfg.langevin.method,
+                    energy_fn=ef,
+                    v_query=q,
+                    v_init=v,
+                    lr=cfg.langevin.lr,
+                    noise_scale=cfg.langevin.noise_scale,
+                    max_steps=cfg.critic_eval_langevin_steps,
+                    target_norm=cfg.langevin.target_norm,
+                    energy_threshold=None,
+                    plateau_patience=max(cfg.critic_eval_langevin_steps + 1, cfg.langevin.plateau_patience),
+                    plateau_delta=cfg.langevin.plateau_delta,
+                    tangent_noise=cfg.langevin_tangent_noise,
+                    v_target=None,
+                    **kw,
                 )
                 final = res.v_last if res.v_last is not None else res.v_final
             else:
                 final = v
-            cb.append(float(F.cosine_similarity(pos, noisy, dim=-1).item()))
-            ca.append(float(F.cosine_similarity(pos, final, dim=-1).item()))
-            lb.append(float(torch.norm(pos - noisy, dim=-1).item()))
-            la.append(float(torch.norm(pos - final, dim=-1).item()))
+
+            cb_batch = F.cosine_similarity(pos, noisy, dim=-1)
+            ca_batch = F.cosine_similarity(pos, final, dim=-1)
+            lb_batch = torch.norm(pos - noisy, dim=-1)
+            la_batch = torch.norm(pos - final, dim=-1)
+            step_batch = torch.norm(final - noisy, dim=-1)
             with torch.no_grad():
-                ep_i = float(ef(q, pos).item()); eb_i = float(ef(q, noisy).item()); ea_i = float(ef(q, final).item())
-            ep.append(ep_i); eb.append(eb_i); ea.append(ea_i)
-            step.append(float(torch.norm(final - noisy, dim=-1).item()))
-            succ.append(1.0 if ea_i < eb_i else 0.0)
-            viol.append(1.0 if ea_i < ep_i else 0.0)
+                ep_batch = ef(q, pos).detach()
+                eb_batch = ef(q, noisy).detach()
+                ea_batch = ef(q, final).detach()
+
+            cb.extend(cb_batch.detach().cpu().tolist())
+            ca.extend(ca_batch.detach().cpu().tolist())
+            lb.extend(lb_batch.detach().cpu().tolist())
+            la.extend(la_batch.detach().cpu().tolist())
+            ep.extend(ep_batch.detach().cpu().tolist())
+            eb.extend(eb_batch.detach().cpu().tolist())
+            ea.extend(ea_batch.detach().cpu().tolist())
+            step.extend(step_batch.detach().cpu().tolist())
+            succ.extend((ea_batch < eb_batch).to(torch.float32).detach().cpu().tolist())
+            viol.extend((ea_batch < ep_batch).to(torch.float32).detach().cpu().tolist())
         n = float(len(cb))
         out[f"noise_{ns}"] = {
             "cos_before_mean": sum(cb) / n,
@@ -302,10 +473,133 @@ def eval_model(
             "energy_success_rate": sum(succ) / n,
             "clean_min_violation_rate": sum(viol) / n,
             "step_norm_mean": sum(step) / n,
+            # Backward-compatible alias:
+            # `success_rate` historically meant cosine-gain success.
             "success_rate": sum(1.0 for b, a in zip(cb, ca) if a > b) / n,
+            "cos_success_rate": sum(1.0 for b, a in zip(cb, ca) if a > b) / n,
             "retrieval_cosine_mean": sum(rcos) / n,
         }
     return out
+
+
+def _not_evaluated_kill_stub() -> dict:
+    """Stable schema for epochs where eval is intentionally skipped."""
+    return {
+        "status": "not_evaluated",
+        "score": None,
+        "passed": None,
+        "global_gates": {},
+        "aggregate": {},
+        "per_noise": {},
+    }
+
+
+def _validate_stage15_config(cfg: Stage1_5Config) -> None:
+    def _must_be_non_negative(name: str, value: float) -> None:
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+
+    def _must_be_positive(name: str, value: float) -> None:
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0, got {value}")
+
+    for name in [
+        "critic_lr",
+        "actor_lr",
+        "prior_critic_lr",
+        "clip_grad_norm",
+        "loss_spike_factor",
+        "sigma_curriculum_end",
+        "sigma_max",
+        "nce_temperature",
+        "actor_step_size",
+        "ortho_n_iters",
+        "eval_langevin_batch_size",
+    ]:
+        _must_be_positive(name, float(getattr(cfg, name)))
+
+    for name in [
+        "weight_decay",
+        "lambda_mdsm",
+        "lambda_rank",
+        "lambda_nce",
+        "lambda_cql",
+        "lambda_shell",
+        "lambda_geo",
+        "lambda_align",
+        "lambda_bc_reg",
+        "lambda_prior",
+        "lambda_prior_nce",
+        "lambda_actor_barrier",
+        "gradient_penalty_lambda",
+        "shell_barrier_margin",
+        "cql_noise_scale",
+        "nce_num_random_negatives",
+        "sigma_curriculum_start",
+        "sigma_min",
+        "mdsm_magnitude_aux_weight",
+        "critic_margin_clean_actor",
+        "critic_margin_actor_noisy",
+        "critic_margin_clean_noisy",
+        "retrieval_self_sim_exclude",
+        "non_finite_backoff_streak_trigger",
+        "max_consecutive_non_finite_batches",
+        "param_finite_check_interval",
+        "critic_steps_per_actor",
+    ]:
+        _must_be_non_negative(name, float(getattr(cfg, name)))
+
+    if cfg.sigma_curriculum_start > cfg.sigma_curriculum_end:
+        raise ValueError(
+            "sigma_curriculum_start must be <= sigma_curriculum_end, "
+            f"got {cfg.sigma_curriculum_start} > {cfg.sigma_curriculum_end}"
+        )
+    if cfg.sigma_min > cfg.sigma_max:
+        raise ValueError(f"sigma_min must be <= sigma_max, got {cfg.sigma_min} > {cfg.sigma_max}")
+    if cfg.eval_every_epochs < 1:
+        raise ValueError(f"eval_every_epochs must be >= 1, got {cfg.eval_every_epochs}")
+    if cfg.num_epochs < 1:
+        raise ValueError(f"num_epochs must be >= 1, got {cfg.num_epochs}")
+    if cfg.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}")
+    if cfg.retrieval_self_sim_exclude > 1.0:
+        raise ValueError(
+            f"retrieval_self_sim_exclude must be <= 1.0 for cosine similarity, got {cfg.retrieval_self_sim_exclude}"
+        )
+    if cfg.compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
+        raise ValueError(
+            "compile_mode must be one of {'default','reduce-overhead','max-autotune'}, "
+            f"got {cfg.compile_mode}"
+        )
+
+    if cfg.ortho_schedule_enabled:
+        if not cfg.ortho_schedule_iters:
+            raise ValueError("ortho_schedule_enabled requires non-empty ortho_schedule_iters")
+        if len(cfg.ortho_schedule_boundaries) != max(0, len(cfg.ortho_schedule_iters) - 1):
+            raise ValueError(
+                "len(ortho_schedule_boundaries) must equal len(ortho_schedule_iters)-1, "
+                f"got {len(cfg.ortho_schedule_boundaries)} vs {len(cfg.ortho_schedule_iters)-1}"
+            )
+        prev = -float("inf")
+        for b in cfg.ortho_schedule_boundaries:
+            if not (0.0 < float(b) < 1.0):
+                raise ValueError(f"ortho_schedule_boundaries values must be in (0,1), got {b}")
+            if float(b) <= prev:
+                raise ValueError("ortho_schedule_boundaries must be strictly increasing")
+            prev = float(b)
+
+    for name in [
+        "lr",
+        "noise_scale",
+        "max_steps",
+        "pid_kp",
+        "pid_ki",
+        "pid_kd",
+        "pid_integral_decay",
+        "momentum_beta",
+    ]:
+        value = float(getattr(cfg.langevin, name))
+        _must_be_non_negative(f"langevin.{name}", value)
 
 
 def load_config(path: str) -> Stage1_5Config:
@@ -324,6 +618,7 @@ def load_config(path: str) -> Stage1_5Config:
         cfg.min_cosine_success_rate = float(kill.get("min_cosine_success_rate", cfg.min_cosine_success_rate))
         cfg.min_energy_success_rate = float(kill.get("min_energy_success_rate", cfg.min_energy_success_rate))
         cfg.max_clean_min_violation_rate = float(kill.get("max_clean_min_violation_rate", cfg.max_clean_min_violation_rate))
+    _validate_stage15_config(cfg)
     return cfg
 
 
@@ -343,39 +638,96 @@ def main() -> None:
     else:
         n_val = max(1, min(cfg.eval_num_samples * 2, len(ds) // 10))
         ds, ds_val = ds.subset(0, max(1, len(ds) - n_val)), ds.subset(max(1, len(ds) - n_val), len(ds))
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=(device.type == "cuda"))
-    bank_tr, bankn_tr = build_bank(ds, device, cfg.retrieval_bank_size)
-    bank_va, bankn_va = build_bank(ds_val, device, cfg.retrieval_bank_size)
+    train_index_ds = torch.arange(len(ds), dtype=torch.long)
+    loader = DataLoader(
+        train_index_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    bank_tr, bankn_tr, bankidx_tr = build_bank(ds, device, cfg.retrieval_bank_size)
+    bank_va, bankn_va, bankidx_va = build_bank(ds_val, device, cfg.retrieval_bank_size)
+    eval_gen = torch.Generator(device="cpu").manual_seed(int(cfg.seed) + 1009)
+    eval_ids = torch.randperm(len(ds_val), generator=eval_gen)[: min(cfg.eval_num_samples, len(ds_val))]
 
-    c1 = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
-    c2 = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
-    actor = LatentDenoiseActor(cfg.energy_dim, cfg.actor_hidden_dims, cfg.norm_mode, "silu", ortho_n_iters=cfg.ortho_n_iters).to(device)
-    prior = UnconditionalEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters).to(device) if cfg.use_prior_critic else None
-    for m in [c1, c2, actor] + ([prior] if prior is not None else []):
-        set_ortho_n_iters(m, cfg.ortho_n_iters)
-    ef = TwinHybridEnergy(c1, c2, prior, cfg.lambda_prior if cfg.use_prior_critic else 0.0, cfg.twin_aggregate)
+    c1_base = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
+    c2_base = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
+    actor_base = LatentDenoiseActor(cfg.energy_dim, cfg.actor_hidden_dims, cfg.norm_mode, "silu", ortho_n_iters=cfg.ortho_n_iters).to(device)
+    prior_base = UnconditionalEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters).to(device) if cfg.use_prior_critic else None
 
-    groups = [{"params": list(c1.parameters()), "lr": cfg.critic_lr}, {"params": list(c2.parameters()), "lr": cfg.critic_lr}]
-    if prior is not None:
-        groups.append({"params": list(prior.parameters()), "lr": cfg.prior_critic_lr})
+    # Runtime n_iters is epoch-scheduled; initialize to first-epoch value.
+    init_ortho_iters = resolve_ortho_n_iters(cfg, epoch_idx=0, total_epochs=cfg.num_epochs)
+    for m in [c1_base, c2_base, actor_base] + ([prior_base] if prior_base is not None else []):
+        set_ortho_n_iters(m, init_ortho_iters)
+
+    c1, c2, actor, prior = c1_base, c2_base, actor_base, prior_base
+    compile_enabled = bool(
+        cfg.enable_compile
+        and device.type == "cuda"
+        and hasattr(torch, "compile")
+    )
+    if compile_enabled:
+        try:
+            c1 = torch.compile(c1_base, mode=cfg.compile_mode, fullgraph=cfg.compile_fullgraph)
+            c2 = torch.compile(c2_base, mode=cfg.compile_mode, fullgraph=cfg.compile_fullgraph)
+            actor = torch.compile(actor_base, mode=cfg.compile_mode, fullgraph=cfg.compile_fullgraph)
+            if prior_base is not None:
+                prior = torch.compile(prior_base, mode=cfg.compile_mode, fullgraph=cfg.compile_fullgraph)
+            print(f"torch.compile: enabled (mode={cfg.compile_mode}, fullgraph={cfg.compile_fullgraph})")
+        except Exception as ex:
+            c1, c2, actor, prior = c1_base, c2_base, actor_base, prior_base
+            compile_enabled = False
+            print(f"[WARN] torch.compile disabled due to runtime error: {ex}")
+    ef = TwinHybridEnergy(
+        c1,
+        c2,
+        prior,
+        cfg.lambda_prior if cfg.use_prior_critic else 0.0,
+        cfg.twin_aggregate,
+        cfg.twin_softmax_temperature,
+    )
+
+    groups = [{"params": list(c1_base.parameters()), "lr": cfg.critic_lr}, {"params": list(c2_base.parameters()), "lr": cfg.critic_lr}]
+    if prior_base is not None:
+        groups.append({"params": list(prior_base.parameters()), "lr": cfg.prior_critic_lr})
     opt_c = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
-    opt_a = torch.optim.AdamW(actor.parameters(), lr=cfg.actor_lr, weight_decay=cfg.weight_decay)
+    opt_a = torch.optim.AdamW(actor_base.parameters(), lr=cfg.actor_lr, weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     ckpt_dir, log_dir = Path(cfg.checkpoint_dir), Path(cfg.logs_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True); log_dir.mkdir(parents=True, exist_ok=True)
     best_score, start_epoch, global_step = float("-inf"), 0, 0
     if args.resume:
         ck = torch.load(args.resume, weights_only=False, map_location=device)
-        c1.load_state_dict(ck["critic1_state"]); c2.load_state_dict(ck["critic2_state"]); actor.load_state_dict(ck["actor_state"])
-        if prior is not None and ck.get("prior_state") is not None: prior.load_state_dict(ck["prior_state"])
+        c1_base.load_state_dict(ck["critic1_state"]); c2_base.load_state_dict(ck["critic2_state"]); actor_base.load_state_dict(ck["actor_state"])
+        if prior_base is not None and ck.get("prior_state") is not None: prior_base.load_state_dict(ck["prior_state"])
         opt_c.load_state_dict(ck["opt_c_state"]); opt_a.load_state_dict(ck["opt_a_state"]); scaler.load_state_dict(ck["scaler_state"])
         best_score, start_epoch, global_step = float(ck.get("best_score", best_score)), int(ck.get("epoch", 0)) + 1, int(ck.get("global_step", 0))
 
     th = make_thresholds(cfg)
-    print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)}")
+    print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing}")
     for ep in range(start_epoch, cfg.num_epochs):
-        t0 = time.time(); c1.train(); c2.train(); actor.train(); prior.train() if prior is not None else None
-        sums = {"loss": 0.0, "critic": 0.0, "actor": 0.0, "rank_success": 0.0, "retrieval_cosine": 0.0, "clean_viol": 0.0}
+        t0 = time.time()
+        active_ortho_iters = resolve_ortho_n_iters(cfg, epoch_idx=ep, total_epochs=cfg.num_epochs)
+        for m in [c1_base, c2_base, actor_base] + ([prior_base] if prior_base is not None else []):
+            set_ortho_n_iters(m, active_ortho_iters)
+        print(f"  Ortho schedule: n_iters={active_ortho_iters}")
+        c1.train(); c2.train(); actor.train(); prior.train() if prior is not None else None
+        sums = {
+            "loss": 0.0,
+            "critic": 0.0,
+            "actor": 0.0,
+            "rank": 0.0,
+            "mdsm": 0.0,
+            "cql": 0.0,
+            "nce": 0.0,
+            "rank_success": 0.0,
+            "rank_clean_lt_actor": 0.0,
+            "rank_actor_lt_hard": 0.0,
+            "rank_clean_lt_hard": 0.0,
+            "retrieval_cosine": 0.0,
+            "clean_viol": 0.0,
+        }
         n_ok, n_skip, bad_streak = 0, 0, 0
         ema_c, ema_a = None, None
 
@@ -388,118 +740,371 @@ def main() -> None:
             if bad_streak >= cfg.max_consecutive_non_finite_batches:
                 raise RuntimeError("Too many consecutive bad batches.")
 
-        for bi, q in enumerate(loader):
-            q = q.to(device, non_blocking=True)
-            pos, hard = retrieve_pos_hard(q, bank_tr, bankn_tr, cfg.retrieval_topk_pos, cfg.retrieval_hard_start, cfg.retrieval_hard_end, cfg.retrieval_self_sim_exclude)
+        for bi, batch_idx in enumerate(loader):
+            if (
+                cfg.param_finite_check_interval > 0
+                and (bi % cfg.param_finite_check_interval == 0)
+            ):
+                for module in [c1_base, c2_base, actor_base] + ([prior_base] if prior_base is not None else []):
+                    for p in module.parameters():
+                        if not torch.isfinite(p).all():
+                            raise RuntimeError("Non-finite model parameter detected.")
+            q_idx_cpu = batch_idx.long()
+            q = ds.embeddings[q_idx_cpu].to(device, non_blocking=True)
+            q_idx = q_idx_cpu.to(device=device, dtype=torch.long, non_blocking=True)
+            pos, hard = retrieve_pos_hard(
+                q,
+                bank_tr,
+                bankn_tr,
+                cfg.retrieval_topk_pos,
+                cfg.retrieval_hard_start,
+                cfg.retrieval_hard_end,
+                cfg.retrieval_self_sim_exclude,
+                q_indices=q_idx,
+                bank_indices=bankidx_tr,
+                strict_index_exclusion=cfg.retrieval_strict_index_exclusion,
+            )
             retrieval_cos = float(F.cosine_similarity(q, pos, dim=-1).mean().item())
 
-            c_loss_acc, rank_ok_acc, viol_acc = 0.0, 0.0, 0.0
+            c_loss_acc, rank_acc, mdsm_acc, cql_acc, nce_acc, rank_ok_acc, viol_acc = (
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            rank_clean_actor_acc = 0.0
+            rank_actor_hard_acc = 0.0
+            rank_clean_hard_acc = 0.0
             critic_failed = False
-            for _ in range(max(1, cfg.critic_steps_per_actor)):
-                sigma = sample_sigma(cfg, q.shape[0], device); seed = seed_actor(q, hard, sigma, cfg)
-                with torch.no_grad():
-                    a_init, _ = actor.predict_step(q, seed, sigma=sigma, step_size=cfg.actor_step_size, target_norm=cfg.langevin.target_norm, tangent_projection=cfg.actor_tangent_projection)
-                with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
-                    mdsm = 0.5 * (conditional_mdsm(c1, q, pos, sigma, cfg) + conditional_mdsm(c2, q, pos, sigma, cfg))
-                with autocast():
-                    ep1, ea1, eh1 = c1(q, pos, sigma=sigma.detach()), c1(q, a_init.detach(), sigma=sigma.detach()), c1(q, hard.detach(), sigma=sigma.detach())
-                    ep2, ea2, eh2 = c2(q, pos, sigma=sigma.detach()), c2(q, a_init.detach(), sigma=sigma.detach()), c2(q, hard.detach(), sigma=sigma.detach())
-                    rank = 0.5 * (
-                        (F.relu(ep1 - ea1 + cfg.critic_margin_clean_actor) + F.relu(ea1 - eh1 + cfg.critic_margin_actor_noisy) + F.relu(ep1 - eh1 + cfg.critic_margin_clean_noisy)).mean()
-                        + (F.relu(ep2 - ea2 + cfg.critic_margin_clean_actor) + F.relu(ea2 - eh2 + cfg.critic_margin_actor_noisy) + F.relu(ep2 - eh2 + cfg.critic_margin_clean_noisy)).mean()
-                    )
-                    cql = torch.tensor(0.0, device=device)
-                    if cfg.use_cql:
-                        ood = add_relative_noise(hard.detach(), cfg.cql_noise_scale)
-                        if cfg.langevin.target_norm is not None: ood = F.normalize(ood, dim=-1) * cfg.langevin.target_norm
-                        cql = 0.5 * (F.softplus(-c1(q, ood, sigma=sigma.detach())).mean() + F.softplus(-c2(q, ood, sigma=sigma.detach())).mean())
-                    gp = torch.tensor(0.0, device=device)
-                    if cfg.use_gradient_penalty:
-                        gp = 0.5 * (gradient_penalty(c1, q, a_init.detach()) + gradient_penalty(c2, q, a_init.detach()))
-                    loss_c = cfg.lambda_mdsm * mdsm + cfg.lambda_rank * rank + cfg.lambda_cql * cql + cfg.gradient_penalty_lambda * gp
-                    if prior is not None and cfg.lambda_prior > 0:
-                        loss_c = loss_c + cfg.lambda_prior * F.relu(prior(pos) - prior(hard.detach()) + cfg.critic_margin_clean_noisy).mean()
+            for cstep in range(max(1, cfg.critic_steps_per_actor)):
+                try:
+                    crit = c1 if (cstep % 2 == 0) else c2
+                    crit_base = c1_base if (cstep % 2 == 0) else c2_base
+                    sigma = sample_sigma(cfg, q.shape[0], device)
+                    seed = seed_actor(q, hard, sigma, cfg)
+                    with torch.no_grad():
+                        a_init, _ = actor.predict_step(
+                            q,
+                            seed,
+                            sigma=sigma,
+                            step_size=cfg.actor_step_size,
+                            target_norm=cfg.langevin.target_norm,
+                            tangent_projection=cfg.actor_tangent_projection,
+                        )
+                    with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
+                        mdsm = conditional_mdsm(crit, q, pos, sigma, cfg)
+                    with autocast():
+                        ep = crit(q, pos, sigma=sigma.detach())
+                        ea = crit(q, a_init.detach(), sigma=sigma.detach())
+                        eh = crit(q, hard.detach(), sigma=sigma.detach())
+                        rank = (
+                            F.relu(ep - ea + cfg.critic_margin_clean_actor)
+                            + F.relu(ea - eh + cfg.critic_margin_actor_noisy)
+                            + F.relu(ep - eh + cfg.critic_margin_clean_noisy)
+                        ).mean()
+                        cql = torch.tensor(0.0, device=device)
+                        if cfg.use_cql:
+                            ood = add_relative_noise(hard.detach(), cfg.cql_noise_scale)
+                            if cfg.langevin.target_norm is not None:
+                                ood = F.normalize(ood, dim=-1) * cfg.langevin.target_norm
+                            cql = F.softplus(-crit(q, ood, sigma=sigma.detach())).mean()
+                        nce = torch.tensor(0.0, device=device)
+                        if cfg.use_nce and cfg.lambda_nce > 0:
+                            nce = conditional_nce_loss(
+                                critic=crit,
+                                q=q,
+                                pos=pos,
+                                hard=hard,
+                                bank=bank_tr,
+                                sigma=sigma.detach(),
+                                cfg=cfg,
+                            )
+                        prior_nce = torch.tensor(0.0, device=device)
+                        if (
+                            prior is not None
+                            and cfg.use_prior_nce
+                            and cfg.lambda_prior_nce > 0
+                        ):
+                            prior_nce = prior_nce_loss(
+                                prior=prior,
+                                pos=pos,
+                                hard=hard,
+                                bank=bank_tr,
+                                cfg=cfg,
+                            )
+                        gp = torch.tensor(0.0, device=device)
+                        if cfg.use_gradient_penalty:
+                            gp = gradient_penalty(crit, q, a_init.detach())
+                        shell = torch.tensor(0.0, device=device)
+                        if cfg.use_shell_barrier and cfg.langevin.target_norm is not None:
+                            nrm = a_init.norm(dim=-1)
+                            r = cfg.langevin.target_norm
+                            m = cfg.shell_barrier_margin
+                            shell = (
+                                F.relu(r * (1 - m) - nrm).pow(2)
+                                + F.relu(nrm - r * (1 + m)).pow(2)
+                            ).mean()
+                        loss_c = (
+                            cfg.lambda_mdsm * mdsm
+                            + cfg.lambda_rank * rank
+                            + cfg.lambda_nce * nce
+                            + cfg.lambda_cql * cql
+                            + cfg.gradient_penalty_lambda * gp
+                            + cfg.lambda_shell * shell
+                        )
+                        if (
+                            prior is not None
+                            and cfg.use_prior_nce
+                            and cfg.lambda_prior_nce > 0
+                        ):
+                            loss_c = loss_c + cfg.lambda_prior_nce * prior_nce
+                        if prior is not None and cfg.lambda_prior > 0:
+                            loss_c = loss_c + cfg.lambda_prior * F.relu(
+                                prior(pos) - prior(hard.detach()) + cfg.critic_margin_clean_noisy
+                            ).mean()
 
-                lc = float(loss_c.detach().item())
-                if (not math.isfinite(lc)) or (cfg.guard_loss_spikes and ema_c is not None and global_step >= cfg.loss_spike_warmup_steps and lc > cfg.loss_spike_factor * max(ema_c, 1e-8)):
-                    on_bad(); critic_failed = True; break
-                ema_c = lc if ema_c is None else 0.98 * ema_c + 0.02 * lc
-                mods_c = [c1, c2] + ([prior] if prior is not None else [])
-                opt_c.zero_grad(set_to_none=True)
-                if scaler.is_enabled():
-                    scaler.scale(loss_c).backward(); scaler.unscale_(opt_c); sanitize_grads(mods_c); gn = clip_grads(mods_c, cfg.clip_grad_norm)
-                    if not torch.isfinite(gn): on_bad(); scaler.update(); critic_failed = True; break
-                    scaler.step(opt_c); scaler.update()
-                else:
-                    loss_c.backward(); sanitize_grads(mods_c); gn = clip_grads(mods_c, cfg.clip_grad_norm)
-                    if not torch.isfinite(gn): on_bad(); critic_failed = True; break
-                    opt_c.step()
-                c_loss_acc += lc
-                rank_ok_acc += 0.5 * (((ep1 < eh1).float().mean().item()) + ((ep2 < eh2).float().mean().item()))
-                viol_acc += 0.5 * (((ea1 < ep1).float().mean().item()) + ((ea2 < ep2).float().mean().item()))
+                    lc = float(loss_c.detach().item())
+                    if (
+                        (not math.isfinite(lc))
+                        or (
+                            cfg.guard_loss_spikes
+                            and ema_c is not None
+                            and global_step >= cfg.loss_spike_warmup_steps
+                            and lc > cfg.loss_spike_factor * max(ema_c, 1e-8)
+                        )
+                    ):
+                        on_bad()
+                        critic_failed = True
+                        break
+                    ema_c = lc if ema_c is None else 0.98 * ema_c + 0.02 * lc
+                    mods_c = [crit_base] + ([prior_base] if prior_base is not None else [])
+                    opt_c.zero_grad(set_to_none=True)
+                    if scaler.is_enabled():
+                        scaler.scale(loss_c).backward()
+                        scaler.unscale_(opt_c)
+                        sanitize_grads(mods_c)
+                        gn = clip_grads(mods_c, cfg.clip_grad_norm)
+                        if not torch.isfinite(gn):
+                            on_bad()
+                            scaler.update()
+                            critic_failed = True
+                            break
+                        scaler.step(opt_c)
+                        scaler.update()
+                    else:
+                        loss_c.backward()
+                        sanitize_grads(mods_c)
+                        gn = clip_grads(mods_c, cfg.clip_grad_norm)
+                        if not torch.isfinite(gn):
+                            on_bad()
+                            critic_failed = True
+                            break
+                        opt_c.step()
+
+                    c_loss_acc += lc
+                    rank_acc += float(rank.item())
+                    mdsm_acc += float(mdsm.item())
+                    cql_acc += float(cql.item())
+                    nce_acc += float(nce.item())
+                    rank_clean_actor = (ep < ea).float().mean().item()
+                    rank_actor_hard = (ea < eh).float().mean().item()
+                    rank_clean_hard = (ep < eh).float().mean().item()
+                    rank_ok_acc += float(
+                        ((ep < ea) & (ea < eh) & (ep < eh)).float().mean().item()
+                    )
+                    rank_clean_actor_acc += float(rank_clean_actor)
+                    rank_actor_hard_acc += float(rank_actor_hard)
+                    rank_clean_hard_acc += float(rank_clean_hard)
+                    viol_acc += float((ea < ep).float().mean().item())
+                except torch.OutOfMemoryError:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    on_bad()
+                    critic_failed = True
+                    break
             if critic_failed:
                 continue
 
-            sigma_a = sample_sigma(cfg, q.shape[0], device); seed_a = seed_actor(q, hard, sigma_a, cfg)
-            with autocast():
-                nxt, delta = actor.predict_step(q, seed_a, sigma=sigma_a.detach(), step_size=cfg.actor_step_size, target_norm=cfg.langevin.target_norm, tangent_projection=cfg.actor_tangent_projection)
-                l_geo = (1.0 - F.cosine_similarity(nxt, pos, dim=-1).clamp(-1.0, 1.0)).mean()
-                l_bc = F.mse_loss(nxt, pos) if cfg.use_bc else torch.tensor(0.0, device=device)
-                if cfg.use_grad_align:
-                    with torch.enable_grad():
-                        _, g_seed = ef.energy_and_grad(q, seed_a, sigma=sigma_a.detach())
-                    l_align = (1.0 - F.cosine_similarity(delta, -g_seed, dim=-1, eps=cfg.mdsm_cosine_eps).clamp(-1.0, 1.0)).mean()
+            try:
+                sigma_a = sample_sigma(cfg, q.shape[0], device)
+                seed_a = seed_actor(q, hard, sigma_a, cfg)
+                with autocast():
+                    nxt, delta = actor.predict_step(
+                        q,
+                        seed_a,
+                        sigma=sigma_a.detach(),
+                        step_size=cfg.actor_step_size,
+                        target_norm=cfg.langevin.target_norm,
+                        tangent_projection=cfg.actor_tangent_projection,
+                    )
+                    l_geo = (1.0 - F.cosine_similarity(nxt, pos, dim=-1).clamp(-1.0, 1.0)).mean()
+                    l_bc = F.mse_loss(nxt, pos) if cfg.use_bc else torch.tensor(0.0, device=device)
+                    if cfg.use_grad_align:
+                        with torch.enable_grad():
+                            _, g_seed = ef.energy_and_grad(q, seed_a, sigma=sigma_a.detach())
+                        l_align = (
+                            1.0
+                            - F.cosine_similarity(
+                                delta, -g_seed, dim=-1, eps=cfg.mdsm_cosine_eps
+                            ).clamp(-1.0, 1.0)
+                        ).mean()
+                    else:
+                        l_align = torch.tensor(0.0, device=device)
+                    l_bar = torch.tensor(0.0, device=device)
+                    if cfg.lambda_actor_barrier > 0:
+                        l_bar = F.softplus(
+                            ef(q, pos, sigma=sigma_a.detach()).detach()
+                            - ef(q, nxt, sigma=sigma_a.detach())
+                        ).mean()
+                    loss_a = (
+                        cfg.lambda_geo * l_geo
+                        + cfg.lambda_align * l_align
+                        + cfg.lambda_bc_reg * l_bc
+                        + cfg.lambda_actor_barrier * l_bar
+                    )
+                la = float(loss_a.detach().item())
+                if (
+                    (not math.isfinite(la))
+                    or (
+                        cfg.guard_loss_spikes
+                        and ema_a is not None
+                        and global_step >= cfg.loss_spike_warmup_steps
+                        and la > cfg.loss_spike_factor * max(ema_a, 1e-8)
+                    )
+                ):
+                    on_bad()
+                    continue
+                ema_a = la if ema_a is None else 0.98 * ema_a + 0.02 * la
+                opt_a.zero_grad(set_to_none=True)
+                if scaler.is_enabled():
+                    scaler.scale(loss_a).backward()
+                    scaler.unscale_(opt_a)
+                    sanitize_grads([actor_base])
+                    gn = clip_grads([actor_base], cfg.clip_grad_norm)
+                    if not torch.isfinite(gn):
+                        on_bad()
+                        scaler.update()
+                        continue
+                    scaler.step(opt_a)
+                    scaler.update()
                 else:
-                    l_align = torch.tensor(0.0, device=device)
-                l_bar = torch.tensor(0.0, device=device)
-                if cfg.lambda_actor_barrier > 0:
-                    l_bar = F.softplus(ef(q, pos, sigma=sigma_a.detach()).detach() - ef(q, nxt, sigma=sigma_a.detach())).mean()
-                loss_a = cfg.lambda_geo * l_geo + cfg.lambda_align * l_align + cfg.lambda_bc_reg * l_bc + cfg.lambda_actor_barrier * l_bar
-            la = float(loss_a.detach().item())
-            if (not math.isfinite(la)) or (cfg.guard_loss_spikes and ema_a is not None and global_step >= cfg.loss_spike_warmup_steps and la > cfg.loss_spike_factor * max(ema_a, 1e-8)):
-                on_bad(); continue
-            ema_a = la if ema_a is None else 0.98 * ema_a + 0.02 * la
-            opt_a.zero_grad(set_to_none=True)
-            if scaler.is_enabled():
-                scaler.scale(loss_a).backward(); scaler.unscale_(opt_a); sanitize_grads([actor]); gn = clip_grads([actor], cfg.clip_grad_norm)
-                if not torch.isfinite(gn): on_bad(); scaler.update(); continue
-                scaler.step(opt_a); scaler.update()
-            else:
-                loss_a.backward(); sanitize_grads([actor]); gn = clip_grads([actor], cfg.clip_grad_norm)
-                if not torch.isfinite(gn): on_bad(); continue
-                opt_a.step()
+                    loss_a.backward()
+                    sanitize_grads([actor_base])
+                    gn = clip_grads([actor_base], cfg.clip_grad_norm)
+                    if not torch.isfinite(gn):
+                        on_bad()
+                        continue
+                    opt_a.step()
+            except torch.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                on_bad()
+                continue
             n_ok += 1; global_step += 1; bad_streak = 0
             c_avg = c_loss_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["critic"] += c_avg; sums["actor"] += la; sums["loss"] += c_avg + la
+            sums["rank"] += rank_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["mdsm"] += mdsm_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["cql"] += cql_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["nce"] += nce_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["rank_success"] += rank_ok_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["rank_clean_lt_actor"] += rank_clean_actor_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["rank_actor_lt_hard"] += rank_actor_hard_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["rank_clean_lt_hard"] += rank_clean_hard_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["clean_viol"] += viol_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["retrieval_cosine"] += retrieval_cos
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
-                print(f"  [{bi+1}/{len(loader)}] loss={sums['loss']/n_ok:.4f} critic={sums['critic']/n_ok:.4f} actor={sums['actor']/n_ok:.4f} rank={sums['rank_success']/n_ok:.3f} viol={sums['clean_viol']/n_ok:.3f}")
+                print(
+                    f"  [{bi+1}/{len(loader)}] "
+                    f"loss={sums['loss']/n_ok:.4f} "
+                    f"critic={sums['critic']/n_ok:.4f} "
+                    f"actor={sums['actor']/n_ok:.4f} "
+                    f"rank_loss={sums['rank']/n_ok:.4f} "
+                    f"rank_success={sums['rank_success']/n_ok:.3f} "
+                    f"rank(c<a)={sums['rank_clean_lt_actor']/n_ok:.3f} "
+                    f"rank(a<h)={sums['rank_actor_lt_hard']/n_ok:.3f} "
+                    f"rank(c<h)={sums['rank_clean_lt_hard']/n_ok:.3f} "
+                    f"viol={sums['clean_viol']/n_ok:.3f}"
+                )
 
-        train = {k: (v / max(n_ok, 1)) for k, v in sums.items()}; train["skip_rate"] = n_skip / max(len(loader), 1)
-        eval_m = eval_model(ef, actor, ds_val, bank_va, bankn_va, cfg, device)
-        kill = summarize_conditional_eval(eval_m, th); eval_m["kill_criteria"] = kill; score = float(kill["score"])
-        print(f"Epoch {ep+1}: train={train['loss']:.4f} score={score:+.6f} strict_pass={kill['passed']} skip={train['skip_rate']:.2%} ({time.time()-t0:.1f}s)")
+        train = {k: (v / max(n_ok, 1)) for k, v in sums.items()}
+        train["skip_rate"] = n_skip / max(len(loader), 1)
+        do_eval = ((ep + 1) % max(1, cfg.eval_every_epochs) == 0) or (ep == cfg.num_epochs - 1)
+        if do_eval:
+            eval_m = eval_model(
+                ef,
+                actor,
+                ds_val,
+                bank_va,
+                bankn_va,
+                bankidx_va,
+                cfg,
+                device,
+                eval_ids=eval_ids,
+            )
+            kill = summarize_conditional_eval(eval_m, th)
+            eval_m["kill_criteria"] = kill
+            score = float(kill["score"])
+            print(
+                f"Epoch {ep+1}: train={train['loss']:.4f} score={score:+.6f} "
+                f"strict_pass={kill['passed']} skip={train['skip_rate']:.2%} ({time.time()-t0:.1f}s)"
+            )
+        else:
+            eval_m = {"status": "not_evaluated"}
+            kill = _not_evaluated_kill_stub()
+            score = None
+            print(
+                f"Epoch {ep+1}: train={train['loss']:.4f} "
+                f"skip={train['skip_rate']:.2%} eval=skipped ({time.time()-t0:.1f}s)"
+            )
+        is_new_best = bool(do_eval and score is not None and score > best_score)
+        if is_new_best:
+            best_score = score
+
         payload = {
             "epoch": ep, "global_step": global_step, "best_score": best_score,
-            "critic1_state": c1.state_dict(), "critic2_state": c2.state_dict(), "actor_state": actor.state_dict(),
-            "prior_state": prior.state_dict() if prior is not None else None,
+            "critic1_state": c1_base.state_dict(), "critic2_state": c2_base.state_dict(), "actor_state": actor_base.state_dict(),
+            "prior_state": prior_base.state_dict() if prior_base is not None else None,
             "opt_c_state": opt_c.state_dict(), "opt_a_state": opt_a.state_dict(), "scaler_state": scaler.state_dict(),
             "train_metrics": train, "eval_metrics": eval_m, "config": asdict(cfg),
         }
         torch.save(payload, ckpt_dir / f"epoch_{ep+1}.pt")
-        if score > best_score:
-            best_score = score; payload["best_score"] = best_score; torch.save(payload, ckpt_dir / "best.pt")
+        if is_new_best:
+            payload["best_score"] = best_score
+            torch.save(payload, ckpt_dir / "best.pt")
         with open(log_dir / "training_metrics.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps({"epoch": ep + 1, "score": score, "train_metrics": train, "kill_criteria": kill}) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "epoch": ep + 1,
+                        "score": score,
+                        "eval_ran": do_eval,
+                        "train_metrics": train,
+                        "kill_criteria": kill,
+                    }
+                )
+                + "\n"
+            )
 
-    final_eval = eval_model(ef, actor, ds_val, bank_va, bankn_va, cfg, device)
+    final_eval = eval_model(
+        ef,
+        actor,
+        ds_val,
+        bank_va,
+        bankn_va,
+        bankidx_va,
+        cfg,
+        device,
+        eval_ids=eval_ids,
+    )
     final_kill = summarize_conditional_eval(final_eval, th); final_eval["kill_criteria"] = final_kill
     torch.save(
         {
-            "critic1_state": c1.state_dict(), "critic2_state": c2.state_dict(), "actor_state": actor.state_dict(),
-            "prior_state": prior.state_dict() if prior is not None else None,
+            "critic1_state": c1_base.state_dict(), "critic2_state": c2_base.state_dict(), "actor_state": actor_base.state_dict(),
+            "prior_state": prior_base.state_dict() if prior_base is not None else None,
             "eval_metrics": final_eval, "config": asdict(cfg), "best_score": best_score,
         },
         ckpt_dir / "final.pt",

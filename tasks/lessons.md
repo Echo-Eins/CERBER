@@ -12,6 +12,18 @@ Before marking Stage1.5+ as "proposal/refinement":
 3) verify twin-critic aggregation is actually used in actor/inference paths,
 4) verify hard-retrieval negatives are part of critic loss, not only Gaussian OOD.
 
+## 2026-03-26 - Twin critic + MDSM on 8GB requires explicit memory budget
+
+### Pattern
+Runtime logs showed late-epoch CUDA OOM despite finite losses when both critics were trained in one second-order graph with Björck layers.
+
+### Rule
+For 8GB-class GPUs in Stage1.5:
+1) update critic branches sequentially (not both in the same MDSM graph),
+2) keep OOM-safe skip path (`empty_cache` + backoff),
+3) reduce default eval cadence/load (`eval_every_epochs`, sample count, Langevin eval steps),
+4) keep conservative baseline defaults (`batch_size`, `ortho_n_iters`, retrieval bank size) in config.
+
 ## 2026-03-23 - User requested repeated AGENTS reread and restart from scratch
 
 ### Pattern
@@ -341,3 +353,25 @@ Before marking any stage implementation as complete:
 2) verify that declared features are actually reachable in code paths,
 3) treat “py_compile passes” as syntax-only check, never as execution proof,
 4) record unresolved runtime blockers explicitly in `tasks/todo.md`.
+
+## 2026-03-26 - Stage1.5 telemetry labels must match actual metrics
+
+### Pattern
+Training console printed `rank=...`, but the value came from `rank_success`, not ranking loss.
+
+### Rule
+For every training metric:
+1) ensure the printed label matches the exact tensor/statistic being logged,
+2) if a metric has both loss and success-rate versions, print both with explicit names (`*_loss`, `*_success`),
+3) avoid overloaded short labels that can be interpreted as objective values.
+
+## 2026-03-26 - Fair checkpoint selection requires fixed eval subset
+
+### Pattern
+Sampling a new random eval subset each epoch adds score jitter and can select the wrong `best.pt`.
+
+### Rule
+For checkpoint scoring:
+1) freeze a deterministic eval index subset at run start (seeded generator),
+2) reuse the same subset for all periodic eval calls and final eval,
+3) explicitly log when eval is skipped and keep schema stable (`status=not_evaluated`).

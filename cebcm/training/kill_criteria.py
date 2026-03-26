@@ -60,9 +60,11 @@ def summarize_conditional_eval(
     keys = _noise_keys(eval_metrics)
     if not keys:
         return {
+            "status": "invalid_eval",
             "score": float("-inf"),
             "passed": False,
             "reason": "no noise_* entries",
+            "global_gates": {},
             "aggregate": {},
             "per_noise": {},
         }
@@ -79,7 +81,7 @@ def summarize_conditional_eval(
     for key in keys:
         m = eval_metrics.get(key, {})
         cos_imp = _safe_float(m.get("improvement"))
-        cos_success = _safe_float(m.get("success_rate"))
+        cos_success = _safe_float(m.get("cos_success_rate", m.get("success_rate")))
         geo_imp = _safe_float(m.get("geodesic_improvement"))
         l2_imp = _safe_float(m.get("l2_improvement"))
         energy_success = _safe_float(m.get("energy_success_rate"))
@@ -152,6 +154,7 @@ def summarize_conditional_eval(
     }
 
     return {
+        "status": "evaluated",
         "score": float(score),
         "passed": all(global_gates.values()),
         "global_gates": global_gates,
@@ -168,9 +171,11 @@ def summarize_unconditional_eval(
     keys = _noise_keys(eval_metrics)
     if not keys:
         return {
+            "status": "invalid_eval",
             "score": float("-inf"),
             "passed": False,
             "reason": "no noise_* entries",
+            "global_gates": {},
             "aggregate": {},
             "per_noise": {},
             "distribution_gates": {},
@@ -258,6 +263,7 @@ def summarize_unconditional_eval(
 
     passed = all(global_gates.values()) and all(dist_gates.values())
     return {
+        "status": "evaluated",
         "score": float(score),
         "passed": passed,
         "global_gates": global_gates,
@@ -271,4 +277,3 @@ def summarize_unconditional_eval(
         },
         "per_noise": per_noise,
     }
-

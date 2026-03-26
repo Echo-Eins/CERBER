@@ -830,3 +830,87 @@ Current Stage1.5 is now internally consistent and debuggable, but still not full
    - batchwise/hard negative conditioning,
    - support-aware trust region and retrieval-grounded metrics.
 3. Hybrid prior (`E_prior`) exists as optional branch and should remain auxiliary, not primary relevance signal.
+
+---
+
+## 15) Stage1.5 Completion Pass (Pass 13, 2026-03-26)
+
+### 15.1 Closed gaps
+
+1. `critic_steps_per_actor` now changes runtime behavior:
+   - real inner-loop critic updates (no forced fallback to 1).
+2. Teacher-forced setup removed:
+   - training now uses retrieval pairs `q -> v_pos` instead of `q == clean target`.
+3. Twin conditional critic implemented:
+   - separate `critic1`, `critic2`, with hybrid aggregation (`max`/`mean`) in actor/inference path.
+4. Retrieval-conditioned hard negatives implemented:
+   - positives from top-k neighbors with self-match exclusion,
+   - hard negatives sampled from deeper retrieval window.
+
+### 15.2 8GB VRAM stabilization changes
+
+1. Memory peak reduction:
+   - per-step update of a single critic branch (alternating c1/c2) instead of one joint second-order graph for both.
+2. OOM guard:
+   - `torch.OutOfMemoryError` catch + `torch.cuda.empty_cache()` + bad-batch skip/backoff path.
+3. Safer defaults:
+   - `batch_size=32`,
+   - `ortho_n_iters=4`,
+   - reduced eval load (`eval_num_samples=64`, shorter eval Langevin rollout).
+
+### 15.3 Performance interpretation
+
+- Long epoch time in logs is expected under:
+  - second-order MDSM (`create_graph=True`),
+  - orthonormal layers with Björck iterations,
+  - twin critics + retrieval sampling + per-epoch evaluation.
+- Runtime is compute-bound and memory-sensitive on 8GB GPUs; stabilization changes above are necessary baseline.
+
+---
+
+## 16) Stage1.5 Math Upgrades (Pass 14, 2026-03-26)
+
+### 16.1 Implemented
+
+1. Smooth twin critic aggregation:
+   - added `softmax` aggregate (`tau * logsumexp(E_i/tau)`) with temperature control.
+   - avoids non-smooth gradient switching of hard `max`.
+2. Conditional NCE objective:
+   - added InfoNCE-style loss over `(positive, hard negative, random negatives)` per query.
+   - integrated as additive critic term (`lambda_nce`), with optional prior-NCE (`lambda_prior_nce`).
+3. Strict retrieval self-exclusion:
+   - positive/hard candidate selection can exclude exact same sample by index, not just cosine threshold.
+4. Tangent-noise Langevin:
+   - added optional tangent projection for stochastic noise in overdamped/PID/underdamped updates.
+   - exposed through `run_langevin(..., tangent_noise=...)` and Stage1.5 config.
+
+### 16.2 Rationale
+
+- Smooth aggregator improves gradient continuity for actor alignment and Langevin refinement.
+- NCE complements hinge ranking by calibrating relative energies over small candidate sets.
+- Index-level self-exclusion prevents trivial retrieval leakage.
+- Tangent-noise keeps stochastic exploration closer to sphere geometry assumptions.
+
+## 2026-03-26 Stage1.5 optimization re-audit (post-modification)
+
+Primary bottlenecks confirmed:
+1. Bjork orthonormalization in-forward remains dominant compute/memory cost under second-order MDSM.
+2. Actor using orthonorm multiplies overhead; critic and actor can be decoupled by norm mode.
+3. Retrieval path had Python `.item()` synchronization pressure; vectorization is next high-impact step.
+4. Eval jitter from changing sample subset can bias checkpoint selection (now fixed via deterministic eval subset).
+
+External references checked:
+- CVPR 2024 benchmark comparing 1-Lipschitz layers and practical guidelines:  
+  https://openaccess.thecvf.com/content/CVPR2024/papers/Prach_1-Lipschitz_Layers_Compared_Memory_Speed_and_Certifiable_Robustness_CVPR_2024_paper.pdf
+- PyTorch orthogonal parametrization docs (`matrix_exp` / `cayley` / `householder` tradeoffs):  
+  https://docs.pytorch.org/docs/stable/generated/torch.nn.utils.parametrizations.orthogonal.html
+- PyTorch `torch.compile` troubleshooting for graph-break profiling and selective disable:  
+  https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler_troubleshooting.html
+- PyTorch CUDA memory-management environment knobs (`PYTORCH_CUDA_ALLOC_CONF`):  
+  https://docs.pytorch.org/docs/stable/notes/cuda.html#memory-management
+
+Actionable next optimization queue:
+- Introduce Stage1.5 orthonorm schedule (`4->2->1`) with strict eval gates.
+- Add actor-specific norm mode (`spectral_norm`) while keeping critic orthonorm.
+- Vectorize retrieval hard/positive selection to remove Python-side sync loops.
+- Batch eval Langevin path to reduce validation overhead.

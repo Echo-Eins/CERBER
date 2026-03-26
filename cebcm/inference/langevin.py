@@ -107,6 +107,7 @@ def langevin_dynamics(
     noise_scale: float = 0.003,
     max_steps: int = 100,
     target_norm: float | None = None,
+    tangent_noise: bool = False,
     momentum_beta: float = 0.0,
     energy_threshold: float | None = None,
     plateau_patience: int = 10,
@@ -191,6 +192,8 @@ def langevin_dynamics(
 
         # Langevin step
         langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
+        if tangent_noise and target_norm is not None:
+            langevin_noise = _tangent_projection(langevin_noise, v_current)
         v_current = v_current - lr * update + langevin_noise
 
         # OOD projection
@@ -226,6 +229,7 @@ def pid_langevin_dynamics(
     noise_scale: float = 0.003,
     max_steps: int = 100,
     target_norm: float | None = None,
+    tangent_noise: bool = False,
     energy_threshold: float | None = None,
     plateau_patience: int = 10,
     plateau_delta: float = 1e-4,
@@ -343,6 +347,8 @@ def pid_langevin_dynamics(
 
         # Langevin step with PID-controlled gradient
         langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
+        if tangent_noise and target_norm is not None:
+            langevin_noise = _tangent_projection(langevin_noise, v_current)
         v_current = v_current - lr * update + langevin_noise
 
         # OOD projection
@@ -378,6 +384,7 @@ def underdamped_langevin_dynamics(
     noise_scale: float = 0.003,
     max_steps: int = 100,
     target_norm: float | None = None,
+    tangent_noise: bool = False,
     energy_threshold: float | None = None,
     plateau_patience: int = 10,
     plateau_delta: float = 1e-4,
@@ -474,6 +481,8 @@ def underdamped_langevin_dynamics(
         thermal_noise = torch.randn_like(v_current) * (
             2 * friction * lr * noise_scale / mass
         ) ** 0.5
+        if tangent_noise and target_norm is not None:
+            thermal_noise = _tangent_projection(thermal_noise, v_current)
         momentum = (1.0 - friction) * momentum - lr * grad + thermal_noise
 
         # Position update: V_{t+1} = V_t + (η/m)·p_{t+1}
@@ -524,6 +533,7 @@ def run_langevin(
     noise_scale: float = 0.003,
     max_steps: int = 100,
     target_norm: float | None = None,
+    tangent_noise: bool = False,
     energy_threshold: float | None = None,
     plateau_patience: int = 10,
     plateau_delta: float = 1e-4,
@@ -549,7 +559,7 @@ def run_langevin(
     common = dict(
         energy_fn=energy_fn, v_query=v_query, v_init=v_init,
         lr=lr, noise_scale=noise_scale, max_steps=max_steps,
-        target_norm=target_norm, energy_threshold=energy_threshold,
+        target_norm=target_norm, tangent_noise=tangent_noise, energy_threshold=energy_threshold,
         plateau_patience=plateau_patience, plateau_delta=plateau_delta,
         v_target=v_target,
         track_vectors=track_vectors,

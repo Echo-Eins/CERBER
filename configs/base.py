@@ -230,8 +230,12 @@ class Stage1_5Config:
     actor_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
     norm_mode: str = "orthonorm"
     activation: str = "groupsort"
-    ortho_n_iters: int = 8
-    twin_aggregate: str = "max"  # "max" (conservative) or "mean"
+    ortho_n_iters: int = 4
+    ortho_schedule_enabled: bool = True
+    ortho_schedule_iters: list[int] = field(default_factory=lambda: [4, 2, 1])
+    ortho_schedule_boundaries: list[float] = field(default_factory=lambda: [0.34, 0.67])
+    twin_aggregate: str = "softmax"  # "max", "mean", or "softmax"
+    twin_softmax_temperature: float = 0.10
 
     # Optimizer
     critic_lr: float = 1e-4
@@ -239,29 +243,35 @@ class Stage1_5Config:
     prior_critic_lr: float = 1e-4
     weight_decay: float = 0.01
     clip_grad_norm: float = 1.0
-    critic_steps_per_actor: int = 1
+    critic_steps_per_actor: int = 2
 
     # Loss weights
     lambda_mdsm: float = 1.0
     lambda_rank: float = 0.25
+    lambda_nce: float = 0.10
     lambda_cql: float = 0.1
     lambda_shell: float = 0.1
     lambda_geo: float = 1.0
     lambda_align: float = 0.1
     lambda_bc_reg: float = 0.5
     lambda_prior: float = 0.1
+    lambda_prior_nce: float = 0.05
     lambda_actor_barrier: float = 0.1
 
     # Feature flags
     use_cql: bool = True
+    use_nce: bool = True
     use_bc: bool = True
     use_grad_align: bool = True
     use_prior_critic: bool = False
+    use_prior_nce: bool = False
     use_gradient_penalty: bool = False
     use_shell_barrier: bool = False
 
     # Regularization params
     cql_noise_scale: float = 0.5
+    nce_temperature: float = 0.07
+    nce_num_random_negatives: int = 4
     gradient_penalty_lambda: float = 0.05
     shell_barrier_margin: float = 0.1
 
@@ -280,6 +290,7 @@ class Stage1_5Config:
     mdsm_cosine_eps: float = 1e-6
     mdsm_norm_floor: float = 1e-6
     mdsm_force_fp32: bool = True
+    mdsm_gradient_checkpointing: bool = True
 
     # Ranking margins
     critic_margin_clean_actor: float = 0.5
@@ -293,26 +304,33 @@ class Stage1_5Config:
     actor_seed_noise_scale: float = 1.0
     actor_eval_steps: int = 1
     critic_eval_langevin_steps: int = 20
+    eval_langevin_batch_size: int = 16
     eval_noise_scales: list[float] = field(default_factory=lambda: [0.05, 0.1, 0.2, 0.3])
 
     # Retrieval conditioning
-    retrieval_bank_size: int = 4096
+    retrieval_bank_size: int = 2048
     retrieval_topk_pos: int = 8
     retrieval_hard_start: int = 8
     retrieval_hard_end: int = 32
     retrieval_self_sim_exclude: float = 0.9995
+    retrieval_strict_index_exclusion: bool = True
 
     # AMP
     amp_enabled: bool = True
     amp_dtype: str = "bf16"
+    enable_compile: bool = False
+    compile_mode: str = "reduce-overhead"
+    compile_fullgraph: bool = False
 
     # Training
     seed: int = 42
     num_epochs: int = 50
-    batch_size: int = 64
+    batch_size: int = 32
     num_workers: int = 4
     log_every: int = 50
-    eval_num_samples: int = 256
+    eval_num_samples: int = 64
+    eval_every_epochs: int = 2
+    langevin_tangent_noise: bool = True
 
     # Kill criteria thresholds
     min_cosine_improvement: float = 0.05
@@ -331,6 +349,7 @@ class Stage1_5Config:
     guard_loss_spikes: bool = True
     loss_spike_factor: float = 20.0
     loss_spike_warmup_steps: int = 25
+    param_finite_check_interval: int = 50
 
     # Paths
     train_data_path: str = "data/wikitext_sonar_10k.pt"

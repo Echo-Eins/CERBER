@@ -804,13 +804,82 @@ Close remaining Stage1.5 architectural gaps identified by user:
 - implement full twin-critic conditional training with retrieval/hard-negative conditioning.
 
 ## Checklist
-- [ ] Implement non-teacher-forced pair sampling in Stage1.5 (query/positive from retrieval protocol)
-- [ ] Implement retrieval-conditioned hard negatives for critic ranking loss
-- [ ] Implement actual twin conditional critics in Stage1.5 (`E1_cond`, `E2_cond`) plus optional prior
-- [ ] Implement real alternating schedule `critic_steps_per_actor`
-- [ ] Align actor/refinement update with twin hybrid energy and verify sign consistency (`v <- v - lr * ∇E`)
-- [ ] Add explicit Stage1.5 metrics for retrieval/ranking quality and clean-min violations
-- [ ] Update Stage1.5 config schema/json for new retrieval+twin parameters
-- [ ] Run static validation (`py_compile`) for all changed files
-- [ ] Update `research3.md` and `tasks/lessons.md` with findings and anti-regression rules
+- [x] Implement non-teacher-forced pair sampling in Stage1.5 (query/positive from retrieval protocol)
+- [x] Implement retrieval-conditioned hard negatives for critic ranking loss
+- [x] Implement actual twin conditional critics in Stage1.5 (`E1_cond`, `E2_cond`) plus optional prior
+- [x] Implement real alternating schedule `critic_steps_per_actor`
+- [x] Align actor/refinement update with twin hybrid energy and verify sign consistency (`v <- v - lr * grad(E)`)
+- [x] Add explicit Stage1.5 metrics for retrieval/ranking quality and clean-min violations
+- [x] Update Stage1.5 config schema/json for new retrieval+twin parameters
+- [x] Run static validation (`py_compile`) for all changed files
+- [x] Update `research3.md` and `tasks/lessons.md` with findings and anti-regression rules
 
+## Review
+- Stage1.5 training is now non-teacher-forced:
+  - query `q` and target positive `v_pos` are sampled via retrieval (`retrieve_pos_hard`) from a manifold bank.
+- Critic is now truly twin:
+  - separate `critic1` / `critic2` checkpoints,
+  - hybrid inference energy via `max/mean` aggregation (`twin_aggregate`).
+- `critic_steps_per_actor` now changes runtime behavior:
+  - critic updates run in a real inner loop, alternating critic branches.
+- Added retrieval/hard-negative conditioning:
+  - positives from top-k retrieval excluding near-identical self-match,
+  - hard negatives from deeper retrieval window.
+- Added 8GB-safe stabilization:
+  - per-critic update (not both critics in one second-order graph),
+  - OOM catch + `torch.cuda.empty_cache()` skip path,
+  - lighter default config (`batch_size=32`, `ortho_n_iters=4`, reduced eval load).
+- Added math-forward upgrades:
+  - smooth twin critic aggregation (`twin_aggregate=softmax`, temperature-controlled),
+  - conditional NCE loss for retrieval ranking plus optional prior-NCE branch,
+  - strict retrieval self-exclusion by sample index (not only cosine threshold),
+  - tangent-noise Langevin option (`langevin_tangent_noise=true`) for sphere-consistent stochastic steps.
+
+
+
+## Stage1.5 Post-change Audit (2026-03-26)
+
+### Checklist
+- [x] Re-validated Stage1.5 sign consistency (MDSM target, Langevin descent, ranking inequalities, actor alignment)
+- [x] Fixed misleading training telemetry labels (`rank` -> explicit `rank_loss` + `rank_success`)
+- [x] Added per-inequality ranking rates (`clean<actor`, `actor<hard`, `clean<hard`)
+- [x] Added deterministic eval subset reuse for fair checkpoint selection
+- [x] Stabilized no-eval epoch logging schema with `status=not_evaluated`
+- [x] Added numerical sanitization in Stage1.5 `conditional_mdsm`
+- [x] Reduced parameter finite-check overhead (interval-based)
+- [x] Synced Stage1.5 README with actual pipeline/config/checkpoint keys
+- [x] Added minimal Stage1.5 regression tests (`tests/test_stage1_5_integrity.py`)
+
+### Review
+- Fixed correctness gaps in reporting and checkpoint-scoring fairness without changing core objective semantics.
+- Runtime verification is still blocked in this shell due missing `torch/pytest`; static compile checks pass.
+
+---
+
+# Stage1.5 Performance + Math Safety Pass (2026-03-26, Pass 14)
+
+## Goal
+Implement requested SOTA-safe acceleration for Stage1.5 without changing optimization direction:
+- cheaper orthonorm path,
+- batched eval Langevin,
+- `torch.compile` + checkpointing on heavy second-order graph,
+- optional vectorized retrieval.
+
+## Checklist
+- [x] Add Stage1.5 config/runtime knobs for orthonorm schedule, compile, checkpointing, and batched eval
+- [x] Implement epoch-based orthonorm iteration schedule and log active `n_iters`
+- [x] Implement batched eval Langevin with mathematically-safe fixed-step semantics
+- [x] Add optional `torch.compile` wrappers with runtime-safe fallback (no key/ckpt breakage)
+- [x] Add gradient checkpointing in create_graph path (`conditional_mdsm`)
+- [x] Vectorize `retrieve_pos_hard` while preserving strict index exclusion behavior
+- [x] Add/update integrity tests for schema/math-sensitive changes
+- [x] Run `py_compile` and summarize expected perf/quality impact + risks
+
+## Review
+- Added opt-in compile path (`enable_compile`) with safe fallback to eager mode.
+- Added Stage1.5 orthonorm schedule controls and per-epoch `n_iters` logging.
+- Added batched eval Langevin path with fixed-step semantics (no batch-coupled early stop).
+- Added gradient checkpointing knob for MDSM create-graph path.
+- Vectorized retrieval positive/hard selection without relaxing strict index exclusion.
+- Updated tests for ortho schedule and schedule validation contract.
+- Validation: `python -m py_compile` passed for changed Stage1.5 files and tests.

@@ -38,11 +38,15 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Mitigate allocator fragmentation on 8GB-class GPUs unless user overrides.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}"
+
 echo "==================================="
 echo "  Stage 1.5 Training"
 echo "==================================="
 echo "Config: $CONFIG"
 echo "Resume: ${RESUME:-None}"
+echo "PYTORCH_CUDA_ALLOC_CONF: $PYTORCH_CUDA_ALLOC_CONF"
 echo ""
 
 if [ -n "$RESUME" ]; then

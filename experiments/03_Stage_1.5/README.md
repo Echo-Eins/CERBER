@@ -1,149 +1,74 @@
-# Stage 1.5: Hybrid Actor-Critic with SOTA Stabilization
+# Stage 1.5: Hybrid Actor + Twin Critic
 
-## Overview
+## What this stage trains
 
-Stage 1.5 implements the fixed actor-critic training pipeline with all P0-P2 corrections from research3.md.
+Stage 1.5 trains:
+- conditional **twin critics** `E(q, v)` with MDSM + ranking (+ optional NCE/CQL/prior terms),
+- a proposal/refinement **actor** that predicts a latent update,
+- optional short-run Langevin refinement during eval.
 
-**Key fixes:**
-- ✅ Removed `actor_energy_loss` contradiction (P0)
-- ✅ Added MDSM to critic for gradient validity (P0)
-- ✅ Hybrid critic: E_cond(q,v) + λ*E_prior(v) (P1)
-- ✅ Alternating training: 2 critic steps : 1 actor step (P1)
-- ✅ CQL regularization for OOD prevention (P2)
-- ✅ BC regularization for embedding anchor (P2)
-- ✅ Gradient penalty for smooth landscape (P2)
-- ✅ Shell barrier for norm control (P2)
-- ✅ Comprehensive metrics telemetry (P3)
+Current train script:
+- `experiments/01_denoising_poc/train_stage1_5.py`
 
-## Directory Structure
-
-```
-experiments/03_Stage_1.5/
-├── README.md              # This file
-├── checkpoints/           # Saved model checkpoints
-│   ├── checkpoint_epoch_1.pt
-│   ├── checkpoint_epoch_2.pt
-│   ├── ...
-│   └── best.pt            # Best checkpoint by composite score
-├── logs/                  # Training logs
-│   ├── training_metrics.jsonl    # Per-epoch metrics (JSONL)
-│   └── training_summary.json     # Final summary
-└── (runtime artifacts)
-```
-
-## Usage
-
-### Start New Training
+## Run
 
 ```bash
-python experiments/01_denoising_poc/train_stage1_5.py \
-  --config configs/stage1_5_config.json
+bash experiments/03_Stage_1.5/run.sh
 ```
 
-### Resume from Checkpoint
+Resume:
 
 ```bash
-python experiments/01_denoising_poc/train_stage1_5.py \
-  --config configs/stage1_5_config.json \
-  --resume experiments/03_Stage_1.5/checkpoints/checkpoint_epoch_10.pt
+bash experiments/03_Stage_1.5/run.sh --resume experiments/03_Stage_1.5/checkpoints/epoch_10.pt
 ```
 
-## Configuration
+## Current default profile (from `configs/stage1_5_config.json`)
 
-Edit `configs/stage1_5_config.json` for hyperparameters:
+- `batch_size = 32`
+- `critic_steps_per_actor = 2`
+- `norm_mode = orthonorm`, `ortho_n_iters = 4`
+- `ortho_schedule_enabled = true`, `ortho_schedule_iters = [4,2,1]`
+- `twin_aggregate = softmax`, `twin_softmax_temperature = 0.10`
+- `retrieval_bank_size = 2048`
+- `eval_every_epochs = 2`, `eval_num_samples = 64`
+- `critic_eval_langevin_steps = 10`
+- `eval_langevin_batch_size = 16`
+- `mdsm_gradient_checkpointing = true`
+- `enable_compile = false` (opt-in)
+- `param_finite_check_interval = 50`
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num_epochs` | 50 | Training epochs |
-| `batch_size` | 64 | Batch size |
-| `critic_lr` | 1e-4 | Critic learning rate |
-| `actor_lr` | 5e-5 | Actor learning rate |
-| `critic_steps_per_actor` | 2 | Alternating ratio |
-| `lambda_mdsm` | 1.0 | MDSM loss weight |
-| `lambda_rank` | 0.25 | Ranking loss weight |
-| `lambda_cql` | 0.1 | CQL regularization weight |
-| `use_cql` | true | Enable CQL |
-| `use_gradient_penalty` | false | Enable gradient penalty |
-| `use_shell_barrier` | false | Enable shell barrier |
+## Logging semantics
 
-## Composite Score
+Console training line now reports:
+- `rank_loss`: hinge ranking objective value,
+- `rank_success`: joint ordering success `E(clean) < E(actor) < E(hard)`,
+- `rank(c<a)`, `rank(a<h)`, `rank(c<h)`: per-inequality pass rates,
+- `viol`: clean-minimum violation rate (`E(actor) < E(clean)`).
 
-Checkpoints are selected by composite score:
+Per-epoch metrics are stored in:
+- `experiments/03_Stage_1.5/logs/training_metrics.jsonl`
+- `experiments/03_Stage_1.5/logs/training_summary.json`
 
-```python
-composite_score = (
-    cosine_improvement * 0.4 +          # Primary semantic metric
-    geodesic_improvement * 0.3 +        # Geometry-aware metric
-    clean_min_violation_gate * 0.2 +    # 1.0 if violation < 5%
-    energy_success_rate * 0.1           # Energy descent rate
-)
-```
+Schema note:
+- epochs with skipped eval (`eval_every_epochs`) write:
+  - `"eval_ran": false`
+  - `"kill_criteria": {"status": "not_evaluated", ...}`
 
-## Kill Criteria
+## Kill criteria and best checkpoint
 
-Training stops automatically if:
-- `cosine_improvement < 0.05`
-- `energy_success_rate < 0.5`
-- `clean_min_violation_rate > 0.1`
-- `geodesic_improvement < 0.01`
+Source of truth:
+- `cebcm/training/kill_criteria.py`
 
-## Metrics Tracked
+`best.pt` is selected by composite score **only on epochs where eval actually ran**.
 
-Per-epoch metrics (saved to `logs/training_metrics.jsonl`):
+Important:
+- kill criteria are strict quality gates for evaluation/reporting and checkpoint scoring,
+- they do **not** hard-stop the training loop automatically at the moment.
 
-**Losses:**
-- `critic_loss`, `actor_loss`
-- `mdsm_loss`, `ranking_loss`, `cql_loss`
-- `gp_loss` (gradient penalty), `shell_loss`
-- `bc_loss` (behavior cloning)
+## Checkpoint keys
 
-**Energy Statistics:**
-- `e_clean_mean`, `e_actor_mean`, `e_noisy_mean`
-- `critic_gap_clean_actor`, `critic_gap_clean_noisy`
-
-**Stability Metrics:**
-- `clean_min_violation_rate`
-- `grad_norm_mean`, `grad_norm_max`
-
-## What Stage 1.5 Does
-
-Stage 1.5 is an **improved denoising autoencoder** for SONAR embeddings:
-
-**Input:** Noisy embedding `v_noisy`
-**Output:** Refined embedding `v_clean`
-
-**Capabilities:**
-- ✅ Denoising: Restore corrupted vectors
-- ✅ Quality scoring: E(q, v) for ranking candidates
-- ✅ Gradient-based refinement via Langevin dynamics
-- ✅ OOD detection via CQL + shell barrier
-
-**NOT Capabilities:**
-- ❌ Autoregressive generation
-- ❌ Sequence modeling
-- ❌ New vector synthesis from scratch
-
-For autoregressive capabilities, Stage 2 (IPP + Chain Head) is required.
-
-## References
-
-- research3.md: Full audit and design rationale
-- tasks/todo.md: Implementation checklist
-- CEBCM_Technical_Specification.md: Full architecture spec
-
-## Checkpoint Format
-
-```python
-checkpoint = {
-    "epoch": int,
-    "global_step": int,
-    "critic": state_dict,
-    "actor": state_dict,
-    "optimizer": state_dict,
-    "scaler": state_dict,
-    "config": dataclass_dict,
-    "train_metrics": dict,
-    "eval_metrics": dict,
-    "composite_score": float,
-}
-```
+Stage 1.5 checkpoints store:
+- `critic1_state`, `critic2_state`, `actor_state`
+- optional `prior_state`
+- `opt_c_state`, `opt_a_state`, `scaler_state`
+- `train_metrics`, `eval_metrics`, `best_score`, `config`
