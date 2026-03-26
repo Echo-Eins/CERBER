@@ -225,3 +225,95 @@ For Stage1/Stage2 training verdicts:
    - conditional models: angular/geodesic + L2 + energy + clean-min violation gates,
    - unconditional models: energy descent + distribution/manifold gates (MMD/C2ST/PRDC),
 3) select `best.pt` by composite score aligned to objective, not by paired cosine alone.
+
+## 2026-03-25 - Actor-Critic objective alignment is critical (P0)
+
+### Pattern
+In `actor_critic` training, critic ranking loss (`E(clean) < E(actor)`) was combined with actor energy loss minimizing `softplus(e_actor - e_clean)` which pushes `E(actor) < E(clean)`. These gradients fight by construction, producing:
+- Low energy but worse cosine
+- "Improved" L2 but degraded manifold quality
+- Sub-clean attractors in energy landscape
+
+### Rule
+For actor-critic architectures:
+1) verify objective alignment before training: critic and actor must agree on energy ordering,
+2) if critic ranks `E(clean) < E(actor)`, actor must NOT minimize `E(actor) - E(clean)`,
+3) alternative: actor learns from final-state geometry (cosine/geodesic) + gradient alignment with `-∇E`,
+4) always verify clean-min violation rate during eval as sanity check.
+
+## 2026-03-25 - Unconditional sampler semantics must be unified
+
+### Pattern
+Different Langevin implementations used incompatible noise parameterizations:
+- Path A: `noise = randn * noise_scale` + `sqrt(2*lr)*noise` → std = `sqrt(2*lr) * noise_scale`
+- Path B: `noise = randn * sqrt(2*lr*noise_scale)` → std = `sqrt(2*lr*noise_scale)`
+
+These differ by factor of `sqrt(noise_scale)` and can cause order-of-magnitude mismatches.
+
+### Rule
+For Langevin dynamics across codebase:
+1) one canonical sampler backend (shared `cebcm/inference/langevin.py`),
+2) single noise parameterization with explicit documentation,
+3) verify train/eval/GUI produce identical trajectories with same seed,
+4) never duplicate sampler logic; always re-export from central module.
+
+## 2026-03-25 - Unconditional checkpoint selection requires manifold metrics
+
+### Pattern
+Selecting `best.pt` for unconditional `E(x)` by paired cosine improvement (denoising task) is category error:
+- Unconditional model learns data distribution, not pairwise denoising
+- Cosine to clean is diagnostic, not primary objective
+- Checkpoint selection systematically picks wrong models
+
+### Rule
+For unconditional energy model checkpointing:
+1) primary metric: energy descent success rate across noise scales,
+2) distribution metrics: MMD, C2ST, PRDC (precision/recall/density/coverage),
+3) manifold metrics: kNN proximity, shell deviation,
+4) composite score for `best.pt` selection weighted toward manifold quality,
+5) paired cosine only as secondary diagnostic.
+
+## 2026-03-25 - Endpoint semantics must be consistent (v_last vs v_best)
+
+### Pattern
+Training evaluation used `v_final` (best-energy state) while live diagnostics used trajectory endpoint. This caused:
+- Metric drift between train and eval
+- Confusing "improvement=0" reports while trajectory clearly moved
+- False-negative training verdicts
+
+### Rule
+For sampler result propagation:
+1) `v_last` = actually reached terminal state (default for user-facing metrics),
+2) `v_best` = best-energy state along trajectory (analytical metric only),
+3) never mix semantics across reporting paths,
+4) explicitly label which endpoint is used in each context.
+
+## 2026-03-25 - Hybrid critic architecture (conditional + prior)
+
+### Pattern
+Pure conditional critic `E(q, x)` can learn relevance but lacks manifold awareness. Pure unconditional `E(x)` knows manifold but not query relevance. Using either alone leads to:
+- Conditional: low energy but OOD drift
+- Unconditional: good manifold but no query conditioning
+
+### Rule
+For robust Stage2/3 architecture:
+1) hybrid energy: `E_total(q, x) = E_cond(q, x) + lambda_prior * E_prior(x)`,
+2) train conditional as main relevance signal,
+3) train unconditional as auxiliary manifold prior / OOD barrier,
+4) actor proposes within support constraints,
+5) short-run refinement uses combined gradient field.
+
+## 2026-03-25 - Persistent contrastive term required for manifold calibration
+
+### Pattern
+NCE warmstart-then-EM-only training produced weaker manifold density calibration. Persistent equilibrium shaping (keeping contrastive term active during main phase) is required for:
+- Proper mode weighting
+- OOD penalty during training
+- Stable MCMC chain behavior
+
+### Rule
+For unconditional energy training:
+1) keep NCE/contrastive term active during main EM phase (not warmstart-only),
+2) maintain persistent MCMC chains across batches (short-run MCMC),
+3) add negative buffer replay for hard negatives,
+4) monitor PRDC/C2ST as primary manifold quality indicators.

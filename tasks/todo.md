@@ -616,3 +616,124 @@ Eliminate false-positive training verdicts by replacing weak single-metric pass 
 - Static validation passed:
   - `python -m py_compile cebcm/training/kill_criteria.py experiments/01_denoising_poc/train.py experiments/01_denoising_poc/evaluate.py experiments/02_energy_matching/train.py experiments/02_energy_matching/evaluate.py`
 
+---
+
+# Stage1 Pipeline Daborations (2026-03-25, Pass 10)
+
+## Goal
+Implement concrete improvements from `research3.md` audit to fix P0 contradictions and add missing regularizations/manifold controls.
+
+## Priority Matrix
+
+### P0 — Critical Correctness (blocker for Stage2/3)
+
+- [ ] **Fix actor_critic objective contradiction**
+  - Files: `experiments/01_denoising_poc/train.py`
+  - Issue: Critic requires `E(clean) < E(actor)` but actor minimizes `softplus(e_actor - e_clean)` → `E(actor) < E(clean)`
+  - Fix: Remove or flip actor energy coupling to match critic ranking
+  - Test: Verify clean-min violation rate drops, cosine improves
+
+- [ ] **Unify unconditional Langevin noise semantics**
+  - Files: `cebcm/inference/langevin.py`, `cebcm/training/energy_matching.py`, `cebcm/models/energy_unconditional.py`
+  - Issue: Different paths use `noise_scale` vs `sqrt(2*lr*noise_scale)` parameterizations
+  - Fix: Single shared parameterization, one canonical sampler backend
+  - Test: Train/eval/GUI produce identical trajectories with same seed
+
+- [ ] **Fix unconditional checkpoint selection criterion**
+  - Files: `experiments/02_energy_matching/train.py`
+  - Issue: `best.pt` selected by paired cosine improvement (wrong for E(x))
+  - Fix: Use manifold composite score (energy descent + PRDC + C2ST + kNN)
+  - Test: Selected checkpoints show better manifold metrics
+
+- [ ] **Unify endpoint semantics (v_last vs v_final)**
+  - Files: `experiments/01_denoising_poc/train.py` eval path
+  - Issue: Training eval uses `v_final` (best-energy) instead of `v_last` (reached state)
+  - Fix: Default to `v_last` for user-facing metrics, keep `v_best` for analysis
+  - Test: Metrics align with live GUI/diagnostics behavior
+
+### P1 — Objective Alignment
+
+- [ ] **Add gradient penalty to critic loss**
+  - Files: `cebcm/training/losses.py`
+  - Purpose: Smooth energy landscape, prevent sharp minima
+  - Implementation: `gradient_penalty()` function, add to MDSM loss
+
+- [ ] **Add persistent contrastive term to unconditional**
+  - Files: `cebcm/training/negative_buffer.py`, `experiments/02_energy_matching/train.py`
+  - Issue: NCE only in warmstart, not main EM phase
+  - Fix: Keep NCE active during main training with persistent chains
+  - Test: PRDC/C2ST metrics improve vs warmstart-only baseline
+
+- [ ] **Add final-state geometry loss for actor**
+  - Files: `experiments/01_denoising_poc/train.py`
+  - Purpose: Actor optimized for final projected state, not just delta
+  - Implementation: Cosine/geodesic on `v_refined`, gradient alignment with `-∇E`
+
+- [ ] **Add OOD/manifold penalties**
+  - Files: `cebcm/training/losses.py`
+  - Functions: `manifold_proximity_penalty()`, `shell_barrier_penalty()`
+  - Test: OOD rate decreases, kNN proximity improves
+
+### P2 — Stability and Monitoring
+
+- [ ] **Add energy calibration layer**
+  - Files: `cebcm/models/energy_unconditional.py`
+  - Purpose: Normalize energy output to [0, 1] via running statistics
+  - Implementation: `EnergyCalibrator` module with EMA
+
+- [ ] **Add gradient clipping and EMA**
+  - Files: `experiments/01_denoising_poc/train.py`
+  - Implementation: `clip_grad_norm_()`, EMA weight wrapper
+  - Test: Training stability improves, late-training generalization better
+
+- [ ] **Add convergence detection for Langevin**
+  - Files: `cebcm/inference/langevin.py`
+  - Purpose: Early stopping when energy plateaus
+  - Implementation: `converged`, `convergence_step` in `LangevinResult`
+
+- [ ] **Add comprehensive metrics telemetry**
+  - Files: `experiments/01_denoising_poc/train.py`, `experiments/02_energy_matching/train.py`
+  - Track: energy stats, gradient norms, Langevin convergence, manifold quality, OOD rate
+
+### P3 — Architecture Enhancements
+
+- [ ] **Add manifold-aware Langevin dynamics**
+  - Files: `cebcm/inference/langevin.py` (new function)
+  - Purpose: Tangent space projection for hypersphere geometry
+  - Implementation: `manifold_langevin_step()` with tangent gradient + noise
+
+- [ ] **Add spectral normalization to energy network**
+  - Files: `cebcm/models/energy.py`, `cebcm/models/energy_unconditional.py`
+  - Purpose: Enforce 1-Lipschitz constraint, stabilize gradients
+  - Implementation: Spectral norm on OrthoLinear weights
+
+- [ ] **Implement hybrid critic (conditional + prior)**
+  - Files: `experiments/01_denoising_poc/train.py`
+  - Formula: `E_total(q, x) = E_cond(q, x) + lambda_prior * E_prior(x)`
+  - Test: OOD drift reduces without hurting relevance metrics
+
+## Experiment Matrix
+
+| ID | Change | Expected Impact | Validation |
+|----|--------|-----------------|------------|
+| AC-1 | Remove actor energy term | Fix P0 contradiction | Clean-min violation ↓ |
+| AC-2 | Add MDSM to critic | Gradient field quality | Langevin stability ↑ |
+| AC-3 | Final-state geodesic loss | Cosine/geodesic ↑ | kNN proximity ↑ |
+| U-1 | Unify sampler semantics | Train/eval parity | Trajectory match |
+| U-2 | Manifold checkpoint criterion | Better selection | PRDC/C2ST ↑ |
+| U-3 | Persistent NCE in EM | Manifold calibration | Density metrics ↑ |
+| HYB-1 | Hybrid critic + prior | OOD robustness | AUROC ↑ |
+
+## Stage2/3 Readiness Gates
+
+Do **not** advance until:
+- [ ] All P0 items complete and verified
+- [ ] Conditional branch shows stable positive cosine/geodesic gain
+- [ ] Unconditional branch improves PRDC/C2ST/MMD + OOD AUROC
+- [ ] Actor proposals stay within support constraints (multi-start test)
+- [ ] No clean-min violation mode in eval
+
+## Review
+- Plan created from `research3.md` findings
+- Awaiting CUDA runtime for implementation and validation
+

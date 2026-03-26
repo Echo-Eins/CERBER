@@ -361,9 +361,375 @@ This is the most defensible SOTA-aligned route from current Stage1 to stable Sta
 
 ---
 
-## 12) Sources (Primary)
+## 11.5) Concrete Daboration Plans Per Pipeline
 
-1. Energy Matching (NeurIPS 2025):  
+### Plan A: Unconditional Energy Pipeline Improvements
+
+**Goal:** Make unconditional training more stable and manifold-aware.
+
+#### A1. Add Energy Calibration Layer
+**File:** `cebcm/models/energy_unconditional.py`
+
+```python
+class EnergyCalibrator(torch.nn.Module):
+    """Normalizes energy output using running statistics."""
+    def __init__(self, ema_decay=0.999):
+        super().__init__()
+        self.register_buffer("running_mean", torch.zeros(1))
+        self.register_buffer("running_std", torch.ones(1))
+        self.ema_decay = ema_decay
+
+    def forward(self, energy: torch.Tensor, training: bool = False) -> torch.Tensor:
+        if training:
+            batch_mean = energy.mean()
+            batch_std = energy.std()
+            self.running_mean.lerp_(batch_mean, 1 - self.ema_decay)
+            self.running_std.lerp_(batch_std, 1 - self.ema_decay)
+
+        z = (energy - self.running_mean) / (self.running_std + 1e-8)
+        return torch.sigmoid(z)  # Normalize to [0, 1]
+```
+
+**Integration:** Wrap `UnconditionalEnergy.forward()` output.
+
+---
+
+#### A2. Add Manifold-Aware Langevin Dynamics
+**File:** `cebcm/inference/langevin.py` (new function)
+
+```python
+def manifold_langevin_step(
+    v: torch.Tensor,  # [batch, dim] on hypersphere
+    grad: torch.Tensor,
+    lr: float,
+    noise_scale: float,
+    target_norm: float,
+) -> torch.Tensor:
+    """Langevin dynamics constrained to hypersphere manifold."""
+    # 1. Project gradient to tangent space
+    grad_tangent = grad - (grad * v).sum(dim=-1, keepdim=True) * v
+
+    # 2. Tangent space noise (not isotropic!)
+    noise = torch.randn_like(grad_tangent)
+    noise_tangent = noise - (noise * v).sum(dim=-1, keepdim=True) * v
+
+    # 3. Move in tangent space
+    v_tangent = v - lr * grad_tangent + (2 * lr * noise_scale) ** 0.5 * noise_tangent
+
+    # 4. Project back to sphere (exponential map approximation)
+    v_new = torch.nn.functional.normalize(v_tangent, dim=-1) * target_norm
+
+    return v_new
+```
+
+**Citation:** Mathieu & Nickel (2020) "Continuous Hierarchical Representations with Poincaré Variational Auto-Encoders"
+
+---
+
+#### A3. Add Convergence Detection
+**File:** `cebcm/inference/langevin.py`
+
+Extend `LangevinResult`:
+```python
+@dataclass
+class LangevinResult:
+    v_final: torch.Tensor
+    v_last: torch.Tensor  # Already added in Pass 7
+    converged: bool = False  # NEW
+    convergence_step: int | None = None  # NEW
+    final_energy: float | None = None  # NEW
+```
+
+Add early stopping in Langevin loop:
+```python
+plateau_counter = 0
+prev_energy = float("inf")
+energy_tolerance = 1e-4
+patience = 10
+
+for step in range(max_steps):
+    energy = compute_energy(v_current)
+
+    if abs(energy.item() - prev_energy) < energy_tolerance:
+        plateau_counter += 1
+        if plateau_counter >= patience:
+            result.converged = True
+            result.convergence_step = step
+            break
+    else:
+        plateau_counter = 0
+    prev_energy = energy.item()
+```
+
+---
+
+#### A4. Add KL Prior Matching Loss
+**File:** `cebcm/training/energy_matching.py`
+
+```python
+def kl_prior_penalty(v: torch.Tensor, target_norm: float) -> torch.Tensor:
+    """Penalize deviation from target norm shell."""
+    actual_norm = v.norm(dim=-1)
+    return torch.mean((actual_norm - target_norm) ** 2)
+
+# In training loop:
+loss += lambda_kl * kl_prior_penalty(v_samples, target_norm)
+```
+
+---
+
+#### A5. Add Persistent Contrastive Term
+**File:** `cebcm/training/negative_buffer.py` (extend existing)
+
+Keep NCE active during main EM phase, not just warmstart:
+```python
+# In main training loop (not just warmstart):
+if config.use_persistent_contrastive:
+    negative_samples = buffer.sample(batch_size)
+    nce_loss = compute_nce_loss(energy, positive_samples, negative_samples)
+    loss += config.lambda_nce * nce_loss
+    buffer.add(v_current.detach())  # Maintain persistent chains
+```
+
+---
+
+### Plan B: Simple/Actor-Critic Pipeline Improvements
+
+**Goal:** Fix P0 contradictions and add missing regularizations.
+
+#### B1. Fix Actor-Critic Contradiction (P0 CRITICAL)
+**File:** `experiments/01_denoising_poc/train.py`
+
+**Current broken code:**
+```python
+# Critic requires E(clean) < E(actor)
+critic_loss = F.relu(e_clean - e_actor + margin)
+
+# Actor minimizes softplus(e_actor - e_clean), i.e. E(actor) < E(clean)
+actor_loss = torch.nn.functional.softplus(e_actor - e_clean)
+```
+
+**Fix option 1 (remove actor energy coupling):**
+```python
+# Remove actor_energy_loss entirely
+# Actor learns only from:
+# - L2/denoise loss to clean target
+# - Optional: gradient alignment with critic
+total_loss = critic_ranking_loss + actor_denoise_loss
+```
+
+**Fix option 2 (align objectives):**
+```python
+# Make actor help critic by pushing E(actor) HIGHER than E(clean)
+# This matches critic ranking objective
+actor_energy_loss = torch.nn.functional.softplus(e_clean - e_actor)  # Flipped sign
+# Now both critic and actor agree: E(clean) < E(actor)
+```
+
+---
+
+#### B2. Add Gradient Penalty to Critic
+**File:** `cebcm/training/losses.py`
+
+```python
+def gradient_penalty(energy_fn, x: torch.Tensor, lambda_gp: float = 1.0) -> torch.Tensor:
+    """Penalize large gradient norms for smooth energy landscape."""
+    grad = torch.autograd.grad(
+        energy_fn(x).sum(),
+        x,
+        create_graph=True,
+        only_inputs=True,
+    )[0]
+    return lambda_gp * torch.mean((grad.norm(dim=-1) - 1.0) ** 2)
+
+# Add to MDSM loss:
+total_loss = mdsm_loss + gradient_penalty(...)
+```
+
+---
+
+#### B3. Add OOD/Manifold Penalties
+**File:** `cebcm/training/losses.py` (new function)
+
+```python
+def manifold_proximity_penalty(
+    v: torch.Tensor,
+    reference_bank: torch.Tensor,
+    k: int = 5,
+) -> torch.Tensor:
+    """Penalize points far from data manifold via kNN distance."""
+    # Compute min distance to any reference point
+    # reference_bank: [N, dim], v: [batch, dim]
+    distances = torch.cdist(v, reference_bank, p=2)  # [batch, N]
+    min_distances = distances.min(dim=-1).values  # [batch]
+    return torch.mean(torch.relu(min_distances - threshold) ** 2)
+
+def shell_barrier_penalty(v: torch.Tensor, target_norm: float, margin: float = 0.1) -> torch.Tensor:
+    """Penalize points outside norm shell."""
+    norm = v.norm(dim=-1)
+    lower = target_norm * (1 - margin)
+    upper = target_norm * (1 + margin)
+    return torch.mean(torch.relu(lower - norm) ** 2 + torch.relu(norm - upper) ** 2)
+```
+
+---
+
+#### B4. Add Final-State Geometry Loss for Actor
+**File:** `experiments/01_denoising_poc/train.py`
+
+```python
+# After Langevin refinement:
+v_refined = run_langevin(v_actor_init, critic, steps=20)
+
+# Add loss on final refined state (not just delta)
+cosine_final = cosine_similarity(v_refined, v_clean)
+actor_final_loss = 1 - cosine_final.mean()
+
+# Optional: align actor output with critic gradient direction
+with torch.enable_grad():
+    v_actor_init.requires_grad_(True)
+    _, grad = critic.energy_and_grad(v_actor_init)
+grad_alignment = torch.nn.functional.cosine_similarity(
+    (v_refined - v_actor_init).detach(),
+    -grad.detach()
+)
+actor_grad_align_loss = 1 - grad_alignment.mean()
+
+total_actor_loss = actor_denoise_loss + actor_final_loss + actor_grad_align_loss
+```
+
+---
+
+#### B5. Add Gradient Clipping and EMA
+**File:** `experiments/01_denoising_poc/train.py`
+
+```python
+# Gradient clipping
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+# EMA of weights
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {k: v.clone() for k, v in model.state_dict().items()}
+
+    def update(self):
+        for k, v in self.model.state_dict().items():
+            self.shadow[k].lerp_(v, 1 - self.decay)
+
+    def apply(self):
+        self.model.load_state_dict(self.shadow)
+
+# Use EMA for evaluation
+ema = EMA(model, decay=0.999)
+# After each training step:
+ema.update()
+# Before eval:
+ema.apply()
+```
+
+---
+
+#### B6. Add Comprehensive Metrics Telemetry
+**File:** `experiments/01_denoising_poc/train.py`
+
+Track per epoch:
+```python
+metrics = {
+    # Energy statistics
+    "energy_mean": energy.mean().item(),
+    "energy_std": energy.std().item(),
+    "energy_min": energy.min().item(),
+    "energy_max": energy.max().item(),
+
+    # Gradient statistics
+    "grad_norm_mean": grad_norm.mean().item(),
+    "grad_norm_max": grad_norm.max().item(),
+
+    # Langevin diagnostics
+    "langevin_convergence_rate": converged_count / total_samples,
+    "avg_convergence_step": avg_step.item(),
+
+    # Manifold quality
+    "shell_deviation": shell_penalty.item(),
+    "knn_proximity": knn_metric.item(),
+
+    # OOD detection
+    "ood_rate": ood_count / total_samples,
+}
+```
+
+---
+
+## 12) Agent Reports (Detailed Findings)
+
+### 12.1 Unconditional Pipeline Audit (Haiku 4.5)
+
+**Architecture findings:**
+- `UnconditionalEnergy`: MLP [2048, 1024, 512], ~6.7M params, no `_sigma_freqs` buffer
+- Uses `energy_and_grad()` for efficient joint computation
+- Sphere projection implemented: `F.normalize(v, dim=-1) * target_norm`
+
+**Missing regularizations:**
+1. No KL divergence to prior distribution
+2. No manifold constraint loss (decoder fidelity not checked)
+3. No curvature/Hessian regularization for local convexity
+4. No energy calibration layer (values unbounded, range -100 to -370+)
+
+**Missing metrics:**
+- Energy distribution per epoch
+- Gradient norm statistics
+- Langevin convergence rate
+- OOD detection rate (how often projection fires)
+- Manifold coverage metrics
+
+**Key proposals:**
+1. Manifold-aware Langevin (tangent space projection)
+2. Energy calibration module (sigmoid normalization)
+3. Convergence detection with early stopping
+
+---
+
+### 12.2 SOTA Methods Research (Opus 4.5)
+
+**Priority recommendations:**
+
+**Immediate (Low complexity, High impact):**
+- Gradient penalty to Stage1 loss
+- Gradient clipping in optimizer
+- Energy/gradient monitoring telemetry
+- AdamW with weight decay (0.01-0.1)
+
+**Short-term (Medium complexity, High impact):**
+- Persistent MCMC chains (not fresh noise each batch)
+- Contrastive OOD penalty
+- EMA of weights
+- Cosine decay LR after warmup
+
+**Medium-term:**
+- Spectral normalization for energy network
+- Manifold quality metrics (PRDC, C2ST, MMD)
+- Actor-critic gradient flow optimization
+- Hierarchical energy modeling
+
+**Key references:**
+- Song et al. (2020) Score-Based Generative Modeling
+- Du et al. (2020) Improved Contrastive Divergence for EBMs
+- Liu et al. Energy-based OOD Detection
+- Energy Matching (Balcerak et al., NeurIPS 2025)
+
+---
+
+### 12.3 Simple/Actor-Critic Pipeline Status
+
+**Note:** Full code-grounded audit was blocked by file access issues during subagent execution. However, the main synthesis pass (Section 2-11 above) identified all critical P0-P2 issues from direct code inspection.
+
+---
+
+## 13) Sources (Primary)
+
+1. Energy Matching (NeurIPS 2025):
    https://arxiv.org/abs/2504.10612
 
 2. Energy Discrepancies (2023):  
