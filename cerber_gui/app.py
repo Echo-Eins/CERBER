@@ -70,6 +70,7 @@ session_state = {
     "runtime_metrics": {},  # checkpoint_path -> latest live inference metrics
     "sota_eval_cache": {},  # (checkpoint, noise, steps, lr, batch, bank) -> dict
 }
+SOTA_EVAL_CACHE_VERSION = 2
 
 
 def update_dataclass(target, updates: dict) -> None:
@@ -196,6 +197,7 @@ def _make_sota_eval_cache_key(
     eval_bank_size: int,
 ) -> tuple:
     return (
+        int(SOTA_EVAL_CACHE_VERSION),
         checkpoint_path,
         round(float(noise_scale), 5),
         int(steps),
@@ -295,6 +297,21 @@ def _fmt_float(value: float | None, ndigits: int = 4) -> str:
     return f"{float(value):.{ndigits}f}"
 
 
+def _fmt_percent(value: float | None, ndigits: int = 2) -> str:
+    if value is None:
+        return "N/A"
+    return f"{100.0 * float(value):.{ndigits}f}%"
+
+
+def _fmt_signed(value: float | None, ndigits: int = 6) -> str:
+    if value is None:
+        return "N/A"
+    v = float(value)
+    if abs(v) < 10 ** (-(ndigits + 1)):
+        return f"{v:+.3e}"
+    return f"{v:+.{ndigits}f}"
+
+
 def _fmt_hidden_chain(input_dim: int, hidden_dims: list[int]) -> str:
     dims = [str(input_dim)] + [str(int(h)) for h in hidden_dims] + ["1"]
     return " -> ".join(dims)
@@ -337,6 +354,34 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
     checkpoint_name = _safe_display_name(Path(checkpoint_path).name)
     runtime = session_state["runtime_metrics"].get(checkpoint_path)
 
+    train_loss = metrics.train_loss
+    eval_loss = metrics.eval_loss
+    cos_before = metrics.cos_sim_before
+    cos_after = metrics.cos_sim_after
+    cos_improvement = metrics.cos_improvement
+    success_rate = metrics.success_rate
+    used_runtime_fallback = False
+
+    if runtime is not None:
+        if cos_before is None and runtime.get("cos_before") is not None:
+            cos_before = float(runtime["cos_before"])
+            used_runtime_fallback = True
+        if cos_after is None and runtime.get("cos_after") is not None:
+            cos_after = float(runtime["cos_after"])
+            used_runtime_fallback = True
+        if cos_improvement is None and runtime.get("cos_improvement") is not None:
+            cos_improvement = float(runtime["cos_improvement"])
+            used_runtime_fallback = True
+        if success_rate is None:
+            sota_runtime = runtime.get("sota", {})
+            if isinstance(sota_runtime, dict) and sota_runtime.get("available", False):
+                if sota_runtime.get("cos_success_rate") is not None:
+                    success_rate = float(sota_runtime["cos_success_rate"])
+                    used_runtime_fallback = True
+            elif runtime.get("cosine_success") is not None:
+                success_rate = 1.0 if bool(runtime["cosine_success"]) else 0.0
+                used_runtime_fallback = True
+
     lines = [
         f"**Checkpoint:** {checkpoint_name}",
         f"**Epoch:** {metadata.epoch}",
@@ -344,15 +389,47 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
         f"**Architecture:** `{architecture}`",
         f"**Normalization:** `{resolved_norm}`",
         f"**Activation:** `{resolved_activation}`",
-        "",
-        "**Checkpoint Metrics (saved during training):**",
-        f"- Train Loss: `{_fmt_float(metrics.train_loss, 6)}`",
-        f"- Eval Loss: `{_fmt_float(metrics.eval_loss, 6)}`",
-        f"- Cosine Before: `{_fmt_float(metrics.cos_sim_before, 6)}`",
-        f"- Cosine After: `{_fmt_float(metrics.cos_sim_after, 6)}`",
-        f"- Improvement: `{_fmt_float(metrics.cos_improvement, 6)}`",
-        f"- Success Rate: `{_fmt_float(metrics.success_rate, 6)}`",
     ]
+
+    if runtime is not None:
+        lines.extend(
+            [
+                "",
+                "**Quick Inference Snapshot (latest run):**",
+                f"- Cosine: `{runtime['cos_before']:.6f}` -> `{runtime['cos_after']:.6f}` ({_fmt_signed(runtime['cos_improvement'])})",
+                f"- Energy: `{runtime['energy_noisy']:.6f}` -> `{runtime['energy_final']:.6f}` ({_fmt_signed(runtime['energy_improvement'])})",
+                f"- Steps executed: `{runtime['steps_executed']}` / `{runtime['steps_requested']}`",
+            ]
+        )
+        if runtime.get("plane_dist_before") is not None and runtime.get("plane_dist_after") is not None:
+            lines.append(
+                f"- 2D slice distance to reference: `{runtime['plane_dist_before']:.6f}` -> `{runtime['plane_dist_after']:.6f}` "
+                f"({ _fmt_signed(runtime.get('plane_dist_improvement')) })"
+            )
+        if runtime.get("offplane_noisy") is not None and runtime.get("offplane_denoised") is not None:
+            lines.append(
+                f"- Off-plane residual (1024D): `{float(runtime['offplane_noisy']):.6f}` -> `{float(runtime['offplane_denoised']):.6f}`"
+            )
+        lines.append("- Note: plotted coordinates are 2D projections; primary metrics remain 1024D.")
+
+    lines.extend(
+        [
+            "",
+            "**Checkpoint Metrics (saved during training):**",
+            f"- Train Loss: `{_fmt_float(train_loss, 6)}`",
+            f"- Eval Loss: `{_fmt_float(eval_loss, 6)}`",
+            f"- Cosine Before: `{_fmt_float(cos_before, 6)}`",
+            f"- Cosine After: `{_fmt_float(cos_after, 6)}`",
+            f"- Improvement: `{_fmt_signed(cos_improvement, 6)}`",
+            f"- Success Rate: `{_fmt_percent(success_rate, 2)}`",
+        ]
+    )
+    if used_runtime_fallback:
+        lines.extend(
+            [
+                "- Info: unavailable checkpoint metrics were backfilled from latest runtime inference.",
+            ]
+        )
 
     if (
         metadata.energy_dim != resolved_dim
@@ -378,16 +455,29 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                 f"- Early stop: `{runtime['stopped_early']}`",
                 f"- Cosine before: `{runtime['cos_before']:.6f}`",
                 f"- Cosine after: `{runtime['cos_after']:.6f}`",
-                f"- Cosine improvement: `{runtime['cos_improvement']:+.6f}`",
+                f"- Cosine improvement: `{_fmt_signed(runtime['cos_improvement'])}`",
                 f"- Energy(clean ref): `{runtime['energy_clean']:.6f}`",
                 f"- Energy(start noisy): `{runtime['energy_noisy']:.6f}`",
                 f"- Energy(final): `{runtime['energy_final']:.6f}`",
-                f"- Energy improvement (start-final): `{runtime['energy_improvement']:+.6f}`",
+                f"- Energy improvement (start-final): `{_fmt_signed(runtime['energy_improvement'])}`",
                 f"- Success (energy descent): `{runtime['energy_success']}`",
                 f"- Success (cosine gain): `{runtime['cosine_success']}`",
                 f"- Displacement ||x_T - x_0||: `{runtime['displacement']:.6f}`",
             ]
         )
+        if runtime.get("plane_dist_before") is not None and runtime.get("plane_dist_after") is not None:
+            lines.extend(
+                [
+                    f"- 2D slice dist(reference): `{runtime['plane_dist_before']:.6f}` -> `{runtime['plane_dist_after']:.6f}` "
+                    f"({ _fmt_signed(runtime.get('plane_dist_improvement')) })",
+                ]
+            )
+        if runtime.get("offplane_noisy") is not None and runtime.get("offplane_denoised") is not None:
+            lines.extend(
+                [
+                    f"- Off-plane residual: `{float(runtime['offplane_noisy']):.6f}` -> `{float(runtime['offplane_denoised']):.6f}`",
+                ]
+            )
         sota = runtime.get("sota")
         if isinstance(sota, dict):
             if bool(sota.get("available", False)):
@@ -397,16 +487,20 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                         "**SOTA Batch Eval (latest run):**",
                         f"- Eval batch / bank: `{int(sota['eval_batch_size'])}` / `{int(sota['eval_bank_size'])}`",
                         f"- Cosine before/after: `{float(sota['cos_before_mean']):.6f}` -> `{float(sota['cos_after_mean']):.6f}`",
-                        f"- Cosine improvement mean: `{float(sota['cos_improvement_mean']):+.6f}`",
+                        f"- Cosine improvement mean: `{_fmt_signed(float(sota['cos_improvement_mean']), 8)}`",
                         f"- Cosine success rate: `{float(sota['cos_success_rate']):.2%}`",
-                        f"- Energy improvement mean: `{float(sota['energy_improvement_mean']):+.6f}`",
+                        f"- L2(clean,x) mean: `{float(sota.get('l2_before_mean', float('nan'))):.6f}` -> `{float(sota.get('l2_after_mean', float('nan'))):.6f}`",
+                        f"- L2 improvement mean: `{_fmt_signed(float(sota.get('l2_improvement_mean', float('nan'))), 8)}`",
+                        f"- L2 success rate: `{float(sota.get('l2_success_rate', float('nan'))):.2%}`",
+                        f"- Energy improvement mean: `{_fmt_signed(float(sota['energy_improvement_mean']), 8)}`",
                         f"- Energy success rate: `{float(sota['energy_success_rate']):.2%}`",
                         f"- MMD (RBF): `{float(sota['mmd_rbf']):.6f}`",
                         f"- C2ST accuracy: `{float(sota['c2st_acc']):.2%}`",
+                        f"- C2ST raw accuracy: `{float(sota.get('c2st_raw_acc', float('nan'))):.2%}`",
                         f"- PRDC precision/recall: `{float(sota['prdc_precision']):.4f}` / `{float(sota['prdc_recall']):.4f}`",
                         f"- PRDC density/coverage: `{float(sota['prdc_density']):.4f}` / `{float(sota['prdc_coverage']):.4f}`",
-                        f"- kNN cosine top1 improvement: `{float(sota.get('knn_cos_improvement', float('nan'))):+.6f}`",
-                        f"- kNN L2 improvement: `{float(sota.get('knn_l2_improvement', float('nan'))):+.6f}`",
+                        f"- kNN cosine top1 improvement: `{_fmt_signed(float(sota.get('knn_cos_improvement', float('nan'))), 8)}`",
+                        f"- kNN L2 improvement: `{_fmt_signed(float(sota.get('knn_l2_improvement', float('nan'))), 8)}`",
                     ]
                 )
             else:
@@ -676,6 +770,47 @@ def _sample_clean_noisy_pair(
     return v_clean, v_noisy, reference_source
 
 
+@torch.no_grad()
+def _compute_plane_diagnostics(
+    landscape_data: dict,
+    v_clean: torch.Tensor,
+    v_noisy: torch.Tensor,
+    v_denoised: torch.Tensor,
+) -> dict[str, float]:
+    clean_xy = np.asarray(landscape_data.get("clean_point", (0.0, 0.0)), dtype=np.float64)
+    noisy_xy = np.asarray(landscape_data.get("noisy_point", (0.0, 0.0)), dtype=np.float64)
+    denoised_xy = np.asarray(landscape_data.get("denoised_point", (0.0, 0.0)), dtype=np.float64)
+
+    plane_dist_before = float(np.linalg.norm(noisy_xy - clean_xy))
+    plane_dist_after = float(np.linalg.norm(denoised_xy - clean_xy))
+    plane_dist_improvement = float(plane_dist_before - plane_dist_after)
+
+    basis = landscape_data.get("basis")
+    noisy_offplane = float("nan")
+    denoised_offplane = float("nan")
+    if isinstance(basis, tuple) and len(basis) == 2:
+        axis1, axis2 = basis
+        axis1 = axis1.to(v_clean.device, dtype=v_clean.dtype)
+        axis2 = axis2.to(v_clean.device, dtype=v_clean.dtype)
+        v0 = v_clean.squeeze(0)
+
+        def _offplane_norm(v: torch.Tensor) -> float:
+            delta = v.squeeze(0) - v0
+            proj = (delta @ axis1) * axis1 + (delta @ axis2) * axis2
+            return float((delta - proj).norm().item())
+
+        noisy_offplane = _offplane_norm(v_noisy)
+        denoised_offplane = _offplane_norm(v_denoised)
+
+    return {
+        "plane_dist_before": plane_dist_before,
+        "plane_dist_after": plane_dist_after,
+        "plane_dist_improvement": plane_dist_improvement,
+        "offplane_noisy": noisy_offplane,
+        "offplane_denoised": denoised_offplane,
+    }
+
+
 def _sample_dataset_vectors(
     device: torch.device,
     batch_size: int,
@@ -802,6 +937,20 @@ def _compute_sota_eval_metrics(
         "cos_after_mean": float(cos_after.mean().item()),
         "cos_improvement_mean": float((cos_after - cos_before).mean().item()),
         "cos_success_rate": float((cos_after > cos_before).float().mean().item()),
+        "l2_before_mean": float((v_clean_batch - v_noisy_batch).norm(dim=-1).mean().item()),
+        "l2_after_mean": float((v_clean_batch - v_denoised_batch).norm(dim=-1).mean().item()),
+        "l2_improvement_mean": float(
+            ((v_clean_batch - v_noisy_batch).norm(dim=-1) - (v_clean_batch - v_denoised_batch).norm(dim=-1))
+            .mean()
+            .item()
+        ),
+        "l2_success_rate": float(
+            ((v_clean_batch - v_denoised_batch).norm(dim=-1) < (v_clean_batch - v_noisy_batch).norm(dim=-1))
+            .float()
+            .mean()
+            .item()
+        ),
+        "denoise_step_norm_mean": float((v_denoised_batch - v_noisy_batch).norm(dim=-1).mean().item()),
         "energy_before_mean": float(e_noisy.mean().item()),
         "energy_after_mean": float(e_final.mean().item()),
         "energy_improvement_mean": float((e_noisy - e_final).mean().item()),
@@ -944,7 +1093,7 @@ def _format_inference_info(
         f"- Delta energy (final - clean): `{energies['delta_clean_to_denoised']:+.6f}`",
         f"- Cosine(clean, noisy): `{cos_before:.6f}`",
         f"- Cosine(clean, final): `{cos_after:.6f}`",
-        f"- Cosine improvement: `{(cos_after - cos_before):+.6f}`",
+        f"- Cosine improvement: `{_fmt_signed(cos_after - cos_before)}`",
         f"- Final displacement ||x_T - x_0||: `{displacement:.6f}`",
     ]
 
@@ -964,6 +1113,21 @@ def _format_inference_info(
 
     if displacement < 1e-8:
         lines.append("- Warning: final state equals start state (no-op). Check LR/noise/steps or model gradients.")
+    if (
+        isinstance(landscape_data, dict)
+        and landscape_data.get("clean_point") is not None
+        and landscape_data.get("noisy_point") is not None
+        and landscape_data.get("denoised_point") is not None
+    ):
+        clean_xy = np.asarray(landscape_data["clean_point"], dtype=np.float64)
+        noisy_xy = np.asarray(landscape_data["noisy_point"], dtype=np.float64)
+        denoised_xy = np.asarray(landscape_data["denoised_point"], dtype=np.float64)
+        d2_before = float(np.linalg.norm(noisy_xy - clean_xy))
+        d2_after = float(np.linalg.norm(denoised_xy - clean_xy))
+        lines.append(
+            f"- 2D slice distance to reference: `{d2_before:.6f}` -> `{d2_after:.6f}` ({_fmt_signed(d2_before - d2_after)})"
+        )
+        lines.append("- Note: this is 2D projection only; 1024D cosine/energy can differ.")
 
     if isinstance(sota_metrics, dict):
         lines.append("")
@@ -976,30 +1140,42 @@ def _format_inference_info(
                 f"- Cosine before/after: `{float(sota_metrics['cos_before_mean']):.6f}` -> `{float(sota_metrics['cos_after_mean']):.6f}`"
             )
             lines.append(
-                f"- Cosine improvement mean: `{float(sota_metrics['cos_improvement_mean']):+.6f}`"
+                f"- Cosine improvement mean: `{_fmt_signed(float(sota_metrics['cos_improvement_mean']), 8)}`"
             )
             lines.append(
                 f"- Cosine success rate: `{float(sota_metrics['cos_success_rate']):.2%}`"
             )
             lines.append(
-                f"- Energy improvement mean: `{float(sota_metrics['energy_improvement_mean']):+.6f}`"
+                f"- L2(clean,x) mean: `{float(sota_metrics.get('l2_before_mean', float('nan'))):.6f}` -> "
+                f"`{float(sota_metrics.get('l2_after_mean', float('nan'))):.6f}` "
+                f"({ _fmt_signed(float(sota_metrics.get('l2_improvement_mean', float('nan'))), 8) })"
+            )
+            lines.append(
+                f"- L2 success rate: `{float(sota_metrics.get('l2_success_rate', float('nan'))):.2%}`"
+            )
+            lines.append(
+                f"- Mean denoise step ||x_T-x_0||: `{float(sota_metrics.get('denoise_step_norm_mean', float('nan'))):.6f}`"
+            )
+            lines.append(
+                f"- Energy improvement mean: `{_fmt_signed(float(sota_metrics['energy_improvement_mean']), 8)}`"
             )
             lines.append(
                 f"- Energy success rate: `{float(sota_metrics['energy_success_rate']):.2%}`"
             )
             lines.append(f"- MMD (RBF): `{float(sota_metrics['mmd_rbf']):.6f}`")
             lines.append(f"- C2ST accuracy: `{float(sota_metrics['c2st_acc']):.2%}`")
+            lines.append(f"- C2ST raw accuracy: `{float(sota_metrics.get('c2st_raw_acc', float('nan'))):.2%}`")
             lines.append(
                 f"- PRDC (P/R/D/C): `{float(sota_metrics['prdc_precision']):.4f}` / `{float(sota_metrics['prdc_recall']):.4f}` / "
                 f"`{float(sota_metrics['prdc_density']):.4f}` / `{float(sota_metrics['prdc_coverage']):.4f}`"
             )
             if "knn_cos_improvement" in sota_metrics:
                 lines.append(
-                    f"- kNN cosine top1 improvement: `{float(sota_metrics['knn_cos_improvement']):+.6f}`"
+                    f"- kNN cosine top1 improvement: `{_fmt_signed(float(sota_metrics['knn_cos_improvement']), 8)}`"
                 )
             if "knn_l2_improvement" in sota_metrics:
                 lines.append(
-                    f"- kNN L2 improvement: `{float(sota_metrics['knn_l2_improvement']):+.6f}`"
+                    f"- kNN L2 improvement: `{_fmt_signed(float(sota_metrics['knn_l2_improvement']), 8)}`"
                 )
         else:
             lines.append(f"- Unavailable: `{sota_metrics.get('reason', 'unknown')}`")
@@ -1073,6 +1249,14 @@ def run_inference_fn(
         steps_executed=int(langevin_result.num_steps),
         stopped_early=bool(langevin_result.stopped_early),
         reference_source=reference_source,
+    )
+    runtime_metrics.update(
+        _compute_plane_diagnostics(
+            landscape_data=landscape_data,
+            v_clean=v_clean,
+            v_noisy=v_noisy,
+            v_denoised=v_denoised,
+        )
     )
     runtime_metrics["sota"] = _compute_sota_eval_metrics(
         checkpoint_path=checkpoint_path,
@@ -1194,6 +1378,14 @@ def generate_landscape_for_checkpoint(
         steps_executed=int(result.num_steps),
         stopped_early=bool(result.stopped_early),
         reference_source=reference_source,
+    )
+    landscape_data["runtime_metrics"].update(
+        _compute_plane_diagnostics(
+            landscape_data=landscape_data,
+            v_clean=v_clean,
+            v_noisy=v_noisy,
+            v_denoised=v_denoised,
+        )
     )
     landscape_data["runtime_metrics"]["sota"] = _compute_sota_eval_metrics(
         checkpoint_path=checkpoint_path,
@@ -1655,6 +1847,8 @@ if __name__ == "__main__":
         show_error=True,
         theme=gr.themes.Soft(),
     )
+
+
 
 
 

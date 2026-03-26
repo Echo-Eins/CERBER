@@ -462,3 +462,31 @@ Implement full SOTA-grade GUI evaluation for Stage1/Unconditional checks, so mod
   - `python -m py_compile cerber_gui/app.py cerber_gui/sota_eval.py cerber_gui/landscape_3d.py cebcm/visualization/energy_landscape.py`
   - Quick runtime synthetic invariants could not be executed in this shell because active Python environment has no `torch`.
 
+---
+
+# GUI Metric Consistency Patch (2026-03-25, Pass 5)
+
+## Goal
+Resolve user-reported mismatch between visual "near-target" behavior and zero/negative improvement readouts, and surface short runtime metrics where checkpoint-saved metrics are `N/A`.
+
+## Checklist
+- [x] Add explicit 2D-plane diagnostics (projected distance before/after) to runtime output
+- [x] Keep 1024D primary metrics and explicitly label projection-vs-fullspace distinction
+- [x] Add fallback for missing checkpoint metrics from latest runtime inference
+- [x] Improve tiny-delta formatting (scientific fallback) to avoid false `0.000000` interpretation
+- [x] Extend SOTA block with L2-before/after and denoise step norm
+- [x] Fix C2ST reporting to be label-invariant (`max(acc, 1-acc)`) and expose raw acc
+- [x] Bump SOTA eval cache key version to avoid stale pre-fix cache reuse
+- [x] Validate via py_compile
+
+## Review
+- Implemented:
+  - Added `Quick Inference Snapshot` in checkpoint summary with cosine/energy deltas.
+  - Added fallback backfill for missing checkpoint cosine/success metrics from latest runtime run.
+  - Added `2D slice distance to reference` diagnostics and explicit note that plot coordinates are projections.
+  - Added L2 diagnostics (`l2_before/after/improvement/success`) and `denoise_step_norm_mean` to SOTA batch metrics.
+  - Updated C2ST metric in `cerber_gui/sota_eval.py` to report label-invariant accuracy and raw accuracy.
+  - Added `SOTA_EVAL_CACHE_VERSION=2` into cache key to prevent stale cached metrics.
+- Validation:
+  - `python -m py_compile cerber_gui/app.py cerber_gui/sota_eval.py`
+

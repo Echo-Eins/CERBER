@@ -141,8 +141,11 @@ def compute_c2st_linear(
     with torch.no_grad():
         test_logits = probe(x_test).squeeze(-1)
         pred = (torch.sigmoid(test_logits) > 0.5).float()
-        acc = (pred == y_test).float().mean()
-    return {"c2st_acc": _safe_float(acc)}
+        raw_acc = (pred == y_test).float().mean()
+        # Two-sample separability should be label-invariant (a flipped decision
+        # boundary is still a valid separator), so we report max(acc, 1-acc).
+        acc = torch.maximum(raw_acc, 1.0 - raw_acc)
+    return {"c2st_acc": _safe_float(acc), "c2st_raw_acc": _safe_float(raw_acc)}
 
 
 def _kth_radius(dist_self: torch.Tensor, k: int) -> torch.Tensor:

@@ -167,3 +167,15 @@ After changing any callback/function signature in GUI code:
 1) update every event binding (`.click`, `.change`, `.submit`) that calls it,
 2) add/verify matching UI controls exist for each new argument,
 3) run compile checks and inspect handler arity end-to-end before considering integration complete.
+
+## 2026-03-25 - Never equate 2D landscape proximity with 1024D improvement
+
+### Pattern
+User observed denoised point near target on contour plot while global cosine/energy did not improve. Root cause: plot shows projection to 2D scan plane; optimization metrics are computed in full latent space.
+
+### Rule
+For every GUI landscape run:
+1) always report both projection-space diagnostics and full-space metrics,
+2) explicitly label 2D values as projection-only,
+3) avoid rounding tiny deltas to ambiguous zero; use scientific format fallback,
+4) version metric caches when schema/metric definitions change.
