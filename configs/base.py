@@ -234,7 +234,7 @@ class Stage1_5Config:
     actor_activation: str = "silu"       # "silu", "gelu", "relu", "groupsort", "lipschitz_spline"
     ortho_n_iters: int = 4
     ortho_schedule_enabled: bool = True
-    ortho_schedule_iters: list[int] = field(default_factory=lambda: [4, 2, 1])
+    ortho_schedule_iters: list[int] = field(default_factory=lambda: [4, 2, 2])
     ortho_schedule_boundaries: list[float] = field(default_factory=lambda: [0.34, 0.67])
     twin_aggregate: str = "softmax"  # "max", "mean", or "softmax"
     twin_softmax_temperature: float = 0.10
@@ -260,6 +260,20 @@ class Stage1_5Config:
     lambda_prior_nce: float = 0.05
     lambda_actor_barrier: float = 0.1
     lambda_actor_descent: float = 0.1
+    # P0: Clean-minimum penalty — prevents sub-clean attractors
+    lambda_clean_min: float = 0.3
+    clean_min_margin: float = 0.1
+    # P0: Explicit gradient direction loss — teaches critic WHERE to point
+    lambda_direction: float = 0.15
+    direction_num_samples: int = 0  # 0 = reuse MDSM noisy sample; >0 = separate samples
+    # P1: Support/manifold proximity penalty — kNN to retrieval bank
+    lambda_support: float = 0.1
+    support_k: int = 5
+    support_threshold_percentile: float = 95.0  # auto-calibrate from bank distances
+    # P1: Enhanced multi-negative contrastive — in-batch cross-negatives
+    lambda_inbatch_nce: float = 0.15
+    inbatch_nce_temperature: float = 0.07
+    use_inbatch_negatives: bool = True
 
     # Feature flags
     use_cql: bool = True
@@ -270,6 +284,9 @@ class Stage1_5Config:
     use_prior_nce: bool = False
     use_gradient_penalty: bool = False
     use_shell_barrier: bool = False
+    use_clean_min_penalty: bool = True
+    use_direction_loss: bool = True
+    use_support_penalty: bool = True
 
     # Regularization params
     cql_noise_scale: float = 0.5

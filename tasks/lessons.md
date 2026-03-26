@@ -1,5 +1,32 @@
 # Lessons
 
+## 2026-03-26 - Björck ortho_n_iters=1 causes immediate rank degradation
+
+### Pattern
+Training logs epochs 30-50 proved that when ortho schedule drops to n_iters=1, rank_success immediately plummets (0.615→0.451 at epoch 33) and never recovers. The Björck orthonormalization needs at least 2 iterations to maintain the singular-value control required for stable MDSM gradients.
+
+### Rule
+1. NEVER allow ortho_n_iters < 2 in the schedule. Minimum is 2.
+2. Both config default AND resolve_ortho_n_iters() must enforce floor of 2.
+3. If training speed is a concern, optimize the Björck implementation itself rather than reducing iterations below 2.
+4. When user provides training logs proving a parameter causes degradation, treat that as ground truth — don't debate it.
+
+### Evidence
+- Epoch 30 (n_iters=2): rank_success=0.615, rank(c<a)=0.878, viol=0.028
+- Epoch 33 (n_iters=1): rank_success=0.451 (immediate DROP), metrics destabilized
+- By epoch 50: rank_success never recovered above ~0.54
+
+## 2026-03-26 - Sub-clean attractors cause cosine degradation despite energy improvement
+
+### Pattern
+Cosine similarity degrades (-30 to -60 range) while energy values improve. Root cause: critic creates energy minima BELOW clean target energy. Langevin dynamics follows gradient to these sub-clean attractors, overshooting past clean target. Energy looks good (lower = "better") but cosine to clean target worsens.
+
+### Rule
+1. Always include clean-minimum penalty: L = relu(E_clean - E_actor + margin) to prevent sub-clean attractors
+2. Monitor viol rate (E_actor < E_clean) — this is the most direct indicator of this problem
+3. Auto-inference with large noise (0.15) can mask this issue since starting point is far from clean; manual inference with small noise (0.05) exposes it
+4. When energy improves but cosine degrades, suspect sub-clean attractors first
+
 ## 2026-03-26 - Do not claim proposal/refinement when training is still teacher-forced
 
 ### Pattern

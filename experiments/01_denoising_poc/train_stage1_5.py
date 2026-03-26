@@ -94,7 +94,7 @@ def resolve_ortho_n_iters(cfg: Stage1_5Config, epoch_idx: int, total_epochs: int
     if not cfg.ortho_schedule_iters:
         return base
 
-    iters = [max(1, int(v)) for v in cfg.ortho_schedule_iters]
+    iters = [max(2, int(v)) for v in cfg.ortho_schedule_iters]
     bounds = [float(v) for v in cfg.ortho_schedule_boundaries]
     progress = float(epoch_idx + 1) / float(max(1, total_epochs))
     stage = 0
@@ -330,6 +330,130 @@ def prior_nce_loss(
     logits = torch.cat(logits_parts, dim=1)
     labels = torch.zeros(bsz, dtype=torch.long, device=pos.device)
     return F.cross_entropy(logits, labels)
+
+
+def clean_minimum_penalty(
+    e_clean: torch.Tensor,
+    e_actor: torch.Tensor,
+    margin: float = 0.1,
+) -> torch.Tensor:
+    """P0.1: Penalize when critic assigns lower energy to actor output than to clean target.
+
+    This prevents sub-clean attractors — energy minima that are NOT at the clean
+    target, which cause Langevin to overshoot past clean and degrade cosine.
+
+    L = relu(E_clean - E_actor + margin).mean()
+    When E_actor < E_clean (violation), this produces a positive penalty.
+    """
+    return F.relu(e_clean - e_actor + margin).mean()
+
+
+def gradient_direction_loss(
+    critic: SimpleEnergy,
+    q: torch.Tensor,
+    pos: torch.Tensor,
+    sigma: torch.Tensor,
+    cfg: Stage1_5Config,
+) -> torch.Tensor:
+    """P0.2: Explicit gradient direction loss — teaches critic WHERE to point.
+
+    At noisy points, -grad_E should point toward clean target (pos).
+    This is AUXILIARY to MDSM (first-order only, no create_graph needed for target),
+    providing a direct supervision signal on gradient direction.
+
+    L = (1 - cos_sim(F.normalize(-grad_E), F.normalize(v_clean - v_noisy))).mean()
+    """
+    noise = torch.randn_like(pos)
+    nrm = pos.norm(dim=-1, keepdim=True).clamp(min=cfg.mdsm_norm_floor)
+    noisy = pos + noise * sigma * nrm
+    noisy_req = noisy.detach().requires_grad_(True)
+    e = critic(q, noisy_req, sigma=sigma.detach())
+    # First-order gradient only — no create_graph needed since this is a direct target
+    g = torch.autograd.grad(e.sum(), noisy_req, create_graph=True)[0]
+    g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
+    # Target direction: from noisy toward clean
+    target_dir = pos - noisy.detach()
+    # Tangent projection on sphere if configured
+    if cfg.mdsm_tangent_projection:
+        vh = F.normalize(noisy.detach(), dim=-1)
+        g = g - (g * vh).sum(dim=-1, keepdim=True) * vh
+        target_dir = target_dir - (target_dir * vh).sum(dim=-1, keepdim=True) * vh
+    # Cosine similarity between negative gradient and target direction
+    neg_g = -g
+    cos = F.cosine_similarity(
+        F.normalize(neg_g, dim=-1, eps=1e-8),
+        F.normalize(target_dir, dim=-1, eps=1e-8),
+        dim=-1,
+        eps=cfg.mdsm_cosine_eps,
+    ).clamp(-1.0, 1.0)
+    return (1.0 - cos).mean()
+
+
+def inbatch_cross_negative_nce(
+    critic: SimpleEnergy,
+    q: torch.Tensor,
+    pos: torch.Tensor,
+    sigma: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """P1.3: In-batch cross-negative contrastive loss.
+
+    For each query q_i, the positive is pos_i and negatives are ALL other pos_j (j≠i)
+    in the batch. This is a dense, balanced NCE that scales with batch size without
+    extra bank lookups.
+
+    Uses symmetric InfoNCE: for each q_i, compute energy to all pos_j,
+    then cross-entropy with label=i.
+    """
+    bsz = q.shape[0]
+    if bsz < 2:
+        return torch.tensor(0.0, device=q.device)
+    temp = max(1e-6, temperature)
+    # Compute pairwise energies: E(q_i, pos_j) for all i,j
+    # Expand q: [B, 1, D] -> [B, B, D], pos: [1, B, D] -> [B, B, D]
+    q_exp = q.unsqueeze(1).expand(bsz, bsz, -1).reshape(bsz * bsz, -1)
+    pos_exp = pos.unsqueeze(0).expand(bsz, bsz, -1).reshape(bsz * bsz, -1)
+    sigma_exp = sigma.unsqueeze(1).expand(bsz, bsz).reshape(bsz * bsz).unsqueeze(-1) if sigma.dim() == 1 else sigma.repeat(bsz, 1)
+    if sigma_exp.dim() == 1:
+        sigma_exp = sigma_exp.unsqueeze(-1)
+    e_all = critic(q_exp, pos_exp, sigma=sigma_exp.detach()).view(bsz, bsz)
+    # Logits: lower energy = higher probability
+    logits = -e_all / temp
+    labels = torch.arange(bsz, device=q.device)
+    return F.cross_entropy(logits, labels)
+
+
+def knn_support_penalty(
+    actor_output: torch.Tensor,
+    bank: torch.Tensor,
+    k: int = 5,
+    threshold: float | None = None,
+) -> tuple[torch.Tensor, float]:
+    """P1.2: Support/manifold proximity penalty via kNN distance to retrieval bank.
+
+    Penalizes actor outputs that are far from the data manifold (measured by
+    distance to k-th nearest neighbor in the bank). This prevents the actor
+    from drifting into low-density regions of embedding space.
+
+    Returns (penalty, mean_knn_dist) for logging.
+    """
+    # Compute cosine distances to bank (1 - cosine_sim)
+    # actor_output: [B, D], bank: [N, D]
+    actor_normed = F.normalize(actor_output, dim=-1)
+    bank_normed = F.normalize(bank, dim=-1)
+    # [B, N] cosine similarity matrix
+    sim = torch.mm(actor_normed, bank_normed.t())
+    dist = 1.0 - sim  # cosine distance
+    # k-th nearest neighbor distance (k-th smallest distance)
+    topk_dist, _ = dist.topk(k, dim=1, largest=False)
+    knn_dist = topk_dist[:, -1]  # k-th nearest = last of top-k smallest
+    mean_knn = float(knn_dist.mean().item())
+    if threshold is None:
+        # No penalty if no threshold set
+        return torch.tensor(0.0, device=actor_output.device), mean_knn
+    # Penalty: penalize distances beyond threshold (soft hinge)
+    penalty = F.relu(knn_dist - threshold).pow(2).mean()
+    return penalty, mean_knn
 
 
 class TwinHybridEnergy:
@@ -831,6 +955,24 @@ def main() -> None:
         stream_path.write_text("", encoding="utf-8")
 
     th = make_thresholds(cfg)
+
+    # P1.2: Calibrate kNN support threshold from bank inter-point distances
+    support_threshold: float | None = None
+    if cfg.use_support_penalty and cfg.lambda_support > 0:
+        with torch.no_grad():
+            # Sample a subset of bank to estimate typical kNN distances
+            n_cal = min(512, bank_tr.shape[0])
+            cal_idx = torch.randperm(bank_tr.shape[0], device=device)[:n_cal]
+            cal_pts = F.normalize(bank_tr[cal_idx], dim=-1)
+            cal_sim = torch.mm(cal_pts, bankn_tr.t())
+            cal_dist = 1.0 - cal_sim
+            cal_topk, _ = cal_dist.topk(cfg.support_k + 1, dim=1, largest=False)  # +1 for self
+            cal_knn = cal_topk[:, -1]  # k-th neighbor (excluding self which is ~0)
+            support_threshold = float(
+                torch.quantile(cal_knn, cfg.support_threshold_percentile / 100.0).item()
+            )
+        print(f"  kNN support threshold (p{cfg.support_threshold_percentile:.0f}): {support_threshold:.6f}")
+
     print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing}")
     print(
         "Checkpoint policy: "
@@ -863,6 +1005,11 @@ def main() -> None:
             "clean_viol": 0.0,
             "actor_barrier": 0.0,
             "actor_descent": 0.0,
+            "clean_min": 0.0,
+            "direction": 0.0,
+            "inbatch_nce": 0.0,
+            "support": 0.0,
+            "knn_dist": 0.0,
         }
         n_ok, n_skip, bad_streak = 0, 0, 0
         ema_c, ema_a = None, None
@@ -915,6 +1062,9 @@ def main() -> None:
             rank_clean_actor_acc = 0.0
             rank_actor_hard_acc = 0.0
             rank_clean_hard_acc = 0.0
+            clean_min_acc = 0.0
+            direction_acc = 0.0
+            inbatch_nce_acc = 0.0
             critic_failed = False
             for cstep in range(max(1, cfg.critic_steps_per_actor)):
                 try:
@@ -1010,6 +1160,41 @@ def main() -> None:
                                 prior(pos) - prior(hard.detach()) + cfg.critic_margin_clean_noisy
                             ).mean()
 
+                        # P0.1: Clean-minimum penalty
+                        l_clean_min = torch.tensor(0.0, device=device)
+                        if cfg.use_clean_min_penalty and cfg.lambda_clean_min > 0:
+                            l_clean_min = clean_minimum_penalty(
+                                e_clean=e_pos,
+                                e_actor=e_actor,
+                                margin=cfg.clean_min_margin,
+                            )
+                            loss_c = loss_c + cfg.lambda_clean_min * l_clean_min
+
+                        # P0.2: Gradient direction loss (auxiliary to MDSM)
+                        l_direction = torch.tensor(0.0, device=device)
+                        if cfg.use_direction_loss and cfg.lambda_direction > 0:
+                            with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
+                                l_direction = gradient_direction_loss(
+                                    critic=crit,
+                                    q=q,
+                                    pos=pos,
+                                    sigma=sigma,
+                                    cfg=cfg,
+                                )
+                            loss_c = loss_c + cfg.lambda_direction * l_direction
+
+                        # P1.3: In-batch cross-negative NCE
+                        l_inbatch = torch.tensor(0.0, device=device)
+                        if cfg.use_inbatch_negatives and cfg.lambda_inbatch_nce > 0:
+                            l_inbatch = inbatch_cross_negative_nce(
+                                critic=crit,
+                                q=q,
+                                pos=pos,
+                                sigma=sigma,
+                                temperature=cfg.inbatch_nce_temperature,
+                            )
+                            loss_c = loss_c + cfg.lambda_inbatch_nce * l_inbatch
+
                     lc = float(loss_c.detach().item())
                     if (
                         (not math.isfinite(lc))
@@ -1053,6 +1238,9 @@ def main() -> None:
                     mdsm_acc += float(mdsm.item())
                     cql_acc += float(cql.item())
                     nce_acc += float(nce.item())
+                    clean_min_acc += float(l_clean_min.item())
+                    direction_acc += float(l_direction.item())
+                    inbatch_nce_acc += float(l_inbatch.item())
                     rank_clean_actor = (e_pos < e_actor).float().mean().item()
                     rank_actor_hard = (e_actor < e_hard).float().mean().item()
                     rank_clean_hard = (e_pos < e_hard).float().mean().item()
@@ -1128,12 +1316,25 @@ def main() -> None:
                     if cfg.lambda_actor_descent > 0:
                         # Actor step should not raise energy from its own seed.
                         l_desc = F.relu(e_next - e_seed).mean()
+
+                    # P1.2: kNN support/manifold proximity penalty
+                    l_support = torch.tensor(0.0, device=device)
+                    knn_dist_val = 0.0
+                    if cfg.use_support_penalty and cfg.lambda_support > 0 and support_threshold is not None:
+                        l_support, knn_dist_val = knn_support_penalty(
+                            actor_output=nxt,
+                            bank=bank_tr,
+                            k=cfg.support_k,
+                            threshold=support_threshold,
+                        )
+
                     loss_a = (
                         cfg.lambda_geo * l_geo
                         + cfg.lambda_align * l_align
                         + cfg.lambda_bc_reg * l_bc
                         + cfg.lambda_actor_barrier * l_bar
                         + cfg.lambda_actor_descent * l_desc
+                        + cfg.lambda_support * l_support
                     )
                 la = float(loss_a.detach().item())
                 if (
@@ -1188,6 +1389,11 @@ def main() -> None:
             sums["retrieval_cosine"] += retrieval_cos
             sums["actor_barrier"] += float(l_bar.item())
             sums["actor_descent"] += float(l_desc.item())
+            sums["clean_min"] += clean_min_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["direction"] += direction_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["inbatch_nce"] += inbatch_nce_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["support"] += float(l_support.item())
+            sums["knn_dist"] += knn_dist_val
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
                 now = time.perf_counter()
                 window_batches = max(1, (bi + 1) - last_window_batch)
@@ -1208,6 +1414,10 @@ def main() -> None:
                     f"viol={sums['clean_viol']/n_ok:.3f} "
                     f"a_bar={sums['actor_barrier']/n_ok:.3f} "
                     f"a_desc={sums['actor_descent']/n_ok:.3f} "
+                    f"cmin={sums['clean_min']/n_ok:.3f} "
+                    f"dir={sums['direction']/n_ok:.3f} "
+                    f"ibnce={sums['inbatch_nce']/n_ok:.3f} "
+                    f"supp={sums['support']/n_ok:.4f} "
                     f"sec/batch={sec_per_batch:.3f} "
                     f"eta={eta_epoch_sec/60.0:.1f}m"
                 )
@@ -1237,6 +1447,11 @@ def main() -> None:
                             "mdsm": float(sums["mdsm"] / n_ok),
                             "nce": float(sums["nce"] / n_ok),
                             "cql": float(sums["cql"] / n_ok),
+                            "clean_min": float(sums["clean_min"] / n_ok),
+                            "direction": float(sums["direction"] / n_ok),
+                            "inbatch_nce": float(sums["inbatch_nce"] / n_ok),
+                            "support": float(sums["support"] / n_ok),
+                            "knn_dist": float(sums["knn_dist"] / n_ok),
                             "skip_rate": float(n_skip / max(len(loader), 1)),
                         },
                     },
