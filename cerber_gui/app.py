@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
+import torch.nn.functional as F
 import gradio as gr
 import plotly.graph_objects as go
 import numpy as np
@@ -59,7 +60,7 @@ session_state = {
     "current_checkpoint": None,
     "metrics_file": None,
     "watcher": None,
-    "landscape_cache": {},  # checkpoint_path -> landscape data
+    "landscape_cache": {},  # (checkpoint, grid, range, noise, steps, seed) -> landscape data
     "dataset_cache": {},  # dataset_path -> SONARVectorDataset
 }
 
@@ -108,7 +109,7 @@ def _sample_reference_clean_vector(
     device: torch.device,
     target_norm: float | None,
     seed: int = 42,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, str]:
     """
     Sample a deterministic reference clean vector.
 
@@ -123,22 +124,69 @@ def _sample_reference_clean_vector(
             # Deterministic sample index for reproducible landscape previews
             idx = seed % len(dataset)
             v_clean = dataset[idx].unsqueeze(0).to(device)
-            return v_clean
+            return v_clean, "dataset"
         except Exception:
             # Fallback to synthetic vector if dataset cannot be loaded.
             pass
 
     dim = 1024
-    v_clean = torch.randn(1, dim, device=device)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    v_clean = torch.randn((1, dim), generator=generator, device=device)
     if target_norm is not None:
         v_clean = torch.nn.functional.normalize(v_clean, dim=-1) * target_norm
-    return v_clean
+    return v_clean, "synthetic"
 
 
-def _add_relative_noise(v: torch.Tensor, scale: float) -> torch.Tensor:
+def _add_relative_noise(v: torch.Tensor, scale: float, seed: int | None = None) -> torch.Tensor:
     """Match CLI noise injection semantics for fair GUI-vs-CLI comparison."""
     norms = v.norm(dim=-1, keepdim=True)
-    return v + torch.randn_like(v) * scale * norms
+    if seed is None:
+        noise = torch.randn_like(v)
+    else:
+        generator = torch.Generator(device=v.device)
+        generator.manual_seed(int(seed))
+        noise = torch.randn(v.shape, generator=generator, device=v.device, dtype=v.dtype)
+    return v + noise * scale * norms
+
+
+def _resolve_scan_params(grid_size: float, range_factor: float) -> tuple[int, float]:
+    """Validate and normalize landscape scan controls."""
+    grid = int(round(grid_size))
+    grid = max(15, min(200, grid))
+    rf = max(0.1, float(range_factor))
+    return grid, rf
+
+
+def _make_landscape_cache_key(
+    checkpoint_path: str,
+    grid_size: int,
+    range_factor: float,
+    noise_scale: float,
+    steps: int,
+    seed: int,
+) -> tuple:
+    return (
+        checkpoint_path,
+        int(grid_size),
+        round(float(range_factor), 5),
+        round(float(noise_scale), 5),
+        int(steps),
+        int(seed),
+    )
+
+
+def _invalidate_checkpoint_cache(checkpoint_path: str) -> None:
+    """Drop all cached landscapes that belong to a checkpoint."""
+    to_remove = []
+    for key in session_state["landscape_cache"].keys():
+        if isinstance(key, tuple):
+            if key and key[0] == checkpoint_path:
+                to_remove.append(key)
+        elif key == checkpoint_path:
+            to_remove.append(key)
+    for key in to_remove:
+        session_state["landscape_cache"].pop(key, None)
 
 
 class _UnconditionalEnergyAdapter:
@@ -165,7 +213,7 @@ class _UnconditionalEnergyAdapter:
 
 
 def load_checkpoints_fn(files):
-    """ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â² ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â· uploaded ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²."""
+    """Load uploaded checkpoint files and refresh dropdown choices."""
     if not files:
         return "No files uploaded", gr.Dropdown(choices=[]), gr.Dropdown(choices=[])
 
@@ -174,129 +222,142 @@ def load_checkpoints_fn(files):
 
     for file in files:
         try:
-            # Gradio ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº tempfile
             checkpoint = load_checkpoint(file.name)
             metadata = checkpoint["metadata"]
 
             session_state["checkpoints"][file.name] = checkpoint
-            session_state["landscape_cache"].pop(file.name, None)
+            _invalidate_checkpoint_cache(file.name)
 
             results.append({
-                "name": Path(file.name).name,
+                "name": _safe_display_name(Path(file.name).name),
                 "epoch": metadata.epoch,
                 "model_type": metadata.model_type,
                 "hidden_dims": metadata.energy_hidden_dims,
             })
         except Exception as e:
-            errors.append(f"{Path(file.name).name}: {e}")
+            errors.append(f"{_safe_display_name(Path(file.name).name)}: {e}")
 
-    # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¤ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ summary
     if results:
         summary = "\n".join([
-            f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ {r['name']} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â epoch {r['epoch']}, {r['model_type']}, hidden={r['hidden_dims']}"
+            f"- {r['name']}: epoch={r['epoch']}, {r['model_type']}, hidden={r['hidden_dims']}"
             for r in results
         ])
     else:
-        summary = ""
+        summary = "No checkpoints loaded."
 
     if errors:
         summary += "\n\nErrors:\n" + "\n".join(errors)
 
-    # ÃƒÆ’Ã‚ÂÃƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ dropdown
     dropdown_choices = list(session_state["checkpoints"].keys())
 
     return summary, gr.update(choices=dropdown_choices), gr.update(choices=dropdown_choices)
 
 
-def select_checkpoint_fn(checkpoint_path, vis_backend="plotly"):
-    """ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°."""
+
+def _fmt_float(value: float | None, ndigits: int = 4) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):.{ndigits}f}"
+
+
+def _fmt_hidden_chain(input_dim: int, hidden_dims: list[int]) -> str:
+    dims = [str(input_dim)] + [str(int(h)) for h in hidden_dims] + ["1"]
+    return " -> ".join(dims)
+
+
+def _safe_display_name(raw_name: str) -> str:
+    """
+    Best-effort mojibake recovery for filenames/titles shown in GUI.
+
+    Some upload paths can arrive with UTF-8 bytes decoded as latin1/cp1252.
+    We keep this conservative and only replace when recovery clearly improves text.
+    """
+    text = str(raw_name)
+
+    def _looks_better(candidate: str, original: str) -> bool:
+        if candidate == original:
+            return False
+        # Typical mojibake markers become fewer after recovery.
+        bad_tokens = ("\u00c3", "\u00d0", "\u00d1", "\ufffd")
+        old_bad = sum(original.count(t) for t in bad_tokens)
+        new_bad = sum(candidate.count(t) for t in bad_tokens)
+        return new_bad < old_bad
+
+    for src_enc, dst_enc in (("latin1", "utf-8"), ("cp1252", "utf-8"), ("cp1251", "utf-8")):
+        try:
+            candidate = text.encode(src_enc).decode(dst_enc)
+        except Exception:
+            continue
+        if _looks_better(candidate, text):
+            text = candidate
+
+    return text
+
+
+def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
+    metadata = checkpoint["metadata"]
+    metrics = extract_metrics(checkpoint)
+    architecture = _fmt_hidden_chain(metadata.energy_dim, metadata.energy_hidden_dims)
+    checkpoint_name = _safe_display_name(Path(checkpoint_path).name)
+
+    lines = [
+        f"**Checkpoint:** {checkpoint_name}",
+        f"**Epoch:** {metadata.epoch}",
+        f"**Model Type:** {metadata.model_type}",
+        f"**Architecture:** `{architecture}`",
+        f"**Normalization:** `{metadata.norm_mode}`",
+        f"**Activation:** `{metadata.activation}`",
+        "",
+        "**Metrics:**",
+        f"- Train Loss: `{_fmt_float(metrics.train_loss, 6)}`",
+        f"- Eval Loss: `{_fmt_float(metrics.eval_loss, 6)}`",
+        f"- Cosine Before: `{_fmt_float(metrics.cos_sim_before, 6)}`",
+        f"- Cosine After: `{_fmt_float(metrics.cos_sim_after, 6)}`",
+        f"- Improvement: `{_fmt_float(metrics.cos_improvement, 6)}`",
+        f"- Success Rate: `{_fmt_float(metrics.success_rate, 6)}`",
+    ]
+    return "\n".join(lines)
+
+
+def _render_landscape_figure(checkpoint_path: str, landscape_data: dict, vis_backend: str):
+    title = f"Energy Landscape - {_safe_display_name(Path(checkpoint_path).name)}"
+    if vis_backend == "matplotlib":
+        return create_surface_plot_matplotlib(landscape_data, title=title)
+    return create_surface_plot(landscape_data, title=title)
+
+
+def select_checkpoint_fn(
+    checkpoint_path,
+    vis_backend="plotly",
+    grid_size=40,
+    range_factor=1.5,
+):
+    """Render checkpoint summary and default landscape preview."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
         return "No checkpoint selected", None, "No metrics available", None
 
     checkpoint = session_state["checkpoints"][checkpoint_path]
-    metadata = checkpoint["metadata"]
-    metrics = extract_metrics(checkpoint)
-
     session_state["current_checkpoint"] = checkpoint_path
 
-    # Summary
-    cos_before_str = f"{metrics.cos_sim_before:.4f}" if metrics.cos_sim_before is not None else "N/A"
-    cos_after_str = f"{metrics.cos_sim_after:.4f}" if metrics.cos_sim_after is not None else "N/A"
-    improvement_str = f"{metrics.cos_improvement:.4f}" if metrics.cos_improvement is not None else "N/A"
-    success_rate_str = f"{metrics.success_rate}" if metrics.success_rate is not None else "N/A"
+    summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
+    grid, rf = _resolve_scan_params(grid_size, range_factor)
 
-    summary = f"""
-**Checkpoint:** {Path(checkpoint_path).name}
-**Epoch:** {metadata.epoch}
-**Model Type:** {metadata.model_type}
-**Architecture:** {metadata.energy_dim} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {metadata.energy_hidden_dims} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ 1
-**Normalization:** {metadata.norm_mode}
-**Activation:** {metadata.activation}
-
-**Metrics:**
-- Train Loss: {metrics.train_loss}
-- Eval Loss: {metrics.eval_loss}
-- Cosine Before: {cos_before_str}
-- Cosine After: {cos_after_str}
-- Improvement: {improvement_str}
-- Success Rate: {success_rate_str}
-""".strip()
-
-    # 3D ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã¢â‚¬ËœÃƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡
     landscape_fig = None
-    inference_info = ""
     trajectory_plot = None
+    info = "Run inference to update denoising trajectory and post-inference landscape."
 
     try:
-        landscape_data = generate_landscape_for_checkpoint(checkpoint_path)
-        session_state["landscape_cache"][checkpoint_path] = landscape_data
-
-        # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ backend ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸
-        if vis_backend == "matplotlib":
-            # Matplotlib backend ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¶ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ
-            landscape_fig = create_surface_plot_matplotlib(
-                landscape_data,
-                title=f"Energy Landscape ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {Path(checkpoint_path).name}",
-            )
-        else:
-            # Plotly backend ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¹ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº
-            try:
-                landscape_fig = create_surface_plot(
-                    landscape_data,
-                    title=f"Energy Landscape ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {Path(checkpoint_path).name}",
-                )
-            except Exception as plotly_err:
-                # Fallback so the UI stays usable even with strict Plotly schema/version mismatch.
-                landscape_fig = create_surface_plot_matplotlib(
-                    landscape_data,
-                    title=f"Energy Landscape ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {Path(checkpoint_path).name} (matplotlib fallback)",
-                )
-                summary += f"\n\n**Plotly Error:** {plotly_err}\nFell back to matplotlib rendering."
-
-        # ÃƒÆ’Ã‚ÂÃƒâ€¹Ã…â€œÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â± ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ
-        if landscape_data.get("v_denoised") is not None:
-            v_clean = landscape_data["v_clean"]
-            v_noisy = landscape_data["v_noisy"]
-            v_denoised = landscape_data["v_denoised"]
-
-            cos_before = float(np.dot(v_clean, v_noisy) / (np.linalg.norm(v_clean) * np.linalg.norm(v_noisy)))
-            cos_after = float(np.dot(v_clean, v_denoised) / (np.linalg.norm(v_clean) * np.linalg.norm(v_denoised)))
-            improvement = cos_after - cos_before
-
-            inference_info = f"""
-**Inference Results:**
-- Cosine (clean, noisy): {cos_before:.4f}
-- Cosine (clean, denoised): {cos_after:.4f}
-- Improvement: {improvement:+.4f}
-- Trajectory steps: {len(landscape_data.get('trajectory_2d', [])) or 0}
-"""
-            # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ (ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° Plotly ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚Â ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸)
-            trajectory_plot = create_trajectory_plot(landscape_data)
-
+        landscape_data = generate_landscape_for_checkpoint(
+            checkpoint_path=checkpoint_path,
+            grid_size=grid,
+            range_factor=rf,
+        )
+        landscape_fig = _render_landscape_figure(checkpoint_path, landscape_data, vis_backend)
+        trajectory_plot = create_trajectory_plot(landscape_data)
     except Exception as e:
-        summary += f"\n\n**Landscape Error:** {e}"
+        info = f"Landscape generation error: {e}"
 
-    return summary, landscape_fig, inference_info, trajectory_plot
+    return summary, landscape_fig, info, trajectory_plot
 
 
 def _extract_hidden_dims_from_state_dict(model_state: dict) -> list[int]:
@@ -418,7 +479,8 @@ def run_langevin_denoise(
     stage1_cfg: Stage1Config,
     max_steps: int,
     lr_override: float | None = None,
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    force_full_steps: bool = True,
+) -> tuple[torch.Tensor, list[torch.Tensor], object]:
     """
     Run Langevin denoising with Stage1-consistent math and trajectory capture.
     """
@@ -441,6 +503,8 @@ def run_langevin_denoise(
 
     lr = float(lr_override) if lr_override is not None else float(stage1_cfg.langevin.lr)
     max_steps = int(max_steps)
+    energy_threshold = None if force_full_steps else stage1_cfg.langevin.energy_threshold
+    plateau_patience = (max_steps + 1) if force_full_steps else stage1_cfg.langevin.plateau_patience
 
     if model_type == "unconditional":
         energy_fn = _UnconditionalEnergyAdapter(model)
@@ -458,22 +522,153 @@ def run_langevin_denoise(
         noise_scale=stage1_cfg.langevin.noise_scale,
         max_steps=max_steps,
         target_norm=stage1_cfg.langevin.target_norm,
-        energy_threshold=stage1_cfg.langevin.energy_threshold,
-        plateau_patience=stage1_cfg.langevin.plateau_patience,
+        energy_threshold=energy_threshold,
+        plateau_patience=plateau_patience,
         plateau_delta=stage1_cfg.langevin.plateau_delta,
         v_target=v_clean,
         track_vectors=True,
         **method_kwargs,
     )
-    return result.v_final, result.v_trajectory
+    trajectory = result.v_trajectory if result.v_trajectory else [v_noisy.detach().cpu().clone()]
+    # GUI should report and render the actually reached final state (last executed step),
+    # not the internal "best energy" fallback, otherwise metrics and trajectory disagree.
+    v_last = trajectory[-1].to(v_noisy.device)
+    return v_last, trajectory, result
 
 
-def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
-    """
-    Run denoising inference and return trajectory plot.
-    """
+
+def _sample_clean_noisy_pair(
+    stage1_cfg: Stage1Config,
+    device: torch.device,
+    noise_scale: float,
+    seed: int = 42,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    v_clean, reference_source = _sample_reference_clean_vector(
+        device=device,
+        target_norm=stage1_cfg.langevin.target_norm,
+        seed=seed,
+    )
+    v_noisy = _add_relative_noise(v_clean, float(noise_scale), seed=seed + 1)
+    return v_clean, v_noisy, reference_source
+
+
+@torch.no_grad()
+def _compute_energy_triplet(
+    model,
+    model_type: str,
+    v_clean: torch.Tensor,
+    v_noisy: torch.Tensor,
+    v_denoised: torch.Tensor,
+) -> dict[str, float]:
+    if model_type == "simple":
+        e_clean = float(model(v_clean, v_clean).mean().item())
+        e_noisy = float(model(v_clean, v_noisy).mean().item())
+        e_denoised = float(model(v_clean, v_denoised).mean().item())
+    else:
+        e_clean = float(model(v_clean).mean().item())
+        e_noisy = float(model(v_noisy).mean().item())
+        e_denoised = float(model(v_denoised).mean().item())
+
+    return {
+        "clean": e_clean,
+        "noisy": e_noisy,
+        "denoised": e_denoised,
+        "delta_noisy_to_denoised": e_denoised - e_noisy,
+        "delta_clean_to_denoised": e_denoised - e_clean,
+    }
+
+
+@torch.no_grad()
+def _compute_alignment_diagnostic(
+    model,
+    model_type: str,
+    v_clean: torch.Tensor,
+    v_noisy: torch.Tensor,
+) -> float | None:
+    if model_type != "unconditional":
+        return None
+
+    _, grad = model.energy_and_grad(v_noisy)
+    target = v_clean - v_noisy
+    return float(F.cosine_similarity(-grad, target, dim=-1).mean().item())
+
+
+def _format_inference_info(
+    model_type: str,
+    stage1_cfg: Stage1Config,
+    noise_scale: float,
+    num_steps: int,
+    learning_rate: float,
+    trajectory_len: int,
+    landscape_data: dict,
+    energies: dict[str, float],
+    cos_before: float,
+    cos_after: float,
+    alignment: float | None,
+    displacement: float,
+    stopped_early: bool,
+    force_full_steps: bool,
+    reference_source: str,
+) -> str:
+    energy_min = float(landscape_data.get("energy_min", np.nan))
+    energy_max = float(landscape_data.get("energy_max", np.nan))
+
+    lines = [
+        "**Inference Results:**",
+        f"- Model type: `{model_type}`",
+        f"- Initial noise scale (relative): `{noise_scale:.4f}`",
+        f"- Langevin method: `{stage1_cfg.langevin.method}`",
+        f"- Steps requested: `{int(num_steps)}`",
+        f"- Learning rate: `{float(learning_rate):.6f}`",
+        f"- Trajectory steps executed: `{trajectory_len}`",
+        f"- Early stop triggered: `{stopped_early}`",
+        f"- Forced full steps (GUI debug mode): `{force_full_steps}`",
+        f"- Reference source: `{reference_source}`",
+        f"- Energy range on scanned plane: `[{energy_min:.4f}, {energy_max:.4f}]`",
+        f"- Energy(clean ref): `{energies['clean']:.6f}`",
+        f"- Energy(noisy start): `{energies['noisy']:.6f}`",
+        f"- Energy(denoised/final): `{energies['denoised']:.6f}`",
+        f"- Delta energy (final - start): `{energies['delta_noisy_to_denoised']:+.6f}`",
+        f"- Primary improvement (start - final energy): `{(-energies['delta_noisy_to_denoised']):+.6f}`",
+        f"- Delta energy (final - clean): `{energies['delta_clean_to_denoised']:+.6f}`",
+        f"- Cosine(clean, noisy): `{cos_before:.6f}`",
+        f"- Cosine(clean, final): `{cos_after:.6f}`",
+        f"- Cosine improvement: `{(cos_after - cos_before):+.6f}`",
+        f"- Final displacement ||x_T - x_0||: `{displacement:.6f}`",
+    ]
+
+    if alignment is not None:
+        lines.append(
+            f"- Alignment diagnostic cos(-gradE(noisy), clean-noisy): `{alignment:.6f}`"
+        )
+
+    if model_type == "unconditional":
+        lines.append("- Note: for unconditional models, cosine-to-clean is only a local diagnostic.")
+        lines.append("- Primary criterion is energy descent and manifold-level sampling metrics.")
+        lines.append("- The reference clean vector is not a mandatory target minimum for this model.")
+
+    if reference_source != "dataset":
+        lines.append("- Warning: dataset reference was unavailable; using synthetic clean vector.")
+        lines.append("- This weakens any cosine-to-clean interpretation for the current run.")
+
+    if displacement < 1e-8:
+        lines.append("- Warning: final state equals start state (no-op). Check LR/noise/steps or model gradients.")
+
+    return "\n".join(lines)
+
+
+def run_inference_fn(
+    checkpoint_path,
+    noise_scale,
+    num_steps,
+    learning_rate,
+    vis_backend,
+    grid_size,
+    range_factor,
+):
+    """Run denoising/refinement inference and refresh both surface + trajectory plots."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
-        return "No checkpoint selected", None
+        return "No checkpoint selected", None, None
 
     checkpoint = session_state["checkpoints"][checkpoint_path]
     stage1_cfg = build_stage1_config(checkpoint)
@@ -481,15 +676,14 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
 
-    # Match CLI semantics: real SONAR sample when available, else deterministic fallback.
-    v_clean = _sample_reference_clean_vector(
+    v_clean, v_noisy, reference_source = _sample_clean_noisy_pair(
+        stage1_cfg=stage1_cfg,
         device=device,
-        target_norm=stage1_cfg.langevin.target_norm,
+        noise_scale=float(noise_scale),
         seed=42,
     )
-    v_noisy = _add_relative_noise(v_clean, float(noise_scale))
 
-    v_denoised, trajectory = run_langevin_denoise(
+    v_denoised, trajectory, langevin_result = run_langevin_denoise(
         model=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
@@ -497,52 +691,88 @@ def run_inference_fn(checkpoint_path, noise_scale, num_steps, learning_rate):
         stage1_cfg=stage1_cfg,
         max_steps=int(num_steps),
         lr_override=float(learning_rate),
+        force_full_steps=True,
     )
+
+    grid, rf = _resolve_scan_params(grid_size, range_factor)
 
     landscape_data = scan_energy_landscape_3d(
         energy_fn=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
-        grid_size=40,
-        range_factor=1.5,
+        grid_size=grid,
+        range_factor=rf,
         v_denoised=v_denoised,
         trajectory=trajectory,
         model_type=model_type,
     )
 
-    v_clean_np = v_clean.squeeze(0).cpu().numpy()
-    v_noisy_np = v_noisy.squeeze(0).cpu().numpy()
-    v_denoised_np = v_denoised.squeeze(0).cpu().numpy()
+    landscape_fig = _render_landscape_figure(checkpoint_path, landscape_data, vis_backend)
+    trajectory_fig = create_trajectory_plot(landscape_data)
+
+    v_clean_np = v_clean.squeeze(0).detach().cpu().numpy()
+    v_noisy_np = v_noisy.squeeze(0).detach().cpu().numpy()
+    v_denoised_np = v_denoised.squeeze(0).detach().cpu().numpy()
 
     cos_before = float(np.dot(v_clean_np, v_noisy_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_noisy_np)))
     cos_after = float(np.dot(v_clean_np, v_denoised_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_denoised_np)))
-    improvement = cos_after - cos_before
 
-    energy_min = float(landscape_data.get("energy_min", np.nan))
-    energy_max = float(landscape_data.get("energy_max", np.nan))
+    energies = _compute_energy_triplet(
+        model=model,
+        model_type=model_type,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+        v_denoised=v_denoised,
+    )
+    alignment = _compute_alignment_diagnostic(
+        model=model,
+        model_type=model_type,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+    )
 
-    info = f"""
-**Inference Results:**
-- Initial noise scale (relative): {noise_scale}
-- Langevin method: {stage1_cfg.langevin.method}
-- Steps: {num_steps}
-- Learning rate: {learning_rate}
-- Energy range: [{energy_min:.4f}, {energy_max:.4f}]
+    displacement = float((v_denoised - v_noisy).norm().item())
 
-- Cosine (clean, noisy): {cos_before:.4f}
-- Cosine (clean, denoised): {cos_after:.4f}
-- Improvement: {improvement:+.4f}
-- Trajectory steps: {len(trajectory)}
-"""
+    info = _format_inference_info(
+        model_type=model_type,
+        stage1_cfg=stage1_cfg,
+        noise_scale=float(noise_scale),
+        num_steps=int(num_steps),
+        learning_rate=float(learning_rate),
+        trajectory_len=langevin_result.num_steps,
+        landscape_data=landscape_data,
+        energies=energies,
+        cos_before=cos_before,
+        cos_after=cos_after,
+        alignment=alignment,
+        displacement=displacement,
+        stopped_early=bool(langevin_result.stopped_early),
+        force_full_steps=True,
+        reference_source=reference_source,
+    )
 
-    trajectory_fig = create_trajectory_plot(landscape_data)
-    return info, trajectory_fig
+    return info, landscape_fig, trajectory_fig
 
 
-def generate_landscape_for_checkpoint(checkpoint_path):
+def generate_landscape_for_checkpoint(
+    checkpoint_path,
+    grid_size=40,
+    range_factor=1.5,
+    preview_noise=0.15,
+    preview_steps=50,
+):
     """Generate deterministic landscape preview for the selected checkpoint."""
-    if checkpoint_path in session_state["landscape_cache"]:
-        return session_state["landscape_cache"][checkpoint_path]
+    grid, rf = _resolve_scan_params(grid_size, range_factor)
+    cache_key = _make_landscape_cache_key(
+        checkpoint_path=checkpoint_path,
+        grid_size=grid,
+        range_factor=rf,
+        noise_scale=float(preview_noise),
+        steps=int(preview_steps),
+        seed=42,
+    )
+    if cache_key in session_state["landscape_cache"]:
+        return session_state["landscape_cache"][cache_key]
 
     checkpoint = session_state["checkpoints"].get(checkpoint_path)
     if not checkpoint:
@@ -552,35 +782,38 @@ def generate_landscape_for_checkpoint(checkpoint_path):
     model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
     stage1_cfg = build_stage1_config(checkpoint)
 
-    v_clean = _sample_reference_clean_vector(
+    v_clean, v_noisy, _ = _sample_clean_noisy_pair(
+        stage1_cfg=stage1_cfg,
         device=device,
-        target_norm=stage1_cfg.langevin.target_norm,
+        noise_scale=float(preview_noise),
         seed=42,
     )
-    v_noisy = _add_relative_noise(v_clean, 0.15)
 
-    v_denoised, trajectory = run_langevin_denoise(
+    v_denoised, trajectory, _ = run_langevin_denoise(
         model=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
         model_type=model_type,
         stage1_cfg=stage1_cfg,
-        max_steps=50,
+        max_steps=int(preview_steps),
         lr_override=None,
+        force_full_steps=True,
     )
 
     landscape_data = scan_energy_landscape_3d(
         energy_fn=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
-        grid_size=40,
-        range_factor=1.5,
+        grid_size=grid,
+        range_factor=rf,
         v_denoised=v_denoised,
         trajectory=trajectory,
         model_type=model_type,
     )
 
+    session_state["landscape_cache"][cache_key] = landscape_data
     return landscape_data
+
 
 def compare_selected_fn(checkpoint_paths):
     """ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²."""
@@ -741,7 +974,23 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     choices=["plotly", "matplotlib"],
                     value="plotly",
                     label="Visualization Backend",
-                    info="Plotly: interactive 3D; Matplotlib: static fallback renderer.",
+                    info="Plotly: interactive 3D. Matplotlib: static fallback renderer.",
+                )
+                grid_size_slider = gr.Slider(
+                    minimum=20,
+                    maximum=120,
+                    value=40,
+                    step=2,
+                    label="Landscape Grid Size",
+                    info="Higher value gives more detail but slower scans.",
+                )
+                range_factor_slider = gr.Slider(
+                    minimum=0.5,
+                    maximum=12.0,
+                    value=1.5,
+                    step=0.1,
+                    label="Landscape Range Factor",
+                    info="Controls how wide the explored 2D slice is.",
                 )
 
             with gr.Row():
@@ -852,22 +1101,42 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
     # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
     checkpoint_dropdown.change(
         select_checkpoint_fn,
-        inputs=[checkpoint_dropdown, vis_backend_radio],
+        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
     # ÃƒÆ’Ã‚ÂÃƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ backend
     vis_backend_radio.change(
         select_checkpoint_fn,
-        inputs=[checkpoint_dropdown, vis_backend_radio],
+        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+    )
+
+    grid_size_slider.change(
+        select_checkpoint_fn,
+        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+    )
+
+    range_factor_slider.change(
+        select_checkpoint_fn,
+        inputs=[checkpoint_dropdown, vis_backend_radio, grid_size_slider, range_factor_slider],
         outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
     )
 
     # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
     run_inference_btn.click(
         run_inference_fn,
-        inputs=[checkpoint_dropdown, noise_scale_slider, num_steps_slider, lr_slider],
-        outputs=[inference_output, trajectory_plot],
+        inputs=[
+            checkpoint_dropdown,
+            noise_scale_slider,
+            num_steps_slider,
+            lr_slider,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+        ],
+        outputs=[inference_output, landscape_plot, trajectory_plot],
     )
 
     # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ
@@ -916,6 +1185,8 @@ if __name__ == "__main__":
         show_error=True,
         theme=gr.themes.Soft(),
     )
+
+
 
 
 

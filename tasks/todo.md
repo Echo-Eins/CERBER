@@ -320,3 +320,60 @@ data distribution p(x), not just local denoising directions. This gives:
 2. Sample generation capability (new)
 3. Theoretically optimal score function near data
 
+---
+
+# CERBER GUI + Math Re-Audit Plan (2026-03-25, Pass 2)
+
+## Goal
+Close all remaining GUI/math inconsistencies reported by user:
+- mojibake/encoding corruption in UI labels,
+- denoised marker/trajectory mismatch on landscape surface,
+- unconditional test semantics (clean vector should not be treated as mandatory minimum),
+- misleading `improvement=0` diagnostics,
+- deterministic parity with CLI and mathematically valid inference diagnostics.
+
+## Checklist
+- [x] Re-audit `cerber_gui` math path end-to-end (sampling, projection, energy eval, plotting coordinates)
+- [x] Fix user-facing text encoding and checkpoint title sanitization in GUI
+- [x] Split diagnostics by model type (`simple` vs `unconditional`) and remove misleading target interpretation
+- [x] Ensure inference output reports both energy-descent and geometric movement; detect no-op/refusal cases
+- [x] Ensure 3D + trajectory plots refresh from the same post-inference landscape payload
+- [x] Validate plot coordinate conventions (x/y/z mapping) with deterministic synthetic regression checks
+- [x] Run static/runtime verification scripts and summarize remaining gaps
+- [x] Produce `research1.md` with mathematical proof notes + test validity matrix + external references
+
+## Review
+- Implemented:
+  - Inference now uses last executed Langevin state for GUI diagnostics and visualization consistency.
+  - Landscape scan auto-expands to include trajectory/denoised projections.
+  - 3D/2D markers are snapped to plotted mesh interpolation to prevent visual floating.
+  - Added checkpoint name mojibake recovery and explicit unconditional-mode semantics in report.
+  - Added explicit `reference source` (`dataset` vs `synthetic`) in inference report with warnings when dataset vectors are unavailable.
+  - Added `research1.md` with external references + code-grounded math audit.
+- Verification:
+  - `python -m py_compile cerber_gui/app.py cerber_gui/landscape_3d.py cebcm/visualization/energy_landscape.py experiments/02_energy_matching/train.py`
+  - Runtime validation script could not run here: active Python environment has no `torch`.
+
+---
+
+# Compact SOTA Research for Stage1 GUI Tests (2026-03-25)
+
+## Goal
+Prepare a compact, practical evidence pack in `research1.md` with 3-5 reliable sources per question:
+- (A) energy interpretation in EBMs (minimum-energy behavior and regimes),
+- (B) why unconditional EBM does not have to reconstruct a specific clean sample from a noisy one,
+- (C) correct metrics for unconditional energy descent in high-dimensional embeddings.
+
+## Checklist
+- [x] Re-check AGENTS workflow and register plan in `tasks/todo.md`
+- [x] Collect 3-5 high-trust sources for (A)
+- [x] Collect 3-5 high-trust sources for (B)
+- [x] Collect 3-5 high-trust sources for (C)
+- [x] Write compact theses + direct CERBER Stage1 GUI implications in `research1.md`
+- [x] Verify links and close review notes
+
+## Review
+- `research1.md` added with compact A/B/C structure.
+- Source coverage: 4 refs for (A), 5 refs for (B), 5 refs for (C).
+- Each block includes direct implications for Stage1 GUI test semantics.
+

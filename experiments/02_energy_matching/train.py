@@ -1,25 +1,26 @@
 """
-Stage 2: Energy Matching — Train UnconditionalEnergy on SONAR embeddings.
+Stage 2: Energy Matching â€” Train UnconditionalEnergy on SONAR embeddings.
 
 Pipeline:
-    SONAR encoder (frozen) → pre-encoded .pt → [UnconditionalEnergy] → EM training
+    SONAR encoder (frozen) â†’ pre-encoded .pt â†’ [UnconditionalEnergy] â†’ EM training
                                                   ^^^TRAINS^^^
 
 Three training modes:
-    1. energy_matching  — Pure EM loss from scratch
-    2. nce_warmstart_em — NCE warmstart (10 epochs) → EM fine-tune
-    3. cosine_em        — Cosine direction EM (for 1-Lipschitz networks)
+    1. energy_matching  â€” Pure EM loss from scratch
+    2. nce_warmstart_em â€” NCE warmstart (10 epochs) â†’ EM fine-tune
+    3. cosine_em        â€” Cosine direction EM (for 1-Lipschitz networks)
 
 Mathematical basis:
-    Energy Matching (Balcerak et al., NeurIPS 2025) trains E_θ(x) such that
-    -∇_x E_θ(x_t) ≈ u_t, where u_t = x₁ - x₀ is the OT velocity field.
-    x_t = (1-t)·x₀ + t·x₁ interpolates between prior (x₀) and data (x₁).
+    Energy Matching (Balcerak et al., NeurIPS 2025) trains E_Î¸(x) such that
+    -âˆ‡_x E_Î¸(x_t) â‰ˆ u_t, where u_t = xâ‚ - xâ‚€ is the OT velocity field.
+    x_t = (1-t)Â·xâ‚€ + tÂ·xâ‚ interpolates between prior (xâ‚€) and data (xâ‚).
 
-    This is SIMULATION-FREE: no Langevin chains during training.
-    The energy landscape simultaneously encodes transport + equilibrium.
+    OT loss itself is simulation-free, but this script may run auxiliary
+    sampling in NCE warmstart / negative-buffer refresh modes.
+    The energy landscape is trained to encode transport + equilibrium behavior.
 
 Usage:
-    # NCE warmstart → Energy Matching (recommended):
+    # NCE warmstart â†’ Energy Matching (recommended):
     python experiments/02_energy_matching/train.py \\
         --data data/wikitext_sonar_10k.pt --mode nce_warmstart_em
 
@@ -35,7 +36,7 @@ Usage:
     python experiments/02_energy_matching/train.py \\
         --data data/wikitext_sonar_10k.pt --norm spectral_norm
 
-Spec reference: §10.5, tasks/todo.md
+Spec reference: Â§10.5, tasks/todo.md
 """
 
 import argparse
@@ -282,8 +283,9 @@ def evaluate_energy_matching(
         v_noisy = v_clean + torch.randn_like(v_clean) * noise_scale * norms
 
         cos_before = F.cosine_similarity(v_clean, v_noisy, dim=-1)
+        energy_before = model(v_noisy).detach()
 
-        # Follow -∇E for 50 steps (no stochastic noise)
+        # Follow -âˆ‡E for 50 steps (no stochastic noise)
         v_current = v_noisy.clone()
         for _ in range(50):
             v_grad = v_current.detach().requires_grad_(True)
@@ -295,12 +297,17 @@ def evaluate_energy_matching(
                 v_current = F.normalize(v_current, dim=-1) * config.target_norm
 
         cos_after = F.cosine_similarity(v_clean, v_current, dim=-1)
+        energy_after = model(v_current).detach()
 
         results[f"noise_{noise_scale}"] = {
             "cos_before_mean": cos_before.mean().item(),
             "cos_after_mean": cos_after.mean().item(),
             "improvement": (cos_after - cos_before).mean().item(),
             "success_rate": (cos_after > cos_before).float().mean().item(),
+            "energy_before_mean": energy_before.mean().item(),
+            "energy_after_mean": energy_after.mean().item(),
+            "energy_improvement": (energy_before - energy_after).mean().item(),
+            "energy_success_rate": (energy_after < energy_before).float().mean().item(),
         }
 
     # --- 3. Sample quality (generate and measure statistics) ---
@@ -400,7 +407,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ── Data ──
+    # â”€â”€ Data â”€â”€
     print(f"Loading dataset from {args.data}...")
     full_dataset = SONARVectorDataset(args.data)
     print(f"  Total vectors: {len(full_dataset)}, dim: {full_dataset.embeddings.shape[1]}")
@@ -415,7 +422,7 @@ def main():
         train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True
     )
 
-    # ── Model ──
+    # â”€â”€ Model â”€â”€
     model = UnconditionalEnergy(
         dim=config.energy_dim,
         hidden_dims=config.energy_hidden_dims,
@@ -432,7 +439,7 @@ def main():
     print(f"  Hidden dims: {config.energy_hidden_dims}")
     print(f"  Loss: {config.loss_type}")
     print(f"  NCE warmstart: {config.nce_warmstart} ({config.nce_epochs} epochs)")
-    print(f"  Prior: N(0, {config.prior_std:.5f}²I), target_norm={config.target_norm}")
+    print(f"  Prior: N(0, {config.prior_std:.5f}Â²I), target_norm={config.target_norm}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
@@ -453,7 +460,7 @@ def main():
         global_step = ckpt.get("global_step", 0)
         print(f"  Resumed at epoch {start_epoch}")
 
-    # ── Negative Buffer ──
+    # â”€â”€ Negative Buffer â”€â”€
     neg_buffer = NegativeBuffer(
         buffer_size=config.buffer_size,
         dim=config.energy_dim,
@@ -468,7 +475,7 @@ def main():
     neg_buffer.seed_from_data(train_dataset.embeddings, noise_scale=config.buffer_seed_noise)
     print(f"  Negative buffer: {config.buffer_size} vectors, seeded from data")
 
-    # ── WandB ──
+    # â”€â”€ WandB â”€â”€
     wandb_run = None
     if config.use_wandb:
         import wandb
@@ -489,15 +496,15 @@ def main():
             },
         )
 
-    # ── Output dirs ──
+    # â”€â”€ Output dirs â”€â”€
     output_dir = Path(config.output_dir)
     checkpoint_dir = Path(config.checkpoint_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Training loop ──
+    # â”€â”€ Training loop â”€â”€
     print(f"\n{'='*60}")
-    print(f"Energy Matching Training — {config.num_epochs} epochs")
+    print(f"Energy Matching Training â€” {config.num_epochs} epochs")
     if config.nce_warmstart:
         print(f"  Phase 1: NCE warmstart ({config.nce_epochs} epochs)")
         print(f"  Phase 2: {config.loss_type} ({config.num_epochs - config.nce_epochs} epochs)")
@@ -542,7 +549,7 @@ def main():
         metrics_str = " ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
         print(f"  {metrics_str} lr={optimizer.param_groups[0]['lr']:.6f} ({epoch_time:.1f}s)")
 
-        # ── Evaluate ──
+        # â”€â”€ Evaluate â”€â”€
         eval_metrics = None
         if config.eval_every_epoch > 0 and (
             (epoch + 1) % config.eval_every_epoch == 0 or epoch == config.num_epochs - 1
@@ -557,9 +564,9 @@ def main():
             for key, val in eval_metrics.items():
                 if key.startswith("noise_"):
                     print(
-                        f"    {key}: cos {val['cos_before_mean']:.4f} → "
+                        f"    {key}: cos {val['cos_before_mean']:.4f} â†’ "
                         f"{val['cos_after_mean']:.4f} "
-                        f"(Δ={val['improvement']:+.4f}, "
+                        f"(Î”={val['improvement']:+.4f}, "
                         f"success={val['success_rate']:.0%})"
                     )
 
@@ -567,7 +574,7 @@ def main():
             if "samples" in eval_metrics:
                 s = eval_metrics["samples"]
                 print(
-                    f"    samples: norm={s['norm_mean']:.4f}±{s['norm_std']:.4f} "
+                    f"    samples: norm={s['norm_mean']:.4f}Â±{s['norm_std']:.4f} "
                     f"(data={s['data_norm_mean']:.4f}), "
                     f"pairwise_cos={s['pairwise_cos_mean']:.4f} "
                     f"(data={s['data_pairwise_cos_mean']:.4f})"
@@ -632,7 +639,7 @@ def main():
                 checkpoint_dir / f"epoch_{epoch + 1:03d}.pt",
             )
 
-    # ── Final evaluation ──
+    # â”€â”€ Final evaluation â”€â”€
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time:.1f}s")
 
@@ -646,9 +653,9 @@ def main():
     for key, val in final_eval.items():
         if key.startswith("noise_"):
             print(
-                f"  {key}: cos {val['cos_before_mean']:.4f} → "
+                f"  {key}: cos {val['cos_before_mean']:.4f} â†’ "
                 f"{val['cos_after_mean']:.4f} "
-                f"(Δ={val['improvement']:+.4f}, "
+                f"(Î”={val['improvement']:+.4f}, "
                 f"success={val['success_rate']:.0%})"
             )
 
@@ -695,23 +702,29 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"\nMetrics saved to {output_dir / 'training_metrics.json'}")
 
-    # ── Kill criterion ──
+    # â”€â”€ Kill criterion â”€â”€
     print(f"\n{'='*60}")
     print("KILL CRITERION CHECK")
     print(f"{'='*60}")
     all_pass = True
     for key, val in final_eval.items():
         if key.startswith("noise_"):
-            passed = val["improvement"] > 0 and val["success_rate"] > 0.5
+            passed = val.get("energy_improvement", 0.0) > 0 and val.get("energy_success_rate", 0.0) > 0.5
             status = "PASS" if passed else "FAIL"
-            print(f"  {key}: improvement={val['improvement']:+.4f}, success={val['success_rate']:.0%} → {status}")
+            print(
+                f"  {key}: "
+                f"energy_improvement={val.get('energy_improvement', float('nan')):+.4f}, "
+                f"energy_success={val.get('energy_success_rate', float('nan')):.0%}, "
+                f"cos_improvement={val.get('improvement', float('nan')):+.4f}, "
+                f"cos_success={val.get('success_rate', float('nan')):.0%} -> {status}"
+            )
             if not passed:
                 all_pass = False
 
     if all_pass:
-        print("\n  VERDICT: Energy Matching PASSED — gradients improve denoising")
+        print("\n  VERDICT: Energy Matching PASSED - gradients reduce energy on noisy samples")
     else:
-        print("\n  VERDICT: Energy Matching FAILED — review architecture or hyperparameters")
+        print("\n  VERDICT: Energy Matching FAILED - review architecture or hyperparameters")
 
     if wandb_run is not None:
         wandb_run.finish()
@@ -719,3 +732,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

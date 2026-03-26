@@ -111,3 +111,32 @@ For any visualization/debug path:
 1) reuse the same inference core (`run_langevin`) and data/noise semantics as CLI,
 2) never silently accept model/checkpoint mismatch; fail fast with explicit missing/unexpected keys,
 3) avoid hard energy clipping in analysis paths; preserve real energy values unless user explicitly requests clipping.
+
+## 2026-03-25 - Do not mix best-state with full trajectory in diagnostics
+
+### Pattern
+When sampler returns `v_best` but UI plots full executed trajectory, denoised marker/metrics can contradict the shown path (`improvement=0` while trajectory clearly moved).
+
+### Rule
+For interactive diagnostics, always align reported denoised state with the displayed trajectory endpoint (or explicitly display both with labels). Never compute user-facing improvement from a state that is different from the plotted endpoint.
+
+## 2026-03-25 - Model-type-specific test semantics are mandatory
+
+### Pattern
+Applying cosine-to-clean as a primary metric to unconditional `E(x)` models leads to false failure conclusions.
+
+### Rule
+Branch evaluation by model type:
+1) `simple` (conditional pairwise): denoising-to-clean metrics are primary.
+2) `unconditional` (distributional EBM): energy descent + manifold/distribution metrics are primary; cosine-to-clean is diagnostic only.
+
+## 2026-03-25 - Never silently fallback to synthetic reference in GUI diagnostics
+
+### Pattern
+If GUI cannot load dataset vectors and silently uses synthetic clean vectors, users can misread denoising/cosine outcomes as model failures.
+
+### Rule
+When fallback to synthetic reference is used:
+1) report this explicitly in the inference output,
+2) downgrade cosine-to-clean interpretation,
+3) prefer energy-descent metrics for decision making.

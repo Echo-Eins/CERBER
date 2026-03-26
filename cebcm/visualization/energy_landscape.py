@@ -71,11 +71,24 @@ def _make_orthogonal_basis(
     diff = v_noisy - v_clean  # [D]
     axis1 = F.normalize(diff, dim=-1)
 
-    # axis2: random orthogonal direction
-    rand_dir = torch.randn_like(axis1)
-    # Gram-Schmidt: remove axis1 component
-    rand_dir = rand_dir - (rand_dir @ axis1) * axis1
-    axis2 = F.normalize(rand_dir, dim=-1)
+    # axis2: deterministic orthogonal direction (stable across repeated scans)
+    # Pick canonical basis vector least aligned with axis1, then Gram-Schmidt.
+    idx_order = torch.argsort(axis1.abs())
+    axis2 = None
+    for idx in idx_order.tolist():
+        candidate = torch.zeros_like(axis1)
+        candidate[idx] = 1.0
+        candidate = candidate - (candidate @ axis1) * axis1
+        cand_norm = candidate.norm()
+        if cand_norm > 1e-8:
+            axis2 = candidate / cand_norm
+            break
+
+    if axis2 is None:
+        # Numerical fallback (rare): build a cyclicly shifted vector.
+        candidate = torch.roll(axis1, shifts=1, dims=0)
+        candidate = candidate - (candidate @ axis1) * axis1
+        axis2 = F.normalize(candidate, dim=-1)
 
     return axis1, axis2
 
@@ -137,6 +150,24 @@ def scan_energy_landscape(
     if grid_range is None:
         dist = (v_noisy_flat - v_clean_flat).norm().item()
         grid_range = dist * 1.5
+
+    # Ensure scanned plane covers key points (noisy/denoised/trajectory), so markers
+    # always lie on the visible surface domain.
+    required_radius = 0.0
+    noisy_xy = _project_to_2d(v_noisy_flat, v_clean_flat, axis1, axis2)
+    required_radius = max(required_radius, abs(noisy_xy[0]), abs(noisy_xy[1]))
+
+    if v_denoised is not None:
+        den_xy = _project_to_2d(v_denoised.squeeze(0).to(device), v_clean_flat, axis1, axis2)
+        required_radius = max(required_radius, abs(den_xy[0]), abs(den_xy[1]))
+
+    if trajectory is not None:
+        for t in trajectory:
+            t_xy = _project_to_2d(t.squeeze(0).to(device), v_clean_flat, axis1, axis2)
+            required_radius = max(required_radius, abs(t_xy[0]), abs(t_xy[1]))
+
+    if required_radius > 0:
+        grid_range = max(float(grid_range), float(required_radius) * 1.1)
 
     # Create grid coordinates
     coords = torch.linspace(-grid_range, grid_range, grid_size, device=device)
