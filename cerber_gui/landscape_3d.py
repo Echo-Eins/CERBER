@@ -59,6 +59,7 @@ def scan_energy_landscape_3d(
     v_noisy: torch.Tensor,
     grid_size: int = 50,
     range_factor: float = 1.5,
+    absolute_half_range: float | None = None,
     v_denoised: torch.Tensor | None = None,
     trajectory: list[torch.Tensor] | None = None,
     model_type: str = "simple",
@@ -91,7 +92,9 @@ def scan_energy_landscape_3d(
     """
     # Ð˜ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÐ¼ Ð¿Ñ€Ð¾Ð²ÐµÑ€ÐµÐ½Ð½ÑƒÑŽ Ñ„ÑƒÐ½ÐºÑ†Ð¸ÑŽ Ð¸Ð· cebcm.visualization
     grid_range = None
-    if range_factor is not None and range_factor > 0:
+    if absolute_half_range is not None and float(absolute_half_range) > 0:
+        grid_range = float(absolute_half_range)
+    elif range_factor is not None and range_factor > 0:
         with torch.no_grad():
             dist = (v_noisy - v_clean).norm().item()
         grid_range = dist * float(range_factor)

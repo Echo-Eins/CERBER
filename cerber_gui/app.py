@@ -158,18 +158,28 @@ def _add_relative_noise(v: torch.Tensor, scale: float, seed: int | None = None) 
     return v + noise * scale * norms
 
 
-def _resolve_scan_params(grid_size: float, range_factor: float) -> tuple[int, float]:
+def _resolve_scan_params(
+    grid_size: float,
+    range_factor: float,
+    absolute_half_range: float = 0.0,
+) -> tuple[int, float, float | None]:
     """Validate and normalize landscape scan controls."""
     grid = int(round(grid_size))
     grid = max(15, min(200, grid))
     rf = max(0.1, float(range_factor))
-    return grid, rf
+    abs_range = float(absolute_half_range)
+    if abs_range <= 0.0:
+        abs_range = None
+    else:
+        abs_range = max(0.05, min(100.0, abs_range))
+    return grid, rf, abs_range
 
 
 def _make_landscape_cache_key(
     checkpoint_path: str,
     grid_size: int,
     range_factor: float,
+    absolute_half_range: float | None,
     noise_scale: float,
     steps: int,
     seed: int,
@@ -180,6 +190,7 @@ def _make_landscape_cache_key(
         checkpoint_path,
         int(grid_size),
         round(float(range_factor), 5),
+        None if absolute_half_range is None else round(float(absolute_half_range), 5),
         round(float(noise_scale), 5),
         int(steps),
         int(seed),
@@ -220,7 +231,15 @@ def _invalidate_checkpoint_cache(checkpoint_path: str) -> None:
         session_state["landscape_cache"].pop(key, None)
     to_remove_sota = []
     for key in session_state["sota_eval_cache"].keys():
-        if isinstance(key, tuple) and key and key[0] == checkpoint_path:
+        if not isinstance(key, tuple) or not key:
+            continue
+        # v2 key format: (cache_version, checkpoint_path, ...)
+        if len(key) >= 2 and isinstance(key[0], int):
+            if key[1] == checkpoint_path:
+                to_remove_sota.append(key)
+            continue
+        # backward compatibility for legacy key format: (checkpoint_path, ...)
+        if key[0] == checkpoint_path:
             to_remove_sota.append(key)
     for key in to_remove_sota:
         session_state["sota_eval_cache"].pop(key, None)
@@ -534,6 +553,7 @@ def select_checkpoint_fn(
     vis_backend="plotly",
     grid_size=40,
     range_factor=1.5,
+    absolute_half_range=0.0,
     sota_eval_batch_size=32,
     sota_eval_bank_size=512,
 ):
@@ -544,7 +564,7 @@ def select_checkpoint_fn(
     checkpoint = session_state["checkpoints"][checkpoint_path]
     session_state["current_checkpoint"] = checkpoint_path
 
-    grid, rf = _resolve_scan_params(grid_size, range_factor)
+    grid, rf, abs_range = _resolve_scan_params(grid_size, range_factor, absolute_half_range)
 
     summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
     landscape_fig = None
@@ -556,6 +576,7 @@ def select_checkpoint_fn(
             checkpoint_path=checkpoint_path,
             grid_size=grid,
             range_factor=rf,
+            absolute_half_range=0.0 if abs_range is None else abs_range,
             sota_eval_batch_size=int(sota_eval_batch_size),
             sota_eval_bank_size=int(sota_eval_bank_size),
         )
@@ -1191,6 +1212,7 @@ def run_inference_fn(
     vis_backend,
     grid_size,
     range_factor,
+    absolute_half_range,
     sota_eval_batch_size,
     sota_eval_bank_size,
 ):
@@ -1222,7 +1244,7 @@ def run_inference_fn(
         force_full_steps=True,
     )
 
-    grid, rf = _resolve_scan_params(grid_size, range_factor)
+    grid, rf, abs_range = _resolve_scan_params(grid_size, range_factor, absolute_half_range)
 
     landscape_data = scan_energy_landscape_3d(
         energy_fn=model,
@@ -1230,6 +1252,7 @@ def run_inference_fn(
         v_noisy=v_noisy,
         grid_size=grid,
         range_factor=rf,
+        absolute_half_range=abs_range,
         v_denoised=v_denoised,
         trajectory=trajectory,
         model_type=model_type,
@@ -1311,17 +1334,19 @@ def generate_landscape_for_checkpoint(
     checkpoint_path,
     grid_size=40,
     range_factor=1.5,
+    absolute_half_range=0.0,
     preview_noise=0.15,
     preview_steps=50,
     sota_eval_batch_size=32,
     sota_eval_bank_size=512,
 ):
     """Generate deterministic landscape preview for the selected checkpoint."""
-    grid, rf = _resolve_scan_params(grid_size, range_factor)
+    grid, rf, abs_range = _resolve_scan_params(grid_size, range_factor, absolute_half_range)
     cache_key = _make_landscape_cache_key(
         checkpoint_path=checkpoint_path,
         grid_size=grid,
         range_factor=rf,
+        absolute_half_range=abs_range,
         noise_scale=float(preview_noise),
         steps=int(preview_steps),
         seed=42,
@@ -1363,6 +1388,7 @@ def generate_landscape_for_checkpoint(
         v_noisy=v_noisy,
         grid_size=grid,
         range_factor=rf,
+        absolute_half_range=abs_range,
         v_denoised=v_denoised,
         trajectory=trajectory,
         model_type=model_type,
@@ -1580,6 +1606,14 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     label="Landscape Range Factor",
                     info="Controls how wide the explored 2D slice is.",
                 )
+                landscape_abs_range_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=100.0,
+                    value=0.0,
+                    step=0.1,
+                    label="Landscape Half-Range (Absolute)",
+                    info="0 = auto from Range Factor; >0 forces explicit axis span for Direction 1/2.",
+                )
 
             with gr.Row():
                 checkpoint_summary = gr.Markdown()
@@ -1712,6 +1746,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
@@ -1726,6 +1761,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
@@ -1739,6 +1775,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
@@ -1752,6 +1789,21 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            landscape_abs_range_slider,
+            sota_eval_batch_size_slider,
+            sota_eval_bank_size_slider,
+        ],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+    )
+
+    landscape_abs_range_slider.change(
+        select_checkpoint_fn,
+        inputs=[
+            checkpoint_dropdown,
+            vis_backend_radio,
+            grid_size_slider,
+            range_factor_slider,
+            landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
@@ -1765,6 +1817,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
@@ -1778,6 +1831,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
@@ -1795,6 +1849,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             vis_backend_radio,
             grid_size_slider,
             range_factor_slider,
+            landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],

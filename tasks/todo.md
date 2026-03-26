@@ -490,3 +490,30 @@ Resolve user-reported mismatch between visual "near-target" behavior and zero/ne
 - Validation:
   - `python -m py_compile cerber_gui/app.py cerber_gui/sota_eval.py`
 
+---
+
+# GUI Landscape Span Control + Cache Invalidation Fix (2026-03-25, Pass 6)
+
+## Goal
+- Add explicit control to expand Direction 1/2 visible range independently from grid detail.
+- Ensure this control is wired through preview + manual inference + cache keys.
+- Fix SOTA cache invalidation after key-versioning change.
+
+## Checklist
+- [x] Add absolute half-range control in UI (`0` = auto, `>0` = forced span)
+- [x] Thread new parameter through `select_checkpoint_fn` and `run_inference_fn`
+- [x] Thread new parameter through `generate_landscape_for_checkpoint` + cache key
+- [x] Extend `scan_energy_landscape_3d` to honor absolute span override
+- [x] Wire all Gradio `.change`/`.click` handlers with the new input
+- [x] Fix `_invalidate_checkpoint_cache` compatibility with versioned SOTA cache keys
+- [x] Validate by compile check
+
+## Review
+- Implemented:
+  - New GUI slider `Landscape Half-Range (Absolute)` with range `[0..100]`.
+  - Full parameter wiring across preview generation, manual inference, landscape scan, and cache keys.
+  - Absolute span now overrides factor-based span when set (`>0`), enabling large-area exploration even for small noise distances.
+  - Updated SOTA cache invalidation logic to support both legacy and v2 cache key formats.
+- Validation:
+  - `python -m py_compile cerber_gui/app.py cerber_gui/landscape_3d.py cerber_gui/sota_eval.py`
+

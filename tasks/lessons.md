@@ -179,3 +179,14 @@ For every GUI landscape run:
 2) explicitly label 2D values as projection-only,
 3) avoid rounding tiny deltas to ambiguous zero; use scientific format fallback,
 4) version metric caches when schema/metric definitions change.
+
+## 2026-03-25 - Separate landscape resolution from landscape span
+
+### Pattern
+`Landscape Grid Size` was used as if it controlled visible area, while it only changes mesh detail. Users needed larger Direction 1/2 field-of-view but had no explicit span control.
+
+### Rule
+Always expose two independent controls in landscape UI:
+1) resolution control (`grid size`) for sampling detail,
+2) span control (absolute half-range or factor) for explored domain size.
+When adding new scan parameters, propagate them through all callbacks and cache keys.
