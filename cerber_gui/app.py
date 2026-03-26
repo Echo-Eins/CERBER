@@ -62,6 +62,7 @@ session_state = {
     "watcher": None,
     "landscape_cache": {},  # (checkpoint, grid, range, noise, steps, seed) -> landscape data
     "dataset_cache": {},  # dataset_path -> SONARVectorDataset
+    "runtime_metrics": {},  # checkpoint_path -> latest live inference metrics
 }
 
 
@@ -297,18 +298,20 @@ def _safe_display_name(raw_name: str) -> str:
 def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
     metadata = checkpoint["metadata"]
     metrics = extract_metrics(checkpoint)
-    architecture = _fmt_hidden_chain(metadata.energy_dim, metadata.energy_hidden_dims)
+    resolved_dim, resolved_hidden, resolved_norm, resolved_activation = _resolve_model_hparams(checkpoint)
+    architecture = _fmt_hidden_chain(resolved_dim, resolved_hidden)
     checkpoint_name = _safe_display_name(Path(checkpoint_path).name)
+    runtime = session_state["runtime_metrics"].get(checkpoint_path)
 
     lines = [
         f"**Checkpoint:** {checkpoint_name}",
         f"**Epoch:** {metadata.epoch}",
         f"**Model Type:** {metadata.model_type}",
         f"**Architecture:** `{architecture}`",
-        f"**Normalization:** `{metadata.norm_mode}`",
-        f"**Activation:** `{metadata.activation}`",
+        f"**Normalization:** `{resolved_norm}`",
+        f"**Activation:** `{resolved_activation}`",
         "",
-        "**Metrics:**",
+        "**Checkpoint Metrics (saved during training):**",
         f"- Train Loss: `{_fmt_float(metrics.train_loss, 6)}`",
         f"- Eval Loss: `{_fmt_float(metrics.eval_loss, 6)}`",
         f"- Cosine Before: `{_fmt_float(metrics.cos_sim_before, 6)}`",
@@ -316,6 +319,49 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
         f"- Improvement: `{_fmt_float(metrics.cos_improvement, 6)}`",
         f"- Success Rate: `{_fmt_float(metrics.success_rate, 6)}`",
     ]
+
+    if (
+        metadata.energy_dim != resolved_dim
+        or list(metadata.energy_hidden_dims) != list(resolved_hidden)
+        or metadata.norm_mode != resolved_norm
+        or metadata.activation != resolved_activation
+    ):
+        lines.extend(
+            [
+                "",
+                "- Warning: metadata/config mismatch detected; architecture shown from loaded `state_dict`.",
+            ]
+        )
+
+    if runtime is not None:
+        lines.extend(
+            [
+                "",
+                "**Live Inference Metrics (latest run):**",
+                f"- Reference source: `{runtime['reference_source']}`",
+                f"- Noise scale: `{runtime['noise_scale']:.4f}`",
+                f"- Steps requested/executed: `{runtime['steps_requested']}` / `{runtime['steps_executed']}`",
+                f"- Early stop: `{runtime['stopped_early']}`",
+                f"- Cosine before: `{runtime['cos_before']:.6f}`",
+                f"- Cosine after: `{runtime['cos_after']:.6f}`",
+                f"- Cosine improvement: `{runtime['cos_improvement']:+.6f}`",
+                f"- Energy(clean ref): `{runtime['energy_clean']:.6f}`",
+                f"- Energy(start noisy): `{runtime['energy_noisy']:.6f}`",
+                f"- Energy(final): `{runtime['energy_final']:.6f}`",
+                f"- Energy improvement (start-final): `{runtime['energy_improvement']:+.6f}`",
+                f"- Success (energy descent): `{runtime['energy_success']}`",
+                f"- Success (cosine gain): `{runtime['cosine_success']}`",
+                f"- Displacement ||x_T - x_0||: `{runtime['displacement']:.6f}`",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "**Live Inference Metrics (latest run):**",
+                "- Not available yet. Select checkpoint/run inference to populate.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -339,9 +385,9 @@ def select_checkpoint_fn(
     checkpoint = session_state["checkpoints"][checkpoint_path]
     session_state["current_checkpoint"] = checkpoint_path
 
-    summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
     grid, rf = _resolve_scan_params(grid_size, range_factor)
 
+    summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
     landscape_fig = None
     trajectory_plot = None
     info = "Run inference to update denoising trajectory and post-inference landscape."
@@ -352,6 +398,10 @@ def select_checkpoint_fn(
             grid_size=grid,
             range_factor=rf,
         )
+        runtime = landscape_data.get("runtime_metrics")
+        if runtime is not None:
+            session_state["runtime_metrics"][checkpoint_path] = runtime
+            summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
         landscape_fig = _render_landscape_figure(checkpoint_path, landscape_data, vis_backend)
         trajectory_plot = create_trajectory_plot(landscape_data)
     except Exception as e:
@@ -578,7 +628,6 @@ def _compute_energy_triplet(
     }
 
 
-@torch.no_grad()
 def _compute_alignment_diagnostic(
     model,
     model_type: str,
@@ -588,9 +637,59 @@ def _compute_alignment_diagnostic(
     if model_type != "unconditional":
         return None
 
-    _, grad = model.energy_and_grad(v_noisy)
+    # Must run under enabled autograd because energy_and_grad differentiates wrt input.
+    with torch.enable_grad():
+        _, grad = model.energy_and_grad(v_noisy)
     target = v_clean - v_noisy
     return float(F.cosine_similarity(-grad, target, dim=-1).mean().item())
+
+
+def _build_runtime_metrics(
+    model,
+    model_type: str,
+    v_clean: torch.Tensor,
+    v_noisy: torch.Tensor,
+    v_denoised: torch.Tensor,
+    noise_scale: float,
+    steps_requested: int,
+    steps_executed: int,
+    stopped_early: bool,
+    reference_source: str,
+) -> dict:
+    v_clean_np = v_clean.squeeze(0).detach().cpu().numpy()
+    v_noisy_np = v_noisy.squeeze(0).detach().cpu().numpy()
+    v_denoised_np = v_denoised.squeeze(0).detach().cpu().numpy()
+
+    cos_before = float(np.dot(v_clean_np, v_noisy_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_noisy_np)))
+    cos_after = float(np.dot(v_clean_np, v_denoised_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_denoised_np)))
+    cos_improvement = cos_after - cos_before
+
+    energies = _compute_energy_triplet(
+        model=model,
+        model_type=model_type,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+        v_denoised=v_denoised,
+    )
+    displacement = float((v_denoised - v_noisy).norm().item())
+
+    return {
+        "reference_source": reference_source,
+        "noise_scale": float(noise_scale),
+        "steps_requested": int(steps_requested),
+        "steps_executed": int(steps_executed),
+        "stopped_early": bool(stopped_early),
+        "cos_before": cos_before,
+        "cos_after": cos_after,
+        "cos_improvement": cos_improvement,
+        "energy_clean": float(energies["clean"]),
+        "energy_noisy": float(energies["noisy"]),
+        "energy_final": float(energies["denoised"]),
+        "energy_improvement": float(energies["noisy"] - energies["denoised"]),
+        "energy_success": bool(energies["denoised"] < energies["noisy"]),
+        "cosine_success": bool(cos_after > cos_before),
+        "displacement": displacement,
+    }
 
 
 def _format_inference_info(
@@ -668,7 +767,7 @@ def run_inference_fn(
 ):
     """Run denoising/refinement inference and refresh both surface + trajectory plots."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
-        return "No checkpoint selected", None, None
+        return "No checkpoint selected", None, None, "No checkpoint selected"
 
     checkpoint = session_state["checkpoints"][checkpoint_path]
     stage1_cfg = build_stage1_config(checkpoint)
@@ -710,28 +809,26 @@ def run_inference_fn(
     landscape_fig = _render_landscape_figure(checkpoint_path, landscape_data, vis_backend)
     trajectory_fig = create_trajectory_plot(landscape_data)
 
-    v_clean_np = v_clean.squeeze(0).detach().cpu().numpy()
-    v_noisy_np = v_noisy.squeeze(0).detach().cpu().numpy()
-    v_denoised_np = v_denoised.squeeze(0).detach().cpu().numpy()
-
-    cos_before = float(np.dot(v_clean_np, v_noisy_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_noisy_np)))
-    cos_after = float(np.dot(v_clean_np, v_denoised_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_denoised_np)))
-
-    energies = _compute_energy_triplet(
+    runtime_metrics = _build_runtime_metrics(
         model=model,
         model_type=model_type,
         v_clean=v_clean,
         v_noisy=v_noisy,
         v_denoised=v_denoised,
+        noise_scale=float(noise_scale),
+        steps_requested=int(num_steps),
+        steps_executed=int(langevin_result.num_steps),
+        stopped_early=bool(langevin_result.stopped_early),
+        reference_source=reference_source,
     )
+    session_state["runtime_metrics"][checkpoint_path] = runtime_metrics
+
     alignment = _compute_alignment_diagnostic(
         model=model,
         model_type=model_type,
         v_clean=v_clean,
         v_noisy=v_noisy,
     )
-
-    displacement = float((v_denoised - v_noisy).norm().item())
 
     info = _format_inference_info(
         model_type=model_type,
@@ -741,17 +838,24 @@ def run_inference_fn(
         learning_rate=float(learning_rate),
         trajectory_len=langevin_result.num_steps,
         landscape_data=landscape_data,
-        energies=energies,
-        cos_before=cos_before,
-        cos_after=cos_after,
+        energies={
+            "clean": runtime_metrics["energy_clean"],
+            "noisy": runtime_metrics["energy_noisy"],
+            "denoised": runtime_metrics["energy_final"],
+            "delta_noisy_to_denoised": runtime_metrics["energy_final"] - runtime_metrics["energy_noisy"],
+            "delta_clean_to_denoised": runtime_metrics["energy_final"] - runtime_metrics["energy_clean"],
+        },
+        cos_before=runtime_metrics["cos_before"],
+        cos_after=runtime_metrics["cos_after"],
         alignment=alignment,
-        displacement=displacement,
+        displacement=runtime_metrics["displacement"],
         stopped_early=bool(langevin_result.stopped_early),
         force_full_steps=True,
         reference_source=reference_source,
     )
 
-    return info, landscape_fig, trajectory_fig
+    summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
+    return info, landscape_fig, trajectory_fig, summary
 
 
 def generate_landscape_for_checkpoint(
@@ -782,14 +886,14 @@ def generate_landscape_for_checkpoint(
     model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
     stage1_cfg = build_stage1_config(checkpoint)
 
-    v_clean, v_noisy, _ = _sample_clean_noisy_pair(
+    v_clean, v_noisy, reference_source = _sample_clean_noisy_pair(
         stage1_cfg=stage1_cfg,
         device=device,
         noise_scale=float(preview_noise),
         seed=42,
     )
 
-    v_denoised, trajectory, _ = run_langevin_denoise(
+    v_denoised, trajectory, result = run_langevin_denoise(
         model=model,
         v_clean=v_clean,
         v_noisy=v_noisy,
@@ -809,6 +913,18 @@ def generate_landscape_for_checkpoint(
         v_denoised=v_denoised,
         trajectory=trajectory,
         model_type=model_type,
+    )
+    landscape_data["runtime_metrics"] = _build_runtime_metrics(
+        model=model,
+        model_type=model_type,
+        v_clean=v_clean,
+        v_noisy=v_noisy,
+        v_denoised=v_denoised,
+        noise_scale=float(preview_noise),
+        steps_requested=int(preview_steps),
+        steps_executed=int(result.num_steps),
+        stopped_early=bool(result.stopped_early),
+        reference_source=reference_source,
     )
 
     session_state["landscape_cache"][cache_key] = landscape_data
@@ -1136,7 +1252,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             grid_size_slider,
             range_factor_slider,
         ],
-        outputs=[inference_output, landscape_plot, trajectory_plot],
+        outputs=[inference_output, landscape_plot, trajectory_plot, checkpoint_summary],
     )
 
     # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ

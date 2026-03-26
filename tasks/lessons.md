@@ -140,3 +140,19 @@ When fallback to synthetic reference is used:
 1) report this explicitly in the inference output,
 2) downgrade cosine-to-clean interpretation,
 3) prefer energy-descent metrics for decision making.
+
+## 2026-03-25 - Do not call input-gradient diagnostics under no_grad
+
+### Pattern
+`energy_and_grad(x)` for unconditional EBM crashed in GUI because diagnostic helper was wrapped with `@torch.no_grad`, disabling autograd graph construction for input gradients.
+
+### Rule
+For diagnostics that require `∂E/∂x`, never use `@torch.no_grad`; run them under `torch.enable_grad()` even in eval mode.
+
+## 2026-03-25 - GUI summary metrics must be live, not only checkpoint-saved
+
+### Pattern
+For checkpoints without embedded metrics, GUI summary showed only `N/A`, hiding useful inference evidence and confusing quality assessment.
+
+### Rule
+Persist and display latest runtime inference metrics per checkpoint, update them on preview inference and every manual inference, and refresh summary in the same UI callback.

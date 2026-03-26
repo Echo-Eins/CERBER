@@ -377,3 +377,68 @@ Prepare a compact, practical evidence pack in `research1.md` with 3-5 reliable s
 - Source coverage: 4 refs for (A), 5 refs for (B), 5 refs for (C).
 - Each block includes direct implications for Stage1 GUI test semantics.
 
+---
+
+# GUI Inference Metrics + Unconditional Crash Fix (2026-03-25, Pass 3)
+
+## Goal
+1) Fix unconditional inference crash (`element 0 ... does not require grad`).
+2) Verify architecture display path for unconditional checkpoints.
+3) Replace `N/A`-style summary with live runtime metrics that refresh after:
+   - checkpoint load preview inference,
+   - every manual inference run.
+
+## Checklist
+- [x] Fix grad-context bug in unconditional alignment diagnostic
+- [x] Validate/strengthen architecture rendering source for unconditional models
+- [x] Add persistent per-checkpoint runtime metrics in session state
+- [x] Compute/update metrics on preview inference (during checkpoint selection)
+- [x] Compute/update metrics on manual inference and refresh checkpoint summary
+- [x] Run compile validation and document findings
+
+## Review
+- Fixed unconditional crash by removing `@torch.no_grad` from alignment path and forcing local `torch.enable_grad()` around `energy_and_grad`.
+- Checkpoint summary architecture now resolves directly from loaded `state_dict` (with mismatch warning vs metadata).
+- Added live per-checkpoint runtime metrics store; summary now shows latest inference metrics and refreshes:
+  - after checkpoint selection preview inference,
+  - after every manual inference run.
+- Manual inference callback now updates `checkpoint_summary` output in the same click event.
+- Validation:
+  - `python -m py_compile cerber_gui/app.py cerber_gui/landscape_3d.py cebcm/visualization/energy_landscape.py experiments/02_energy_matching/train.py`
+
+---
+
+# GUI SOTA-Eval Completion (2026-03-25, Pass 4)
+
+## Goal
+Implement full SOTA-grade GUI evaluation for Stage1/Unconditional checks, so model quality is judged by distribution and manifold metrics, not only single-vector cosine.
+
+## Detailed spec
+- Add a dedicated evaluation core (`cerber_gui/sota_eval.py`) with:
+  - MMD (RBF, median heuristic),
+  - C2ST (linear probe, held-out accuracy),
+  - PRDC (precision/recall/density/coverage),
+  - manifold kNN proximity improvements (cosine and euclidean),
+  - energy-descent statistics over a batch (improvement + success rate),
+  - trajectory monotonicity for the inspected sample.
+- Integrate evaluation in GUI pipeline for:
+  1) checkpoint preview run (on selection),
+  2) every manual inference run.
+- Add GUI controls for evaluation budget:
+  - eval batch size (number of query samples),
+  - eval reference bank size.
+- Persist per-checkpoint latest SOTA metrics in session state and render them:
+  - in checkpoint summary (Live Inference Metrics block),
+  - in inference output markdown.
+- Keep implementation robust:
+  - if dataset unavailable, explicitly mark distribution metrics as unavailable,
+  - avoid accidental no-grad on input-gradient diagnostics.
+
+## Checklist
+- [ ] Add `cerber_gui/sota_eval.py` with stable batched metric implementations
+- [ ] Extend runtime metric payload and formatting to include SOTA metric block
+- [ ] Batch-run Langevin on evaluation sample set and compute post-denoise distribution metrics
+- [ ] Wire new GUI controls (eval batch size, eval bank size) into both preview/manual callbacks
+- [ ] Refresh checkpoint summary after each inference with updated SOTA metrics
+- [ ] Validate with py_compile + quick synthetic invariants (metrics finite / ranges sane)
+
