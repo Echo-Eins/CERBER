@@ -9,6 +9,7 @@ Usage:
 
 import sys
 import re
+import json
 from dataclasses import is_dataclass
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,7 @@ session_state = {
     "live_landscape_traj_fig": None,
     "live_landscape_status": "No live landscape yet",
 }
-SOTA_EVAL_CACHE_VERSION = 3
+SOTA_EVAL_CACHE_VERSION = 4
 
 
 def update_dataclass(target, updates: dict) -> None:
@@ -95,9 +96,65 @@ def build_stage1_config(checkpoint: dict) -> Stage1Config:
     """Build Stage1 config from checkpoint payload with safe defaults."""
     cfg = Stage1Config()
     stage1_cfg = checkpoint.get("stage1_config")
+    if not isinstance(stage1_cfg, dict):
+        # Stage1.5 checkpoints persist runtime settings under "config".
+        stage1_cfg = checkpoint.get("config")
     if isinstance(stage1_cfg, dict):
         update_dataclass(cfg, stage1_cfg)
     return cfg
+
+
+def _extract_stage15_runtime_options(checkpoint_payload: dict) -> dict:
+    """
+    Extract Stage1.5 runtime knobs used by GUI inference/sampling parity.
+    """
+    opts = {
+        "retrieval_topk_pos": 6,
+        "retrieval_hard_start": 6,
+        "retrieval_hard_end": 24,
+        "retrieval_min_pos_similarity": 0.15,
+        "actor_seed_mix_query": 0.5,
+        "actor_seed_noise_scale": 1.0,
+        "langevin_tangent_noise": False,
+    }
+    if not isinstance(checkpoint_payload, dict):
+        return opts
+    cfg_payload = checkpoint_payload.get("config", {})
+    if not isinstance(cfg_payload, dict):
+        return opts
+
+    def _safe_float(name: str, default: float) -> float:
+        try:
+            return float(cfg_payload.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_int(name: str, default: int) -> int:
+        try:
+            return int(cfg_payload.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    opts["retrieval_topk_pos"] = max(2, _safe_int("retrieval_topk_pos", opts["retrieval_topk_pos"]))
+    opts["retrieval_hard_start"] = max(0, _safe_int("retrieval_hard_start", opts["retrieval_hard_start"]))
+    opts["retrieval_hard_end"] = max(
+        opts["retrieval_hard_start"] + 1,
+        _safe_int("retrieval_hard_end", opts["retrieval_hard_end"]),
+    )
+    opts["retrieval_min_pos_similarity"] = max(
+        -1.0,
+        min(1.0, _safe_float("retrieval_min_pos_similarity", opts["retrieval_min_pos_similarity"])),
+    )
+    opts["actor_seed_mix_query"] = max(
+        0.0, min(1.0, _safe_float("actor_seed_mix_query", opts["actor_seed_mix_query"]))
+    )
+    opts["actor_seed_noise_scale"] = max(
+        0.0, _safe_float("actor_seed_noise_scale", opts["actor_seed_noise_scale"])
+    )
+    opts["langevin_tangent_noise"] = bool(
+        cfg_payload.get("langevin_tangent_noise", opts["langevin_tangent_noise"])
+    )
+    return opts
 
 
 def _get_default_dataset_path() -> Path | None:
@@ -274,6 +331,99 @@ class _UnconditionalEnergyAdapter:
         return self.model.energy_and_grad(v_candidate)
 
 
+class _SigmaBoundPairEnergyAdapter:
+    """
+    Adapter that binds fixed sigma for sigma-conditioned pairwise energy models.
+    """
+
+    def __init__(self, model, sigma: torch.Tensor):
+        self.model = model
+        self.sigma = sigma
+
+    def __call__(self, v_query: torch.Tensor, v_candidate: torch.Tensor) -> torch.Tensor:
+        return self.model(v_query, v_candidate, sigma=self.sigma)
+
+    def energy_and_grad(
+        self,
+        v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.model.energy_and_grad(v_query, v_candidate, sigma=self.sigma)
+
+
+class _TwinConditionalEnergyAdapter:
+    """
+    Runtime adapter for Stage1.5 twin-critic conditional energy in GUI paths.
+
+    Mirrors training-time aggregation:
+      - cond = agg(E1(q,v), E2(q,v))
+      - total = cond + lambda_prior * E_prior(v)  (optional)
+    """
+
+    def __init__(
+        self,
+        critic1,
+        critic2,
+        aggregate: str = "softmax",
+        softmax_temperature: float = 0.1,
+        prior=None,
+        lambda_prior: float = 0.0,
+    ):
+        self.critic1 = critic1
+        self.critic2 = critic2
+        self.aggregate = str(aggregate)
+        self.softmax_temperature = float(softmax_temperature)
+        self.prior = prior
+        self.lambda_prior = float(lambda_prior)
+
+    def eval(self):
+        self.critic1.eval()
+        self.critic2.eval()
+        if self.prior is not None:
+            self.prior.eval()
+        return self
+
+    def _conditional_energy(
+        self,
+        v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+        sigma: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        e1 = self.critic1(v_query, v_candidate, sigma=sigma)
+        e2 = self.critic2(v_query, v_candidate, sigma=sigma)
+        if self.aggregate == "mean":
+            return 0.5 * (e1 + e2)
+        if self.aggregate == "max":
+            return torch.maximum(e1, e2)
+        if self.aggregate == "softmax":
+            tau = max(1e-6, float(self.softmax_temperature))
+            stacked = torch.stack([e1, e2], dim=0)
+            return tau * torch.logsumexp(stacked / tau, dim=0)
+        raise ValueError(f"Unknown twin aggregate mode: {self.aggregate}")
+
+    def __call__(
+        self,
+        v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+        sigma: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        e = self._conditional_energy(v_query, v_candidate, sigma=sigma)
+        if self.prior is not None and self.lambda_prior > 0.0:
+            e = e + self.lambda_prior * self.prior(v_candidate)
+        return e
+
+    def energy_and_grad(
+        self,
+        v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+        sigma: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        v_req = v_candidate.detach().requires_grad_(True)
+        energy = self(v_query, v_req, sigma=sigma)
+        grad = torch.autograd.grad(energy.sum(), v_req, create_graph=False)[0]
+        return energy.detach(), grad.detach()
+
+
 def load_checkpoints_fn(files):
     """Load uploaded checkpoint files and refresh dropdown choices."""
     if not files:
@@ -417,11 +567,14 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
     ]
 
     if runtime is not None:
+        runtime_target_label = str(runtime.get("target_label", "clean"))
+        runtime_objective = str(runtime.get("eval_objective", "self_denoise"))
         lines.extend(
             [
                 "",
                 "**Quick Inference Snapshot (latest run):**",
-                f"- Cosine: `{runtime['cos_before']:.6f}` -> `{runtime['cos_after']:.6f}` ({_fmt_signed(runtime['cos_improvement'])})",
+                f"- Objective/target: `{runtime_objective}` / `{runtime_target_label}`",
+                f"- Cosine(target): `{runtime['cos_before']:.6f}` -> `{runtime['cos_after']:.6f}` ({_fmt_signed(runtime['cos_improvement'])})",
                 f"- Energy: `{runtime['energy_noisy']:.6f}` -> `{runtime['energy_final']:.6f}` ({_fmt_signed(runtime['energy_improvement'])})",
                 f"- Steps executed: `{runtime['steps_executed']}` / `{runtime['steps_requested']}`",
             ]
@@ -475,13 +628,14 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                 "",
                 "**Live Inference Metrics (latest run):**",
                 f"- Reference source: `{runtime['reference_source']}`",
+                f"- Eval objective: `{runtime_objective}` (target=`{runtime_target_label}`)",
                 f"- Noise scale: `{runtime['noise_scale']:.4f}`",
                 f"- Steps requested/executed: `{runtime['steps_requested']}` / `{runtime['steps_executed']}`",
                 f"- Early stop: `{runtime['stopped_early']}`",
-                f"- Cosine before: `{runtime['cos_before']:.6f}`",
-                f"- Cosine after: `{runtime['cos_after']:.6f}`",
+                f"- Cosine(target, before): `{runtime['cos_before']:.6f}`",
+                f"- Cosine(target, after): `{runtime['cos_after']:.6f}`",
                 f"- Cosine improvement: `{_fmt_signed(runtime['cos_improvement'])}`",
-                f"- Energy(clean ref): `{runtime['energy_clean']:.6f}`",
+                f"- Energy(target ref): `{runtime['energy_clean']:.6f}`",
                 f"- Energy(start noisy): `{runtime['energy_noisy']:.6f}`",
                 f"- Energy(final): `{runtime['energy_final']:.6f}`",
                 f"- Energy improvement (start-final): `{_fmt_signed(runtime['energy_improvement'])}`",
@@ -490,6 +644,8 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                 f"- Displacement ||x_T - x_0||: `{runtime['displacement']:.6f}`",
             ]
         )
+        if runtime.get("query_target_cos") is not None and np.isfinite(float(runtime.get("query_target_cos"))):
+            lines.extend([f"- Query-target cosine: `{float(runtime['query_target_cos']):.6f}`"])
         if runtime.get("plane_dist_before") is not None and runtime.get("plane_dist_after") is not None:
             lines.extend(
                 [
@@ -506,15 +662,18 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
         sota = runtime.get("sota")
         if isinstance(sota, dict):
             if bool(sota.get("available", False)):
+                target_label = str(sota.get("target_label", "clean"))
+                objective = str(sota.get("eval_objective", "self_denoise"))
                 lines.extend(
                     [
                         "",
                         "**SOTA Batch Eval (latest run):**",
                         f"- Eval batch / bank: `{int(sota['eval_batch_size'])}` / `{int(sota['eval_bank_size'])}`",
+                        f"- Eval objective: `{objective}` (target=`{target_label}`)",
                         f"- Cosine before/after: `{float(sota['cos_before_mean']):.6f}` -> `{float(sota['cos_after_mean']):.6f}`",
                         f"- Cosine improvement mean: `{_fmt_signed(float(sota['cos_improvement_mean']), 8)}`",
                         f"- Cosine success rate: `{float(sota['cos_success_rate']):.2%}`",
-                        f"- L2(clean,x) mean: `{float(sota.get('l2_before_mean', float('nan'))):.6f}` -> `{float(sota.get('l2_after_mean', float('nan'))):.6f}`",
+                        f"- L2(target,x) mean: `{float(sota.get('l2_before_mean', float('nan'))):.6f}` -> `{float(sota.get('l2_after_mean', float('nan'))):.6f}`",
                         f"- L2 improvement mean: `{_fmt_signed(float(sota.get('l2_improvement_mean', float('nan'))), 8)}`",
                         f"- L2 success rate: `{float(sota.get('l2_success_rate', float('nan'))):.2%}`",
                         f"- Energy improvement mean: `{_fmt_signed(float(sota['energy_improvement_mean']), 8)}`",
@@ -672,11 +831,75 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
     from cebcm.models.energy import SimpleEnergy
     from cebcm.models.energy_unconditional import UnconditionalEnergy
 
+    def _load_state_or_raise(model_obj, state_dict: dict, label: str) -> None:
+        load_result = model_obj.load_state_dict(state_dict, strict=False)
+        missing = [k for k in load_result.missing_keys if k != "_sigma_freqs"]
+        unexpected = [k for k in load_result.unexpected_keys]
+        if missing or unexpected:
+            missing_preview = ", ".join(missing[:8])
+            unexpected_preview = ", ".join(unexpected[:8])
+            raise RuntimeError(
+                "Checkpoint/model mismatch while loading GUI model. "
+                f"{label} | Missing({len(missing)}): {missing_preview}. "
+                f"Unexpected({len(unexpected)}): {unexpected_preview}."
+            )
+
     model_type = checkpoint["model_type"]
     model_state = checkpoint["model_state"]
     dim, hidden_dims, norm_mode, activation = _resolve_model_hparams(checkpoint)
 
     if model_type == "simple":
+        # Stage1.5 checkpoints contain twin critics. GUI must load the same
+        # hybrid energy used in training/eval, not a single critic fallback.
+        has_twin = ("critic1_state" in checkpoint) or ("critic2_state" in checkpoint)
+        if has_twin:
+            c1 = SimpleEnergy(
+                dim=dim,
+                hidden_dims=hidden_dims,
+                norm_mode=norm_mode,
+                activation=activation,
+                energy_output_clamp=None,
+            ).to(device)
+            c2 = SimpleEnergy(
+                dim=dim,
+                hidden_dims=hidden_dims,
+                norm_mode=norm_mode,
+                activation=activation,
+                energy_output_clamp=None,
+            ).to(device)
+            c1_state = checkpoint.get("critic1_state", model_state)
+            c2_state = checkpoint.get("critic2_state", c1_state)
+            _load_state_or_raise(c1, c1_state, "critic1")
+            _load_state_or_raise(c2, c2_state, "critic2")
+
+            cfg = checkpoint.get("config", {}) or {}
+            aggregate = str(cfg.get("twin_aggregate", "max"))
+            softmax_temperature = float(cfg.get("twin_softmax_temperature", 0.1))
+
+            prior = None
+            lambda_prior = 0.0
+            prior_state = checkpoint.get("prior_state")
+            if prior_state is not None:
+                prior = UnconditionalEnergy(
+                    dim=dim,
+                    hidden_dims=hidden_dims,
+                    norm_mode=norm_mode,
+                    activation=activation,
+                ).to(device)
+                _load_state_or_raise(prior, prior_state, "prior")
+                lambda_prior = float(cfg.get("lambda_prior", 0.0))
+
+            model = _TwinConditionalEnergyAdapter(
+                critic1=c1,
+                critic2=c2,
+                aggregate=aggregate,
+                softmax_temperature=softmax_temperature,
+                prior=prior,
+                lambda_prior=lambda_prior,
+            )
+            model.eval()
+            return model, model_type
+
         model = SimpleEnergy(
             dim=dim,
             hidden_dims=hidden_dims,
@@ -692,19 +915,11 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
             activation=activation,
         ).to(device)
 
-    load_result = model.load_state_dict(model_state, strict=False)
-    missing = [k for k in load_result.missing_keys if k != "_sigma_freqs"]
-    unexpected = [k for k in load_result.unexpected_keys]
-    if missing or unexpected:
-        missing_preview = ", ".join(missing[:8])
-        unexpected_preview = ", ".join(unexpected[:8])
-        raise RuntimeError(
-            "Checkpoint/model mismatch while loading GUI model. "
-            f"model_type={model_type}, dim={dim}, hidden_dims={hidden_dims}, "
-            f"norm_mode={norm_mode}, activation={activation}. "
-            f"Missing({len(missing)}): {missing_preview}. "
-            f"Unexpected({len(unexpected)}): {unexpected_preview}."
-        )
+    _load_state_or_raise(
+        model,
+        model_state,
+        f"model_type={model_type}, dim={dim}, hidden_dims={hidden_dims}, norm_mode={norm_mode}, activation={activation}",
+    )
 
     model.eval()
     return model, model_type
@@ -720,6 +935,10 @@ def run_langevin_denoise(
     lr_override: float | None = None,
     force_full_steps: bool = True,
     track_vectors: bool = True,
+    v_query_override: torch.Tensor | None = None,
+    v_target_override: torch.Tensor | None = None,
+    tangent_noise_override: bool | None = None,
+    sigma_override: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor], object]:
     """
     Run Langevin denoising with Stage1-consistent math and trajectory capture.
@@ -745,13 +964,21 @@ def run_langevin_denoise(
     max_steps = int(max_steps)
     energy_threshold = None if force_full_steps else stage1_cfg.langevin.energy_threshold
     plateau_patience = (max_steps + 1) if force_full_steps else stage1_cfg.langevin.plateau_patience
+    tangent_noise = bool(tangent_noise_override) if tangent_noise_override is not None else bool(
+        getattr(stage1_cfg, "langevin_tangent_noise", False)
+    )
+
+    v_target = v_target_override if v_target_override is not None else v_clean
 
     if model_type == "unconditional":
         energy_fn = _UnconditionalEnergyAdapter(model)
         v_query = torch.zeros_like(v_clean)
     else:
-        energy_fn = model
-        v_query = v_clean
+        if sigma_override is not None:
+            energy_fn = _SigmaBoundPairEnergyAdapter(model, sigma=sigma_override)
+        else:
+            energy_fn = model
+        v_query = v_query_override if v_query_override is not None else v_clean
 
     result = run_langevin(
         method=method,
@@ -762,10 +989,11 @@ def run_langevin_denoise(
         noise_scale=stage1_cfg.langevin.noise_scale,
         max_steps=max_steps,
         target_norm=stage1_cfg.langevin.target_norm,
+        tangent_noise=tangent_noise,
         energy_threshold=energy_threshold,
         plateau_patience=plateau_patience,
         plateau_delta=stage1_cfg.langevin.plateau_delta,
-        v_target=v_clean,
+        v_target=v_target,
         track_vectors=track_vectors,
         **method_kwargs,
     )
@@ -796,6 +1024,57 @@ def _sample_clean_noisy_pair(
     )
     v_noisy = _add_relative_noise(v_clean, float(noise_scale), seed=seed + 1)
     return v_clean, v_noisy, reference_source
+
+
+def _is_stage15_conditional_checkpoint(checkpoint_payload: dict, model_type: str) -> bool:
+    if model_type != "simple" or not isinstance(checkpoint_payload, dict):
+        return False
+    return (
+        ("critic1_state" in checkpoint_payload)
+        or ("critic2_state" in checkpoint_payload)
+        or ("actor_state" in checkpoint_payload)
+    )
+
+
+def _sample_inference_triplet(
+    checkpoint_payload: dict,
+    model_type: str,
+    stage1_cfg: Stage1Config,
+    device: torch.device,
+    noise_scale: float,
+    seed: int,
+    retrieval_bank_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str, str]:
+    """
+    Unified sampler for single-run inference:
+    returns (v_query, v_target, v_noisy, reference_source, target_label, objective).
+    """
+    if _is_stage15_conditional_checkpoint(checkpoint_payload, model_type):
+        rt = _extract_stage15_runtime_options(checkpoint_payload)
+        q, pos, hard, src = _sample_conditional_retrieval_batch(
+            device=device,
+            batch_size=1,
+            bank_size=max(64, int(retrieval_bank_size)),
+            seed=int(seed),
+            topk_pos=int(rt["retrieval_topk_pos"]),
+            hard_start=int(rt["retrieval_hard_start"]),
+            hard_end=int(rt["retrieval_hard_end"]),
+            min_pos_similarity=float(rt["retrieval_min_pos_similarity"]),
+        )
+        if q is not None and pos is not None and hard is not None:
+            seed_mix = float(rt["actor_seed_mix_query"])
+            seed_scale = float(rt["actor_seed_noise_scale"])
+            seed_vec = seed_mix * q + (1.0 - seed_mix) * hard
+            noisy = _add_relative_noise(seed_vec, float(noise_scale) * seed_scale, seed=seed + 1)
+            return q, pos, noisy, src, "retrieved_pos", "conditional_retrieval"
+
+    v_clean, v_noisy, src = _sample_clean_noisy_pair(
+        stage1_cfg=stage1_cfg,
+        device=device,
+        noise_scale=float(noise_scale),
+        seed=int(seed),
+    )
+    return v_clean, v_clean, v_noisy, src, "clean", "self_denoise"
 
 
 @torch.no_grad()
@@ -866,13 +1145,106 @@ def _sample_dataset_vectors(
 
 
 @torch.no_grad()
+def _sample_conditional_retrieval_batch(
+    device: torch.device,
+    batch_size: int,
+    bank_size: int,
+    seed: int,
+    topk_pos: int = 6,
+    hard_start: int = 6,
+    hard_end: int = 24,
+    min_pos_similarity: float = 0.15,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, str]:
+    """
+    Sample (query, positive, hard) triplets from dataset using cosine retrieval.
+    This mirrors Stage 1.5 conditional objective better than self-target eval.
+    """
+    dataset_path = _get_default_dataset_path()
+    if dataset_path is None:
+        return None, None, None, "unavailable"
+    try:
+        dataset = _get_dataset(dataset_path)
+    except Exception:
+        return None, None, None, "unavailable"
+
+    n = len(dataset)
+    if n < 4:
+        return None, None, None, "unavailable"
+
+    bs = max(1, min(int(batch_size), n))
+    bank_bs = max(bs, min(int(bank_size), n))
+
+    gen_q = torch.Generator(device="cpu")
+    gen_q.manual_seed(int(seed))
+    q_idx_cpu = torch.randperm(n, generator=gen_q)[:bs]
+
+    gen_b = torch.Generator(device="cpu")
+    gen_b.manual_seed(int(seed) + 9973)
+    bank_idx_cpu = torch.randperm(n, generator=gen_b)[:bank_bs]
+
+    q_idx = q_idx_cpu.to(device=device, dtype=torch.long)
+    bank_idx = bank_idx_cpu.to(device=device, dtype=torch.long)
+    q = dataset.embeddings[q_idx_cpu].to(device)
+    bank = dataset.embeddings[bank_idx_cpu].to(device)
+
+    qn = F.normalize(q, dim=-1)
+    bn = F.normalize(bank, dim=-1)
+    sims = qn @ bn.T
+
+    # Exclude exact self index in retrieval bank.
+    same_index = q_idx.unsqueeze(1).eq(bank_idx.unsqueeze(0))
+    sims = sims.masked_fill(same_index, -1e9)
+
+    k = min(bank.shape[0], max(2, int(topk_pos), int(hard_end)))
+    top_vals, top_idx = torch.topk(sims, k=k, dim=-1, largest=True)
+
+    # Positive: first neighbor that passes min similarity threshold.
+    valid_pos = top_vals >= float(min_pos_similarity)
+    has_valid = valid_pos.any(dim=1)
+    first_valid_col = valid_pos.to(torch.int64).argmax(dim=1)
+    pos_rel = top_idx[torch.arange(bs, device=device), first_valid_col]
+    # If no valid retrieval positive, provisional fallback uses top-1.
+    pos_rel = torch.where(has_valid, pos_rel, top_idx[:, 0])
+
+    hs = min(max(0, int(hard_start)), k - 1)
+    he = min(max(hs + 1, int(hard_end)), k)
+    width = max(1, he - hs)
+    hard_rng = torch.Generator(device=device)
+    hard_rng.manual_seed(int(seed) + 2027)
+    hard_offset = torch.randint(0, width, (bs,), device=device, generator=hard_rng)
+    hard_rel = top_idx[torch.arange(bs, device=device), hs + hard_offset]
+
+    # Avoid hard==positive.
+    hard_eq_pos = hard_rel.eq(pos_rel)
+    if hard_eq_pos.any():
+        fallback = top_idx[hard_eq_pos, -1]
+        hard_rel = hard_rel.clone()
+        hard_rel[hard_eq_pos] = fallback
+        hard_still_eq = hard_rel.eq(pos_rel)
+        if hard_still_eq.any() and k > 1:
+            hard_rel[hard_still_eq] = top_idx[hard_still_eq, k - 2]
+
+    pos = bank[pos_rel]
+    if (~has_valid).any():
+        # Keep objective well-posed: if retrieval neighborhood is too weak,
+        # fall back to identity target for those rows.
+        pos = pos.clone()
+        pos[~has_valid] = q[~has_valid]
+    hard = bank[hard_rel]
+    return q, pos, hard, "dataset"
+
+
+@torch.no_grad()
 def _compute_energy_batch(
     model,
     model_type: str,
     v_clean: torch.Tensor,
     v_candidate: torch.Tensor,
+    sigma_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if model_type == "simple":
+        if sigma_override is not None:
+            return model(v_clean, v_candidate, sigma=sigma_override).detach()
         return model(v_clean, v_candidate).detach()
     return model(v_candidate).detach()
 
@@ -900,39 +1272,105 @@ def _compute_sota_eval_metrics(
         return session_state["sota_eval_cache"][key]
 
     device = next(model.parameters()).device
-    v_clean_batch, source = _sample_dataset_vectors(device, int(eval_batch_size), seed=31415)
-    if v_clean_batch is None:
+    checkpoint_payload = session_state["checkpoints"].get(checkpoint_path, {})
+    is_stage15_conditional = _is_stage15_conditional_checkpoint(checkpoint_payload, model_type)
+    stage15_rt = _extract_stage15_runtime_options(checkpoint_payload)
+    tangent_noise = bool(stage15_rt["langevin_tangent_noise"]) if is_stage15_conditional else False
+
+    if is_stage15_conditional:
+        q_batch, v_target_batch, v_hard_batch, source = _sample_conditional_retrieval_batch(
+            device=device,
+            batch_size=int(eval_batch_size),
+            bank_size=int(eval_bank_size),
+            seed=31415,
+            topk_pos=int(stage15_rt["retrieval_topk_pos"]),
+            hard_start=int(stage15_rt["retrieval_hard_start"]),
+            hard_end=int(stage15_rt["retrieval_hard_end"]),
+            min_pos_similarity=float(stage15_rt["retrieval_min_pos_similarity"]),
+        )
+        if q_batch is None or v_target_batch is None or v_hard_batch is None:
+            out = {"available": False, "reason": "dataset_unavailable"}
+            session_state["sota_eval_cache"][key] = out
+            return out
+        seed_mix = float(stage15_rt["actor_seed_mix_query"])
+        seed_scale = float(stage15_rt["actor_seed_noise_scale"])
+        seed_vec = seed_mix * q_batch + (1.0 - seed_mix) * v_hard_batch
+        v_noisy_batch = _add_relative_noise(seed_vec, float(noise_scale) * seed_scale, seed=31416)
+        sigma_eval = torch.full(
+            (v_noisy_batch.shape[0], 1),
+            float(noise_scale),
+            device=device,
+            dtype=v_noisy_batch.dtype,
+        )
+        v_denoised_batch, _, batch_result = run_langevin_denoise(
+            model=model,
+            v_clean=v_target_batch,
+            v_noisy=v_noisy_batch,
+            model_type=model_type,
+            stage1_cfg=stage1_cfg,
+            max_steps=int(num_steps),
+            lr_override=float(learning_rate),
+            force_full_steps=True,
+            track_vectors=False,
+            v_query_override=q_batch,
+            v_target_override=v_target_batch,
+            tangent_noise_override=tangent_noise,
+            sigma_override=sigma_eval,
+        )
+        eval_query_batch = q_batch
+    else:
+        v_clean_batch, source = _sample_dataset_vectors(device, int(eval_batch_size), seed=31415)
+        if v_clean_batch is None:
+            out = {"available": False, "reason": "dataset_unavailable"}
+            session_state["sota_eval_cache"][key] = out
+            return out
+        v_target_batch = v_clean_batch
+        v_noisy_batch = _add_relative_noise(v_clean_batch, float(noise_scale), seed=31416)
+        sigma_eval = (
+            torch.full(
+                (v_noisy_batch.shape[0], 1),
+                float(noise_scale),
+                device=device,
+                dtype=v_noisy_batch.dtype,
+            )
+            if model_type == "simple"
+            else None
+        )
+        v_denoised_batch, _, batch_result = run_langevin_denoise(
+            model=model,
+            v_clean=v_target_batch,
+            v_noisy=v_noisy_batch,
+            model_type=model_type,
+            stage1_cfg=stage1_cfg,
+            max_steps=int(num_steps),
+            lr_override=float(learning_rate),
+            force_full_steps=True,
+            track_vectors=False,
+            sigma_override=sigma_eval,
+        )
+        eval_query_batch = v_clean_batch
+
+    if v_target_batch is None:
         out = {"available": False, "reason": "dataset_unavailable"}
         session_state["sota_eval_cache"][key] = out
         return out
 
-    v_noisy_batch = _add_relative_noise(v_clean_batch, float(noise_scale), seed=31416)
-    v_denoised_batch, _, batch_result = run_langevin_denoise(
-        model=model,
-        v_clean=v_clean_batch,
-        v_noisy=v_noisy_batch,
-        model_type=model_type,
-        stage1_cfg=stage1_cfg,
-        max_steps=int(num_steps),
-        lr_override=float(learning_rate),
-        force_full_steps=True,
-        track_vectors=False,
-    )
-
-    cos_before = F.cosine_similarity(v_clean_batch, v_noisy_batch, dim=-1)
-    cos_after = F.cosine_similarity(v_clean_batch, v_denoised_batch, dim=-1)
+    cos_before = F.cosine_similarity(v_target_batch, v_noisy_batch, dim=-1)
+    cos_after = F.cosine_similarity(v_target_batch, v_denoised_batch, dim=-1)
 
     e_noisy = _compute_energy_batch(
         model=model,
         model_type=model_type,
-        v_clean=v_clean_batch,
+        v_clean=eval_query_batch,
         v_candidate=v_noisy_batch,
+        sigma_override=sigma_eval,
     )
     e_final = _compute_energy_batch(
         model=model,
         model_type=model_type,
-        v_clean=v_clean_batch,
+        v_clean=eval_query_batch,
         v_candidate=v_denoised_batch,
+        sigma_override=sigma_eval,
     )
 
     ref_bank, _ = _sample_dataset_vectors(device, int(eval_bank_size), seed=27182)
@@ -944,7 +1382,7 @@ def _compute_sota_eval_metrics(
         c2st_train_frac=0.8,
         mmd_subsample=min(256, int(eval_batch_size)),
     )
-    suite = compute_distribution_suite(v_clean_batch, v_denoised_batch, cfg=cfg)
+    suite = compute_distribution_suite(v_target_batch, v_denoised_batch, cfg=cfg)
     if ref_bank is not None:
         suite.update(
             compute_manifold_knn_metrics(
@@ -958,22 +1396,26 @@ def _compute_sota_eval_metrics(
     out = {
         "available": True,
         "reference_source": source,
-        "eval_batch_size": int(v_clean_batch.shape[0]),
+        "eval_objective": (
+            "conditional_retrieval" if is_stage15_conditional else "self_denoise"
+        ),
+        "target_label": ("retrieved_pos" if is_stage15_conditional else "clean"),
+        "eval_batch_size": int(v_target_batch.shape[0]),
         "eval_bank_size": int(0 if ref_bank is None else ref_bank.shape[0]),
         "steps_executed_mean": float(batch_result.num_steps),
         "cos_before_mean": float(cos_before.mean().item()),
         "cos_after_mean": float(cos_after.mean().item()),
         "cos_improvement_mean": float((cos_after - cos_before).mean().item()),
         "cos_success_rate": float((cos_after > cos_before).float().mean().item()),
-        "l2_before_mean": float((v_clean_batch - v_noisy_batch).norm(dim=-1).mean().item()),
-        "l2_after_mean": float((v_clean_batch - v_denoised_batch).norm(dim=-1).mean().item()),
+        "l2_before_mean": float((v_target_batch - v_noisy_batch).norm(dim=-1).mean().item()),
+        "l2_after_mean": float((v_target_batch - v_denoised_batch).norm(dim=-1).mean().item()),
         "l2_improvement_mean": float(
-            ((v_clean_batch - v_noisy_batch).norm(dim=-1) - (v_clean_batch - v_denoised_batch).norm(dim=-1))
+            ((v_target_batch - v_noisy_batch).norm(dim=-1) - (v_target_batch - v_denoised_batch).norm(dim=-1))
             .mean()
             .item()
         ),
         "l2_success_rate": float(
-            ((v_clean_batch - v_denoised_batch).norm(dim=-1) < (v_clean_batch - v_noisy_batch).norm(dim=-1))
+            ((v_target_batch - v_denoised_batch).norm(dim=-1) < (v_target_batch - v_noisy_batch).norm(dim=-1))
             .float()
             .mean()
             .item()
@@ -994,25 +1436,34 @@ def _compute_sota_eval_metrics(
 def _compute_energy_triplet(
     model,
     model_type: str,
-    v_clean: torch.Tensor,
+    v_query: torch.Tensor,
+    v_target: torch.Tensor,
     v_noisy: torch.Tensor,
     v_denoised: torch.Tensor,
+    sigma_override: torch.Tensor | None = None,
 ) -> dict[str, float]:
     if model_type == "simple":
-        e_clean = float(model(v_clean, v_clean).mean().item())
-        e_noisy = float(model(v_clean, v_noisy).mean().item())
-        e_denoised = float(model(v_clean, v_denoised).mean().item())
+        if sigma_override is not None:
+            e_target = float(model(v_query, v_target, sigma=sigma_override).mean().item())
+            e_noisy = float(model(v_query, v_noisy, sigma=sigma_override).mean().item())
+            e_denoised = float(model(v_query, v_denoised, sigma=sigma_override).mean().item())
+        else:
+            e_target = float(model(v_query, v_target).mean().item())
+            e_noisy = float(model(v_query, v_noisy).mean().item())
+            e_denoised = float(model(v_query, v_denoised).mean().item())
     else:
-        e_clean = float(model(v_clean).mean().item())
+        e_target = float(model(v_target).mean().item())
         e_noisy = float(model(v_noisy).mean().item())
         e_denoised = float(model(v_denoised).mean().item())
 
     return {
-        "clean": e_clean,
+        "target": e_target,
+        # Backward-compatible alias for existing UI fields:
+        "clean": e_target,
         "noisy": e_noisy,
         "denoised": e_denoised,
         "delta_noisy_to_denoised": e_denoised - e_noisy,
-        "delta_clean_to_denoised": e_denoised - e_clean,
+        "delta_clean_to_denoised": e_denoised - e_target,
     }
 
 
@@ -1035,7 +1486,8 @@ def _compute_alignment_diagnostic(
 def _build_runtime_metrics(
     model,
     model_type: str,
-    v_clean: torch.Tensor,
+    v_query: torch.Tensor,
+    v_target: torch.Tensor,
     v_noisy: torch.Tensor,
     v_denoised: torch.Tensor,
     noise_scale: float,
@@ -1043,26 +1495,37 @@ def _build_runtime_metrics(
     steps_executed: int,
     stopped_early: bool,
     reference_source: str,
+    target_label: str = "clean",
+    eval_objective: str = "self_denoise",
+    sigma_override: torch.Tensor | None = None,
 ) -> dict:
-    v_clean_np = v_clean.squeeze(0).detach().cpu().numpy()
+    v_target_np = v_target.squeeze(0).detach().cpu().numpy()
     v_noisy_np = v_noisy.squeeze(0).detach().cpu().numpy()
     v_denoised_np = v_denoised.squeeze(0).detach().cpu().numpy()
 
-    cos_before = float(np.dot(v_clean_np, v_noisy_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_noisy_np)))
-    cos_after = float(np.dot(v_clean_np, v_denoised_np) / (np.linalg.norm(v_clean_np) * np.linalg.norm(v_denoised_np)))
+    cos_before = float(np.dot(v_target_np, v_noisy_np) / (np.linalg.norm(v_target_np) * np.linalg.norm(v_noisy_np)))
+    cos_after = float(np.dot(v_target_np, v_denoised_np) / (np.linalg.norm(v_target_np) * np.linalg.norm(v_denoised_np)))
     cos_improvement = cos_after - cos_before
 
     energies = _compute_energy_triplet(
         model=model,
         model_type=model_type,
-        v_clean=v_clean,
+        v_query=v_query,
+        v_target=v_target,
         v_noisy=v_noisy,
         v_denoised=v_denoised,
+        sigma_override=sigma_override,
     )
     displacement = float((v_denoised - v_noisy).norm().item())
 
+    query_target_cos = float(
+        F.cosine_similarity(v_query, v_target, dim=-1).mean().item()
+    ) if model_type == "simple" else float("nan")
+
     return {
         "reference_source": reference_source,
+        "target_label": str(target_label),
+        "eval_objective": str(eval_objective),
         "noise_scale": float(noise_scale),
         "steps_requested": int(steps_requested),
         "steps_executed": int(steps_executed),
@@ -1070,13 +1533,15 @@ def _build_runtime_metrics(
         "cos_before": cos_before,
         "cos_after": cos_after,
         "cos_improvement": cos_improvement,
-        "energy_clean": float(energies["clean"]),
+        "energy_target": float(energies["target"]),
+        "energy_clean": float(energies["target"]),
         "energy_noisy": float(energies["noisy"]),
         "energy_final": float(energies["denoised"]),
         "energy_improvement": float(energies["noisy"] - energies["denoised"]),
         "energy_success": bool(energies["denoised"] < energies["noisy"]),
         "cosine_success": bool(cos_after > cos_before),
         "displacement": displacement,
+        "query_target_cos": query_target_cos,
     }
 
 
@@ -1097,6 +1562,9 @@ def _format_inference_info(
     force_full_steps: bool,
     reference_source: str,
     sota_metrics: dict | None = None,
+    target_label: str = "clean",
+    eval_objective: str = "self_denoise",
+    query_target_cos: float | None = None,
 ) -> str:
     energy_min = float(landscape_data.get("energy_min", np.nan))
     energy_max = float(landscape_data.get("energy_max", np.nan))
@@ -1112,15 +1580,16 @@ def _format_inference_info(
         f"- Early stop triggered: `{stopped_early}`",
         f"- Forced full steps (GUI debug mode): `{force_full_steps}`",
         f"- Reference source: `{reference_source}`",
+        f"- Eval objective: `{eval_objective}` (target=`{target_label}`)",
         f"- Energy range on scanned plane: `[{energy_min:.4f}, {energy_max:.4f}]`",
-        f"- Energy(clean ref): `{energies['clean']:.6f}`",
+        f"- Energy(target ref): `{energies['clean']:.6f}`",
         f"- Energy(noisy start): `{energies['noisy']:.6f}`",
         f"- Energy(denoised/final): `{energies['denoised']:.6f}`",
         f"- Delta energy (final - start): `{energies['delta_noisy_to_denoised']:+.6f}`",
         f"- Primary improvement (start - final energy): `{(-energies['delta_noisy_to_denoised']):+.6f}`",
-        f"- Delta energy (final - clean): `{energies['delta_clean_to_denoised']:+.6f}`",
-        f"- Cosine(clean, noisy): `{cos_before:.6f}`",
-        f"- Cosine(clean, final): `{cos_after:.6f}`",
+        f"- Delta energy (final - target): `{energies['delta_clean_to_denoised']:+.6f}`",
+        f"- Cosine(target, noisy): `{cos_before:.6f}`",
+        f"- Cosine(target, final): `{cos_after:.6f}`",
         f"- Cosine improvement: `{_fmt_signed(cos_after - cos_before)}`",
         f"- Final displacement ||x_T - x_0||: `{displacement:.6f}`",
     ]
@@ -1134,6 +1603,10 @@ def _format_inference_info(
         lines.append("- Note: for unconditional models, cosine-to-clean is only a local diagnostic.")
         lines.append("- Primary criterion is energy descent and manifold-level sampling metrics.")
         lines.append("- The reference clean vector is not a mandatory target minimum for this model.")
+    elif eval_objective == "conditional_retrieval":
+        lines.append("- Note: conditional Stage1.5 evaluates against retrieved positive target (not self-clean reconstruction).")
+        if query_target_cos is not None and np.isfinite(query_target_cos):
+            lines.append(f"- Query-target cosine (retrieval quality): `{query_target_cos:.6f}`")
 
     if reference_source != "dataset":
         lines.append("- Warning: dataset reference was unavailable; using synthetic clean vector.")
@@ -1161,9 +1634,12 @@ def _format_inference_info(
         lines.append("")
         lines.append("**SOTA Batch Eval:**")
         if bool(sota_metrics.get("available", False)):
+            target_label = str(sota_metrics.get("target_label", "clean"))
+            objective = str(sota_metrics.get("eval_objective", "self_denoise"))
             lines.append(
                 f"- Eval batch / bank: `{int(sota_metrics['eval_batch_size'])}` / `{int(sota_metrics['eval_bank_size'])}`"
             )
+            lines.append(f"- Eval objective: `{objective}` (target=`{target_label}`)")
             lines.append(
                 f"- Cosine before/after: `{float(sota_metrics['cos_before_mean']):.6f}` -> `{float(sota_metrics['cos_after_mean']):.6f}`"
             )
@@ -1174,7 +1650,7 @@ def _format_inference_info(
                 f"- Cosine success rate: `{float(sota_metrics['cos_success_rate']):.2%}`"
             )
             lines.append(
-                f"- L2(clean,x) mean: `{float(sota_metrics.get('l2_before_mean', float('nan'))):.6f}` -> "
+                f"- L2(target,x) mean: `{float(sota_metrics.get('l2_before_mean', float('nan'))):.6f}` -> "
                 f"`{float(sota_metrics.get('l2_after_mean', float('nan'))):.6f}` "
                 f"({ _fmt_signed(float(sota_metrics.get('l2_improvement_mean', float('nan'))), 8) })"
             )
@@ -1229,33 +1705,46 @@ def run_inference_fn(
 
     checkpoint = session_state["checkpoints"][checkpoint_path]
     stage1_cfg = build_stage1_config(checkpoint)
+    stage15_rt = _extract_stage15_runtime_options(checkpoint)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
-
-    v_clean, v_noisy, reference_source = _sample_clean_noisy_pair(
+    v_query, v_target, v_noisy, reference_source, target_label, eval_objective = _sample_inference_triplet(
+        checkpoint_payload=checkpoint,
+        model_type=model_type,
         stage1_cfg=stage1_cfg,
         device=device,
         noise_scale=float(noise_scale),
         seed=42,
+        retrieval_bank_size=int(sota_eval_bank_size),
     )
+    sigma_infer = (
+        torch.full((v_noisy.shape[0], 1), float(noise_scale), device=device, dtype=v_noisy.dtype)
+        if model_type == "simple"
+        else None
+    )
+    tangent_noise = bool(stage15_rt["langevin_tangent_noise"]) if eval_objective == "conditional_retrieval" else False
 
     v_denoised, trajectory, langevin_result = run_langevin_denoise(
         model=model,
-        v_clean=v_clean,
+        v_clean=v_target,
         v_noisy=v_noisy,
         model_type=model_type,
         stage1_cfg=stage1_cfg,
         max_steps=int(num_steps),
         lr_override=float(learning_rate),
         force_full_steps=True,
+        v_query_override=v_query,
+        v_target_override=v_target,
+        tangent_noise_override=tangent_noise,
+        sigma_override=sigma_infer,
     )
 
     grid, rf, abs_range = _resolve_scan_params(grid_size, range_factor, absolute_half_range)
 
     landscape_data = scan_energy_landscape_3d(
         energy_fn=model,
-        v_clean=v_clean,
+        v_clean=v_target,
         v_noisy=v_noisy,
         grid_size=grid,
         range_factor=rf,
@@ -1264,6 +1753,12 @@ def run_inference_fn(
         trajectory=trajectory,
         model_type=model_type,
     )
+    if eval_objective == "conditional_retrieval":
+        if isinstance(landscape_data.get("point_labels"), dict):
+            landscape_data["point_labels"]["clean"] = "Retrieved Target"
+            landscape_data["point_labels"]["noisy"] = "Noisy Seed"
+            landscape_data["point_labels"]["denoised"] = "Refined"
+        landscape_data["axis1_label"] = "Direction 1 (target -> noisy)"
 
     landscape_fig = _render_landscape_figure(checkpoint_path, landscape_data, vis_backend)
     trajectory_fig = create_trajectory_plot(landscape_data)
@@ -1271,7 +1766,8 @@ def run_inference_fn(
     runtime_metrics = _build_runtime_metrics(
         model=model,
         model_type=model_type,
-        v_clean=v_clean,
+        v_query=v_query,
+        v_target=v_target,
         v_noisy=v_noisy,
         v_denoised=v_denoised,
         noise_scale=float(noise_scale),
@@ -1279,11 +1775,14 @@ def run_inference_fn(
         steps_executed=int(langevin_result.num_steps),
         stopped_early=bool(langevin_result.stopped_early),
         reference_source=reference_source,
+        target_label=target_label,
+        eval_objective=eval_objective,
+        sigma_override=sigma_infer,
     )
     runtime_metrics.update(
         _compute_plane_diagnostics(
             landscape_data=landscape_data,
-            v_clean=v_clean,
+            v_clean=v_target,
             v_noisy=v_noisy,
             v_denoised=v_denoised,
         )
@@ -1304,7 +1803,7 @@ def run_inference_fn(
     alignment = _compute_alignment_diagnostic(
         model=model,
         model_type=model_type,
-        v_clean=v_clean,
+        v_clean=v_target,
         v_noisy=v_noisy,
     )
 
@@ -1331,6 +1830,11 @@ def run_inference_fn(
         force_full_steps=True,
         reference_source=reference_source,
         sota_metrics=runtime_metrics.get("sota"),
+        target_label=str(runtime_metrics.get("target_label", target_label)),
+        eval_objective=str(runtime_metrics.get("eval_objective", eval_objective)),
+        query_target_cos=float(runtime_metrics.get("query_target_cos"))
+        if runtime_metrics.get("query_target_cos") is not None
+        else None,
     )
 
     summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
@@ -1370,28 +1874,42 @@ def generate_landscape_for_checkpoint(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
     stage1_cfg = build_stage1_config(checkpoint)
+    stage15_rt = _extract_stage15_runtime_options(checkpoint)
 
-    v_clean, v_noisy, reference_source = _sample_clean_noisy_pair(
+    v_query, v_target, v_noisy, reference_source, target_label, eval_objective = _sample_inference_triplet(
+        checkpoint_payload=checkpoint,
+        model_type=model_type,
         stage1_cfg=stage1_cfg,
         device=device,
         noise_scale=float(preview_noise),
         seed=42,
+        retrieval_bank_size=int(sota_eval_bank_size),
     )
+    sigma_preview = (
+        torch.full((v_noisy.shape[0], 1), float(preview_noise), device=device, dtype=v_noisy.dtype)
+        if model_type == "simple"
+        else None
+    )
+    tangent_noise = bool(stage15_rt["langevin_tangent_noise"]) if eval_objective == "conditional_retrieval" else False
 
     v_denoised, trajectory, result = run_langevin_denoise(
         model=model,
-        v_clean=v_clean,
+        v_clean=v_target,
         v_noisy=v_noisy,
         model_type=model_type,
         stage1_cfg=stage1_cfg,
         max_steps=int(preview_steps),
         lr_override=None,
         force_full_steps=True,
+        v_query_override=v_query,
+        v_target_override=v_target,
+        tangent_noise_override=tangent_noise,
+        sigma_override=sigma_preview,
     )
 
     landscape_data = scan_energy_landscape_3d(
         energy_fn=model,
-        v_clean=v_clean,
+        v_clean=v_target,
         v_noisy=v_noisy,
         grid_size=grid,
         range_factor=rf,
@@ -1400,10 +1918,17 @@ def generate_landscape_for_checkpoint(
         trajectory=trajectory,
         model_type=model_type,
     )
+    if eval_objective == "conditional_retrieval":
+        if isinstance(landscape_data.get("point_labels"), dict):
+            landscape_data["point_labels"]["clean"] = "Retrieved Target"
+            landscape_data["point_labels"]["noisy"] = "Noisy Seed"
+            landscape_data["point_labels"]["denoised"] = "Refined"
+        landscape_data["axis1_label"] = "Direction 1 (target -> noisy)"
     landscape_data["runtime_metrics"] = _build_runtime_metrics(
         model=model,
         model_type=model_type,
-        v_clean=v_clean,
+        v_query=v_query,
+        v_target=v_target,
         v_noisy=v_noisy,
         v_denoised=v_denoised,
         noise_scale=float(preview_noise),
@@ -1411,11 +1936,14 @@ def generate_landscape_for_checkpoint(
         steps_executed=int(result.num_steps),
         stopped_early=bool(result.stopped_early),
         reference_source=reference_source,
+        target_label=target_label,
+        eval_objective=eval_objective,
+        sigma_override=sigma_preview,
     )
     landscape_data["runtime_metrics"].update(
         _compute_plane_diagnostics(
             landscape_data=landscape_data,
-            v_clean=v_clean,
+            v_clean=v_target,
             v_noisy=v_noisy,
             v_denoised=v_denoised,
         )

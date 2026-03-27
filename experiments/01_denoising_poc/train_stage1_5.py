@@ -128,6 +128,7 @@ def retrieve_pos_hard(
     hard_start: int,
     hard_end: int,
     self_sim_exclude: float,
+    min_pos_similarity: float,
     q_indices: torch.Tensor | None = None,
     bank_indices: torch.Tensor | None = None,
     strict_index_exclusion: bool = True,
@@ -148,7 +149,11 @@ def retrieve_pos_hard(
     if strict_has_index:
         same_index = bank_indices[idx] == q_indices.unsqueeze(1)
 
-    valid_pos = (~same_index) & (vals < float(self_sim_exclude))
+    valid_pos = (
+        (~same_index)
+        & (vals < float(self_sim_exclude))
+        & (vals >= float(min_pos_similarity))
+    )
     has_valid_pos = valid_pos.any(dim=1)
     first_valid_col = valid_pos.to(torch.int64).argmax(dim=1)
     pos = idx[batch, first_valid_col]
@@ -184,7 +189,14 @@ def retrieve_pos_hard(
     alt = rev_idx[batch, alt_col]
     hard = torch.where(need_fix & has_alt, alt, hard)
 
-    return bank[pos], bank[hard]
+    pos_vec = bank[pos]
+    if (~has_valid_pos).any():
+        # No reliable retrieval positive for this query:
+        # fall back to identity target to avoid training on semantically wrong pairs.
+        pos_vec = pos_vec.clone()
+        pos_vec[~has_valid_pos] = q[~has_valid_pos]
+
+    return pos_vec, bank[hard]
 
 
 def seed_actor(q: torch.Tensor, hard: torch.Tensor, sigma: torch.Tensor, cfg: Stage1_5Config) -> torch.Tensor:
@@ -233,11 +245,36 @@ def conditional_mdsm(
         w = sigma_eff_sq.squeeze(-1)
     elif cfg.sigma_weighting == "inv_sigma2":
         w = 1.0 / sigma_eff_sq.squeeze(-1).clamp(min=1e-8)
-    else:
+    elif cfg.sigma_weighting == "uniform":
         w = torch.ones_like(loss)
+    else:
+        raise ValueError(f"Unknown sigma_weighting: {cfg.sigma_weighting}")
     loss = torch.nan_to_num(loss, nan=1e4, posinf=1e4, neginf=1e4)
     w = w / w.mean().clamp(min=1e-8)
     return (w * loss).mean()
+
+
+def normalize_triplet_energies(
+    e_pos: torch.Tensor,
+    e_actor: torch.Tensor,
+    e_hard: torch.Tensor,
+    enabled: bool,
+    std_floor: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Normalize triplet energies by detached batch statistics to make ranking margins
+    scale-invariant. This prevents impossible absolute-margin constraints when
+    energy range is narrow.
+    """
+    if not enabled:
+        return e_pos, e_actor, e_hard
+    with torch.no_grad():
+        stacked = torch.cat([e_pos, e_actor, e_hard], dim=0)
+        mu = stacked.mean()
+        std = stacked.std(unbiased=False).clamp(min=float(std_floor))
+    mu = mu.detach()
+    std = std.detach()
+    return (e_pos - mu) / std, (e_actor - mu) / std, (e_hard - mu) / std
 
 
 def conditional_nce_loss(
@@ -320,7 +357,9 @@ class TwinHybridEnergy:
             tau = max(1e-6, float(self.softmax_temperature))
             stacked = torch.stack([e1, e2], dim=0)
             return tau * torch.logsumexp(stacked / tau, dim=0)
-        return torch.maximum(e1, e2)
+        if self.aggregate == "max":
+            return torch.maximum(e1, e2)
+        raise ValueError(f"Unknown twin aggregation mode: {self.aggregate}")
 
     def __call__(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
         e = self.cond(q, v, sigma=sigma)
@@ -335,6 +374,26 @@ class TwinHybridEnergy:
         e = self(q, v_req, sigma=sigma)
         g = torch.autograd.grad(e.sum(), v_req, create_graph=False)[0]
         return e.detach(), g.detach()
+
+
+class SigmaBoundEnergy:
+    """
+    Bind a fixed sigma tensor to an energy callable for Langevin API parity.
+    """
+
+    def __init__(self, energy_fn: TwinHybridEnergy, sigma: torch.Tensor):
+        self.energy_fn = energy_fn
+        self.sigma = sigma
+
+    def __call__(self, v_query: torch.Tensor, v_candidate: torch.Tensor) -> torch.Tensor:
+        return self.energy_fn(v_query, v_candidate, sigma=self.sigma)
+
+    def energy_and_grad(
+        self,
+        v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.energy_fn.energy_and_grad(v_query, v_candidate, sigma=self.sigma)
 
 
 def make_thresholds(cfg: Stage1_5Config) -> ConditionalThresholds:
@@ -397,6 +456,7 @@ def eval_model(
                 cfg.retrieval_hard_start,
                 cfg.retrieval_hard_end,
                 cfg.retrieval_self_sim_exclude,
+                cfg.retrieval_min_pos_similarity,
                 q_indices=q_idx,
                 bank_indices=bank_idx,
                 strict_index_exclusion=cfg.retrieval_strict_index_exclusion,
@@ -415,12 +475,13 @@ def eval_model(
                         target_norm=cfg.langevin.target_norm,
                         tangent_projection=cfg.actor_tangent_projection,
                     )
+            sigma_bound_ef = SigmaBoundEnergy(ef, sigma=sigma.detach())
             if cfg.critic_eval_langevin_steps > 0:
                 # Keep eval math sample-independent when batched: fixed-step rollout,
                 # no batch-coupled early stop by mean energy.
                 res = run_langevin(
                     method=cfg.langevin.method,
-                    energy_fn=ef,
+                    energy_fn=sigma_bound_ef,
                     v_query=q,
                     v_init=v,
                     lr=cfg.langevin.lr,
@@ -444,9 +505,9 @@ def eval_model(
             la_batch = torch.norm(pos - final, dim=-1)
             step_batch = torch.norm(final - noisy, dim=-1)
             with torch.no_grad():
-                ep_batch = ef(q, pos).detach()
-                eb_batch = ef(q, noisy).detach()
-                ea_batch = ef(q, final).detach()
+                ep_batch = ef(q, pos, sigma=sigma.detach()).detach()
+                eb_batch = ef(q, noisy, sigma=sigma.detach()).detach()
+                ea_batch = ef(q, final, sigma=sigma.detach()).detach()
 
             cb.extend(cb_batch.detach().cpu().tolist())
             ca.extend(ca_batch.detach().cpu().tolist())
@@ -538,6 +599,7 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "lambda_prior",
         "lambda_prior_nce",
         "lambda_actor_barrier",
+        "lambda_actor_descent",
         "gradient_penalty_lambda",
         "shell_barrier_margin",
         "cql_noise_scale",
@@ -548,18 +610,27 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "critic_margin_clean_actor",
         "critic_margin_actor_noisy",
         "critic_margin_clean_noisy",
+        "rank_std_floor",
+        "actor_energy_margin_pos",
+        "actor_energy_margin_hard",
         "retrieval_self_sim_exclude",
+        "retrieval_min_pos_similarity",
         "non_finite_backoff_streak_trigger",
         "max_consecutive_non_finite_batches",
         "param_finite_check_interval",
-        "critic_steps_per_actor",
     ]:
         _must_be_non_negative(name, float(getattr(cfg, name)))
+    if int(cfg.critic_steps_per_actor) < 1:
+        raise ValueError(f"critic_steps_per_actor must be >= 1, got {cfg.critic_steps_per_actor}")
 
     if cfg.sigma_curriculum_start > cfg.sigma_curriculum_end:
         raise ValueError(
             "sigma_curriculum_start must be <= sigma_curriculum_end, "
             f"got {cfg.sigma_curriculum_start} > {cfg.sigma_curriculum_end}"
+        )
+    if cfg.sigma_curriculum_start <= 0.0:
+        raise ValueError(
+            f"sigma_curriculum_start must be > 0 for loguniform sampling, got {cfg.sigma_curriculum_start}"
         )
     if cfg.sigma_min > cfg.sigma_max:
         raise ValueError(f"sigma_min must be <= sigma_max, got {cfg.sigma_min} > {cfg.sigma_max}")
@@ -572,6 +643,32 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
     if cfg.retrieval_self_sim_exclude > 1.0:
         raise ValueError(
             f"retrieval_self_sim_exclude must be <= 1.0 for cosine similarity, got {cfg.retrieval_self_sim_exclude}"
+        )
+    if cfg.retrieval_min_pos_similarity < -1.0 or cfg.retrieval_min_pos_similarity > 1.0:
+        raise ValueError(
+            f"retrieval_min_pos_similarity must be in [-1,1], got {cfg.retrieval_min_pos_similarity}"
+        )
+    if cfg.rank_std_floor <= 0:
+        raise ValueError(f"rank_std_floor must be > 0, got {cfg.rank_std_floor}")
+    if cfg.sigma_weighting not in {"sigma2", "uniform", "inv_sigma2"}:
+        raise ValueError(
+            "sigma_weighting must be one of {'sigma2','uniform','inv_sigma2'}, "
+            f"got {cfg.sigma_weighting}"
+        )
+    if cfg.twin_aggregate not in {"max", "mean", "softmax"}:
+        raise ValueError(
+            "twin_aggregate must be one of {'max','mean','softmax'}, "
+            f"got {cfg.twin_aggregate}"
+        )
+    if cfg.actor_norm_mode not in {"orthonorm", "spectral_norm", "none"}:
+        raise ValueError(
+            "actor_norm_mode must be one of {'orthonorm','spectral_norm','none'}, "
+            f"got {cfg.actor_norm_mode}"
+        )
+    if cfg.actor_activation not in {"silu", "gelu", "relu", "groupsort", "lipschitz_spline"}:
+        raise ValueError(
+            "actor_activation must be one of {'silu','gelu','relu','groupsort','lipschitz_spline'}, "
+            f"got {cfg.actor_activation}"
         )
     if cfg.compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
         raise ValueError(
@@ -609,6 +706,16 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
     ]:
         value = float(getattr(cfg.langevin, name))
         _must_be_non_negative(f"langevin.{name}", value)
+    if cfg.langevin.method == "underdamped":
+        if float(cfg.langevin.underdamped_mass) <= 0.0:
+            raise ValueError(
+                f"langevin.underdamped_mass must be > 0, got {cfg.langevin.underdamped_mass}"
+            )
+        fr = float(cfg.langevin.underdamped_friction)
+        if not (0.0 < fr <= 1.0):
+            raise ValueError(
+                f"langevin.underdamped_friction must be in (0,1], got {cfg.langevin.underdamped_friction}"
+            )
 
 
 def load_config(path: str) -> Stage1_5Config:
@@ -662,7 +769,13 @@ def main() -> None:
 
     c1_base = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
     c2_base = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
-    actor_base = LatentDenoiseActor(cfg.energy_dim, cfg.actor_hidden_dims, cfg.norm_mode, "silu", ortho_n_iters=cfg.ortho_n_iters).to(device)
+    actor_base = LatentDenoiseActor(
+        cfg.energy_dim,
+        cfg.actor_hidden_dims,
+        cfg.actor_norm_mode,
+        cfg.actor_activation,
+        ortho_n_iters=cfg.ortho_n_iters,
+    ).to(device)
     prior_base = UnconditionalEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters).to(device) if cfg.use_prior_critic else None
 
     # Runtime n_iters is epoch-scheduled; initialize to first-epoch value.
@@ -748,6 +861,8 @@ def main() -> None:
             "rank_clean_lt_hard": 0.0,
             "retrieval_cosine": 0.0,
             "clean_viol": 0.0,
+            "actor_barrier": 0.0,
+            "actor_descent": 0.0,
         }
         n_ok, n_skip, bad_streak = 0, 0, 0
         ema_c, ema_a = None, None
@@ -781,6 +896,7 @@ def main() -> None:
                 cfg.retrieval_hard_start,
                 cfg.retrieval_hard_end,
                 cfg.retrieval_self_sim_exclude,
+                cfg.retrieval_min_pos_similarity,
                 q_indices=q_idx,
                 bank_indices=bankidx_tr,
                 strict_index_exclusion=cfg.retrieval_strict_index_exclusion,
@@ -821,10 +937,17 @@ def main() -> None:
                         e_pos = crit(q, pos, sigma=sigma.detach())
                         e_actor = crit(q, a_init.detach(), sigma=sigma.detach())
                         e_hard = crit(q, hard.detach(), sigma=sigma.detach())
+                        e_pos_rank, e_actor_rank, e_hard_rank = normalize_triplet_energies(
+                            e_pos=e_pos,
+                            e_actor=e_actor,
+                            e_hard=e_hard,
+                            enabled=bool(cfg.rank_normalize_by_std),
+                            std_floor=float(cfg.rank_std_floor),
+                        )
                         rank = (
-                            F.relu(e_pos - e_actor + cfg.critic_margin_clean_actor)
-                            + F.relu(e_actor - e_hard + cfg.critic_margin_actor_noisy)
-                            + F.relu(e_pos - e_hard + cfg.critic_margin_clean_noisy)
+                            F.relu(e_pos_rank - e_actor_rank + cfg.critic_margin_clean_actor)
+                            + F.relu(e_actor_rank - e_hard_rank + cfg.critic_margin_actor_noisy)
+                            + F.relu(e_pos_rank - e_hard_rank + cfg.critic_margin_clean_noisy)
                         ).mean()
                         cql = torch.tensor(0.0, device=device)
                         if cfg.use_cql:
@@ -858,7 +981,7 @@ def main() -> None:
                             )
                         gp = torch.tensor(0.0, device=device)
                         if cfg.use_gradient_penalty:
-                            gp = gradient_penalty(crit, q, a_init.detach())
+                            gp = gradient_penalty(crit, q, a_init.detach(), sigma=sigma.detach())
                         shell = torch.tensor(0.0, device=device)
                         if cfg.use_shell_barrier and cfg.langevin.target_norm is not None:
                             nrm = a_init.norm(dim=-1)
@@ -966,6 +1089,9 @@ def main() -> None:
                     if cfg.use_grad_align:
                         with torch.enable_grad():
                             _, g_seed = ef.energy_and_grad(q, seed_a, sigma=sigma_a.detach())
+                        if cfg.actor_tangent_projection and cfg.langevin.target_norm is not None:
+                            seed_hat = F.normalize(seed_a, dim=-1)
+                            g_seed = g_seed - (g_seed * seed_hat).sum(dim=-1, keepdim=True) * seed_hat
                         l_align = (
                             1.0
                             - F.cosine_similarity(
@@ -974,17 +1100,40 @@ def main() -> None:
                         ).mean()
                     else:
                         l_align = torch.tensor(0.0, device=device)
+                    e_next = ef(q, nxt, sigma=sigma_a.detach())
+                    if cfg.langevin.target_norm is not None:
+                        seed_ref = F.normalize(seed_a, dim=-1) * cfg.langevin.target_norm
+                    else:
+                        seed_ref = seed_a
+                    e_seed = ef(q, seed_ref, sigma=sigma_a.detach()).detach()
+                    e_pos_ref = ef(q, pos, sigma=sigma_a.detach()).detach()
+                    e_hard_ref = ef(q, hard.detach(), sigma=sigma_a.detach()).detach()
+                    e_pos_bar, e_next_bar, e_hard_bar = normalize_triplet_energies(
+                        e_pos=e_pos_ref,
+                        e_actor=e_next,
+                        e_hard=e_hard_ref,
+                        enabled=bool(cfg.actor_barrier_normalize_by_std),
+                        std_floor=float(cfg.rank_std_floor),
+                    )
+
                     l_bar = torch.tensor(0.0, device=device)
                     if cfg.lambda_actor_barrier > 0:
-                        l_bar = F.softplus(
-                            ef(q, pos, sigma=sigma_a.detach()).detach()
-                            - ef(q, nxt, sigma=sigma_a.detach())
-                        ).mean()
+                        # Keep actor proposal in a valid critic band:
+                        # E(pos)+m_pos <= E(actor) <= E(hard)-m_hard
+                        low = F.relu((e_pos_bar + cfg.actor_energy_margin_pos) - e_next_bar)
+                        high = F.relu(e_next_bar - (e_hard_bar - cfg.actor_energy_margin_hard))
+                        l_bar = (low + high).mean()
+
+                    l_desc = torch.tensor(0.0, device=device)
+                    if cfg.lambda_actor_descent > 0:
+                        # Actor step should not raise energy from its own seed.
+                        l_desc = F.relu(e_next - e_seed).mean()
                     loss_a = (
                         cfg.lambda_geo * l_geo
                         + cfg.lambda_align * l_align
                         + cfg.lambda_bc_reg * l_bc
                         + cfg.lambda_actor_barrier * l_bar
+                        + cfg.lambda_actor_descent * l_desc
                     )
                 la = float(loss_a.detach().item())
                 if (
@@ -1037,6 +1186,8 @@ def main() -> None:
             sums["rank_clean_lt_hard"] += rank_clean_hard_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["clean_viol"] += viol_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["retrieval_cosine"] += retrieval_cos
+            sums["actor_barrier"] += float(l_bar.item())
+            sums["actor_descent"] += float(l_desc.item())
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
                 now = time.perf_counter()
                 window_batches = max(1, (bi + 1) - last_window_batch)
@@ -1055,6 +1206,8 @@ def main() -> None:
                     f"rank(a<h)={sums['rank_actor_lt_hard']/n_ok:.3f} "
                     f"rank(c<h)={sums['rank_clean_lt_hard']/n_ok:.3f} "
                     f"viol={sums['clean_viol']/n_ok:.3f} "
+                    f"a_bar={sums['actor_barrier']/n_ok:.3f} "
+                    f"a_desc={sums['actor_descent']/n_ok:.3f} "
                     f"sec/batch={sec_per_batch:.3f} "
                     f"eta={eta_epoch_sec/60.0:.1f}m"
                 )
@@ -1079,6 +1232,8 @@ def main() -> None:
                             "rank_clean_lt_hard": float(sums["rank_clean_lt_hard"] / n_ok),
                             "clean_viol": float(sums["clean_viol"] / n_ok),
                             "retrieval_cosine": float(sums["retrieval_cosine"] / n_ok),
+                            "actor_barrier": float(sums["actor_barrier"] / n_ok),
+                            "actor_descent": float(sums["actor_descent"] / n_ok),
                             "mdsm": float(sums["mdsm"] / n_ok),
                             "nce": float(sums["nce"] / n_ok),
                             "cql": float(sums["cql"] / n_ok),

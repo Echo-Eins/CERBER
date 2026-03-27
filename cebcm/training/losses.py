@@ -200,9 +200,17 @@ def gradient_penalty(
     energy_fn: torch.nn.Module,
     v_query: Tensor,
     v_candidate: Tensor,
+    sigma: Tensor | None = None,
 ) -> Tensor:
     v_candidate = v_candidate.detach().requires_grad_(True)
-    energy = energy_fn(v_query, v_candidate)
+    if sigma is None:
+        energy = energy_fn(v_query, v_candidate)
+    else:
+        try:
+            energy = energy_fn(v_query, v_candidate, sigma=sigma)
+        except TypeError:
+            # Backward compatibility: unconditional/simple callables without sigma arg.
+            energy = energy_fn(v_query, v_candidate)
     grad = torch.autograd.grad(
         energy.sum(),
         v_candidate,

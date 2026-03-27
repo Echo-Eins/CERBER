@@ -19,6 +19,8 @@
   "actor_hidden_dims": [2048, 1024, 512],
   "norm_mode": "orthonorm",
   "activation": "groupsort",
+  "actor_norm_mode": "orthonorm",
+  "actor_activation": "silu",
   "ortho_n_iters": 4,
   "ortho_schedule_enabled": true,
   "ortho_schedule_iters": [4, 2, 1],
@@ -44,6 +46,7 @@
   "lambda_prior": 0.1,
   "lambda_prior_nce": 0.05,
   "lambda_actor_barrier": 0.2,
+  "lambda_actor_descent": 0.1,
 
   "use_cql": true,
   "use_nce": true,
@@ -79,6 +82,11 @@
   "critic_margin_clean_actor": 0.2,
   "critic_margin_actor_noisy": 0.1,
   "critic_margin_clean_noisy": 0.3,
+  "rank_normalize_by_std": true,
+  "rank_std_floor": 0.001,
+  "actor_energy_margin_pos": 0.05,
+  "actor_energy_margin_hard": 0.05,
+  "actor_barrier_normalize_by_std": true,
 
   "actor_step_size": 0.5,
   "actor_tangent_projection": true,
@@ -94,6 +102,7 @@
   "retrieval_hard_start": 6,
   "retrieval_hard_end": 24,
   "retrieval_self_sim_exclude": 0.9995,
+  "retrieval_min_pos_similarity": 0.15,
   "retrieval_strict_index_exclusion": true,
 
   "amp_enabled": true,

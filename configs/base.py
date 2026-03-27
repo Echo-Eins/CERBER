@@ -230,6 +230,8 @@ class Stage1_5Config:
     actor_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
     norm_mode: str = "orthonorm"
     activation: str = "groupsort"
+    actor_norm_mode: str = "orthonorm"   # "orthonorm", "spectral_norm", "none"
+    actor_activation: str = "silu"       # "silu", "gelu", "relu", "groupsort", "lipschitz_spline"
     ortho_n_iters: int = 4
     ortho_schedule_enabled: bool = True
     ortho_schedule_iters: list[int] = field(default_factory=lambda: [4, 2, 1])
@@ -257,6 +259,7 @@ class Stage1_5Config:
     lambda_prior: float = 0.1
     lambda_prior_nce: float = 0.05
     lambda_actor_barrier: float = 0.1
+    lambda_actor_descent: float = 0.1
 
     # Feature flags
     use_cql: bool = True
@@ -296,6 +299,11 @@ class Stage1_5Config:
     critic_margin_clean_actor: float = 0.5
     critic_margin_actor_noisy: float = 0.3
     critic_margin_clean_noisy: float = 0.8
+    rank_normalize_by_std: bool = True
+    rank_std_floor: float = 1e-3
+    actor_energy_margin_pos: float = 0.05
+    actor_energy_margin_hard: float = 0.05
+    actor_barrier_normalize_by_std: bool = True
 
     # Actor/inference rollout
     actor_step_size: float = 1.0
@@ -313,6 +321,7 @@ class Stage1_5Config:
     retrieval_hard_start: int = 8
     retrieval_hard_end: int = 32
     retrieval_self_sim_exclude: float = 0.9995
+    retrieval_min_pos_similarity: float = 0.15
     retrieval_strict_index_exclusion: bool = True
 
     # AMP

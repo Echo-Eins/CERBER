@@ -990,3 +990,115 @@ Eliminate live-monitor UX gaps:
   - `create_trajectory_plot(...)`
 - Added Stage1.5 checkpoint format support in analyzer (`critic1_state` as fallback `model_state`).
 - Added a scroll-preservation JS observer and skipped redundant plot refreshes when watcher data has not changed.
+
+# Stage 1.5 GUI Eval Protocol Alignment + Runtime NameError Fix (2026-03-26, Pass 18)
+
+## Goal
+Fix Stage 1.5 GUI evaluation mismatch (self-target vs retrieval-target) and resolve runtime crash in live landscape auto-update.
+
+## Checklist
+- [x] Fix `NameError: json is not defined` in `cerber_gui/app.py`
+- [x] Add Stage 1.5-aware SOTA eval branch in GUI (conditional retrieval objective)
+- [x] Keep backward compatibility for unconditional/self-denoise checkpoints
+- [x] Update SOTA text labels from `clean` to `target` where applicable
+- [x] Validate modified modules with `py_compile`
+
+## Review
+- Added `import json` to app module to unblock JSONL epoch parsing in auto landscape refresh.
+- Added conditional Stage 1.5 SOTA eval path:
+  - sample `(query, positive, hard)` triplets via cosine retrieval,
+  - seed noisy candidates from query/hard mix,
+  - evaluate cosine/L2 against retrieval target (not self clean) for conditional checkpoints.
+- Added explicit SOTA metadata in UI output:
+  - `eval_objective` (`conditional_retrieval` or `self_denoise`),
+  - `target_label` (`retrieved_pos` or `clean`).
+- Compiled successfully:
+  - `python -m py_compile cerber_gui/app.py`
+  - `python -m py_compile cerber_gui/checkpoint_analyzer.py`
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py`
+
+# Stage 1.5 Single-Run Inference Protocol Alignment (2026-03-26, Pass 19)
+
+## Goal
+Align single-run GUI inference with Stage 1.5 conditional objective to remove mixed interpretation between runtime metrics and SOTA batch eval.
+
+## Checklist
+- [x] Add shared conditional-checkpoint detector helper
+- [x] Add unified inference sampler returning query/target/noisy for both self and conditional modes
+- [x] Route `run_langevin_denoise` with explicit `v_query_override` / `v_target_override` in conditional mode
+- [x] Recompute runtime cosine/L2/energy against target (not always self-clean)
+- [x] Update runtime/report labels: objective + target semantics
+- [x] Apply same alignment to checkpoint landscape preview path
+- [x] Validate with `py_compile`
+
+## Review
+- Runtime and SOTA now evaluate under coherent objective semantics.
+- Stage 1.5 conditional checkpoints use retrieval target in both preview and manual inference.
+- GUI now displays objective context explicitly (`self_denoise` vs `conditional_retrieval`).
+
+# Stage 1.5 Structural Math Fixes: Actor Energy Corridor + Retrieval Target Hygiene (2026-03-26, Pass 20)
+
+## Goal
+Fix non-hyperparameter mathematical failure modes causing false minima trapping and rank/violation drift.
+
+## Checklist
+- [x] Add retrieval positive quality floor + fallback-to-query when no valid positive exists
+- [x] Add actor two-sided energy corridor loss using critic references (`pos` and `hard`)
+- [x] Add actor monotonic descent guard from seed (`E(next) <= E(seed)`)
+- [x] Expose new actor guard metrics in batch logs (`a_bar`, `a_desc`)
+- [x] Sync GUI conditional retrieval sampler with same min-similarity + fallback logic
+- [x] Validate via `py_compile`
+
+## Review
+- Retrieval objective no longer trains on semantically invalid positives when neighborhood quality is poor.
+- Actor is constrained to stay between critic reference energies (with margins), reducing collapse into pathological low-energy pockets.
+- Additional descent guard suppresses actor steps that increase energy from its own seed.
+- Runtime observability improved with explicit actor guard metrics in training stream.
+
+# Stage1.5 Full Math Audit: Critics + Actor + Navigation (2026-03-26, Pass 21)
+
+## Goal
+Close non-hyperparameter correctness gaps found in full Stage1.5 audit:
+- sigma-conditioning parity between train and eval/inference,
+- tangent-space alignment consistency in actor loss,
+- underdamped Langevin step correctness and safety checks,
+- GUI runtime parity with Stage1.5 checkpoint config.
+
+## Checklist
+- [x] Re-audit Stage1.5 critic/actor/navigation math end-to-end with subagent cross-check
+- [x] Fix Stage1.5 eval sigma mismatch by binding explicit sigma in Langevin/eval energy path
+- [x] Fix actor gradient-alignment geometry to compare tangent vs tangent directions
+- [x] Fix actor descent guard to compare energies on the same projected manifold
+- [x] Harden config validation (`sigma_curriculum_start>0`, strict enums, underdamped constraints)
+- [x] Fix underdamped Langevin position update scaling (remove extra `lr` factor)
+- [x] Add numerical-safe sphere/tangent projection for zero-norm edge cases
+- [x] Fix GUI Stage1.5 runtime config hydration (`checkpoint["config"]` fallback)
+- [x] Add GUI sigma/tangent/sampler parity for Stage1.5 conditional inference and SOTA batch eval
+- [x] Run static verification (`py_compile`) on all changed modules
+
+## Review
+- Stage1.5 eval now optimizes and measures the same sigma-conditioned critic regime used in training.
+- Actor alignment no longer asks tangent-projected delta to match full-space gradients.
+- Underdamped dynamics no longer apply an unintended `O(lr^2)` position scaling.
+- GUI now inherits Stage1.5 runtime knobs from checkpoints and uses matching conditional seed/noise semantics.
+- Validation run:
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py cebcm/inference/langevin.py cebcm/training/losses.py cerber_gui/app.py configs/base.py`
+
+# Stage1.5 Twin-Critic GUI Parity Fix (2026-03-26, Pass 22)
+
+## Goal
+Remove structural visualization/inference mismatch where Stage1.5 checkpoints were rendered as single-critic (`critic1_state`) models instead of true twin-hybrid energy.
+
+## Checklist
+- [x] Add runtime twin-energy adapter in GUI (`_TwinConditionalEnergyAdapter`)
+- [x] Load both `critic1_state` and `critic2_state` for Stage1.5 checkpoints
+- [x] Apply training-time aggregation mode parity (`max` / `mean` / `softmax`, with temperature)
+- [x] Load optional `prior_state` + `lambda_prior` into GUI runtime energy
+- [x] Keep backward compatibility for non-Stage1.5 single-model checkpoints
+- [x] Validate via `py_compile`
+
+## Review
+- GUI inference/landscape now reflects the same hybrid energy family used during Stage1.5 training.
+- This removes a major source of apparent "training vs landscape" contradictions in checkpoint inspection.
+- Validation run:
+  - `python -m py_compile cerber_gui/app.py`

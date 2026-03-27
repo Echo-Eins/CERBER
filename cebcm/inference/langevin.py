@@ -83,14 +83,25 @@ def _check_early_stop(
     return False, best_energy, plateau_counter, improved
 
 
+def _safe_unit(v: Tensor, eps: float = 1e-8) -> Tensor:
+    """Numerically stable normalization with deterministic fallback direction."""
+    norm = v.norm(dim=-1, keepdim=True)
+    unit = v / norm.clamp(min=eps)
+    if (norm <= eps).any():
+        fallback = torch.zeros_like(v)
+        fallback[..., 0] = 1.0
+        unit = torch.where(norm <= eps, fallback, unit)
+    return unit
+
+
 def _project_to_sphere(v: Tensor, target_norm: float) -> Tensor:
     """Project vectors onto sphere of given radius."""
-    return F.normalize(v, dim=-1) * target_norm
+    return _safe_unit(v) * target_norm
 
 
 def _tangent_projection(update: Tensor, v_current: Tensor) -> Tensor:
     """Remove radial component so update moves along the sphere."""
-    v_hat = F.normalize(v_current, dim=-1)
+    v_hat = _safe_unit(v_current)
     radial = (update * v_hat).sum(dim=-1, keepdim=True) * v_hat
     return update - radial
 
@@ -176,7 +187,7 @@ def langevin_dynamics(
                 trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
-                num_steps=step + 1, stopped_early=True,
+                num_steps=step, stopped_early=True,
             )
 
         # Update with optional momentum
@@ -320,7 +331,7 @@ def pid_langevin_dynamics(
                 trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
-                num_steps=step + 1, stopped_early=True,
+                num_steps=step, stopped_early=True,
             )
 
         # PID components
@@ -438,6 +449,11 @@ def underdamped_langevin_dynamics(
     Returns:
         LangevinResult with final vectors and diagnostics.
     """
+    if mass <= 0:
+        raise ValueError(f"underdamped mass must be > 0, got {mass}")
+    if friction <= 0 or friction > 1:
+        raise ValueError(f"underdamped friction must be in (0, 1], got {friction}")
+
     v_current = v_init.clone().detach()
     momentum = torch.zeros_like(v_current)  # auxiliary momentum variable p
 
@@ -473,7 +489,7 @@ def underdamped_langevin_dynamics(
                 trajectory=trajectory,
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
-                num_steps=step + 1, stopped_early=True,
+                num_steps=step, stopped_early=True,
             )
 
         # Underdamped update:
@@ -485,8 +501,9 @@ def underdamped_langevin_dynamics(
             thermal_noise = _tangent_projection(thermal_noise, v_current)
         momentum = (1.0 - friction) * momentum - lr * grad + thermal_noise
 
-        # Position update: V_{t+1} = V_t + (η/m)·p_{t+1}
-        position_update = (lr / mass) * momentum
+        # Position update: V_{t+1} = V_t + p_{t+1}/m
+        # Momentum already includes lr-scaled gradient/noise terms.
+        position_update = momentum / mass
 
         # Tangent projection (apply to position update, not momentum directly)
         if target_norm is not None:

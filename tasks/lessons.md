@@ -401,3 +401,81 @@ For any "live monitor / web dashboard" request:
 2) if 3D parity is expected, reuse the same rendering pipeline as checkpoint analysis (no simplified substitute),
 3) add both manual trigger and policy-driven auto-refresh controls (e.g., every N epochs),
 4) ensure checkpoint policy supports near-real-time visualization (rolling latest + periodic milestones).
+
+## 2026-03-26 - Evaluation protocol must match training objective
+
+### Pattern
+Stage 1.5 conditional training used retrieval positives (query -> pos), while GUI SOTA eval measured self-denoise (query -> clean self). This produced misleading cosine failures despite energy descent.
+
+### Rule
+Before trusting eval metrics:
+1) verify eval target distribution matches train target distribution,
+2) report eval objective explicitly in UI/logs (`self_denoise` vs `conditional_retrieval`),
+3) avoid hard-coded metric labels (`L2(clean,x)`) when target is dynamic,
+4) treat objective/eval mismatch as P0 diagnostics bug.
+
+## 2026-03-26 - Add imports for new exception types in the same patch
+
+### Pattern
+A new `except json.JSONDecodeError` branch was added without importing `json`, causing runtime NameError in Gradio callback.
+
+### Rule
+For every new symbol in exception handling or typed branches:
+1) run a symbol import check before commit,
+2) run at least one module `py_compile` after patching callbacks,
+3) treat missing-import callback crashes as P0 regressions.
+
+## 2026-03-26 - Structural objective conflicts beat raw loss reduction
+
+### Pattern
+Global training loss decreased while rank ordering quality (`rank_success`) collapsed and clean-min violation grew. This came from objective mismatch: actor could minimize geometry terms while falling into critic-invalid energy pockets.
+
+### Rule
+For actor-critic EBMs:
+1) enforce explicit actor energy interval constraints relative to critic references,
+2) add monotonic energy guard from actor seed,
+3) never trust decreasing aggregate loss without rank/violation diagnostics,
+4) treat retrieval-positive quality failures as objective corruption and fallback safely.
+
+## 2026-03-26 - Sigma-conditioned critics require sigma parity in eval/inference
+
+### Pattern
+Stage1.5 trained critics with explicit sampled `sigma`, but eval/Langevin/inference paths omitted `sigma`, silently falling back to distance-estimated sigma. This made train objective and runtime navigation optimize different fields.
+
+### Rule
+For any sigma-conditioned energy model:
+1) pass explicit sigma in train, eval, and inference consistently,
+2) if runtime uses adaptive sigma, train with the same adaptive rule,
+3) never mix fixed-sigma training with implicit-sigma inference without explicit ablation.
+
+## 2026-03-26 - Compare tangent quantities to tangent quantities
+
+### Pattern
+Actor delta was tangent-projected, but alignment loss compared it to full-space `-gradE` including radial component, creating impossible targets.
+
+### Rule
+When tangent projection is enabled:
+1) project all direction targets (gradients/noise/updates) to the same tangent plane before directional losses,
+2) keep geometry/energy comparisons on the same manifold (project both states if needed).
+
+## 2026-03-26 - Underdamped discretization must avoid hidden extra step-size factors
+
+### Pattern
+Underdamped update used momentum with `-lr*grad` and then multiplied momentum by `lr` again in position update, yielding unintended `lr^2` scaling in drift.
+
+### Rule
+For second-order samplers:
+1) define one consistent discretization (velocity-like vs momentum-like state),
+2) verify drift/noise scaling dimensions once in code and doc,
+3) add parameter guards (`mass > 0`, friction range) and fail fast.
+
+## 2026-03-26 - Stage1.5 GUI must load twin critic, not critic1 fallback
+
+### Pattern
+Checkpoint analyzer fallback mapped Stage1.5 checkpoints to `model_state=critic1_state`; GUI then rendered/inferred with a single critic while training used twin aggregation, causing misleading landscape behavior.
+
+### Rule
+For multi-head/multi-critic checkpoints:
+1) GUI/runtime evaluators must reconstruct the exact training aggregation graph,
+2) keep fallback-to-single-model only for genuinely single-model checkpoints,
+3) treat visualization/runtime architecture mismatch as P0 diagnostics defect.
