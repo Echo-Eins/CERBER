@@ -2409,10 +2409,10 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
             with gr.Row():
                 noise_scale_slider = gr.Slider(
-                    minimum=0.05,
+                    minimum=0.0,
                     maximum=0.5,
-                    value=0.15,
-                    step=0.01,
+                    value=0.0002,
+                    step=0.0001,
                     label="Noise Scale",
                 )
                 num_steps_slider = gr.Slider(
@@ -2562,10 +2562,10 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     label="Landscape Half-Range (Absolute)",
                 )
                 live_preview_noise = gr.Slider(
-                    minimum=0.05,
+                    minimum=0.0,
                     maximum=0.5,
-                    value=0.15,
-                    step=0.01,
+                    value=0.0002,
+                    step=0.0001,
                     label="Preview Noise",
                 )
                 live_preview_steps = gr.Slider(

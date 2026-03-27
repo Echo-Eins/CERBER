@@ -1014,6 +1014,7 @@ def main() -> None:
             "inbatch_nce": 0.0,
             "support": 0.0,
             "knn_dist": 0.0,
+            "energy_reg": 0.0,
         }
         n_ok, n_skip, bad_streak = 0, 0, 0
         ema_c, ema_a = None, None
@@ -1069,6 +1070,7 @@ def main() -> None:
             clean_min_acc = 0.0
             direction_acc = 0.0
             inbatch_nce_acc = 0.0
+            energy_reg_acc = 0.0
             critic_failed = False
             for cstep in range(max(1, cfg.critic_steps_per_actor)):
                 try:
@@ -1199,6 +1201,12 @@ def main() -> None:
                             )
                             loss_c = loss_c + cfg.lambda_inbatch_nce * l_inbatch
 
+                        # Energy scale regularization — penalize large absolute energies
+                        l_energy_reg = torch.tensor(0.0, device=device)
+                        if getattr(cfg, 'use_energy_reg', False):
+                            l_energy_reg = (e_pos ** 2).mean()
+                            loss_c = loss_c + cfg.lambda_energy_reg * l_energy_reg
+
                     lc = float(loss_c.detach().item())
                     if (
                         (not math.isfinite(lc))
@@ -1245,6 +1253,7 @@ def main() -> None:
                     clean_min_acc += float(l_clean_min.item())
                     direction_acc += float(l_direction.item())
                     inbatch_nce_acc += float(l_inbatch.item())
+                    energy_reg_acc += float(l_energy_reg.item())
                     rank_clean_actor = (e_pos < e_actor).float().mean().item()
                     rank_actor_hard = (e_actor < e_hard).float().mean().item()
                     rank_clean_hard = (e_pos < e_hard).float().mean().item()
@@ -1398,6 +1407,7 @@ def main() -> None:
             sums["inbatch_nce"] += inbatch_nce_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["support"] += float(l_support.item())
             sums["knn_dist"] += knn_dist_val
+            sums["energy_reg"] += energy_reg_acc / float(max(1, cfg.critic_steps_per_actor))
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
                 now = time.perf_counter()
                 window_batches = max(1, (bi + 1) - last_window_batch)
@@ -1422,6 +1432,7 @@ def main() -> None:
                     f"dir={sums['direction']/n_ok:.3f} "
                     f"ibnce={sums['inbatch_nce']/n_ok:.3f} "
                     f"supp={sums['support']/n_ok:.4f} "
+                    f"ereg={sums['energy_reg']/n_ok:.3f} "
                     f"sec/batch={sec_per_batch:.3f} "
                     f"eta={eta_epoch_sec/60.0:.1f}m"
                 )
@@ -1456,6 +1467,7 @@ def main() -> None:
                             "inbatch_nce": float(sums["inbatch_nce"] / n_ok),
                             "support": float(sums["support"] / n_ok),
                             "knn_dist": float(sums["knn_dist"] / n_ok),
+                            "energy_reg": float(sums["energy_reg"] / n_ok),
                             "skip_rate": float(n_skip / max(len(loader), 1)),
                         },
                     },

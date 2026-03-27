@@ -69,6 +69,8 @@
   "use_direction_loss": true,
   "use_support_penalty": true,
   "use_inbatch_negatives": true,
+  "use_energy_reg": true,
+  "lambda_energy_reg": 0.01,
 
   "gradient_penalty_lambda": 0.05,
   "shell_barrier_margin": 0.1,
@@ -147,7 +149,7 @@
     "method": "pid",
     "target_norm": 0.2051,
     "lr": 0.001,
-    "noise_scale": 0.05,
+    "noise_scale": 0.0002,
     "max_steps": 100,
     "pid_kp": 0.1,
     "pid_ki": 0.01,

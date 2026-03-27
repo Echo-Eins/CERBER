@@ -215,7 +215,7 @@ class Stage1_5Config:
     sonar: SONARConfig = field(default_factory=SONARConfig)
     langevin: LangevinConfig = field(default_factory=lambda: LangevinConfig(
         lr=0.001,
-        noise_scale=0.05,
+        noise_scale=0.0002,
         max_steps=100,
         target_norm=0.2051,
         method="pid",
@@ -287,6 +287,9 @@ class Stage1_5Config:
     use_clean_min_penalty: bool = True
     use_direction_loss: bool = True
     use_support_penalty: bool = True
+    # Energy scale regularization (prevent unbounded energy growth)
+    use_energy_reg: bool = True
+    lambda_energy_reg: float = 0.01
 
     # Regularization params
     cql_noise_scale: float = 0.5
