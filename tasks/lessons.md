@@ -496,6 +496,39 @@ For second-order samplers:
 2) verify drift/noise scaling dimensions once in code and doc,
 3) add parameter guards (`mass > 0`, friction range) and fail fast.
 
+## 2026-03-27 - Langevin noise_scale in high-D destroys angular information
+
+### Pattern
+With `noise_scale=0.05` and `lr=0.001` in 1024D SONAR space (sphere radius ≈ 0.2051), the per-step noise norm was:
+`sqrt(2 * lr * noise_scale) * sqrt(D) = sqrt(2 * 0.001 * 0.05) * sqrt(1024) ≈ 0.32`
+This is 1.56x the sphere radius per step. After projection, each step was effectively a ~70° random rotation, completely destroying angular information in ~5 steps. Noise-to-signal ratio was 3.3:1 (noise_norm 0.32 vs gradient_step_norm 0.096).
+
+With the GUI default (`noise_scale=0.15`), the ratio was 6:1 — even worse.
+
+### Rule
+1. ALWAYS compute effective noise norm in high-D before setting noise_scale: `noise_norm = sqrt(2 * lr * noise_scale * D)`
+2. Effective noise norm must be << sphere radius (target_norm). A ratio of noise_norm/target_norm < 0.1 is safe.
+3. For D=1024, target_norm=0.2051: noise_scale should be ~0.0002 (not 0.05).
+4. When user reports "cosine always degrades to ~0", check noise scale FIRST — this is the most common cause.
+5. GUI slider ranges must match safe operational ranges, not arbitrary [0, 1].
+6. Training eval uses the same Langevin params — broken noise_scale makes eval results meaningless even if model learns correctly.
+
+### Evidence
+- noise_scale=0.05, lr=0.001: cosine 0.303→0.012 (destruction)
+- noise_scale=0.05, lr=0.005: cosine 0.303→-0.053 (even worse, sqrt(lr) amplifies)
+- Mathematical proof: noise_norm/sphere_radius = 0.32/0.205 = 1.56x per step
+
+## 2026-03-27 - Energy scale inflation requires explicit regularization
+
+### Pattern
+Energy values grew from ~7 (epoch 30) to ~16 (epoch 50) without bound. Unbounded energy scale makes Langevin step sizes miscalibrated (gradient magnitude grows proportionally) and complicates hyperparameter tuning across checkpoints.
+
+### Rule
+1. Add energy scale regularization: `lambda_energy_reg * E(clean)^2` to prevent unbounded growth
+2. Monitor absolute energy values across epochs — monotonic growth signals missing regularization
+3. When energy at epoch N is 2x+ energy at epoch N-20, this is a P1 issue requiring intervention
+4. Default lambda_energy_reg=0.01 is a light touch — increase if growth continues
+
 ## 2026-03-26 - Stage1.5 GUI must load twin critic, not critic1 fallback
 
 ### Pattern

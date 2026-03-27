@@ -286,6 +286,7 @@ class TrainingMetricsWatcher:
                     "inbatch_nce": float(train_metrics.get("inbatch_nce", np.nan)),
                     "support": float(train_metrics.get("support", np.nan)),
                     "knn_dist": float(train_metrics.get("knn_dist", np.nan)),
+                    "energy_reg": float(train_metrics.get("energy_reg", np.nan)),
                     "skip_rate": float(train_metrics.get("skip_rate", np.nan)),
                     "sec_per_batch_window": float(rec.get("sec_per_batch_window", np.nan)),
                     "eta_epoch_sec": float(rec.get("eta_epoch_sec", np.nan)),
@@ -366,6 +367,7 @@ class TrainingMetricsWatcher:
                     "inbatch_nce": np.nan,
                     "support": np.nan,
                     "knn_dist": np.nan,
+                    "energy_reg": np.nan,
                     "skip_rate": np.nan,
                     "sec_per_batch_window": np.nan,
                     "eta_epoch_sec": np.nan,
@@ -600,6 +602,7 @@ def create_live_metrics_plot(
         "inbatch_nce",
         "support",
         "knn_dist",
+        "energy_reg",
         "skip_rate",
         "sec_per_batch_window",
         "eta_epoch_sec",
@@ -688,6 +691,7 @@ def create_live_metrics_plot(
     _add_trace(batch_df, "actor_barrier", 3, "Actor Barrier", "#c5b0d5")
     _add_trace(batch_df, "actor_descent", 3, "Actor Descent", "#ffbb78")
     _add_trace(batch_df, "retrieval_cosine", 3, "Retrieval Cosine", "#bcbd22")
+    _add_trace(batch_df, "energy_reg", 3, "Energy Reg", "#d6616b")
     _add_trace(batch_df, "skip_rate", 3, "Skip Rate", "#7f7f7f", dash="dot")
 
     # Row 4: speed + eval
