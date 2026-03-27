@@ -521,6 +521,7 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "actor_step_size",
         "ortho_n_iters",
         "eval_langevin_batch_size",
+        "checkpoint_every_epochs",
     ]:
         _must_be_positive(name, float(getattr(cfg, name)))
 
@@ -577,6 +578,8 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
             "compile_mode must be one of {'default','reduce-overhead','max-autotune'}, "
             f"got {cfg.compile_mode}"
         )
+    if not str(cfg.rolling_checkpoint_name).strip():
+        raise ValueError("rolling_checkpoint_name must be non-empty")
 
     if cfg.ortho_schedule_enabled:
         if not cfg.ortho_schedule_iters:
@@ -716,6 +719,11 @@ def main() -> None:
 
     th = make_thresholds(cfg)
     print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing}")
+    print(
+        "Checkpoint policy: "
+        f"periodic_every={int(cfg.checkpoint_every_epochs)} "
+        f"rolling='{cfg.rolling_checkpoint_name}'"
+    )
     for epoch_idx in range(start_epoch, cfg.num_epochs):
         t0 = time.time()
         epoch_timer_start = time.perf_counter()
@@ -1121,7 +1129,28 @@ def main() -> None:
             "opt_c_state": opt_c.state_dict(), "opt_a_state": opt_a.state_dict(), "scaler_state": scaler.state_dict(),
             "train_metrics": train, "eval_metrics": eval_m, "config": asdict(cfg),
         }
-        torch.save(payload, ckpt_dir / f"epoch_{epoch_idx+1}.pt")
+        current_epoch_1b = int(epoch_idx + 1)
+        checkpoint_period = max(1, int(cfg.checkpoint_every_epochs))
+        is_periodic_checkpoint = (current_epoch_1b % checkpoint_period) == 0
+        is_last_epoch = current_epoch_1b == int(cfg.num_epochs)
+        if is_periodic_checkpoint or is_last_epoch:
+            torch.save(payload, ckpt_dir / f"epoch_{current_epoch_1b}.pt")
+
+        # Rolling checkpoint for live landscape inspection.
+        rolling_ckpt = ckpt_dir / str(cfg.rolling_checkpoint_name)
+        torch.save(payload, rolling_ckpt)
+
+        # Cleanup stale non-periodic epoch checkpoints (from legacy runs).
+        epoch_file_current = ckpt_dir / f"epoch_{current_epoch_1b}.pt"
+        if (not is_periodic_checkpoint) and (not is_last_epoch) and epoch_file_current.exists():
+            epoch_file_current.unlink(missing_ok=True)
+
+        prev_epoch = current_epoch_1b - 1
+        if prev_epoch > 0 and (prev_epoch % checkpoint_period) != 0:
+            prev_epoch_file = ckpt_dir / f"epoch_{prev_epoch}.pt"
+            if prev_epoch_file.exists():
+                prev_epoch_file.unlink(missing_ok=True)
+
         if is_new_best:
             payload["best_score"] = best_score
             torch.save(payload, ckpt_dir / "best.pt")

@@ -328,6 +328,8 @@ class Stage1_5Config:
     batch_size: int = 32
     num_workers: int = 4
     log_every: int = 50
+    checkpoint_every_epochs: int = 10
+    rolling_checkpoint_name: str = "latest_epoch.pt"
     eval_num_samples: int = 64
     eval_every_epochs: int = 2
     langevin_tangent_noise: bool = True

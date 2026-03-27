@@ -11,6 +11,7 @@ import sys
 import re
 from dataclasses import is_dataclass
 from pathlib import Path
+from typing import Any
 
 # Add project root to import path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -69,6 +70,11 @@ session_state = {
     "dataset_cache": {},  # dataset_path -> SONARVectorDataset
     "runtime_metrics": {},  # checkpoint_path -> latest live inference metrics
     "sota_eval_cache": {},  # (checkpoint, noise, steps, lr, batch, bank) -> dict
+    "live_plot_last_update": None,
+    "live_landscape_last_epoch": None,
+    "live_landscape_fig": None,
+    "live_landscape_traj_fig": None,
+    "live_landscape_status": "No live landscape yet",
 }
 SOTA_EVAL_CACHE_VERSION = 3
 
@@ -1502,6 +1508,229 @@ def load_metrics_file_fn(file):
         return f"Error: {e}", None
 
 
+def _extract_latest_epoch_from_metrics_file(metrics_path: Path) -> int | None:
+    if not metrics_path.exists():
+        return None
+
+    if metrics_path.suffix.lower() == ".jsonl":
+        latest_epoch: int | None = None
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                epoch_val = rec.get("epoch")
+                if isinstance(epoch_val, (int, float)):
+                    epoch_int = int(epoch_val)
+                    if latest_epoch is None or epoch_int > latest_epoch:
+                        latest_epoch = epoch_int
+        return latest_epoch
+
+    try:
+        payload = load_training_metrics(metrics_path)
+    except Exception:
+        return None
+
+    if isinstance(payload, dict):
+        epochs = payload.get("epochs")
+        if isinstance(epochs, list) and epochs:
+            last = epochs[-1]
+            if isinstance(last, (int, float)):
+                return int(last)
+        epoch_val = payload.get("epoch")
+        if isinstance(epoch_val, (int, float)):
+            return int(epoch_val)
+    return None
+
+
+def _find_latest_checkpoint_path(
+    checkpoint_dir: Path,
+    rolling_name: str = "latest_epoch.pt",
+) -> tuple[Path | None, str]:
+    if not checkpoint_dir.exists() or not checkpoint_dir.is_dir():
+        return None, "Checkpoint directory not found"
+
+    rolling_path = checkpoint_dir / rolling_name
+    if rolling_path.exists():
+        return rolling_path, "rolling"
+
+    epoch_files = list(checkpoint_dir.glob("epoch_*.pt"))
+    best_file: Path | None = None
+    best_epoch = -1
+    for file_path in epoch_files:
+        m = re.match(r"^epoch_(\d+)\.pt$", file_path.name)
+        if not m:
+            continue
+        epoch_val = int(m.group(1))
+        if epoch_val > best_epoch:
+            best_epoch = epoch_val
+            best_file = file_path
+    if best_file is not None:
+        return best_file, "milestone"
+
+    final_path = checkpoint_dir / "final.pt"
+    if final_path.exists():
+        return final_path, "final"
+    best_path = checkpoint_dir / "best.pt"
+    if best_path.exists():
+        return best_path, "best"
+    return None, "No checkpoint files found"
+
+
+def _generate_live_landscape_from_checkpoint(
+    checkpoint_path: str,
+    vis_backend: str,
+    grid_size: float,
+    range_factor: float,
+    absolute_half_range: float,
+    preview_noise: float,
+    preview_steps: int,
+    sota_eval_batch_size: int,
+    sota_eval_bank_size: int,
+) -> tuple[str, Any, Any]:
+    checkpoint = load_checkpoint(checkpoint_path)
+    session_state["checkpoints"][checkpoint_path] = checkpoint
+    _invalidate_checkpoint_cache(checkpoint_path)
+
+    landscape_data = generate_landscape_for_checkpoint(
+        checkpoint_path,
+        grid_size=grid_size,
+        range_factor=range_factor,
+        absolute_half_range=absolute_half_range,
+        preview_noise=preview_noise,
+        preview_steps=preview_steps,
+        sota_eval_batch_size=sota_eval_batch_size,
+        sota_eval_bank_size=sota_eval_bank_size,
+    )
+    landscape_fig = _render_landscape_figure(checkpoint_path, landscape_data, vis_backend)
+    trajectory_fig = create_trajectory_plot(landscape_data)
+
+    metadata = checkpoint.get("metadata")
+    epoch_display = getattr(metadata, "epoch", "?") if metadata is not None else checkpoint.get("epoch", "?")
+    status = (
+        f"Landscape from: `{_safe_display_name(Path(checkpoint_path).name)}` | "
+        f"epoch: `{epoch_display}`"
+    )
+    return status, landscape_fig, trajectory_fig
+
+
+def check_live_landscape_fn(
+    metrics_path,
+    checkpoint_dir,
+    vis_backend,
+    grid_size,
+    range_factor,
+    absolute_half_range,
+    preview_noise,
+    preview_steps,
+    auto_every_epochs,
+    sota_eval_batch_size,
+    sota_eval_bank_size,
+):
+    if not checkpoint_dir:
+        return "Checkpoint directory is required", None, None
+
+    ckpt_dir = Path(checkpoint_dir)
+    ckpt_path, reason = _find_latest_checkpoint_path(ckpt_dir, rolling_name="latest_epoch.pt")
+    if ckpt_path is None:
+        return f"Cannot find checkpoint: {reason}", None, None
+
+    try:
+        status, landscape_fig, trajectory_fig = _generate_live_landscape_from_checkpoint(
+            checkpoint_path=str(ckpt_path),
+            vis_backend=vis_backend,
+            grid_size=float(grid_size),
+            range_factor=float(range_factor),
+            absolute_half_range=float(absolute_half_range),
+            preview_noise=float(preview_noise),
+            preview_steps=int(preview_steps),
+            sota_eval_batch_size=int(sota_eval_batch_size),
+            sota_eval_bank_size=int(sota_eval_bank_size),
+        )
+        latest_epoch = _extract_latest_epoch_from_metrics_file(Path(metrics_path)) if metrics_path else None
+        session_state["live_landscape_last_epoch"] = latest_epoch
+        session_state["live_landscape_fig"] = landscape_fig
+        session_state["live_landscape_traj_fig"] = trajectory_fig
+        session_state["live_landscape_status"] = (
+            f"{status} | source={reason} | auto every {int(auto_every_epochs)} epochs"
+        )
+        return session_state["live_landscape_status"], landscape_fig, trajectory_fig
+    except Exception as e:
+        return f"Landscape update failed: {e}", session_state.get("live_landscape_fig"), session_state.get("live_landscape_traj_fig")
+
+
+def auto_update_live_landscape_fn(
+    metrics_path,
+    checkpoint_dir,
+    vis_backend,
+    grid_size,
+    range_factor,
+    absolute_half_range,
+    preview_noise,
+    preview_steps,
+    auto_every_epochs,
+    auto_enabled,
+    sota_eval_batch_size,
+    sota_eval_bank_size,
+):
+    if not auto_enabled:
+        return (
+            session_state.get("live_landscape_status", "Auto-update disabled"),
+            session_state.get("live_landscape_fig"),
+            session_state.get("live_landscape_traj_fig"),
+        )
+
+    if not metrics_path or not checkpoint_dir:
+        return (
+            session_state.get("live_landscape_status", "Waiting for metrics/checkpoints path"),
+            session_state.get("live_landscape_fig"),
+            session_state.get("live_landscape_traj_fig"),
+        )
+
+    latest_epoch = _extract_latest_epoch_from_metrics_file(Path(metrics_path))
+    if latest_epoch is None:
+        return (
+            session_state.get("live_landscape_status", "Waiting for first epoch in metrics"),
+            session_state.get("live_landscape_fig"),
+            session_state.get("live_landscape_traj_fig"),
+        )
+
+    every = max(1, int(auto_every_epochs))
+    if latest_epoch % every != 0:
+        return (
+            session_state.get("live_landscape_status", f"Latest epoch {latest_epoch}: waiting for multiple of {every}"),
+            session_state.get("live_landscape_fig"),
+            session_state.get("live_landscape_traj_fig"),
+        )
+
+    if session_state.get("live_landscape_last_epoch") == latest_epoch:
+        return (
+            session_state.get("live_landscape_status", f"Landscape already updated for epoch {latest_epoch}"),
+            session_state.get("live_landscape_fig"),
+            session_state.get("live_landscape_traj_fig"),
+        )
+
+    return check_live_landscape_fn(
+        metrics_path=metrics_path,
+        checkpoint_dir=checkpoint_dir,
+        vis_backend=vis_backend,
+        grid_size=grid_size,
+        range_factor=range_factor,
+        absolute_half_range=absolute_half_range,
+        preview_noise=preview_noise,
+        preview_steps=preview_steps,
+        auto_every_epochs=auto_every_epochs,
+        sota_eval_batch_size=sota_eval_batch_size,
+        sota_eval_bank_size=sota_eval_bank_size,
+    )
+
+
 def start_live_monitor_fn(metrics_path):
     """ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº live ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°."""
     if not metrics_path:
@@ -1523,6 +1752,7 @@ def start_live_monitor_fn(metrics_path):
         watcher = TrainingMetricsWatcher(path)
         watcher.start()
         session_state["watcher"] = watcher
+        session_state["live_plot_last_update"] = None
         df = watcher.history.to_dataframe()
         fig = create_live_metrics_plot(df, plot_type="all") if not df.empty else None
         return f"Monitoring started: {path}", fig
@@ -1536,11 +1766,18 @@ def update_live_plot_fn():
     if not watcher:
         return None
 
+    status = watcher.get_status()
+    update_key = status.last_update.isoformat() if status.last_update is not None else None
+    if update_key is not None and update_key == session_state.get("live_plot_last_update"):
+        return gr.update()
+
     df = watcher.history.to_dataframe()
     if df.empty:
         return None
 
-    return create_live_metrics_plot(df, plot_type="all")
+    fig = create_live_metrics_plot(df, plot_type="all")
+    session_state["live_plot_last_update"] = update_key
+    return fig
 
 
 def export_comparison_fn(checkpoint_paths, output_format):
@@ -1740,6 +1977,92 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             live_status = gr.Textbox(label="Status")
             live_plot = gr.Plot(label="Live Metrics")
 
+            gr.Markdown("### Live 3D Landscape")
+            with gr.Row():
+                live_ckpt_dir_input = gr.Textbox(
+                    label="Checkpoint Directory",
+                    value="experiments/03_Stage_1.5/checkpoints",
+                    placeholder="experiments/03_Stage_1.5/checkpoints",
+                )
+                check_landscape_btn = gr.Button("Check Landscape", variant="secondary")
+
+            with gr.Row():
+                live_landscape_backend = gr.Radio(
+                    choices=["plotly", "matplotlib"],
+                    value="plotly",
+                    label="Landscape Backend",
+                )
+                live_auto_landscape = gr.Checkbox(
+                    value=True,
+                    label="Auto-update landscape",
+                    info="Refresh when new epoch is multiple of N",
+                )
+                live_auto_every_epochs = gr.Slider(
+                    minimum=1,
+                    maximum=20,
+                    value=5,
+                    step=1,
+                    label="Auto Every N Epochs",
+                )
+
+            with gr.Row():
+                live_landscape_grid = gr.Slider(
+                    minimum=20,
+                    maximum=120,
+                    value=40,
+                    step=2,
+                    label="Landscape Grid Size",
+                )
+                live_landscape_range = gr.Slider(
+                    minimum=0.5,
+                    maximum=12.0,
+                    value=1.5,
+                    step=0.1,
+                    label="Landscape Range Factor",
+                )
+                live_landscape_abs_range = gr.Slider(
+                    minimum=0.0,
+                    maximum=100.0,
+                    value=0.0,
+                    step=0.1,
+                    label="Landscape Half-Range (Absolute)",
+                )
+                live_preview_noise = gr.Slider(
+                    minimum=0.05,
+                    maximum=0.5,
+                    value=0.15,
+                    step=0.01,
+                    label="Preview Noise",
+                )
+                live_preview_steps = gr.Slider(
+                    minimum=10,
+                    maximum=200,
+                    value=50,
+                    step=10,
+                    label="Preview Langevin Steps",
+                )
+
+            with gr.Row():
+                live_sota_eval_batch_size = gr.Slider(
+                    minimum=8,
+                    maximum=256,
+                    value=32,
+                    step=8,
+                    label="Landscape Eval Batch Size",
+                )
+                live_sota_eval_bank_size = gr.Slider(
+                    minimum=64,
+                    maximum=4096,
+                    value=512,
+                    step=64,
+                    label="Landscape Eval Bank Size",
+                )
+
+            live_landscape_status = gr.Textbox(label="Landscape Status")
+            with gr.Row():
+                live_landscape_plot = gr.Plot(label="Live 3D Landscape", scale=2)
+                live_landscape_traj_plot = gr.Plot(label="Live Langevin Trajectory", scale=1)
+
             # Auto-refresh every 5 seconds
             live_timer = gr.Timer(value=5, active=True)
     # === Event Handlers ===
@@ -1897,9 +2220,76 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
         outputs=[live_status, live_plot],
     )
 
+    check_landscape_btn.click(
+        check_live_landscape_fn,
+        inputs=[
+            live_path_input,
+            live_ckpt_dir_input,
+            live_landscape_backend,
+            live_landscape_grid,
+            live_landscape_range,
+            live_landscape_abs_range,
+            live_preview_noise,
+            live_preview_steps,
+            live_auto_every_epochs,
+            live_sota_eval_batch_size,
+            live_sota_eval_bank_size,
+        ],
+        outputs=[live_landscape_status, live_landscape_plot, live_landscape_traj_plot],
+    )
+
     live_timer.tick(
         update_live_plot_fn,
         outputs=[live_plot],
+    )
+
+    live_timer.tick(
+        auto_update_live_landscape_fn,
+        inputs=[
+            live_path_input,
+            live_ckpt_dir_input,
+            live_landscape_backend,
+            live_landscape_grid,
+            live_landscape_range,
+            live_landscape_abs_range,
+            live_preview_noise,
+            live_preview_steps,
+            live_auto_every_epochs,
+            live_auto_landscape,
+            live_sota_eval_batch_size,
+            live_sota_eval_bank_size,
+        ],
+        outputs=[live_landscape_status, live_landscape_plot, live_landscape_traj_plot],
+    )
+
+    demo.load(
+        fn=lambda: None,
+        inputs=None,
+        outputs=None,
+        js="""
+        () => {
+          let lastY = window.scrollY || 0;
+          let rafPending = false;
+          window.addEventListener("scroll", () => { lastY = window.scrollY || 0; }, { passive: true });
+          const restoreScroll = () => {
+            if (rafPending) return;
+            rafPending = true;
+            requestAnimationFrame(() => {
+              window.scrollTo(0, lastY);
+              rafPending = false;
+            });
+          };
+          const attachObserver = () => {
+            const app = document.querySelector("gradio-app");
+            const root = app && app.shadowRoot ? app.shadowRoot : document.body;
+            if (!root) return;
+            const mo = new MutationObserver(() => restoreScroll());
+            mo.observe(root, { childList: true, subtree: true });
+          };
+          attachObserver();
+          setTimeout(attachObserver, 1500);
+        }
+        """,
     )
 
 

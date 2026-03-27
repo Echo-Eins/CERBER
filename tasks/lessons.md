@@ -389,3 +389,15 @@ For all training loops:
 2) reserve energy tensor names as `e_pos`, `e_actor`, `e_hard` (never `ep`, `ea`, `eh` if loop vars can collide),
 3) run a post-edit grep/lint check for reused short symbols before launch,
 4) treat tensor-vs-scalar name collision as P0 runtime blocker.
+
+## 2026-03-26 - Live monitoring requests must include visualization parity, not only scalar metrics
+
+### Pattern
+User requested live monitoring improvements, but initial implementation covered only metric dashboards and not the requested 3D landscape parity with Checkpoint Analysis.
+
+### Rule
+For any "live monitor / web dashboard" request:
+1) confirm whether user expects scalar charts only or full model-state visualizations (e.g., 3D landscape),
+2) if 3D parity is expected, reuse the same rendering pipeline as checkpoint analysis (no simplified substitute),
+3) add both manual trigger and policy-driven auto-refresh controls (e.g., every N epochs),
+4) ensure checkpoint policy supports near-real-time visualization (rolling latest + periodic milestones).

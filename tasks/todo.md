@@ -952,3 +952,41 @@ Stabilize Stage1.5 default config and provide honest live visualization for trai
   - `python -m py_compile cerber_gui/live_monitor.py`
   - `python -m py_compile cerber_gui/metrics_viewer.py`
   - `python -m py_compile cerber_gui/app.py`
+
+---
+
+# Live 3D Landscape Monitoring + Rolling Checkpoint Policy (2026-03-26, Pass 17)
+
+## Goal
+Eliminate live-monitor UX gaps:
+- prevent aggressive rerender scrolling behavior as much as possible,
+- add live 3D landscape checks during training (manual + auto every N epochs),
+- support rolling latest checkpoint plus periodic milestone checkpoint retention.
+
+## Checklist
+- [x] Add Stage1.5 checkpoint cadence config (`checkpoint_every_epochs`, `rolling_checkpoint_name`)
+- [x] Change Stage1.5 saver to periodic checkpoints + rolling latest + non-periodic cleanup
+- [x] Add Stage1.5 checkpoint compatibility in GUI checkpoint loader (`critic1_state` fallback)
+- [x] Add Live Monitor 3D controls and manual `Check Landscape` button
+- [x] Add timer-based auto landscape refresh gate (default every 5 epochs)
+- [x] Reuse checkpoint-analysis plotting pipeline for live 3D rendering
+- [x] Reduce unnecessary live plot rerenders when metrics file timestamp is unchanged
+- [x] Run syntax validation on modified files
+
+## Review
+- Added rolling checkpoint workflow:
+  - periodic checkpoints are kept every `checkpoint_every_epochs`,
+  - `latest_epoch.pt` is overwritten each epoch for immediate landscape inspection,
+  - stale non-periodic `epoch_*.pt` files are cleaned up.
+- Live tab now includes:
+  - checkpoint directory input,
+  - auto-update toggle,
+  - `Auto Every N Epochs` (default `5`),
+  - manual `Check Landscape` button,
+  - dedicated live 3D landscape + live trajectory plots.
+- Live landscape uses same core rendering modules as Checkpoint Analysis:
+  - `generate_landscape_for_checkpoint(...)`
+  - `_render_landscape_figure(...)`
+  - `create_trajectory_plot(...)`
+- Added Stage1.5 checkpoint format support in analyzer (`critic1_state` as fallback `model_state`).
+- Added a scroll-preservation JS observer and skipped redundant plot refreshes when watcher data has not changed.

@@ -189,6 +189,11 @@ def load_checkpoint(path: str | Path) -> dict:
             checkpoint["model_state"] = checkpoint.pop("model")
         elif "state_dict" in checkpoint:
             checkpoint["model_state"] = checkpoint.pop("state_dict")
+        elif "critic1_state" in checkpoint:
+            # Stage1.5 format: use first critic for landscape/analysis view.
+            checkpoint["model_state"] = checkpoint["critic1_state"]
+        elif "critic_state" in checkpoint:
+            checkpoint["model_state"] = checkpoint["critic_state"]
         else:
             raise ValueError(f"Invalid checkpoint format: no 'model_state' found in {path}")
 
