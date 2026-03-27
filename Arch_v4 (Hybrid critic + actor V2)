@@ -1,0 +1,404 @@
+((.venv) ) EchoEins@rog15 ~/Coding/Python/CERBER $ python experiments/01_denoising_poc/train_stage1_5.py --config configs/stage1_5_config.json
+  kNN support threshold (p95): 0.766583
+Device: cuda | Train: 10372 | Val: 128 | compile=False | grad_checkpointing=True
+Checkpoint policy: periodic_every=10 rolling='latest_epoch.pt'
+  Ortho schedule: n_iters=4
+  [50/325] loss=3.2366 critic=2.2485 actor=0.9882 rank_loss=0.8768 rank_success=0.132 rank(c<a)=0.667 rank(a<h)=0.335 rank(c<h)=0.514 viol=0.317 a_bar=0.500 a_desc=0.000 cmin=0.095 dir=0.938 ibnce=3.466 supp=0.0073 sec/batch=1.512 eta=6.9m
+  [100/325] loss=3.1715 critic=2.1992 actor=0.9723 rank_loss=0.8847 rank_success=0.115 rank(c<a)=0.672 rank(a<h)=0.323 rank(c<h)=0.516 viol=0.292 a_bar=0.526 a_desc=0.000 cmin=0.093 dir=0.912 ibnce=3.464 supp=0.0068 sec/batch=1.520 eta=5.7m
+  [150/325] loss=3.1453 critic=2.1765 actor=0.9688 rank_loss=0.9038 rank_success=0.099 rank(c<a)=0.656 rank(a<h)=0.321 rank(c<h)=0.506 viol=0.290 a_bar=0.540 a_desc=0.000 cmin=0.093 dir=0.900 ibnce=3.462 supp=0.0067 sec/batch=1.526 eta=4.5m
+  [200/325] loss=3.1229 critic=2.1568 actor=0.9660 rank_loss=0.9099 rank_success=0.090 rank(c<a)=0.647 rank(a<h)=0.324 rank(c<h)=0.496 viol=0.294 a_bar=0.547 a_desc=0.000 cmin=0.092 dir=0.890 ibnce=3.462 supp=0.0066 sec/batch=1.528 eta=3.2m
+  [250/325] loss=3.1055 critic=2.1428 actor=0.9627 rank_loss=0.9127 rank_success=0.085 rank(c<a)=0.641 rank(a<h)=0.328 rank(c<h)=0.491 viol=0.297 a_bar=0.551 a_desc=0.000 cmin=0.092 dir=0.882 ibnce=3.461 supp=0.0065 sec/batch=1.529 eta=1.9m
+  [300/325] loss=3.0972 critic=2.1349 actor=0.9624 rank_loss=0.9228 rank_success=0.083 rank(c<a)=0.636 rank(a<h)=0.334 rank(c<h)=0.490 viol=0.300 a_bar=0.563 a_desc=0.000 cmin=0.092 dir=0.877 ibnce=3.461 supp=0.0064 sec/batch=1.529 eta=0.6m
+Epoch 1: train=3.0937 skip=0.00% eval=skipped (495.4s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=3.0318 critic=2.0772 actor=0.9546 rank_loss=0.9291 rank_success=0.069 rank(c<a)=0.583 rank(a<h)=0.389 rank(c<h)=0.494 viol=0.335 a_bar=0.619 a_desc=0.000 cmin=0.092 dir=0.851 ibnce=3.457 supp=0.0056 sec/batch=1.535 eta=7.0m
+  [100/325] loss=3.0428 critic=2.0908 actor=0.9521 rank_loss=0.9615 rank_success=0.065 rank(c<a)=0.557 rank(a<h)=0.397 rank(c<h)=0.468 viol=0.357 a_bar=0.593 a_desc=0.000 cmin=0.093 dir=0.858 ibnce=3.457 supp=0.0056 sec/batch=1.535 eta=5.8m
+  [150/325] loss=3.0267 critic=2.0787 actor=0.9480 rank_loss=0.9432 rank_success=0.062 rank(c<a)=0.566 rank(a<h)=0.392 rank(c<h)=0.473 viol=0.356 a_bar=0.583 a_desc=0.000 cmin=0.092 dir=0.851 ibnce=3.458 supp=0.0056 sec/batch=1.532 eta=4.5m
+  [200/325] loss=3.0259 critic=2.0796 actor=0.9463 rank_loss=0.9404 rank_success=0.063 rank(c<a)=0.560 rank(a<h)=0.396 rank(c<h)=0.474 viol=0.361 a_bar=0.572 a_desc=0.000 cmin=0.093 dir=0.854 ibnce=3.457 supp=0.0055 sec/batch=1.531 eta=3.2m
+  [250/325] loss=3.0115 critic=2.0709 actor=0.9406 rank_loss=0.9245 rank_success=0.062 rank(c<a)=0.559 rank(a<h)=0.400 rank(c<h)=0.476 viol=0.364 a_bar=0.550 a_desc=0.000 cmin=0.093 dir=0.851 ibnce=3.457 supp=0.0055 sec/batch=1.531 eta=1.9m
+  [300/325] loss=3.0038 critic=2.0653 actor=0.9386 rank_loss=0.9180 rank_success=0.061 rank(c<a)=0.558 rank(a<h)=0.403 rank(c<h)=0.477 viol=0.365 a_bar=0.544 a_desc=0.000 cmin=0.093 dir=0.847 ibnce=3.457 supp=0.0055 sec/batch=1.530 eta=0.6m
+Epoch 2: train=3.0015 score=-0.143877 strict_pass=False skip=0.00% (518.1s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.9824 critic=2.0510 actor=0.9314 rank_loss=0.9431 rank_success=0.041 rank(c<a)=0.531 rank(a<h)=0.421 rank(c<h)=0.444 viol=0.384 a_bar=0.591 a_desc=0.001 cmin=0.100 dir=0.820 ibnce=3.460 supp=0.0051 sec/batch=1.533 eta=7.0m
+  [100/325] loss=2.9899 critic=2.0552 actor=0.9347 rank_loss=0.9229 rank_success=0.038 rank(c<a)=0.503 rank(a<h)=0.408 rank(c<h)=0.421 viol=0.377 a_bar=0.568 a_desc=0.000 cmin=0.097 dir=0.835 ibnce=3.459 supp=0.0051 sec/batch=1.533 eta=5.7m
+  [150/325] loss=2.9807 critic=2.0514 actor=0.9293 rank_loss=0.8963 rank_success=0.038 rank(c<a)=0.494 rank(a<h)=0.411 rank(c<h)=0.417 viol=0.372 a_bar=0.540 a_desc=0.000 cmin=0.097 dir=0.841 ibnce=3.458 supp=0.0050 sec/batch=1.532 eta=4.5m
+  [200/325] loss=2.9754 critic=2.0513 actor=0.9241 rank_loss=0.8916 rank_success=0.039 rank(c<a)=0.486 rank(a<h)=0.412 rank(c<h)=0.413 viol=0.372 a_bar=0.520 a_desc=0.000 cmin=0.097 dir=0.844 ibnce=3.458 supp=0.0049 sec/batch=1.532 eta=3.2m
+  [250/325] loss=2.9634 critic=2.0431 actor=0.9203 rank_loss=0.8909 rank_success=0.035 rank(c<a)=0.486 rank(a<h)=0.417 rank(c<h)=0.409 viol=0.380 a_bar=0.513 a_desc=0.000 cmin=0.096 dir=0.838 ibnce=3.458 supp=0.0049 sec/batch=1.531 eta=1.9m
+  [300/325] loss=2.9596 critic=2.0397 actor=0.9199 rank_loss=0.8814 rank_success=0.035 rank(c<a)=0.482 rank(a<h)=0.419 rank(c<h)=0.407 viol=0.382 a_bar=0.503 a_desc=0.000 cmin=0.096 dir=0.838 ibnce=3.458 supp=0.0048 sec/batch=1.530 eta=0.6m
+Epoch 3: train=2.9563 skip=0.00% eval=skipped (497.9s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8930 critic=2.0030 actor=0.8900 rank_loss=0.8802 rank_success=0.038 rank(c<a)=0.512 rank(a<h)=0.434 rank(c<h)=0.422 viol=0.398 a_bar=0.478 a_desc=0.000 cmin=0.093 dir=0.808 ibnce=3.458 supp=0.0041 sec/batch=1.533 eta=7.0m
+  [100/325] loss=2.9044 critic=2.0056 actor=0.8987 rank_loss=0.8571 rank_success=0.031 rank(c<a)=0.480 rank(a<h)=0.446 rank(c<h)=0.408 viol=0.412 a_bar=0.476 a_desc=0.000 cmin=0.095 dir=0.818 ibnce=3.459 supp=0.0043 sec/batch=1.532 eta=5.7m
+  [150/325] loss=2.9055 critic=2.0062 actor=0.8992 rank_loss=0.8511 rank_success=0.027 rank(c<a)=0.473 rank(a<h)=0.451 rank(c<h)=0.398 viol=0.417 a_bar=0.469 a_desc=0.000 cmin=0.096 dir=0.820 ibnce=3.458 supp=0.0044 sec/batch=1.536 eta=4.5m
+  [200/325] loss=2.9152 critic=2.0121 actor=0.9031 rank_loss=0.8806 rank_success=0.029 rank(c<a)=0.468 rank(a<h)=0.457 rank(c<h)=0.397 viol=0.425 a_bar=0.495 a_desc=0.000 cmin=0.097 dir=0.818 ibnce=3.458 supp=0.0043 sec/batch=1.539 eta=3.2m
+  [250/325] loss=2.9156 critic=2.0132 actor=0.9023 rank_loss=0.8750 rank_success=0.027 rank(c<a)=0.454 rank(a<h)=0.465 rank(c<h)=0.392 viol=0.432 a_bar=0.488 a_desc=0.000 cmin=0.097 dir=0.821 ibnce=3.459 supp=0.0043 sec/batch=1.538 eta=1.9m
+  [300/325] loss=2.9152 critic=2.0137 actor=0.9014 rank_loss=0.8700 rank_success=0.026 rank(c<a)=0.452 rank(a<h)=0.463 rank(c<h)=0.387 viol=0.433 a_bar=0.479 a_desc=0.000 cmin=0.098 dir=0.823 ibnce=3.459 supp=0.0043 sec/batch=1.541 eta=0.6m
+Epoch 4: train=2.9144 score=-0.080607 strict_pass=False skip=0.00% (519.6s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8958 critic=2.0079 actor=0.8879 rank_loss=0.8543 rank_success=0.018 rank(c<a)=0.443 rank(a<h)=0.479 rank(c<h)=0.400 viol=0.452 a_bar=0.443 a_desc=0.000 cmin=0.099 dir=0.822 ibnce=3.458 supp=0.0039 sec/batch=1.539 eta=7.1m
+  [100/325] loss=2.8833 critic=1.9996 actor=0.8837 rank_loss=0.8559 rank_success=0.017 rank(c<a)=0.444 rank(a<h)=0.481 rank(c<h)=0.385 viol=0.457 a_bar=0.440 a_desc=0.000 cmin=0.099 dir=0.812 ibnce=3.458 supp=0.0039 sec/batch=1.537 eta=5.8m
+  [150/325] loss=2.8931 critic=2.0055 actor=0.8876 rank_loss=0.8513 rank_success=0.018 rank(c<a)=0.431 rank(a<h)=0.483 rank(c<h)=0.386 viol=0.455 a_bar=0.439 a_desc=0.000 cmin=0.099 dir=0.820 ibnce=3.458 supp=0.0038 sec/batch=1.536 eta=4.5m
+  [200/325] loss=2.8850 critic=2.0002 actor=0.8848 rank_loss=0.8511 rank_success=0.017 rank(c<a)=0.435 rank(a<h)=0.482 rank(c<h)=0.377 viol=0.459 a_bar=0.440 a_desc=0.000 cmin=0.100 dir=0.814 ibnce=3.458 supp=0.0038 sec/batch=1.537 eta=3.2m
+  [250/325] loss=2.8813 critic=1.9984 actor=0.8830 rank_loss=0.8482 rank_success=0.017 rank(c<a)=0.430 rank(a<h)=0.486 rank(c<h)=0.375 viol=0.464 a_bar=0.433 a_desc=0.000 cmin=0.100 dir=0.814 ibnce=3.457 supp=0.0037 sec/batch=1.536 eta=1.9m
+  [300/325] loss=2.8801 critic=1.9988 actor=0.8812 rank_loss=0.8538 rank_success=0.018 rank(c<a)=0.427 rank(a<h)=0.490 rank(c<h)=0.379 viol=0.468 a_bar=0.428 a_desc=0.000 cmin=0.100 dir=0.814 ibnce=3.457 supp=0.0036 sec/batch=1.535 eta=0.6m
+Epoch 5: train=2.8778 skip=0.00% eval=skipped (499.4s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8723 critic=1.9982 actor=0.8742 rank_loss=0.8434 rank_success=0.015 rank(c<a)=0.410 rank(a<h)=0.516 rank(c<h)=0.361 viol=0.491 a_bar=0.426 a_desc=0.000 cmin=0.102 dir=0.815 ibnce=3.457 supp=0.0033 sec/batch=1.541 eta=7.1m
+  [100/325] loss=2.8725 critic=2.0000 actor=0.8725 rank_loss=0.8437 rank_success=0.014 rank(c<a)=0.401 rank(a<h)=0.516 rank(c<h)=0.358 viol=0.500 a_bar=0.421 a_desc=0.000 cmin=0.103 dir=0.815 ibnce=3.458 supp=0.0033 sec/batch=1.535 eta=5.8m
+  [150/325] loss=2.8660 critic=1.9979 actor=0.8681 rank_loss=0.8294 rank_success=0.015 rank(c<a)=0.392 rank(a<h)=0.519 rank(c<h)=0.357 viol=0.503 a_bar=0.409 a_desc=0.000 cmin=0.103 dir=0.818 ibnce=3.457 supp=0.0032 sec/batch=1.534 eta=4.5m
+  [200/325] loss=2.8609 critic=1.9945 actor=0.8664 rank_loss=0.8330 rank_success=0.014 rank(c<a)=0.397 rank(a<h)=0.517 rank(c<h)=0.357 viol=0.503 a_bar=0.415 a_desc=0.000 cmin=0.103 dir=0.813 ibnce=3.458 supp=0.0031 sec/batch=1.534 eta=3.2m
+  [250/325] loss=2.8659 critic=1.9973 actor=0.8686 rank_loss=0.8430 rank_success=0.014 rank(c<a)=0.388 rank(a<h)=0.518 rank(c<h)=0.363 viol=0.507 a_bar=0.419 a_desc=0.000 cmin=0.103 dir=0.813 ibnce=3.458 supp=0.0031 sec/batch=1.533 eta=1.9m
+  [300/325] loss=2.8643 critic=1.9964 actor=0.8678 rank_loss=0.8424 rank_success=0.014 rank(c<a)=0.388 rank(a<h)=0.516 rank(c<h)=0.357 viol=0.506 a_bar=0.419 a_desc=0.000 cmin=0.103 dir=0.811 ibnce=3.457 supp=0.0031 sec/batch=1.527 eta=0.6m
+Epoch 6: train=2.8619 score=-0.098109 strict_pass=False skip=0.00% (518.3s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8580 critic=1.9928 actor=0.8653 rank_loss=0.8265 rank_success=0.008 rank(c<a)=0.351 rank(a<h)=0.507 rank(c<h)=0.323 viol=0.493 a_bar=0.397 a_desc=0.000 cmin=0.103 dir=0.817 ibnce=3.456 supp=0.0024 sec/batch=1.525 eta=7.0m
+  [100/325] loss=2.8538 critic=1.9832 actor=0.8706 rank_loss=0.8136 rank_success=0.009 rank(c<a)=0.375 rank(a<h)=0.497 rank(c<h)=0.314 viol=0.482 a_bar=0.386 a_desc=0.000 cmin=0.102 dir=0.809 ibnce=3.457 supp=0.0038 sec/batch=1.450 eta=5.4m
+  [150/325] loss=2.8523 critic=1.9816 actor=0.8707 rank_loss=0.8134 rank_success=0.007 rank(c<a)=0.378 rank(a<h)=0.498 rank(c<h)=0.307 viol=0.484 a_bar=0.393 a_desc=0.000 cmin=0.102 dir=0.806 ibnce=3.456 supp=0.0041 sec/batch=1.521 eta=4.4m
+  [200/325] loss=2.8533 critic=1.9789 actor=0.8744 rank_loss=0.8071 rank_success=0.011 rank(c<a)=0.378 rank(a<h)=0.498 rank(c<h)=0.312 viol=0.481 a_bar=0.393 a_desc=0.001 cmin=0.102 dir=0.805 ibnce=3.457 supp=0.0048 sec/batch=1.535 eta=3.2m
+  [250/325] loss=2.8557 critic=1.9801 actor=0.8757 rank_loss=0.8081 rank_success=0.010 rank(c<a)=0.371 rank(a<h)=0.503 rank(c<h)=0.305 viol=0.488 a_bar=0.395 a_desc=0.001 cmin=0.103 dir=0.806 ibnce=3.457 supp=0.0049 sec/batch=1.535 eta=1.9m
+  [300/325] loss=2.8533 critic=1.9802 actor=0.8731 rank_loss=0.8092 rank_success=0.010 rank(c<a)=0.369 rank(a<h)=0.502 rank(c<h)=0.302 viol=0.488 a_bar=0.399 a_desc=0.000 cmin=0.103 dir=0.806 ibnce=3.457 supp=0.0045 sec/batch=1.536 eta=0.6m
+Epoch 7: train=2.8550 skip=1.85% eval=skipped (493.5s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8538 critic=1.9915 actor=0.8622 rank_loss=0.7813 rank_success=0.003 rank(c<a)=0.302 rank(a<h)=0.523 rank(c<h)=0.264 viol=0.490 a_bar=0.350 a_desc=0.000 cmin=0.104 dir=0.829 ibnce=3.456 supp=0.0045 sec/batch=1.540 eta=7.1m
+  [100/325] loss=2.8527 critic=1.9911 actor=0.8615 rank_loss=0.8224 rank_success=0.004 rank(c<a)=0.312 rank(a<h)=0.524 rank(c<h)=0.265 viol=0.508 a_bar=0.378 a_desc=0.000 cmin=0.106 dir=0.812 ibnce=3.456 supp=0.0042 sec/batch=1.529 eta=5.7m
+  [150/325] loss=2.8508 critic=1.9884 actor=0.8624 rank_loss=0.8076 rank_success=0.003 rank(c<a)=0.314 rank(a<h)=0.515 rank(c<h)=0.258 viol=0.497 a_bar=0.370 a_desc=0.000 cmin=0.105 dir=0.814 ibnce=3.456 supp=0.0043 sec/batch=1.485 eta=4.3m
+  [200/325] loss=2.8422 critic=1.9844 actor=0.8578 rank_loss=0.8048 rank_success=0.003 rank(c<a)=0.315 rank(a<h)=0.518 rank(c<h)=0.254 viol=0.499 a_bar=0.364 a_desc=0.000 cmin=0.105 dir=0.814 ibnce=3.456 supp=0.0038 sec/batch=1.524 eta=3.2m
+  [250/325] loss=2.8438 critic=1.9847 actor=0.8590 rank_loss=0.8059 rank_success=0.003 rank(c<a)=0.315 rank(a<h)=0.515 rank(c<h)=0.249 viol=0.499 a_bar=0.368 a_desc=0.000 cmin=0.105 dir=0.813 ibnce=3.456 supp=0.0039 sec/batch=1.498 eta=1.9m
+  [300/325] loss=2.8416 critic=1.9831 actor=0.8585 rank_loss=0.8058 rank_success=0.003 rank(c<a)=0.319 rank(a<h)=0.511 rank(c<h)=0.250 viol=0.495 a_bar=0.367 a_desc=0.000 cmin=0.105 dir=0.811 ibnce=3.456 supp=0.0038 sec/batch=1.522 eta=0.6m
+Epoch 8: train=2.8392 score=-0.097139 strict_pass=False skip=1.85% (512.8s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8199 critic=1.9694 actor=0.8505 rank_loss=0.7939 rank_success=0.001 rank(c<a)=0.313 rank(a<h)=0.512 rank(c<h)=0.237 viol=0.499 a_bar=0.364 a_desc=0.000 cmin=0.105 dir=0.803 ibnce=3.455 supp=0.0033 sec/batch=1.522 eta=7.0m
+  [100/325] loss=2.8221 critic=1.9687 actor=0.8534 rank_loss=0.7962 rank_success=0.002 rank(c<a)=0.314 rank(a<h)=0.519 rank(c<h)=0.245 viol=0.505 a_bar=0.365 a_desc=0.000 cmin=0.106 dir=0.801 ibnce=3.456 supp=0.0037 sec/batch=1.494 eta=5.6m
+  [150/325] loss=2.8258 critic=1.9709 actor=0.8548 rank_loss=0.7941 rank_success=0.001 rank(c<a)=0.297 rank(a<h)=0.526 rank(c<h)=0.238 viol=0.510 a_bar=0.367 a_desc=0.000 cmin=0.106 dir=0.802 ibnce=3.456 supp=0.0038 sec/batch=1.520 eta=4.4m
+  [200/325] loss=2.8266 critic=1.9744 actor=0.8521 rank_loss=0.7956 rank_success=0.001 rank(c<a)=0.287 rank(a<h)=0.522 rank(c<h)=0.231 viol=0.506 a_bar=0.363 a_desc=0.000 cmin=0.106 dir=0.805 ibnce=3.456 supp=0.0037 sec/batch=1.454 eta=3.0m
+  [250/325] loss=2.8289 critic=1.9752 actor=0.8537 rank_loss=0.7965 rank_success=0.001 rank(c<a)=0.280 rank(a<h)=0.525 rank(c<h)=0.222 viol=0.511 a_bar=0.365 a_desc=0.000 cmin=0.106 dir=0.805 ibnce=3.456 supp=0.0038 sec/batch=1.447 eta=1.8m
+  [300/325] loss=2.8275 critic=1.9762 actor=0.8513 rank_loss=0.8012 rank_success=0.002 rank(c<a)=0.279 rank(a<h)=0.523 rank(c<h)=0.223 viol=0.509 a_bar=0.365 a_desc=0.000 cmin=0.106 dir=0.804 ibnce=3.456 supp=0.0036 sec/batch=1.517 eta=0.6m
+Epoch 9: train=2.8275 skip=4.92% eval=skipped (485.8s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8253 critic=1.9712 actor=0.8541 rank_loss=0.7755 rank_success=0.003 rank(c<a)=0.252 rank(a<h)=0.517 rank(c<h)=0.204 viol=0.496 a_bar=0.361 a_desc=0.000 cmin=0.106 dir=0.815 ibnce=3.456 supp=0.0039 sec/batch=1.511 eta=6.9m
+  [100/325] loss=2.8177 critic=1.9675 actor=0.8502 rank_loss=0.7739 rank_success=0.002 rank(c<a)=0.244 rank(a<h)=0.540 rank(c<h)=0.214 viol=0.521 a_bar=0.351 a_desc=0.000 cmin=0.107 dir=0.812 ibnce=3.454 supp=0.0038 sec/batch=1.520 eta=5.7m
+  [150/325] loss=2.8180 critic=1.9694 actor=0.8486 rank_loss=0.7841 rank_success=0.001 rank(c<a)=0.245 rank(a<h)=0.533 rank(c<h)=0.204 viol=0.516 a_bar=0.356 a_desc=0.000 cmin=0.107 dir=0.809 ibnce=3.454 supp=0.0035 sec/batch=1.509 eta=4.4m
+  [200/325] loss=2.8203 critic=1.9699 actor=0.8504 rank_loss=0.7881 rank_success=0.003 rank(c<a)=0.246 rank(a<h)=0.537 rank(c<h)=0.221 viol=0.517 a_bar=0.357 a_desc=0.000 cmin=0.107 dir=0.807 ibnce=3.455 supp=0.0038 sec/batch=1.521 eta=3.2m
+  [250/325] loss=2.8176 critic=1.9696 actor=0.8480 rank_loss=0.7869 rank_success=0.003 rank(c<a)=0.243 rank(a<h)=0.542 rank(c<h)=0.225 viol=0.520 a_bar=0.355 a_desc=0.000 cmin=0.107 dir=0.807 ibnce=3.454 supp=0.0034 sec/batch=1.521 eta=1.9m
+  [300/325] loss=2.8172 critic=1.9701 actor=0.8471 rank_loss=0.7868 rank_success=0.003 rank(c<a)=0.239 rank(a<h)=0.542 rank(c<h)=0.224 viol=0.521 a_bar=0.357 a_desc=0.000 cmin=0.107 dir=0.807 ibnce=3.454 supp=0.0033 sec/batch=1.508 eta=0.6m
+Epoch 10: train=2.8157 score=-0.079171 strict_pass=False skip=0.92% (512.5s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8073 critic=1.9709 actor=0.8364 rank_loss=0.7699 rank_success=0.001 rank(c<a)=0.232 rank(a<h)=0.512 rank(c<h)=0.203 viol=0.497 a_bar=0.346 a_desc=0.000 cmin=0.107 dir=0.809 ibnce=3.452 supp=0.0017 sec/batch=1.522 eta=7.0m
+  [100/325] loss=2.8055 critic=1.9640 actor=0.8415 rank_loss=0.7662 rank_success=0.001 rank(c<a)=0.228 rank(a<h)=0.513 rank(c<h)=0.196 viol=0.496 a_bar=0.334 a_desc=0.000 cmin=0.107 dir=0.805 ibnce=3.452 supp=0.0028 sec/batch=1.508 eta=5.7m
+  [150/325] loss=2.8090 critic=1.9661 actor=0.8428 rank_loss=0.7630 rank_success=0.001 rank(c<a)=0.228 rank(a<h)=0.508 rank(c<h)=0.201 viol=0.490 a_bar=0.331 a_desc=0.000 cmin=0.106 dir=0.809 ibnce=3.451 supp=0.0027 sec/batch=1.518 eta=4.4m
+  [200/325] loss=2.8054 critic=1.9651 actor=0.8403 rank_loss=0.7647 rank_success=0.001 rank(c<a)=0.224 rank(a<h)=0.507 rank(c<h)=0.196 viol=0.489 a_bar=0.329 a_desc=0.000 cmin=0.106 dir=0.807 ibnce=3.450 supp=0.0024 sec/batch=1.521 eta=3.2m
+  [250/325] loss=2.8061 critic=1.9654 actor=0.8406 rank_loss=0.7676 rank_success=0.001 rank(c<a)=0.221 rank(a<h)=0.507 rank(c<h)=0.191 viol=0.490 a_bar=0.331 a_desc=0.000 cmin=0.106 dir=0.807 ibnce=3.450 supp=0.0025 sec/batch=1.520 eta=1.9m
+  [300/325] loss=2.8062 critic=1.9648 actor=0.8414 rank_loss=0.7671 rank_success=0.001 rank(c<a)=0.219 rank(a<h)=0.508 rank(c<h)=0.195 viol=0.489 a_bar=0.332 a_desc=0.000 cmin=0.106 dir=0.808 ibnce=3.450 supp=0.0025 sec/batch=1.519 eta=0.6m
+Epoch 11: train=2.8044 skip=2.15% eval=skipped (492.2s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.8026 critic=1.9595 actor=0.8431 rank_loss=0.7127 rank_success=0.004 rank(c<a)=0.249 rank(a<h)=0.474 rank(c<h)=0.260 viol=0.426 a_bar=0.295 a_desc=0.000 cmin=0.104 dir=0.822 ibnce=3.443 supp=0.0025 sec/batch=1.511 eta=6.9m
+  [100/325] loss=2.7991 critic=1.9582 actor=0.8409 rank_loss=0.7142 rank_success=0.004 rank(c<a)=0.243 rank(a<h)=0.477 rank(c<h)=0.265 viol=0.429 a_bar=0.303 a_desc=0.000 cmin=0.104 dir=0.824 ibnce=3.443 supp=0.0019 sec/batch=1.521 eta=5.7m
+  [150/325] loss=2.8015 critic=1.9567 actor=0.8449 rank_loss=0.7191 rank_success=0.004 rank(c<a)=0.243 rank(a<h)=0.472 rank(c<h)=0.254 viol=0.428 a_bar=0.302 a_desc=0.000 cmin=0.104 dir=0.823 ibnce=3.442 supp=0.0024 sec/batch=1.519 eta=4.4m
+  [200/325] loss=2.7979 critic=1.9562 actor=0.8417 rank_loss=0.7252 rank_success=0.005 rank(c<a)=0.245 rank(a<h)=0.474 rank(c<h)=0.258 viol=0.428 a_bar=0.300 a_desc=0.000 cmin=0.104 dir=0.821 ibnce=3.442 supp=0.0021 sec/batch=1.520 eta=3.2m
+  [250/325] loss=2.7979 critic=1.9575 actor=0.8404 rank_loss=0.7277 rank_success=0.005 rank(c<a)=0.243 rank(a<h)=0.473 rank(c<h)=0.254 viol=0.430 a_bar=0.297 a_desc=0.000 cmin=0.104 dir=0.822 ibnce=3.441 supp=0.0020 sec/batch=1.520 eta=1.9m
+  [300/325] loss=2.7945 critic=1.9559 actor=0.8386 rank_loss=0.7293 rank_success=0.004 rank(c<a)=0.240 rank(a<h)=0.461 rank(c<h)=0.246 viol=0.421 a_bar=0.293 a_desc=0.000 cmin=0.104 dir=0.821 ibnce=3.441 supp=0.0018 sec/batch=1.518 eta=0.6m
+Epoch 12: train=2.7939 score=-0.085301 strict_pass=False skip=0.92% (513.4s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.7984 critic=1.9512 actor=0.8472 rank_loss=0.7100 rank_success=0.005 rank(c<a)=0.268 rank(a<h)=0.420 rank(c<h)=0.270 viol=0.363 a_bar=0.283 a_desc=0.000 cmin=0.102 dir=0.828 ibnce=3.433 supp=0.0022 sec/batch=1.516 eta=6.9m
+  [100/325] loss=2.7866 critic=1.9452 actor=0.8414 rank_loss=0.7005 rank_success=0.005 rank(c<a)=0.268 rank(a<h)=0.404 rank(c<h)=0.266 viol=0.351 a_bar=0.277 a_desc=0.000 cmin=0.101 dir=0.827 ibnce=3.432 supp=0.0016 sec/batch=1.518 eta=5.7m
+  [150/325] loss=2.7872 critic=1.9461 actor=0.8412 rank_loss=0.7107 rank_success=0.005 rank(c<a)=0.267 rank(a<h)=0.401 rank(c<h)=0.264 viol=0.346 a_bar=0.283 a_desc=0.000 cmin=0.101 dir=0.827 ibnce=3.429 supp=0.0014 sec/batch=1.520 eta=4.4m
+  [200/325] loss=2.7837 critic=1.9434 actor=0.8403 rank_loss=0.7060 rank_success=0.005 rank(c<a)=0.261 rank(a<h)=0.397 rank(c<h)=0.264 viol=0.344 a_bar=0.275 a_desc=0.000 cmin=0.101 dir=0.828 ibnce=3.428 supp=0.0013 sec/batch=1.522 eta=3.2m
+  [250/325] loss=2.7854 critic=1.9436 actor=0.8418 rank_loss=0.7065 rank_success=0.005 rank(c<a)=0.258 rank(a<h)=0.390 rank(c<h)=0.261 viol=0.337 a_bar=0.269 a_desc=0.000 cmin=0.101 dir=0.830 ibnce=3.426 supp=0.0017 sec/batch=1.520 eta=1.9m
+  [300/325] loss=2.7812 critic=1.9403 actor=0.8410 rank_loss=0.7028 rank_success=0.005 rank(c<a)=0.259 rank(a<h)=0.383 rank(c<h)=0.262 viol=0.328 a_bar=0.271 a_desc=0.000 cmin=0.101 dir=0.829 ibnce=3.424 supp=0.0016 sec/batch=1.518 eta=0.6m
+Epoch 13: train=2.7804 skip=0.92% eval=skipped (491.9s)
+  Ortho schedule: n_iters=4
+  [100/325] loss=2.7578 critic=1.9219 actor=0.8359 rank_loss=0.6638 rank_success=0.011 rank(c<a)=0.279 rank(a<h)=0.345 rank(c<h)=0.300 viol=0.258 a_bar=0.247 a_desc=0.000 cmin=0.099 dir=0.841 ibnce=3.407 supp=0.0008 sec/batch=1.509 eta=5.7m
+  [150/325] loss=2.7634 critic=1.9247 actor=0.8387 rank_loss=0.6858 rank_success=0.010 rank(c<a)=0.277 rank(a<h)=0.344 rank(c<h)=0.302 viol=0.264 a_bar=0.267 a_desc=0.000 cmin=0.100 dir=0.841 ibnce=3.402 supp=0.0008 sec/batch=1.521 eta=4.4m
+  [200/325] loss=2.7615 critic=1.9242 actor=0.8373 rank_loss=0.6847 rank_success=0.012 rank(c<a)=0.282 rank(a<h)=0.338 rank(c<h)=0.303 viol=0.258 a_bar=0.261 a_desc=0.000 cmin=0.100 dir=0.841 ibnce=3.399 supp=0.0008 sec/batch=1.508 eta=3.1m
+  [250/325] loss=2.7609 critic=1.9229 actor=0.8380 rank_loss=0.6838 rank_success=0.011 rank(c<a)=0.278 rank(a<h)=0.337 rank(c<h)=0.299 viol=0.259 a_bar=0.262 a_desc=0.000 cmin=0.100 dir=0.841 ibnce=3.398 supp=0.0010 sec/batch=1.521 eta=1.9m
+  [300/325] loss=2.7579 critic=1.9211 actor=0.8368 rank_loss=0.6866 rank_success=0.011 rank(c<a)=0.278 rank(a<h)=0.325 rank(c<h)=0.294 viol=0.250 a_bar=0.260 a_desc=0.000 cmin=0.099 dir=0.839 ibnce=3.399 supp=0.0009 sec/batch=1.497 eta=0.6m
+Epoch 14: train=2.7586 score=-0.053926 strict_pass=False skip=0.92% (511.3s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.7386 critic=1.9060 actor=0.8325 rank_loss=0.6663 rank_success=0.016 rank(c<a)=0.288 rank(a<h)=0.333 rank(c<h)=0.313 viol=0.245 a_bar=0.245 a_desc=0.000 cmin=0.099 dir=0.845 ibnce=3.385 supp=0.0007 sec/batch=1.510 eta=6.9m
+  [100/325] loss=2.7379 critic=1.9011 actor=0.8369 rank_loss=0.6573 rank_success=0.016 rank(c<a)=0.277 rank(a<h)=0.318 rank(c<h)=0.312 viol=0.223 a_bar=0.243 a_desc=0.000 cmin=0.099 dir=0.848 ibnce=3.377 supp=0.0018 sec/batch=1.519 eta=5.7m
+  [150/325] loss=2.7316 critic=1.8987 actor=0.8329 rank_loss=0.6580 rank_success=0.017 rank(c<a)=0.273 rank(a<h)=0.320 rank(c<h)=0.319 viol=0.220 a_bar=0.242 a_desc=0.000 cmin=0.099 dir=0.847 ibnce=3.371 supp=0.0014 sec/batch=1.520 eta=4.4m
+  [200/325] loss=2.7321 critic=1.8995 actor=0.8325 rank_loss=0.6597 rank_success=0.018 rank(c<a)=0.275 rank(a<h)=0.323 rank(c<h)=0.327 viol=0.219 a_bar=0.240 a_desc=0.000 cmin=0.099 dir=0.850 ibnce=3.365 supp=0.0012 sec/batch=1.521 eta=3.2m
+  [250/325] loss=2.7283 critic=1.8975 actor=0.8308 rank_loss=0.6603 rank_success=0.019 rank(c<a)=0.277 rank(a<h)=0.318 rank(c<h)=0.329 viol=0.215 a_bar=0.237 a_desc=0.000 cmin=0.099 dir=0.849 ibnce=3.362 supp=0.0011 sec/batch=1.520 eta=1.9m
+  [300/325] loss=2.7294 critic=1.8986 actor=0.8308 rank_loss=0.6660 rank_success=0.020 rank(c<a)=0.282 rank(a<h)=0.313 rank(c<h)=0.332 viol=0.212 a_bar=0.241 a_desc=0.000 cmin=0.098 dir=0.849 ibnce=3.358 supp=0.0010 sec/batch=1.521 eta=0.6m
+Epoch 15: train=2.7282 skip=0.31% eval=skipped (493.5s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.7133 critic=1.8822 actor=0.8311 rank_loss=0.6376 rank_success=0.027 rank(c<a)=0.272 rank(a<h)=0.332 rank(c<h)=0.371 viol=0.191 a_bar=0.224 a_desc=0.001 cmin=0.098 dir=0.858 ibnce=3.339 supp=0.0015 sec/batch=1.524 eta=7.0m
+  [100/325] loss=2.7190 critic=1.8882 actor=0.8309 rank_loss=0.6900 rank_success=0.032 rank(c<a)=0.296 rank(a<h)=0.333 rank(c<h)=0.377 viol=0.208 a_bar=0.255 a_desc=0.001 cmin=0.098 dir=0.855 ibnce=3.337 supp=0.0010 sec/batch=1.521 eta=5.7m
+  [150/325] loss=2.7159 critic=1.8864 actor=0.8295 rank_loss=0.6759 rank_success=0.030 rank(c<a)=0.290 rank(a<h)=0.329 rank(c<h)=0.371 viol=0.204 a_bar=0.247 a_desc=0.001 cmin=0.098 dir=0.857 ibnce=3.326 supp=0.0008 sec/batch=1.520 eta=4.4m
+  [200/325] loss=2.7061 critic=1.8783 actor=0.8278 rank_loss=0.6649 rank_success=0.029 rank(c<a)=0.293 rank(a<h)=0.328 rank(c<h)=0.375 viol=0.203 a_bar=0.243 a_desc=0.001 cmin=0.098 dir=0.855 ibnce=3.318 supp=0.0007 sec/batch=1.520 eta=3.2m
+  [250/325] loss=2.7018 critic=1.8746 actor=0.8272 rank_loss=0.6592 rank_success=0.029 rank(c<a)=0.296 rank(a<h)=0.327 rank(c<h)=0.379 viol=0.197 a_bar=0.242 a_desc=0.001 cmin=0.098 dir=0.854 ibnce=3.311 supp=0.0007 sec/batch=1.520 eta=1.9m
+  [300/325] loss=2.7018 critic=1.8739 actor=0.8279 rank_loss=0.6567 rank_success=0.030 rank(c<a)=0.294 rank(a<h)=0.330 rank(c<h)=0.384 viol=0.194 a_bar=0.237 a_desc=0.001 cmin=0.098 dir=0.856 ibnce=3.305 supp=0.0008 sec/batch=1.520 eta=0.6m
+Epoch 16: train=2.7013 score=-0.067708 strict_pass=False skip=0.00% (514.3s)
+  Ortho schedule: n_iters=4
+  [50/325] loss=2.6724 critic=1.8455 actor=0.8269 rank_loss=0.6276 rank_success=0.036 rank(c<a)=0.316 rank(a<h)=0.321 rank(c<h)=0.422 viol=0.161 a_bar=0.228 a_desc=0.001 cmin=0.097 dir=0.856 ibnce=3.257 supp=0.0015 sec/batch=1.524 eta=7.0m
+  [100/325] loss=2.6824 critic=1.8497 actor=0.8327 rank_loss=0.6329 rank_success=0.039 rank(c<a)=0.319 rank(a<h)=0.334 rank(c<h)=0.432 viol=0.172 a_bar=0.248 a_desc=0.001 cmin=0.097 dir=0.860 ibnce=3.248 supp=0.0015 sec/batch=1.521 eta=5.7m
+  [150/325] loss=2.6740 critic=1.8456 actor=0.8285 rank_loss=0.6322 rank_success=0.040 rank(c<a)=0.326 rank(a<h)=0.327 rank(c<h)=0.431 viol=0.163 a_bar=0.241 a_desc=0.001 cmin=0.097 dir=0.858 ibnce=3.247 supp=0.0011 sec/batch=1.510 eta=4.4m
+  [200/325] loss=2.6677 critic=1.8422 actor=0.8255 rank_loss=0.6271 rank_success=0.042 rank(c<a)=0.333 rank(a<h)=0.328 rank(c<h)=0.438 viol=0.162 a_bar=0.235 a_desc=0.001 cmin=0.097 dir=0.857 ibnce=3.244 supp=0.0009 sec/batch=1.520 eta=3.2m
+  [250/325] loss=2.6649 critic=1.8403 actor=0.8247 rank_loss=0.6197 rank_success=0.044 rank(c<a)=0.334 rank(a<h)=0.334 rank(c<h)=0.443 viol=0.160 a_bar=0.234 a_desc=0.001 cmin=0.097 dir=0.859 ibnce=3.242 supp=0.0008 sec/batch=1.522 eta=1.9m
+  [300/325] loss=2.6613 critic=1.8369 actor=0.8243 rank_loss=0.6191 rank_success=0.045 rank(c<a)=0.337 rank(a<h)=0.338 rank(c<h)=0.448 viol=0.162 a_bar=0.237 a_desc=0.001 cmin=0.097 dir=0.858 ibnce=3.234 supp=0.0007 sec/batch=1.523 eta=0.6m
+Epoch 17: train=2.6580 skip=0.62% eval=skipped (494.0s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.6992 critic=1.8722 actor=0.8271 rank_loss=0.7625 rank_success=0.046 rank(c<a)=0.325 rank(a<h)=0.366 rank(c<h)=0.428 viol=0.227 a_bar=0.257 a_desc=0.002 cmin=0.099 dir=0.855 ibnce=3.217 supp=0.0004 sec/batch=0.846 eta=3.9m
+  [100/325] loss=2.6899 critic=1.8605 actor=0.8294 rank_loss=0.7270 rank_success=0.055 rank(c<a)=0.357 rank(a<h)=0.362 rank(c<h)=0.451 viol=0.205 a_bar=0.276 a_desc=0.002 cmin=0.097 dir=0.850 ibnce=3.222 supp=0.0003 sec/batch=0.842 eta=3.2m
+  [150/325] loss=2.6821 critic=1.8561 actor=0.8260 rank_loss=0.6898 rank_success=0.052 rank(c<a)=0.349 rank(a<h)=0.362 rank(c<h)=0.455 viol=0.196 a_bar=0.257 a_desc=0.002 cmin=0.097 dir=0.855 ibnce=3.226 supp=0.0003 sec/batch=0.845 eta=2.5m
+  [200/325] loss=2.6777 critic=1.8526 actor=0.8251 rank_loss=0.6789 rank_success=0.051 rank(c<a)=0.347 rank(a<h)=0.361 rank(c<h)=0.455 viol=0.191 a_bar=0.256 a_desc=0.002 cmin=0.097 dir=0.855 ibnce=3.228 supp=0.0003 sec/batch=0.846 eta=1.8m
+  [250/325] loss=2.6701 critic=1.8466 actor=0.8235 rank_loss=0.6643 rank_success=0.054 rank(c<a)=0.343 rank(a<h)=0.365 rank(c<h)=0.457 viol=0.188 a_bar=0.248 a_desc=0.002 cmin=0.097 dir=0.856 ibnce=3.224 supp=0.0003 sec/batch=0.846 eta=1.1m
+  [300/325] loss=2.6658 critic=1.8420 actor=0.8239 rank_loss=0.6560 rank_success=0.055 rank(c<a)=0.339 rank(a<h)=0.371 rank(c<h)=0.461 viol=0.186 a_bar=0.245 a_desc=0.002 cmin=0.097 dir=0.858 ibnce=3.213 supp=0.0003 sec/batch=0.846 eta=0.4m
+Epoch 18: train=2.6642 score=-0.080873 strict_pass=False skip=0.00% (285.2s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.6342 critic=1.8087 actor=0.8255 rank_loss=0.5919 rank_success=0.059 rank(c<a)=0.344 rank(a<h)=0.373 rank(c<h)=0.485 viol=0.161 a_bar=0.264 a_desc=0.002 cmin=0.097 dir=0.864 ibnce=3.186 supp=0.0002 sec/batch=0.849 eta=3.9m
+  [100/325] loss=2.6234 critic=1.8015 actor=0.8219 rank_loss=0.5810 rank_success=0.064 rank(c<a)=0.347 rank(a<h)=0.386 rank(c<h)=0.497 viol=0.159 a_bar=0.240 a_desc=0.002 cmin=0.096 dir=0.863 ibnce=3.159 supp=0.0002 sec/batch=0.846 eta=3.2m
+  [150/325] loss=2.6199 critic=1.7998 actor=0.8201 rank_loss=0.5799 rank_success=0.064 rank(c<a)=0.351 rank(a<h)=0.389 rank(c<h)=0.504 viol=0.163 a_bar=0.237 a_desc=0.002 cmin=0.096 dir=0.864 ibnce=3.149 supp=0.0002 sec/batch=0.846 eta=2.5m
+  [200/325] loss=2.6208 critic=1.8000 actor=0.8208 rank_loss=0.5787 rank_success=0.064 rank(c<a)=0.353 rank(a<h)=0.389 rank(c<h)=0.504 viol=0.162 a_bar=0.240 a_desc=0.002 cmin=0.096 dir=0.863 ibnce=3.148 supp=0.0002 sec/batch=0.845 eta=1.8m
+  [250/325] loss=2.6188 critic=1.7984 actor=0.8204 rank_loss=0.5745 rank_success=0.066 rank(c<a)=0.356 rank(a<h)=0.389 rank(c<h)=0.507 viol=0.159 a_bar=0.242 a_desc=0.002 cmin=0.096 dir=0.862 ibnce=3.148 supp=0.0002 sec/batch=0.846 eta=1.1m
+  [300/325] loss=2.6199 critic=1.7986 actor=0.8213 rank_loss=0.5809 rank_success=0.068 rank(c<a)=0.361 rank(a<h)=0.389 rank(c<h)=0.509 viol=0.158 a_bar=0.246 a_desc=0.002 cmin=0.096 dir=0.861 ibnce=3.143 supp=0.0002 sec/batch=0.845 eta=0.4m
+Epoch 19: train=2.6192 skip=0.00% eval=skipped (274.9s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.6153 critic=1.7926 actor=0.8226 rank_loss=0.5627 rank_success=0.078 rank(c<a)=0.386 rank(a<h)=0.401 rank(c<h)=0.556 viol=0.136 a_bar=0.242 a_desc=0.002 cmin=0.095 dir=0.859 ibnce=3.133 supp=0.0002 sec/batch=0.847 eta=3.9m
+  [100/325] loss=2.6094 critic=1.7877 actor=0.8217 rank_loss=0.5650 rank_success=0.081 rank(c<a)=0.390 rank(a<h)=0.400 rank(c<h)=0.553 viol=0.134 a_bar=0.248 a_desc=0.002 cmin=0.095 dir=0.860 ibnce=3.129 supp=0.0002 sec/batch=0.843 eta=3.2m
+  [150/325] loss=2.6010 critic=1.7812 actor=0.8198 rank_loss=0.5577 rank_success=0.083 rank(c<a)=0.390 rank(a<h)=0.404 rank(c<h)=0.557 viol=0.138 a_bar=0.243 a_desc=0.002 cmin=0.095 dir=0.861 ibnce=3.113 supp=0.0002 sec/batch=0.844 eta=2.5m
+  [200/325] loss=2.5974 critic=1.7793 actor=0.8181 rank_loss=0.5579 rank_success=0.085 rank(c<a)=0.393 rank(a<h)=0.402 rank(c<h)=0.561 viol=0.135 a_bar=0.239 a_desc=0.002 cmin=0.095 dir=0.861 ibnce=3.105 supp=0.0002 sec/batch=0.843 eta=1.8m
+  [250/325] loss=2.5947 critic=1.7768 actor=0.8179 rank_loss=0.5568 rank_success=0.086 rank(c<a)=0.398 rank(a<h)=0.404 rank(c<h)=0.565 viol=0.136 a_bar=0.244 a_desc=0.002 cmin=0.095 dir=0.860 ibnce=3.103 supp=0.0002 sec/batch=0.844 eta=1.1m
+  [300/325] loss=2.5941 critic=1.7758 actor=0.8183 rank_loss=0.5619 rank_success=0.089 rank(c<a)=0.401 rank(a<h)=0.405 rank(c<h)=0.566 viol=0.138 a_bar=0.250 a_desc=0.003 cmin=0.094 dir=0.859 ibnce=3.095 supp=0.0002 sec/batch=0.844 eta=0.4m
+Epoch 20: train=2.5926 score=-0.071467 strict_pass=False skip=0.00% (284.9s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.5685 critic=1.7530 actor=0.8155 rank_loss=0.5503 rank_success=0.099 rank(c<a)=0.431 rank(a<h)=0.413 rank(c<h)=0.611 viol=0.117 a_bar=0.239 a_desc=0.003 cmin=0.094 dir=0.861 ibnce=3.006 supp=0.0001 sec/batch=0.848 eta=3.9m
+  [100/325] loss=2.5763 critic=1.7582 actor=0.8181 rank_loss=0.5444 rank_success=0.111 rank(c<a)=0.431 rank(a<h)=0.433 rank(c<h)=0.612 viol=0.120 a_bar=0.243 a_desc=0.003 cmin=0.094 dir=0.862 ibnce=3.025 supp=0.0001 sec/batch=0.844 eta=3.2m
+  [150/325] loss=2.5739 critic=1.7548 actor=0.8191 rank_loss=0.5415 rank_success=0.115 rank(c<a)=0.437 rank(a<h)=0.433 rank(c<h)=0.614 viol=0.118 a_bar=0.251 a_desc=0.003 cmin=0.093 dir=0.860 ibnce=3.025 supp=0.0001 sec/batch=0.842 eta=2.5m
+  [200/325] loss=2.5672 critic=1.7499 actor=0.8174 rank_loss=0.5353 rank_success=0.115 rank(c<a)=0.433 rank(a<h)=0.436 rank(c<h)=0.615 viol=0.121 a_bar=0.243 a_desc=0.003 cmin=0.094 dir=0.860 ibnce=3.014 supp=0.0001 sec/batch=0.843 eta=1.8m
+  [250/325] loss=2.5647 critic=1.7470 actor=0.8177 rank_loss=0.5305 rank_success=0.115 rank(c<a)=0.431 rank(a<h)=0.433 rank(c<h)=0.614 viol=0.119 a_bar=0.240 a_desc=0.003 cmin=0.093 dir=0.859 ibnce=3.013 supp=0.0001 sec/batch=0.842 eta=1.1m
+  [300/325] loss=2.5628 critic=1.7454 actor=0.8174 rank_loss=0.5389 rank_success=0.111 rank(c<a)=0.422 rank(a<h)=0.424 rank(c<h)=0.603 viol=0.114 a_bar=0.241 a_desc=0.003 cmin=0.093 dir=0.858 ibnce=3.002 supp=0.0001 sec/batch=0.843 eta=0.4m
+Epoch 21: train=2.5606 skip=0.00% eval=skipped (274.2s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.5419 critic=1.7244 actor=0.8175 rank_loss=0.5631 rank_success=0.101 rank(c<a)=0.405 rank(a<h)=0.403 rank(c<h)=0.589 viol=0.107 a_bar=0.246 a_desc=0.004 cmin=0.092 dir=0.853 ibnce=2.913 supp=0.0001 sec/batch=0.845 eta=3.9m
+  [100/325] loss=2.5430 critic=1.7235 actor=0.8195 rank_loss=0.5618 rank_success=0.099 rank(c<a)=0.409 rank(a<h)=0.403 rank(c<h)=0.599 viol=0.101 a_bar=0.260 a_desc=0.004 cmin=0.092 dir=0.851 ibnce=2.931 supp=0.0001 sec/batch=0.844 eta=3.2m
+  [150/325] loss=2.5461 critic=1.7282 actor=0.8179 rank_loss=0.5690 rank_success=0.090 rank(c<a)=0.404 rank(a<h)=0.391 rank(c<h)=0.587 viol=0.102 a_bar=0.260 a_desc=0.004 cmin=0.091 dir=0.850 ibnce=2.947 supp=0.0001 sec/batch=0.844 eta=2.5m
+  [200/325] loss=2.5462 critic=1.7281 actor=0.8181 rank_loss=0.5663 rank_success=0.079 rank(c<a)=0.389 rank(a<h)=0.378 rank(c<h)=0.576 viol=0.094 a_bar=0.258 a_desc=0.004 cmin=0.091 dir=0.851 ibnce=2.939 supp=0.0001 sec/batch=0.844 eta=1.8m
+  [250/325] loss=2.5479 critic=1.7285 actor=0.8193 rank_loss=0.5696 rank_success=0.071 rank(c<a)=0.379 rank(a<h)=0.367 rank(c<h)=0.566 viol=0.087 a_bar=0.263 a_desc=0.004 cmin=0.091 dir=0.852 ibnce=2.936 supp=0.0001 sec/batch=0.844 eta=1.1m
+  [300/325] loss=2.5448 critic=1.7263 actor=0.8185 rank_loss=0.5726 rank_success=0.069 rank(c<a)=0.377 rank(a<h)=0.364 rank(c<h)=0.563 viol=0.086 a_bar=0.261 a_desc=0.005 cmin=0.091 dir=0.852 ibnce=2.929 supp=0.0001 sec/batch=0.844 eta=0.4m
+Epoch 22: train=2.5422 score=-0.058631 strict_pass=False skip=0.00% (284.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.4905 critic=1.6774 actor=0.8131 rank_loss=0.5330 rank_success=0.081 rank(c<a)=0.394 rank(a<h)=0.377 rank(c<h)=0.593 viol=0.072 a_bar=0.244 a_desc=0.006 cmin=0.088 dir=0.843 ibnce=2.790 supp=0.0001 sec/batch=0.847 eta=3.9m
+  [100/325] loss=2.4930 critic=1.6811 actor=0.8119 rank_loss=0.5201 rank_success=0.083 rank(c<a)=0.400 rank(a<h)=0.383 rank(c<h)=0.606 viol=0.072 a_bar=0.234 a_desc=0.007 cmin=0.088 dir=0.848 ibnce=2.817 supp=0.0001 sec/batch=0.845 eta=3.2m
+  [150/325] loss=2.5019 critic=1.6876 actor=0.8144 rank_loss=0.5229 rank_success=0.081 rank(c<a)=0.399 rank(a<h)=0.386 rank(c<h)=0.608 viol=0.071 a_bar=0.239 a_desc=0.007 cmin=0.088 dir=0.850 ibnce=2.825 supp=0.0001 sec/batch=0.846 eta=2.5m
+  [200/325] loss=2.5026 critic=1.6879 actor=0.8146 rank_loss=0.5223 rank_success=0.086 rank(c<a)=0.407 rank(a<h)=0.393 rank(c<h)=0.617 viol=0.073 a_bar=0.243 a_desc=0.007 cmin=0.088 dir=0.850 ibnce=2.826 supp=0.0001 sec/batch=0.845 eta=1.8m
+  [250/325] loss=2.4994 critic=1.6858 actor=0.8136 rank_loss=0.5246 rank_success=0.083 rank(c<a)=0.403 rank(a<h)=0.388 rank(c<h)=0.613 viol=0.070 a_bar=0.245 a_desc=0.006 cmin=0.088 dir=0.849 ibnce=2.821 supp=0.0001 sec/batch=0.845 eta=1.1m
+  [300/325] loss=2.5007 critic=1.6870 actor=0.8137 rank_loss=0.5258 rank_success=0.080 rank(c<a)=0.399 rank(a<h)=0.383 rank(c<h)=0.608 viol=0.069 a_bar=0.245 a_desc=0.007 cmin=0.088 dir=0.850 ibnce=2.823 supp=0.0001 sec/batch=0.846 eta=0.4m
+Epoch 23: train=2.4997 skip=0.00% eval=skipped (274.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.4736 critic=1.6654 actor=0.8082 rank_loss=0.4889 rank_success=0.091 rank(c<a)=0.421 rank(a<h)=0.387 rank(c<h)=0.635 viol=0.057 a_bar=0.226 a_desc=0.008 cmin=0.087 dir=0.853 ibnce=2.775 supp=0.0001 sec/batch=0.845 eta=3.9m
+  [100/325] loss=2.4535 critic=1.6473 actor=0.8062 rank_loss=0.4731 rank_success=0.083 rank(c<a)=0.426 rank(a<h)=0.387 rank(c<h)=0.647 viol=0.053 a_bar=0.221 a_desc=0.007 cmin=0.087 dir=0.846 ibnce=2.736 supp=0.0001 sec/batch=0.842 eta=3.2m
+  [150/325] loss=2.4477 critic=1.6411 actor=0.8065 rank_loss=0.4690 rank_success=0.084 rank(c<a)=0.426 rank(a<h)=0.392 rank(c<h)=0.653 viol=0.052 a_bar=0.221 a_desc=0.007 cmin=0.087 dir=0.846 ibnce=2.722 supp=0.0000 sec/batch=0.843 eta=2.5m
+  [200/325] loss=2.4403 critic=1.6348 actor=0.8055 rank_loss=0.4657 rank_success=0.087 rank(c<a)=0.428 rank(a<h)=0.398 rank(c<h)=0.657 viol=0.053 a_bar=0.221 a_desc=0.007 cmin=0.087 dir=0.844 ibnce=2.702 supp=0.0000 sec/batch=0.843 eta=1.8m
+  [250/325] loss=2.4405 critic=1.6351 actor=0.8054 rank_loss=0.4647 rank_success=0.087 rank(c<a)=0.428 rank(a<h)=0.398 rank(c<h)=0.657 viol=0.054 a_bar=0.220 a_desc=0.007 cmin=0.086 dir=0.845 ibnce=2.705 supp=0.0000 sec/batch=0.843 eta=1.1m
+  [300/325] loss=2.4416 critic=1.6359 actor=0.8057 rank_loss=0.4701 rank_success=0.085 rank(c<a)=0.422 rank(a<h)=0.396 rank(c<h)=0.651 viol=0.054 a_bar=0.222 a_desc=0.008 cmin=0.087 dir=0.846 ibnce=2.695 supp=0.0000 sec/batch=0.844 eta=0.4m
+Epoch 24: train=2.4400 score=-0.057076 strict_pass=False skip=0.00% (284.6s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.3830 critic=1.5910 actor=0.7920 rank_loss=0.4245 rank_success=0.111 rank(c<a)=0.445 rank(a<h)=0.436 rank(c<h)=0.696 viol=0.051 a_bar=0.179 a_desc=0.010 cmin=0.084 dir=0.842 ibnce=2.569 supp=0.0000 sec/batch=0.848 eta=3.9m
+  [100/325] loss=2.3725 critic=1.5758 actor=0.7968 rank_loss=0.4158 rank_success=0.114 rank(c<a)=0.454 rank(a<h)=0.435 rank(c<h)=0.705 viol=0.050 a_bar=0.187 a_desc=0.011 cmin=0.083 dir=0.843 ibnce=2.501 supp=0.0000 sec/batch=0.844 eta=3.2m
+  [150/325] loss=2.3727 critic=1.5757 actor=0.7970 rank_loss=0.4253 rank_success=0.112 rank(c<a)=0.454 rank(a<h)=0.430 rank(c<h)=0.697 viol=0.051 a_bar=0.188 a_desc=0.011 cmin=0.083 dir=0.841 ibnce=2.501 supp=0.0000 sec/batch=0.845 eta=2.5m
+  [200/325] loss=2.3739 critic=1.5776 actor=0.7963 rank_loss=0.4230 rank_success=0.114 rank(c<a)=0.455 rank(a<h)=0.431 rank(c<h)=0.699 viol=0.051 a_bar=0.182 a_desc=0.011 cmin=0.083 dir=0.841 ibnce=2.512 supp=0.0000 sec/batch=0.845 eta=1.8m
+  [250/325] loss=2.3772 critic=1.5808 actor=0.7964 rank_loss=0.4249 rank_success=0.115 rank(c<a)=0.455 rank(a<h)=0.430 rank(c<h)=0.698 viol=0.051 a_bar=0.180 a_desc=0.012 cmin=0.083 dir=0.842 ibnce=2.520 supp=0.0000 sec/batch=0.844 eta=1.1m
+  [300/325] loss=2.3737 critic=1.5773 actor=0.7963 rank_loss=0.4260 rank_success=0.112 rank(c<a)=0.455 rank(a<h)=0.426 rank(c<h)=0.696 viol=0.051 a_bar=0.178 a_desc=0.012 cmin=0.083 dir=0.842 ibnce=2.502 supp=0.0000 sec/batch=0.844 eta=0.4m
+Epoch 25: train=2.3705 skip=0.00% eval=skipped (274.6s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.3556 critic=1.5626 actor=0.7930 rank_loss=0.3847 rank_success=0.110 rank(c<a)=0.479 rank(a<h)=0.437 rank(c<h)=0.739 viol=0.043 a_bar=0.143 a_desc=0.012 cmin=0.080 dir=0.839 ibnce=2.513 supp=0.0000 sec/batch=0.849 eta=3.9m
+  [100/325] loss=2.3560 critic=1.5623 actor=0.7936 rank_loss=0.3804 rank_success=0.112 rank(c<a)=0.474 rank(a<h)=0.438 rank(c<h)=0.737 viol=0.042 a_bar=0.149 a_desc=0.011 cmin=0.082 dir=0.841 ibnce=2.511 supp=0.0000 sec/batch=0.844 eta=3.2m
+  [150/325] loss=2.3446 critic=1.5512 actor=0.7934 rank_loss=0.3767 rank_success=0.110 rank(c<a)=0.468 rank(a<h)=0.437 rank(c<h)=0.732 viol=0.041 a_bar=0.148 a_desc=0.013 cmin=0.082 dir=0.841 ibnce=2.464 supp=0.0000 sec/batch=0.845 eta=2.5m
+  [200/325] loss=2.3441 critic=1.5514 actor=0.7928 rank_loss=0.3780 rank_success=0.112 rank(c<a)=0.469 rank(a<h)=0.439 rank(c<h)=0.732 viol=0.041 a_bar=0.148 a_desc=0.013 cmin=0.082 dir=0.842 ibnce=2.475 supp=0.0000 sec/batch=0.846 eta=1.8m
+  [250/325] loss=2.3437 critic=1.5511 actor=0.7926 rank_loss=0.3804 rank_success=0.111 rank(c<a)=0.469 rank(a<h)=0.437 rank(c<h)=0.731 viol=0.041 a_bar=0.150 a_desc=0.014 cmin=0.081 dir=0.840 ibnce=2.474 supp=0.0000 sec/batch=0.845 eta=1.1m
+  [300/325] loss=2.3429 critic=1.5504 actor=0.7925 rank_loss=0.3799 rank_success=0.109 rank(c<a)=0.467 rank(a<h)=0.437 rank(c<h)=0.733 viol=0.041 a_bar=0.152 a_desc=0.015 cmin=0.081 dir=0.839 ibnce=2.477 supp=0.0000 sec/batch=0.845 eta=0.4m
+Epoch 26: train=2.3428 score=-0.051236 strict_pass=False skip=0.00% (285.3s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.3526 critic=1.5706 actor=0.7819 rank_loss=0.3508 rank_success=0.127 rank(c<a)=0.490 rank(a<h)=0.466 rank(c<h)=0.770 viol=0.037 a_bar=0.118 a_desc=0.016 cmin=0.079 dir=0.834 ibnce=2.627 supp=0.0000 sec/batch=0.846 eta=3.9m
+  [100/325] loss=2.3323 critic=1.5473 actor=0.7850 rank_loss=0.3460 rank_success=0.127 rank(c<a)=0.490 rank(a<h)=0.461 rank(c<h)=0.768 viol=0.035 a_bar=0.132 a_desc=0.015 cmin=0.079 dir=0.834 ibnce=2.518 supp=0.0000 sec/batch=0.844 eta=3.2m
+  [150/325] loss=2.3231 critic=1.5370 actor=0.7861 rank_loss=0.3496 rank_success=0.124 rank(c<a)=0.485 rank(a<h)=0.458 rank(c<h)=0.763 viol=0.034 a_bar=0.132 a_desc=0.014 cmin=0.080 dir=0.834 ibnce=2.466 supp=0.0000 sec/batch=0.845 eta=2.5m
+  [200/325] loss=2.3210 critic=1.5341 actor=0.7869 rank_loss=0.3450 rank_success=0.126 rank(c<a)=0.486 rank(a<h)=0.456 rank(c<h)=0.763 viol=0.033 a_bar=0.129 a_desc=0.015 cmin=0.079 dir=0.835 ibnce=2.453 supp=0.0000 sec/batch=0.846 eta=1.8m
+  [250/325] loss=2.3215 critic=1.5343 actor=0.7872 rank_loss=0.3453 rank_success=0.126 rank(c<a)=0.486 rank(a<h)=0.459 rank(c<h)=0.764 viol=0.034 a_bar=0.132 a_desc=0.016 cmin=0.079 dir=0.836 ibnce=2.451 supp=0.0000 sec/batch=0.846 eta=1.1m
+  [300/325] loss=2.3203 critic=1.5337 actor=0.7866 rank_loss=0.3436 rank_success=0.126 rank(c<a)=0.487 rank(a<h)=0.457 rank(c<h)=0.764 viol=0.033 a_bar=0.130 a_desc=0.015 cmin=0.080 dir=0.836 ibnce=2.453 supp=0.0000 sec/batch=0.845 eta=0.4m
+Epoch 27: train=2.3206 skip=0.00% eval=skipped (274.7s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.2544 critic=1.4682 actor=0.7863 rank_loss=0.2899 rank_success=0.157 rank(c<a)=0.532 rank(a<h)=0.477 rank(c<h)=0.817 viol=0.020 a_bar=0.130 a_desc=0.017 cmin=0.074 dir=0.828 ibnce=2.262 supp=0.0000 sec/batch=0.846 eta=3.9m
+  [100/325] loss=2.2710 critic=1.4878 actor=0.7832 rank_loss=0.2997 rank_success=0.148 rank(c<a)=0.514 rank(a<h)=0.477 rank(c<h)=0.804 viol=0.022 a_bar=0.119 a_desc=0.018 cmin=0.076 dir=0.832 ibnce=2.321 supp=0.0000 sec/batch=0.843 eta=3.2m
+  [150/325] loss=2.2745 critic=1.4914 actor=0.7831 rank_loss=0.3103 rank_success=0.149 rank(c<a)=0.514 rank(a<h)=0.476 rank(c<h)=0.798 viol=0.025 a_bar=0.121 a_desc=0.018 cmin=0.075 dir=0.828 ibnce=2.346 supp=0.0000 sec/batch=0.843 eta=2.5m
+  [200/325] loss=2.2755 critic=1.4920 actor=0.7835 rank_loss=0.3112 rank_success=0.149 rank(c<a)=0.515 rank(a<h)=0.475 rank(c<h)=0.796 viol=0.026 a_bar=0.124 a_desc=0.018 cmin=0.075 dir=0.827 ibnce=2.348 supp=0.0000 sec/batch=0.844 eta=1.8m
+  [250/325] loss=2.2727 critic=1.4898 actor=0.7829 rank_loss=0.3121 rank_success=0.149 rank(c<a)=0.514 rank(a<h)=0.478 rank(c<h)=0.797 viol=0.028 a_bar=0.122 a_desc=0.019 cmin=0.075 dir=0.827 ibnce=2.339 supp=0.0000 sec/batch=0.845 eta=1.1m
+  [300/325] loss=2.2752 critic=1.4925 actor=0.7826 rank_loss=0.3135 rank_success=0.149 rank(c<a)=0.515 rank(a<h)=0.477 rank(c<h)=0.795 viol=0.028 a_bar=0.119 a_desc=0.019 cmin=0.075 dir=0.828 ibnce=2.345 supp=0.0000 sec/batch=0.845 eta=0.4m
+Epoch 28: train=2.2731 score=-0.058800 strict_pass=False skip=0.00% (285.0s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.2358 critic=1.4583 actor=0.7774 rank_loss=0.2768 rank_success=0.168 rank(c<a)=0.540 rank(a<h)=0.506 rank(c<h)=0.835 viol=0.021 a_bar=0.094 a_desc=0.019 cmin=0.077 dir=0.830 ibnce=2.217 supp=0.0000 sec/batch=0.848 eta=3.9m
+  [100/325] loss=2.2494 critic=1.4696 actor=0.7798 rank_loss=0.2734 rank_success=0.170 rank(c<a)=0.539 rank(a<h)=0.508 rank(c<h)=0.838 viol=0.021 a_bar=0.099 a_desc=0.018 cmin=0.075 dir=0.831 ibnce=2.274 supp=0.0000 sec/batch=0.844 eta=3.2m
+  [150/325] loss=2.2565 critic=1.4769 actor=0.7796 rank_loss=0.2706 rank_success=0.172 rank(c<a)=0.541 rank(a<h)=0.507 rank(c<h)=0.837 viol=0.022 a_bar=0.098 a_desc=0.018 cmin=0.075 dir=0.830 ibnce=2.316 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=2.2615 critic=1.4809 actor=0.7806 rank_loss=0.2740 rank_success=0.170 rank(c<a)=0.540 rank(a<h)=0.508 rank(c<h)=0.837 viol=0.023 a_bar=0.099 a_desc=0.018 cmin=0.075 dir=0.831 ibnce=2.318 supp=0.0000 sec/batch=0.843 eta=1.8m
+  [250/325] loss=2.2647 critic=1.4837 actor=0.7810 rank_loss=0.2771 rank_success=0.170 rank(c<a)=0.538 rank(a<h)=0.507 rank(c<h)=0.833 viol=0.024 a_bar=0.098 a_desc=0.019 cmin=0.075 dir=0.832 ibnce=2.321 supp=0.0000 sec/batch=0.843 eta=1.1m
+  [300/325] loss=2.2639 critic=1.4826 actor=0.7813 rank_loss=0.2808 rank_success=0.168 rank(c<a)=0.534 rank(a<h)=0.505 rank(c<h)=0.830 viol=0.024 a_bar=0.099 a_desc=0.019 cmin=0.075 dir=0.832 ibnce=2.313 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 29: train=2.2613 skip=0.00% eval=skipped (274.2s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.2162 critic=1.4364 actor=0.7798 rank_loss=0.2474 rank_success=0.190 rank(c<a)=0.561 rank(a<h)=0.525 rank(c<h)=0.863 viol=0.015 a_bar=0.089 a_desc=0.020 cmin=0.072 dir=0.827 ibnce=2.162 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=2.2269 critic=1.4467 actor=0.7802 rank_loss=0.2535 rank_success=0.186 rank(c<a)=0.555 rank(a<h)=0.521 rank(c<h)=0.855 viol=0.017 a_bar=0.096 a_desc=0.019 cmin=0.073 dir=0.829 ibnce=2.190 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=2.2364 critic=1.4560 actor=0.7804 rank_loss=0.2571 rank_success=0.187 rank(c<a)=0.556 rank(a<h)=0.519 rank(c<h)=0.852 viol=0.018 a_bar=0.098 a_desc=0.020 cmin=0.074 dir=0.829 ibnce=2.224 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=2.2403 critic=1.4592 actor=0.7812 rank_loss=0.2618 rank_success=0.182 rank(c<a)=0.552 rank(a<h)=0.517 rank(c<h)=0.850 viol=0.019 a_bar=0.102 a_desc=0.020 cmin=0.074 dir=0.828 ibnce=2.240 supp=0.0000 sec/batch=0.844 eta=1.8m
+  [250/325] loss=2.2475 critic=1.4653 actor=0.7822 rank_loss=0.2627 rank_success=0.183 rank(c<a)=0.550 rank(a<h)=0.519 rank(c<h)=0.849 viol=0.020 a_bar=0.102 a_desc=0.020 cmin=0.073 dir=0.829 ibnce=2.264 supp=0.0000 sec/batch=0.844 eta=1.1m
+  [300/325] loss=2.2504 critic=1.4679 actor=0.7825 rank_loss=0.2592 rank_success=0.186 rank(c<a)=0.551 rank(a<h)=0.521 rank(c<h)=0.850 viol=0.019 a_bar=0.101 a_desc=0.021 cmin=0.073 dir=0.830 ibnce=2.278 supp=0.0000 sec/batch=0.844 eta=0.4m
+Epoch 30: train=2.2463 score=-0.057640 strict_pass=False skip=0.00% (284.7s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.1825 critic=1.4077 actor=0.7748 rank_loss=0.2431 rank_success=0.214 rank(c<a)=0.581 rank(a<h)=0.539 rank(c<h)=0.874 viol=0.016 a_bar=0.090 a_desc=0.020 cmin=0.068 dir=0.823 ibnce=2.038 supp=0.0000 sec/batch=0.850 eta=3.9m
+  [100/325] loss=2.1951 critic=1.4184 actor=0.7767 rank_loss=0.2373 rank_success=0.216 rank(c<a)=0.578 rank(a<h)=0.539 rank(c<h)=0.872 viol=0.015 a_bar=0.084 a_desc=0.022 cmin=0.068 dir=0.824 ibnce=2.110 supp=0.0000 sec/batch=0.853 eta=3.2m
+  [150/325] loss=2.2063 critic=1.4291 actor=0.7772 rank_loss=0.2323 rank_success=0.217 rank(c<a)=0.582 rank(a<h)=0.541 rank(c<h)=0.877 viol=0.016 a_bar=0.083 a_desc=0.022 cmin=0.068 dir=0.824 ibnce=2.159 supp=0.0000 sec/batch=0.851 eta=2.5m
+  [200/325] loss=2.2179 critic=1.4402 actor=0.7777 rank_loss=0.2322 rank_success=0.218 rank(c<a)=0.581 rank(a<h)=0.543 rank(c<h)=0.877 viol=0.017 a_bar=0.084 a_desc=0.022 cmin=0.069 dir=0.827 ibnce=2.202 supp=0.0000 sec/batch=0.854 eta=1.8m
+  [250/325] loss=2.2161 critic=1.4378 actor=0.7782 rank_loss=0.2351 rank_success=0.216 rank(c<a)=0.580 rank(a<h)=0.542 rank(c<h)=0.875 viol=0.018 a_bar=0.085 a_desc=0.023 cmin=0.069 dir=0.828 ibnce=2.184 supp=0.0000 sec/batch=0.851 eta=1.1m
+  [300/325] loss=2.2191 critic=1.4401 actor=0.7790 rank_loss=0.2367 rank_success=0.213 rank(c<a)=0.578 rank(a<h)=0.539 rank(c<h)=0.873 viol=0.018 a_bar=0.086 a_desc=0.023 cmin=0.070 dir=0.829 ibnce=2.192 supp=0.0000 sec/batch=0.852 eta=0.4m
+Epoch 31: train=2.2211 skip=0.00% eval=skipped (276.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.1876 critic=1.4071 actor=0.7805 rank_loss=0.1983 rank_success=0.243 rank(c<a)=0.602 rank(a<h)=0.561 rank(c<h)=0.902 viol=0.007 a_bar=0.078 a_desc=0.020 cmin=0.067 dir=0.821 ibnce=2.120 supp=0.0000 sec/batch=0.855 eta=3.9m
+  [100/325] loss=2.1915 critic=1.4117 actor=0.7798 rank_loss=0.2051 rank_success=0.241 rank(c<a)=0.603 rank(a<h)=0.562 rank(c<h)=0.902 viol=0.010 a_bar=0.080 a_desc=0.022 cmin=0.067 dir=0.820 ibnce=2.130 supp=0.0000 sec/batch=0.851 eta=3.2m
+  [150/325] loss=2.1840 critic=1.4052 actor=0.7788 rank_loss=0.2083 rank_success=0.238 rank(c<a)=0.603 rank(a<h)=0.557 rank(c<h)=0.899 viol=0.010 a_bar=0.082 a_desc=0.022 cmin=0.067 dir=0.821 ibnce=2.098 supp=0.0000 sec/batch=0.855 eta=2.5m
+  [200/325] loss=2.1853 critic=1.4062 actor=0.7791 rank_loss=0.2106 rank_success=0.237 rank(c<a)=0.602 rank(a<h)=0.558 rank(c<h)=0.898 viol=0.011 a_bar=0.086 a_desc=0.024 cmin=0.066 dir=0.822 ibnce=2.102 supp=0.0000 sec/batch=0.853 eta=1.8m
+  [250/325] loss=2.1861 critic=1.4067 actor=0.7793 rank_loss=0.2138 rank_success=0.238 rank(c<a)=0.602 rank(a<h)=0.557 rank(c<h)=0.896 viol=0.013 a_bar=0.087 a_desc=0.025 cmin=0.067 dir=0.822 ibnce=2.098 supp=0.0000 sec/batch=0.852 eta=1.1m
+  [300/325] loss=2.1876 critic=1.4084 actor=0.7792 rank_loss=0.2151 rank_success=0.235 rank(c<a)=0.600 rank(a<h)=0.555 rank(c<h)=0.894 viol=0.013 a_bar=0.087 a_desc=0.025 cmin=0.067 dir=0.822 ibnce=2.105 supp=0.0000 sec/batch=0.865 eta=0.4m
+Epoch 32: train=2.1864 score=-0.053261 strict_pass=False skip=0.00% (288.9s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.1745 critic=1.3961 actor=0.7784 rank_loss=0.2048 rank_success=0.230 rank(c<a)=0.592 rank(a<h)=0.546 rank(c<h)=0.889 viol=0.011 a_bar=0.089 a_desc=0.023 cmin=0.067 dir=0.818 ibnce=2.052 supp=0.0000 sec/batch=0.871 eta=4.0m
+  [100/325] loss=2.1841 critic=1.4064 actor=0.7777 rank_loss=0.2086 rank_success=0.229 rank(c<a)=0.593 rank(a<h)=0.544 rank(c<h)=0.888 viol=0.012 a_bar=0.085 a_desc=0.025 cmin=0.066 dir=0.820 ibnce=2.097 supp=0.0000 sec/batch=0.853 eta=3.2m
+  [150/325] loss=2.1848 critic=1.4044 actor=0.7805 rank_loss=0.2301 rank_success=0.207 rank(c<a)=0.565 rank(a<h)=0.515 rank(c<h)=0.852 viol=0.010 a_bar=0.093 a_desc=0.025 cmin=0.067 dir=0.819 ibnce=2.073 supp=0.0000 sec/batch=0.845 eta=2.5m
+  [200/325] loss=2.1796 critic=1.3987 actor=0.7808 rank_loss=0.2346 rank_success=0.206 rank(c<a)=0.560 rank(a<h)=0.514 rank(c<h)=0.847 viol=0.011 a_bar=0.095 a_desc=0.027 cmin=0.067 dir=0.820 ibnce=2.045 supp=0.0000 sec/batch=0.844 eta=1.8m
+  [250/325] loss=2.1846 critic=1.4038 actor=0.7808 rank_loss=0.2408 rank_success=0.200 rank(c<a)=0.549 rank(a<h)=0.507 rank(c<h)=0.834 viol=0.012 a_bar=0.098 a_desc=0.025 cmin=0.068 dir=0.819 ibnce=2.062 supp=0.0000 sec/batch=0.843 eta=1.1m
+  [300/325] loss=2.1848 critic=1.4043 actor=0.7804 rank_loss=0.2398 rank_success=0.201 rank(c<a)=0.552 rank(a<h)=0.511 rank(c<h)=0.840 viol=0.013 a_bar=0.097 a_desc=0.026 cmin=0.068 dir=0.820 ibnce=2.061 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 33: train=2.1898 skip=0.00% eval=skipped (276.1s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.1751 critic=1.3970 actor=0.7781 rank_loss=0.2576 rank_success=0.197 rank(c<a)=0.543 rank(a<h)=0.498 rank(c<h)=0.817 viol=0.007 a_bar=0.095 a_desc=0.023 cmin=0.066 dir=0.818 ibnce=2.018 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=2.1355 critic=1.3615 actor=0.7740 rank_loss=0.2256 rank_success=0.233 rank(c<a)=0.585 rank(a<h)=0.533 rank(c<h)=0.861 viol=0.009 a_bar=0.084 a_desc=0.026 cmin=0.062 dir=0.814 ibnce=1.911 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=2.1502 critic=1.3758 actor=0.7744 rank_loss=0.2229 rank_success=0.228 rank(c<a)=0.582 rank(a<h)=0.527 rank(c<h)=0.858 viol=0.009 a_bar=0.086 a_desc=0.025 cmin=0.063 dir=0.811 ibnce=1.994 supp=0.0000 sec/batch=0.843 eta=2.5m
+  [200/325] loss=2.1735 critic=1.3981 actor=0.7754 rank_loss=0.2436 rank_success=0.199 rank(c<a)=0.545 rank(a<h)=0.494 rank(c<h)=0.819 viol=0.009 a_bar=0.085 a_desc=0.024 cmin=0.065 dir=0.813 ibnce=2.067 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=2.1685 critic=1.3928 actor=0.7757 rank_loss=0.2499 rank_success=0.196 rank(c<a)=0.535 rank(a<h)=0.490 rank(c<h)=0.807 viol=0.009 a_bar=0.085 a_desc=0.025 cmin=0.065 dir=0.815 ibnce=2.031 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=2.1646 critic=1.3888 actor=0.7758 rank_loss=0.2531 rank_success=0.195 rank(c<a)=0.533 rank(a<h)=0.489 rank(c<h)=0.804 viol=0.009 a_bar=0.085 a_desc=0.027 cmin=0.065 dir=0.816 ibnce=2.003 supp=0.0000 sec/batch=0.841 eta=0.4m
+Epoch 34: train=2.1668 score=-0.054607 strict_pass=False skip=0.00% (284.3s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.1227 critic=1.3467 actor=0.7761 rank_loss=0.2086 rank_success=0.246 rank(c<a)=0.590 rank(a<h)=0.549 rank(c<h)=0.878 viol=0.012 a_bar=0.078 a_desc=0.023 cmin=0.060 dir=0.813 ibnce=1.797 supp=0.0000 sec/batch=0.846 eta=3.9m
+  [100/325] loss=2.1580 critic=1.3826 actor=0.7753 rank_loss=0.2168 rank_success=0.225 rank(c<a)=0.575 rank(a<h)=0.531 rank(c<h)=0.865 viol=0.011 a_bar=0.078 a_desc=0.026 cmin=0.062 dir=0.814 ibnce=1.967 supp=0.0000 sec/batch=0.841 eta=3.2m
+  [150/325] loss=2.1556 critic=1.3787 actor=0.7769 rank_loss=0.2171 rank_success=0.235 rank(c<a)=0.579 rank(a<h)=0.537 rank(c<h)=0.863 viol=0.010 a_bar=0.083 a_desc=0.028 cmin=0.061 dir=0.816 ibnce=1.958 supp=0.0000 sec/batch=0.841 eta=2.5m
+  [200/325] loss=2.1590 critic=1.3826 actor=0.7764 rank_loss=0.2291 rank_success=0.214 rank(c<a)=0.559 rank(a<h)=0.514 rank(c<h)=0.841 viol=0.010 a_bar=0.082 a_desc=0.026 cmin=0.063 dir=0.816 ibnce=1.963 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=2.1831 critic=1.4001 actor=0.7830 rank_loss=0.2720 rank_success=0.203 rank(c<a)=0.548 rank(a<h)=0.508 rank(c<h)=0.827 viol=0.016 a_bar=0.118 a_desc=0.028 cmin=0.064 dir=0.818 ibnce=1.989 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=2.1800 critic=1.3976 actor=0.7824 rank_loss=0.2723 rank_success=0.199 rank(c<a)=0.542 rank(a<h)=0.501 rank(c<h)=0.819 viol=0.015 a_bar=0.115 a_desc=0.030 cmin=0.064 dir=0.818 ibnce=1.979 supp=0.0000 sec/batch=0.842 eta=0.4m
+Epoch 35: train=2.1745 skip=0.00% eval=skipped (273.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.1842 critic=1.4047 actor=0.7795 rank_loss=0.2634 rank_success=0.173 rank(c<a)=0.494 rank(a<h)=0.475 rank(c<h)=0.780 viol=0.006 a_bar=0.105 a_desc=0.019 cmin=0.067 dir=0.813 ibnce=2.067 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=2.1311 critic=1.3564 actor=0.7747 rank_loss=0.2221 rank_success=0.242 rank(c<a)=0.570 rank(a<h)=0.532 rank(c<h)=0.845 viol=0.007 a_bar=0.085 a_desc=0.023 cmin=0.062 dir=0.811 ibnce=1.896 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=2.1526 critic=1.3766 actor=0.7760 rank_loss=0.2456 rank_success=0.206 rank(c<a)=0.534 rank(a<h)=0.496 rank(c<h)=0.808 viol=0.006 a_bar=0.090 a_desc=0.023 cmin=0.064 dir=0.813 ibnce=1.962 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=2.1378 critic=1.3623 actor=0.7754 rank_loss=0.2300 rank_success=0.225 rank(c<a)=0.561 rank(a<h)=0.520 rank(c<h)=0.839 viol=0.008 a_bar=0.086 a_desc=0.027 cmin=0.062 dir=0.813 ibnce=1.924 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=2.1451 critic=1.3686 actor=0.7766 rank_loss=0.2394 rank_success=0.212 rank(c<a)=0.546 rank(a<h)=0.507 rank(c<h)=0.824 viol=0.007 a_bar=0.087 a_desc=0.027 cmin=0.063 dir=0.814 ibnce=1.937 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=2.1336 critic=1.3570 actor=0.7766 rank_loss=0.2356 rank_success=0.219 rank(c<a)=0.555 rank(a<h)=0.514 rank(c<h)=0.832 viol=0.008 a_bar=0.087 a_desc=0.027 cmin=0.063 dir=0.813 ibnce=1.886 supp=0.0000 sec/batch=0.844 eta=0.4m
+Epoch 36: train=2.1334 score=-0.038817 strict_pass=False skip=0.00% (284.3s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.0511 critic=1.2771 actor=0.7740 rank_loss=0.1550 rank_success=0.333 rank(c<a)=0.685 rank(a<h)=0.610 rank(c<h)=0.949 viol=0.006 a_bar=0.061 a_desc=0.027 cmin=0.053 dir=0.801 ibnce=1.653 supp=0.0000 sec/batch=0.843 eta=3.9m
+  [100/325] loss=2.0449 critic=1.2729 actor=0.7719 rank_loss=0.1509 rank_success=0.346 rank(c<a)=0.688 rank(a<h)=0.620 rank(c<h)=0.951 viol=0.006 a_bar=0.062 a_desc=0.030 cmin=0.053 dir=0.801 ibnce=1.651 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=2.0568 critic=1.2856 actor=0.7712 rank_loss=0.1526 rank_success=0.345 rank(c<a)=0.687 rank(a<h)=0.619 rank(c<h)=0.949 viol=0.006 a_bar=0.067 a_desc=0.030 cmin=0.053 dir=0.800 ibnce=1.707 supp=0.0000 sec/batch=0.843 eta=2.5m
+  [200/325] loss=2.0624 critic=1.2904 actor=0.7720 rank_loss=0.1577 rank_success=0.334 rank(c<a)=0.678 rank(a<h)=0.615 rank(c<h)=0.946 viol=0.007 a_bar=0.068 a_desc=0.032 cmin=0.054 dir=0.803 ibnce=1.704 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=2.0560 critic=1.2842 actor=0.7718 rank_loss=0.1621 rank_success=0.330 rank(c<a)=0.672 rank(a<h)=0.612 rank(c<h)=0.942 viol=0.007 a_bar=0.068 a_desc=0.031 cmin=0.054 dir=0.804 ibnce=1.662 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=2.0706 critic=1.2989 actor=0.7717 rank_loss=0.1832 rank_success=0.302 rank(c<a)=0.640 rank(a<h)=0.584 rank(c<h)=0.908 viol=0.007 a_bar=0.072 a_desc=0.029 cmin=0.056 dir=0.805 ibnce=1.709 supp=0.0000 sec/batch=0.842 eta=0.4m
+Epoch 37: train=2.0709 skip=0.00% eval=skipped (273.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.0519 critic=1.2826 actor=0.7694 rank_loss=0.1486 rank_success=0.357 rank(c<a)=0.706 rank(a<h)=0.623 rank(c<h)=0.961 viol=0.006 a_bar=0.058 a_desc=0.035 cmin=0.051 dir=0.797 ibnce=1.724 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=2.1014 critic=1.3335 actor=0.7679 rank_loss=0.1688 rank_success=0.317 rank(c<a)=0.660 rank(a<h)=0.588 rank(c<h)=0.920 viol=0.006 a_bar=0.057 a_desc=0.035 cmin=0.055 dir=0.801 ibnce=1.913 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=2.0829 critic=1.3149 actor=0.7679 rank_loss=0.1627 rank_success=0.334 rank(c<a)=0.671 rank(a<h)=0.607 rank(c<h)=0.932 viol=0.006 a_bar=0.060 a_desc=0.035 cmin=0.054 dir=0.800 ibnce=1.835 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=2.0775 critic=1.3087 actor=0.7688 rank_loss=0.1697 rank_success=0.317 rank(c<a)=0.660 rank(a<h)=0.592 rank(c<h)=0.922 viol=0.007 a_bar=0.060 a_desc=0.035 cmin=0.055 dir=0.801 ibnce=1.800 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=2.0628 critic=1.2941 actor=0.7688 rank_loss=0.1681 rank_success=0.320 rank(c<a)=0.660 rank(a<h)=0.596 rank(c<h)=0.924 viol=0.007 a_bar=0.061 a_desc=0.034 cmin=0.055 dir=0.802 ibnce=1.733 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=2.0564 critic=1.2872 actor=0.7692 rank_loss=0.1691 rank_success=0.318 rank(c<a)=0.657 rank(a<h)=0.596 rank(c<h)=0.922 viol=0.007 a_bar=0.062 a_desc=0.035 cmin=0.055 dir=0.802 ibnce=1.698 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 38: train=2.0595 score=-0.046540 strict_pass=False skip=0.00% (284.3s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=2.0635 critic=1.2929 actor=0.7706 rank_loss=0.1519 rank_success=0.364 rank(c<a)=0.696 rank(a<h)=0.631 rank(c<h)=0.951 viol=0.005 a_bar=0.061 a_desc=0.038 cmin=0.052 dir=0.792 ibnce=1.807 supp=0.0000 sec/batch=0.844 eta=3.9m
+  [100/325] loss=2.0697 critic=1.3012 actor=0.7685 rank_loss=0.1587 rank_success=0.341 rank(c<a)=0.678 rank(a<h)=0.614 rank(c<h)=0.940 viol=0.007 a_bar=0.055 a_desc=0.032 cmin=0.053 dir=0.796 ibnce=1.799 supp=0.0000 sec/batch=0.843 eta=3.2m
+  [150/325] loss=2.0506 critic=1.2822 actor=0.7684 rank_loss=0.1586 rank_success=0.347 rank(c<a)=0.682 rank(a<h)=0.620 rank(c<h)=0.943 viol=0.007 a_bar=0.055 a_desc=0.030 cmin=0.053 dir=0.797 ibnce=1.699 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=2.0358 critic=1.2673 actor=0.7684 rank_loss=0.1567 rank_success=0.348 rank(c<a)=0.683 rank(a<h)=0.623 rank(c<h)=0.946 viol=0.007 a_bar=0.058 a_desc=0.031 cmin=0.053 dir=0.798 ibnce=1.627 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=2.0309 critic=1.2623 actor=0.7686 rank_loss=0.1558 rank_success=0.353 rank(c<a)=0.686 rank(a<h)=0.627 rank(c<h)=0.948 viol=0.007 a_bar=0.061 a_desc=0.032 cmin=0.052 dir=0.797 ibnce=1.611 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=2.0343 critic=1.2657 actor=0.7686 rank_loss=0.1543 rank_success=0.355 rank(c<a)=0.688 rank(a<h)=0.628 rank(c<h)=0.949 viol=0.007 a_bar=0.063 a_desc=0.032 cmin=0.052 dir=0.797 ibnce=1.636 supp=0.0000 sec/batch=0.842 eta=0.4m
+Epoch 39: train=2.0383 skip=0.00% eval=skipped (273.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.9930 critic=1.2281 actor=0.7649 rank_loss=0.1268 rank_success=0.405 rank(c<a)=0.730 rank(a<h)=0.657 rank(c<h)=0.974 viol=0.005 a_bar=0.046 a_desc=0.040 cmin=0.049 dir=0.792 ibnce=1.479 supp=0.0000 sec/batch=0.844 eta=3.9m
+  [100/325] loss=1.9860 critic=1.2202 actor=0.7658 rank_loss=0.1261 rank_success=0.407 rank(c<a)=0.727 rank(a<h)=0.659 rank(c<h)=0.972 viol=0.004 a_bar=0.054 a_desc=0.042 cmin=0.048 dir=0.794 ibnce=1.442 supp=0.0000 sec/batch=0.841 eta=3.2m
+  [150/325] loss=1.9724 critic=1.2070 actor=0.7655 rank_loss=0.1288 rank_success=0.403 rank(c<a)=0.725 rank(a<h)=0.656 rank(c<h)=0.972 viol=0.005 a_bar=0.052 a_desc=0.041 cmin=0.048 dir=0.793 ibnce=1.378 supp=0.0000 sec/batch=0.841 eta=2.5m
+  [200/325] loss=1.9698 critic=1.2037 actor=0.7661 rank_loss=0.1308 rank_success=0.393 rank(c<a)=0.718 rank(a<h)=0.653 rank(c<h)=0.970 viol=0.005 a_bar=0.057 a_desc=0.039 cmin=0.049 dir=0.791 ibnce=1.370 supp=0.0000 sec/batch=0.841 eta=1.8m
+  [250/325] loss=1.9718 critic=1.2057 actor=0.7661 rank_loss=0.1337 rank_success=0.387 rank(c<a)=0.715 rank(a<h)=0.650 rank(c<h)=0.970 viol=0.005 a_bar=0.059 a_desc=0.039 cmin=0.049 dir=0.792 ibnce=1.377 supp=0.0000 sec/batch=0.841 eta=1.1m
+  [300/325] loss=1.9809 critic=1.2144 actor=0.7665 rank_loss=0.1379 rank_success=0.380 rank(c<a)=0.710 rank(a<h)=0.646 rank(c<h)=0.967 viol=0.006 a_bar=0.061 a_desc=0.040 cmin=0.049 dir=0.793 ibnce=1.418 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 40: train=1.9888 score=-0.062572 strict_pass=False skip=0.00% (284.0s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.9870 critic=1.2167 actor=0.7702 rank_loss=0.1206 rank_success=0.406 rank(c<a)=0.738 rank(a<h)=0.654 rank(c<h)=0.979 viol=0.003 a_bar=0.073 a_desc=0.035 cmin=0.048 dir=0.793 ibnce=1.473 supp=0.0000 sec/batch=0.844 eta=3.9m
+  [100/325] loss=1.9682 critic=1.1992 actor=0.7690 rank_loss=0.1227 rank_success=0.407 rank(c<a)=0.735 rank(a<h)=0.654 rank(c<h)=0.976 viol=0.003 a_bar=0.072 a_desc=0.035 cmin=0.048 dir=0.790 ibnce=1.378 supp=0.0000 sec/batch=0.841 eta=3.2m
+  [150/325] loss=1.9589 critic=1.1903 actor=0.7686 rank_loss=0.1271 rank_success=0.401 rank(c<a)=0.727 rank(a<h)=0.655 rank(c<h)=0.973 viol=0.003 a_bar=0.068 a_desc=0.040 cmin=0.049 dir=0.790 ibnce=1.332 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=1.9747 critic=1.2060 actor=0.7686 rank_loss=0.1281 rank_success=0.399 rank(c<a)=0.727 rank(a<h)=0.652 rank(c<h)=0.973 viol=0.004 a_bar=0.071 a_desc=0.037 cmin=0.049 dir=0.789 ibnce=1.412 supp=0.0000 sec/batch=0.843 eta=1.8m
+  [250/325] loss=1.9875 critic=1.2199 actor=0.7676 rank_loss=0.1311 rank_success=0.395 rank(c<a)=0.725 rank(a<h)=0.651 rank(c<h)=0.971 viol=0.005 a_bar=0.072 a_desc=0.038 cmin=0.049 dir=0.790 ibnce=1.474 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=1.9860 critic=1.2182 actor=0.7679 rank_loss=0.1317 rank_success=0.393 rank(c<a)=0.722 rank(a<h)=0.651 rank(c<h)=0.972 viol=0.006 a_bar=0.071 a_desc=0.039 cmin=0.049 dir=0.791 ibnce=1.456 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 41: train=1.9847 skip=0.00% eval=skipped (273.9s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.9322 critic=1.1655 actor=0.7667 rank_loss=0.1070 rank_success=0.454 rank(c<a)=0.754 rank(a<h)=0.688 rank(c<h)=0.984 viol=0.002 a_bar=0.073 a_desc=0.028 cmin=0.047 dir=0.787 ibnce=1.250 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=1.9250 critic=1.1597 actor=0.7653 rank_loss=0.1166 rank_success=0.435 rank(c<a)=0.745 rank(a<h)=0.676 rank(c<h)=0.979 viol=0.003 a_bar=0.074 a_desc=0.031 cmin=0.047 dir=0.784 ibnce=1.213 supp=0.0000 sec/batch=0.843 eta=3.2m
+  [150/325] loss=1.9354 critic=1.1700 actor=0.7654 rank_loss=0.1175 rank_success=0.430 rank(c<a)=0.743 rank(a<h)=0.672 rank(c<h)=0.978 viol=0.003 a_bar=0.069 a_desc=0.033 cmin=0.047 dir=0.785 ibnce=1.256 supp=0.0000 sec/batch=0.844 eta=2.5m
+  [200/325] loss=1.9558 critic=1.1894 actor=0.7664 rank_loss=0.1199 rank_success=0.427 rank(c<a)=0.739 rank(a<h)=0.672 rank(c<h)=0.977 viol=0.003 a_bar=0.069 a_desc=0.036 cmin=0.048 dir=0.786 ibnce=1.342 supp=0.0000 sec/batch=0.843 eta=1.8m
+  [250/325] loss=1.9565 critic=1.1895 actor=0.7671 rank_loss=0.1264 rank_success=0.418 rank(c<a)=0.734 rank(a<h)=0.667 rank(c<h)=0.975 viol=0.004 a_bar=0.071 a_desc=0.036 cmin=0.047 dir=0.788 ibnce=1.327 supp=0.0000 sec/batch=0.844 eta=1.1m
+  [300/325] loss=1.9612 critic=1.1948 actor=0.7664 rank_loss=0.1301 rank_success=0.411 rank(c<a)=0.731 rank(a<h)=0.662 rank(c<h)=0.973 viol=0.004 a_bar=0.071 a_desc=0.039 cmin=0.047 dir=0.788 ibnce=1.347 supp=0.0000 sec/batch=0.844 eta=0.4m
+Epoch 42: train=1.9608 score=-0.057141 strict_pass=False skip=0.00% (284.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.9727 critic=1.2097 actor=0.7630 rank_loss=0.1065 rank_success=0.450 rank(c<a)=0.757 rank(a<h)=0.680 rank(c<h)=0.981 viol=0.003 a_bar=0.056 a_desc=0.042 cmin=0.047 dir=0.783 ibnce=1.470 supp=0.0000 sec/batch=0.846 eta=3.9m
+  [100/325] loss=1.9355 critic=1.1733 actor=0.7621 rank_loss=0.1114 rank_success=0.441 rank(c<a)=0.748 rank(a<h)=0.681 rank(c<h)=0.982 viol=0.003 a_bar=0.050 a_desc=0.045 cmin=0.043 dir=0.785 ibnce=1.287 supp=0.0000 sec/batch=0.845 eta=3.2m
+  [150/325] loss=1.9281 critic=1.1649 actor=0.7633 rank_loss=0.1157 rank_success=0.435 rank(c<a)=0.746 rank(a<h)=0.674 rank(c<h)=0.978 viol=0.004 a_bar=0.056 a_desc=0.042 cmin=0.044 dir=0.784 ibnce=1.237 supp=0.0000 sec/batch=0.844 eta=2.5m
+  [200/325] loss=1.9221 critic=1.1594 actor=0.7627 rank_loss=0.1188 rank_success=0.429 rank(c<a)=0.743 rank(a<h)=0.669 rank(c<h)=0.976 viol=0.004 a_bar=0.059 a_desc=0.040 cmin=0.045 dir=0.784 ibnce=1.216 supp=0.0000 sec/batch=0.844 eta=1.8m
+  [250/325] loss=1.9139 critic=1.1513 actor=0.7626 rank_loss=0.1210 rank_success=0.420 rank(c<a)=0.737 rank(a<h)=0.666 rank(c<h)=0.975 viol=0.004 a_bar=0.061 a_desc=0.038 cmin=0.045 dir=0.782 ibnce=1.179 supp=0.0000 sec/batch=0.844 eta=1.1m
+  [300/325] loss=1.9101 critic=1.1468 actor=0.7633 rank_loss=0.1241 rank_success=0.415 rank(c<a)=0.734 rank(a<h)=0.663 rank(c<h)=0.974 viol=0.004 a_bar=0.060 a_desc=0.040 cmin=0.045 dir=0.783 ibnce=1.149 supp=0.0000 sec/batch=0.844 eta=0.4m
+Epoch 43: train=1.9087 skip=0.00% eval=skipped (274.5s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.8919 critic=1.1329 actor=0.7589 rank_loss=0.1110 rank_success=0.433 rank(c<a)=0.746 rank(a<h)=0.675 rank(c<h)=0.982 viol=0.004 a_bar=0.046 a_desc=0.055 cmin=0.044 dir=0.779 ibnce=1.097 supp=0.0000 sec/batch=0.847 eta=3.9m
+  [100/325] loss=1.9020 critic=1.1410 actor=0.7610 rank_loss=0.1112 rank_success=0.435 rank(c<a)=0.744 rank(a<h)=0.680 rank(c<h)=0.983 viol=0.003 a_bar=0.050 a_desc=0.050 cmin=0.043 dir=0.779 ibnce=1.136 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=1.9188 critic=1.1568 actor=0.7620 rank_loss=0.1110 rank_success=0.434 rank(c<a)=0.745 rank(a<h)=0.677 rank(c<h)=0.982 viol=0.003 a_bar=0.055 a_desc=0.045 cmin=0.044 dir=0.781 ibnce=1.214 supp=0.0000 sec/batch=0.845 eta=2.5m
+  [200/325] loss=1.9117 critic=1.1491 actor=0.7626 rank_loss=0.1136 rank_success=0.435 rank(c<a)=0.746 rank(a<h)=0.676 rank(c<h)=0.981 viol=0.003 a_bar=0.060 a_desc=0.043 cmin=0.044 dir=0.779 ibnce=1.179 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=1.9064 critic=1.1428 actor=0.7637 rank_loss=0.1149 rank_success=0.430 rank(c<a)=0.742 rank(a<h)=0.674 rank(c<h)=0.980 viol=0.003 a_bar=0.063 a_desc=0.046 cmin=0.044 dir=0.779 ibnce=1.147 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=1.9070 critic=1.1428 actor=0.7641 rank_loss=0.1168 rank_success=0.426 rank(c<a)=0.740 rank(a<h)=0.672 rank(c<h)=0.979 viol=0.003 a_bar=0.063 a_desc=0.047 cmin=0.043 dir=0.779 ibnce=1.153 supp=0.0000 sec/batch=0.842 eta=0.4m
+Epoch 44: train=1.9076 score=-0.058371 strict_pass=False skip=0.00% (284.5s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.8422 critic=1.0782 actor=0.7640 rank_loss=0.1000 rank_success=0.470 rank(c<a)=0.774 rank(a<h)=0.689 rank(c<h)=0.990 viol=0.004 a_bar=0.061 a_desc=0.029 cmin=0.038 dir=0.773 ibnce=0.853 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=1.8762 critic=1.1114 actor=0.7648 rank_loss=0.1071 rank_success=0.459 rank(c<a)=0.770 rank(a<h)=0.680 rank(c<h)=0.987 viol=0.004 a_bar=0.069 a_desc=0.030 cmin=0.041 dir=0.775 ibnce=1.006 supp=0.0000 sec/batch=0.841 eta=3.2m
+  [150/325] loss=1.8837 critic=1.1188 actor=0.7649 rank_loss=0.1104 rank_success=0.453 rank(c<a)=0.763 rank(a<h)=0.681 rank(c<h)=0.985 viol=0.004 a_bar=0.073 a_desc=0.032 cmin=0.042 dir=0.774 ibnce=1.038 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=1.8808 critic=1.1172 actor=0.7636 rank_loss=0.1105 rank_success=0.448 rank(c<a)=0.759 rank(a<h)=0.679 rank(c<h)=0.984 viol=0.004 a_bar=0.072 a_desc=0.034 cmin=0.043 dir=0.773 ibnce=1.030 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=1.8787 critic=1.1152 actor=0.7635 rank_loss=0.1096 rank_success=0.446 rank(c<a)=0.757 rank(a<h)=0.677 rank(c<h)=0.984 viol=0.003 a_bar=0.072 a_desc=0.034 cmin=0.044 dir=0.773 ibnce=1.022 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=1.8753 critic=1.1118 actor=0.7635 rank_loss=0.1105 rank_success=0.443 rank(c<a)=0.754 rank(a<h)=0.677 rank(c<h)=0.983 viol=0.003 a_bar=0.069 a_desc=0.036 cmin=0.044 dir=0.773 ibnce=1.005 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 45: train=1.8736 skip=0.00% eval=skipped (273.8s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.8883 critic=1.1310 actor=0.7572 rank_loss=0.0987 rank_success=0.490 rank(c<a)=0.775 rank(a<h)=0.704 rank(c<h)=0.984 viol=0.001 a_bar=0.038 a_desc=0.053 cmin=0.038 dir=0.768 ibnce=1.180 supp=0.0000 sec/batch=0.848 eta=3.9m
+  [100/325] loss=1.8893 critic=1.1332 actor=0.7561 rank_loss=0.1017 rank_success=0.477 rank(c<a)=0.768 rank(a<h)=0.699 rank(c<h)=0.985 viol=0.001 a_bar=0.040 a_desc=0.054 cmin=0.038 dir=0.770 ibnce=1.174 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=1.8924 critic=1.1350 actor=0.7574 rank_loss=0.1002 rank_success=0.477 rank(c<a)=0.767 rank(a<h)=0.700 rank(c<h)=0.986 viol=0.001 a_bar=0.042 a_desc=0.053 cmin=0.041 dir=0.772 ibnce=1.170 supp=0.0000 sec/batch=0.841 eta=2.5m
+  [200/325] loss=1.8866 critic=1.1260 actor=0.7606 rank_loss=0.1019 rank_success=0.471 rank(c<a)=0.762 rank(a<h)=0.698 rank(c<h)=0.984 viol=0.002 a_bar=0.045 a_desc=0.054 cmin=0.041 dir=0.774 ibnce=1.113 supp=0.0000 sec/batch=0.841 eta=1.8m
+  [250/325] loss=1.8810 critic=1.1199 actor=0.7611 rank_loss=0.1037 rank_success=0.465 rank(c<a)=0.757 rank(a<h)=0.696 rank(c<h)=0.984 viol=0.002 a_bar=0.045 a_desc=0.054 cmin=0.041 dir=0.775 ibnce=1.072 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=1.8814 critic=1.1195 actor=0.7619 rank_loss=0.1061 rank_success=0.462 rank(c<a)=0.757 rank(a<h)=0.692 rank(c<h)=0.983 viol=0.002 a_bar=0.047 a_desc=0.055 cmin=0.042 dir=0.777 ibnce=1.067 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 46: train=1.8830 score=-0.044224 strict_pass=False skip=0.00% (284.4s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.8618 critic=1.1072 actor=0.7547 rank_loss=0.0977 rank_success=0.492 rank(c<a)=0.780 rank(a<h)=0.705 rank(c<h)=0.990 viol=0.002 a_bar=0.033 a_desc=0.054 cmin=0.042 dir=0.770 ibnce=1.034 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=1.8496 critic=1.0946 actor=0.7549 rank_loss=0.0951 rank_success=0.495 rank(c<a)=0.783 rank(a<h)=0.705 rank(c<h)=0.990 viol=0.001 a_bar=0.035 a_desc=0.055 cmin=0.042 dir=0.767 ibnce=0.982 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=1.8444 critic=1.0889 actor=0.7555 rank_loss=0.0951 rank_success=0.492 rank(c<a)=0.781 rank(a<h)=0.705 rank(c<h)=0.990 viol=0.001 a_bar=0.041 a_desc=0.052 cmin=0.041 dir=0.765 ibnce=0.958 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=1.8405 critic=1.0852 actor=0.7553 rank_loss=0.0974 rank_success=0.486 rank(c<a)=0.776 rank(a<h)=0.703 rank(c<h)=0.989 viol=0.002 a_bar=0.043 a_desc=0.049 cmin=0.041 dir=0.765 ibnce=0.938 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=1.8356 critic=1.0791 actor=0.7565 rank_loss=0.0994 rank_success=0.479 rank(c<a)=0.772 rank(a<h)=0.699 rank(c<h)=0.988 viol=0.002 a_bar=0.046 a_desc=0.049 cmin=0.041 dir=0.765 ibnce=0.903 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=1.8367 critic=1.0794 actor=0.7573 rank_loss=0.1015 rank_success=0.473 rank(c<a)=0.770 rank(a<h)=0.695 rank(c<h)=0.988 viol=0.002 a_bar=0.049 a_desc=0.048 cmin=0.041 dir=0.765 ibnce=0.897 supp=0.0000 sec/batch=0.842 eta=0.4m
+Epoch 47: train=1.8367 skip=0.00% eval=skipped (273.9s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.8241 critic=1.0691 actor=0.7550 rank_loss=0.0979 rank_success=0.495 rank(c<a)=0.781 rank(a<h)=0.709 rank(c<h)=0.990 viol=0.003 a_bar=0.062 a_desc=0.031 cmin=0.039 dir=0.759 ibnce=0.862 supp=0.0000 sec/batch=0.845 eta=3.9m
+  [100/325] loss=1.8180 critic=1.0612 actor=0.7568 rank_loss=0.0959 rank_success=0.494 rank(c<a)=0.783 rank(a<h)=0.705 rank(c<h)=0.990 viol=0.003 a_bar=0.060 a_desc=0.033 cmin=0.039 dir=0.760 ibnce=0.821 supp=0.0000 sec/batch=0.843 eta=3.2m
+  [150/325] loss=1.8150 critic=1.0583 actor=0.7566 rank_loss=0.0979 rank_success=0.485 rank(c<a)=0.777 rank(a<h)=0.701 rank(c<h)=0.989 viol=0.003 a_bar=0.058 a_desc=0.035 cmin=0.039 dir=0.758 ibnce=0.813 supp=0.0000 sec/batch=0.843 eta=2.5m
+  [200/325] loss=1.8141 critic=1.0581 actor=0.7559 rank_loss=0.0984 rank_success=0.483 rank(c<a)=0.776 rank(a<h)=0.700 rank(c<h)=0.989 viol=0.003 a_bar=0.058 a_desc=0.034 cmin=0.039 dir=0.760 ibnce=0.817 supp=0.0000 sec/batch=0.842 eta=1.8m
+  [250/325] loss=1.8180 critic=1.0627 actor=0.7553 rank_loss=0.0991 rank_success=0.476 rank(c<a)=0.771 rank(a<h)=0.697 rank(c<h)=0.988 viol=0.003 a_bar=0.054 a_desc=0.036 cmin=0.038 dir=0.761 ibnce=0.840 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=1.8317 critic=1.0765 actor=0.7552 rank_loss=0.1056 rank_success=0.455 rank(c<a)=0.760 rank(a<h)=0.684 rank(c<h)=0.984 viol=0.003 a_bar=0.056 a_desc=0.038 cmin=0.039 dir=0.761 ibnce=0.904 supp=0.0000 sec/batch=0.842 eta=0.4m
+Epoch 48: train=1.8373 score=-0.048333 strict_pass=False skip=0.00% (284.4s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.8810 critic=1.1238 actor=0.7572 rank_loss=0.1384 rank_success=0.331 rank(c<a)=0.679 rank(a<h)=0.594 rank(c<h)=0.939 viol=0.003 a_bar=0.055 a_desc=0.034 cmin=0.043 dir=0.768 ibnce=1.070 supp=0.0000 sec/batch=0.846 eta=3.9m
+  [100/325] loss=1.8735 critic=1.1176 actor=0.7559 rank_loss=0.1426 rank_success=0.327 rank(c<a)=0.665 rank(a<h)=0.594 rank(c<h)=0.930 viol=0.003 a_bar=0.056 a_desc=0.034 cmin=0.044 dir=0.766 ibnce=1.043 supp=0.0000 sec/batch=0.842 eta=3.2m
+  [150/325] loss=1.8744 critic=1.1181 actor=0.7563 rank_loss=0.1444 rank_success=0.321 rank(c<a)=0.662 rank(a<h)=0.591 rank(c<h)=0.929 viol=0.003 a_bar=0.058 a_desc=0.035 cmin=0.044 dir=0.765 ibnce=1.051 supp=0.0000 sec/batch=0.842 eta=2.5m
+  [200/325] loss=1.8771 critic=1.1203 actor=0.7568 rank_loss=0.1461 rank_success=0.317 rank(c<a)=0.660 rank(a<h)=0.588 rank(c<h)=0.927 viol=0.003 a_bar=0.060 a_desc=0.035 cmin=0.044 dir=0.765 ibnce=1.065 supp=0.0000 sec/batch=0.843 eta=1.8m
+  [250/325] loss=1.8706 critic=1.1138 actor=0.7568 rank_loss=0.1391 rank_success=0.336 rank(c<a)=0.674 rank(a<h)=0.603 rank(c<h)=0.937 viol=0.003 a_bar=0.059 a_desc=0.039 cmin=0.043 dir=0.765 ibnce=1.046 supp=0.0000 sec/batch=0.842 eta=1.1m
+  [300/325] loss=1.8601 critic=1.1036 actor=0.7565 rank_loss=0.1322 rank_success=0.359 rank(c<a)=0.688 rank(a<h)=0.621 rank(c<h)=0.945 viol=0.003 a_bar=0.055 a_desc=0.041 cmin=0.042 dir=0.764 ibnce=1.005 supp=0.0000 sec/batch=0.843 eta=0.4m
+Epoch 49: train=1.8562 skip=0.00% eval=skipped (274.0s)
+  Ortho schedule: n_iters=2
+  [50/325] loss=1.7848 critic=1.0314 actor=0.7534 rank_loss=0.0840 rank_success=0.508 rank(c<a)=0.789 rank(a<h)=0.715 rank(c<h)=0.994 viol=0.000 a_bar=0.031 a_desc=0.053 cmin=0.036 dir=0.752 ibnce=0.740 supp=0.0000 sec/batch=0.847 eta=3.9m
+  [100/325] loss=1.7912 critic=1.0381 actor=0.7531 rank_loss=0.0879 rank_success=0.514 rank(c<a)=0.787 rank(a<h)=0.722 rank(c<h)=0.992 viol=0.001 a_bar=0.039 a_desc=0.048 cmin=0.036 dir=0.757 ibnce=0.762 supp=0.0000 sec/batch=0.843 eta=3.2m
+  [150/325] loss=1.7928 critic=1.0384 actor=0.7544 rank_loss=0.0902 rank_success=0.509 rank(c<a)=0.786 rank(a<h)=0.718 rank(c<h)=0.992 viol=0.002 a_bar=0.043 a_desc=0.043 cmin=0.035 dir=0.756 ibnce=0.763 supp=0.0000 sec/batch=0.844 eta=2.5m
+  [200/325] loss=1.7927 critic=1.0381 actor=0.7546 rank_loss=0.0907 rank_success=0.510 rank(c<a)=0.787 rank(a<h)=0.718 rank(c<h)=0.992 viol=0.002 a_bar=0.044 a_desc=0.043 cmin=0.035 dir=0.756 ibnce=0.761 supp=0.0000 sec/batch=0.845 eta=1.8m
+  [250/325] loss=1.7937 critic=1.0383 actor=0.7553 rank_loss=0.0961 rank_success=0.493 rank(c<a)=0.774 rank(a<h)=0.708 rank(c<h)=0.985 viol=0.002 a_bar=0.047 a_desc=0.044 cmin=0.035 dir=0.756 ibnce=0.753 supp=0.0000 sec/batch=0.844 eta=1.1m
+  [300/325] loss=1.8029 critic=1.0470 actor=0.7559 rank_loss=0.1084 rank_success=0.458 rank(c<a)=0.747 rank(a<h)=0.686 rank(c<h)=0.970 viol=0.002 a_bar=0.051 a_desc=0.043 cmin=0.037 dir=0.757 ibnce=0.774 supp=0.0000 sec/batch=0.844 eta=0.4m
+Epoch 50: train=1.8055 score=-0.049102 strict_pass=False skip=0.00% (285.0s)
+Final strict pass: False | best_score=-0.038817
