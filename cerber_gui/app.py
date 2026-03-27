@@ -1271,7 +1271,13 @@ def _compute_sota_eval_metrics(
     if key in session_state["sota_eval_cache"]:
         return session_state["sota_eval_cache"][key]
 
-    device = next(model.parameters()).device
+    # Support both nn.Module and adapter wrappers (e.g. _TwinConditionalEnergyAdapter)
+    if hasattr(model, 'parameters'):
+        device = next(model.parameters()).device
+    elif hasattr(model, 'critic1'):
+        device = next(model.critic1.parameters()).device
+    else:
+        device = torch.device("cpu")
     checkpoint_payload = session_state["checkpoints"].get(checkpoint_path, {})
     is_stage15_conditional = _is_stage15_conditional_checkpoint(checkpoint_payload, model_type)
     stage15_rt = _extract_stage15_runtime_options(checkpoint_payload)

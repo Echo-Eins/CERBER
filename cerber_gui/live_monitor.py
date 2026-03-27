@@ -279,6 +279,13 @@ class TrainingMetricsWatcher:
                     "mdsm": float(train_metrics.get("mdsm", np.nan)),
                     "nce": float(train_metrics.get("nce", np.nan)),
                     "cql": float(train_metrics.get("cql", np.nan)),
+                    "actor_barrier": float(train_metrics.get("actor_barrier", np.nan)),
+                    "actor_descent": float(train_metrics.get("actor_descent", np.nan)),
+                    "clean_min": float(train_metrics.get("clean_min", np.nan)),
+                    "direction": float(train_metrics.get("direction", np.nan)),
+                    "inbatch_nce": float(train_metrics.get("inbatch_nce", np.nan)),
+                    "support": float(train_metrics.get("support", np.nan)),
+                    "knn_dist": float(train_metrics.get("knn_dist", np.nan)),
                     "skip_rate": float(train_metrics.get("skip_rate", np.nan)),
                     "sec_per_batch_window": float(rec.get("sec_per_batch_window", np.nan)),
                     "eta_epoch_sec": float(rec.get("eta_epoch_sec", np.nan)),
@@ -352,6 +359,13 @@ class TrainingMetricsWatcher:
                     "mdsm": np.nan,
                     "nce": np.nan,
                     "cql": np.nan,
+                    "actor_barrier": np.nan,
+                    "actor_descent": np.nan,
+                    "clean_min": np.nan,
+                    "direction": np.nan,
+                    "inbatch_nce": np.nan,
+                    "support": np.nan,
+                    "knn_dist": np.nan,
                     "skip_rate": np.nan,
                     "sec_per_batch_window": np.nan,
                     "eta_epoch_sec": np.nan,
@@ -579,6 +593,13 @@ def create_live_metrics_plot(
         "mdsm",
         "nce",
         "cql",
+        "actor_barrier",
+        "actor_descent",
+        "clean_min",
+        "direction",
+        "inbatch_nce",
+        "support",
+        "knn_dist",
         "skip_rate",
         "sec_per_batch_window",
         "eta_epoch_sec",
@@ -620,7 +641,7 @@ def create_live_metrics_plot(
         subplot_titles=(
             "Core Losses",
             "Ranking + Violation Metrics",
-            "Regularizers + Retrieval + Skip",
+            "Regularizers + P0/P1 Losses",
             "Speed + Eval/Kill Signals",
         ),
     )
@@ -655,11 +676,17 @@ def create_live_metrics_plot(
     _add_trace(batch_df, "rank_clean_lt_hard", 2, "Rank(clean<hard)", "#19d3f3")
     _add_trace(batch_df, "clean_viol", 2, "Clean Violation", "#ef553b")
 
-    # Row 3: regularizers
+    # Row 3: regularizers + P0/P1 losses
     _add_trace(batch_df, "rank_loss", 3, "Rank Loss", "#d62728")
     _add_trace(batch_df, "mdsm", 3, "MDSM", "#9467bd")
     _add_trace(batch_df, "nce", 3, "NCE", "#17becf")
     _add_trace(batch_df, "cql", 3, "CQL", "#8c564b")
+    _add_trace(batch_df, "clean_min", 3, "Clean-Min (P0)", "#e377c2")
+    _add_trace(batch_df, "direction", 3, "Direction (P0)", "#ff9896")
+    _add_trace(batch_df, "inbatch_nce", 3, "InBatch NCE (P1)", "#aec7e8")
+    _add_trace(batch_df, "support", 3, "Support (P1)", "#98df8a")
+    _add_trace(batch_df, "actor_barrier", 3, "Actor Barrier", "#c5b0d5")
+    _add_trace(batch_df, "actor_descent", 3, "Actor Descent", "#ffbb78")
     _add_trace(batch_df, "retrieval_cosine", 3, "Retrieval Cosine", "#bcbd22")
     _add_trace(batch_df, "skip_rate", 3, "Skip Rate", "#7f7f7f", dash="dot")
 
