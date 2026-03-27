@@ -883,3 +883,72 @@ Implement requested SOTA-safe acceleration for Stage1.5 without changing optimiz
 - Vectorized retrieval positive/hard selection without relaxing strict index exclusion.
 - Updated tests for ortho schedule and schedule validation contract.
 - Validation: `python -m py_compile` passed for changed Stage1.5 files and tests.
+
+---
+
+# Stage1.5 Runtime Hotfix (2026-03-26, Pass 15)
+
+## Goal
+Fix runtime crash after epoch due to scalar/tensor variable shadowing in Stage1.5 training loop.
+
+## Checklist
+- [x] Reproduce and localize crash source from traceback (`Boolean value of Tensor ... ambiguous`)
+- [x] Rename conflicting epoch loop variable to `epoch_idx`
+- [x] Rename critic energy tensors to explicit `e_pos/e_actor/e_hard`
+- [x] Update all downstream logging/checkpoint fields to use `epoch_idx`
+- [x] Re-run syntax validation (`py_compile`)
+- [x] Update `tasks/lessons.md` anti-regression rule
+
+## Review
+- Root cause: `ep` (epoch index) was overwritten by energy tensor `ep = crit(...)` in same function scope.
+- Fixed in `experiments/01_denoising_poc/train_stage1_5.py`; eval gate and JSON logging now read scalar epoch index only.
+- Validation: `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py` passed.
+
+---
+
+# Stage1.5 Config + Live Monitoring Upgrade (2026-03-26, Pass 16)
+
+## Goal
+Stabilize Stage1.5 default config and provide honest live visualization for training progress:
+- fix unstable rank margins / actor barrier defaults,
+- log batch-window timing (`sec/batch`) in training output,
+- stream batch+epoch metrics to GUI-compatible JSONL,
+- update web live monitor to read Stage1.5 JSONL and render detailed progress charts.
+
+## Checklist
+- [x] Re-check and update `configs/stage1_5_config.json` for safer startup hyperparameters
+- [x] Add per-log-window timing metrics in `train_stage1_5.py` and persist to JSONL stream
+- [x] Keep epoch-level metrics/kill criteria logging schema stable and backward compatible
+- [x] Extend `cerber_gui/live_monitor.py` to parse both JSON (legacy) and JSONL (Stage1.5 stream)
+- [x] Add detailed live dashboard traces (loss, rank metrics, violation, speed) in Plotly
+- [x] Update GUI labels/help text (`app.py`) for Stage1.5 live path defaults
+- [x] Validate syntax (`py_compile`) for all changed files and summarize runtime usage
+
+## Review
+- Config defaults were tightened for stability:
+  - lower ranking margins (`0.5/0.3/0.8 -> 0.2/0.1/0.3`),
+  - smaller actor step size (`1.0 -> 0.5`),
+  - stronger actor barrier (`0.1 -> 0.2`),
+  - softer retrieval hardness window (`topk/hard: 8..32 -> 6..24`).
+- Stage1.5 trainer now emits timing in console every `log_every` window:
+  - `sec/batch=...`
+  - `eta=...m`
+- Stage1.5 trainer now writes streaming metrics to
+  `experiments/03_Stage_1.5/logs/training_metrics.jsonl` with explicit events:
+  - `event=batch` (window metrics + timing),
+  - `event=epoch` (train aggregate + kill/eval snapshot),
+  - `event=final`.
+- Live monitor now supports both legacy JSON and Stage1.5 JSONL streams and builds a detailed 4-panel Plotly dashboard:
+  - core losses,
+  - rank/violation rates,
+  - regularizers/retrieval/skip,
+  - speed + eval/kill signals.
+- GUI updates:
+  - metrics upload accepts `.json` and `.jsonl`,
+  - live tab labels/default path now target Stage1.5 JSONL stream,
+  - live monitor startup stops old watcher and immediately returns a plot.
+- Validation:
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py`
+  - `python -m py_compile cerber_gui/live_monitor.py`
+  - `python -m py_compile cerber_gui/metrics_viewer.py`
+  - `python -m py_compile cerber_gui/app.py`

@@ -1488,7 +1488,10 @@ def load_metrics_file_fn(file):
         df = metrics_to_dataframe(file.name)
 
         # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ dashboard
-        fig = create_metrics_dashboard(df, title="Training Metrics")
+        if "event" in df.columns and df["event"].astype(str).isin(["batch", "epoch", "final"]).any():
+            fig = create_live_metrics_plot(df, plot_type="all")
+        else:
+            fig = create_metrics_dashboard(df, title="Training Metrics")
 
         # Statistics
         stats = compute_summary_statistics(df)
@@ -1509,12 +1512,20 @@ def start_live_monitor_fn(metrics_path):
         return f"File not found: {path}", None
 
     try:
-        # ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â´ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ watcher
+        # Stop previous watcher to avoid duplicate observers on file changes.
+        old_watcher = session_state.get("watcher")
+        if old_watcher is not None:
+            try:
+                old_watcher.stop()
+            except Exception:
+                pass
+
         watcher = TrainingMetricsWatcher(path)
         watcher.start()
         session_state["watcher"] = watcher
-
-        return f"Monitoring started: {path}", gr.update(value=watcher.history.to_dataframe())
+        df = watcher.history.to_dataframe()
+        fig = create_live_metrics_plot(df, plot_type="all") if not df.empty else None
+        return f"Monitoring started: {path}", fig
     except Exception as e:
         return f"Error: {e}", None
 
@@ -1696,12 +1707,12 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
         # === Tab 3: Metrics ===
         with gr.TabItem("Training Metrics"):
-            gr.Markdown("### Upload training_metrics.json")
+            gr.Markdown("### Upload training metrics (`.json` or `.jsonl`)")
 
             with gr.Row():
                 metrics_upload = gr.File(
-                    label="Upload Metrics JSON",
-                    file_types=[".json"],
+                    label="Upload Metrics File",
+                    file_types=[".json", ".jsonl"],
                 )
 
             with gr.Row():
@@ -1714,14 +1725,15 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 """
             ### Real-time Training Monitor
 
-            Provide a path to a `training_metrics.json` file that is being updated during training.
+            Provide a path to a metrics file being updated during training.
+            Stage 1.5 writes `training_metrics.jsonl` (stream of batch/epoch events).
             """
             )
 
             with gr.Row():
                 live_path_input = gr.Textbox(
-                    label="Path to training_metrics.json",
-                    placeholder="experiments/02_energy_matching/training_metrics.json",
+                    label="Path to training metrics (`.json` or `.jsonl`)",
+                    placeholder="experiments/03_Stage_1.5/logs/training_metrics.jsonl",
                 )
                 start_live_btn = gr.Button("Start Monitoring", variant="primary")
 

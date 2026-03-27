@@ -28,6 +28,12 @@ from cebcm.training.losses import gradient_penalty
 from configs.base import LangevinConfig, Stage1_5Config
 
 
+def append_jsonl_record(path: Path, payload: dict) -> None:
+    """Append one JSON record (single line) for live monitoring."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -696,6 +702,7 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     ckpt_dir, log_dir = Path(cfg.checkpoint_dir), Path(cfg.logs_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True); log_dir.mkdir(parents=True, exist_ok=True)
+    stream_path = log_dir / "training_metrics.jsonl"
     best_score, start_epoch, global_step = float("-inf"), 0, 0
     if args.resume:
         ck = torch.load(args.resume, weights_only=False, map_location=device)
@@ -703,12 +710,18 @@ def main() -> None:
         if prior_base is not None and ck.get("prior_state") is not None: prior_base.load_state_dict(ck["prior_state"])
         opt_c.load_state_dict(ck["opt_c_state"]); opt_a.load_state_dict(ck["opt_a_state"]); scaler.load_state_dict(ck["scaler_state"])
         best_score, start_epoch, global_step = float(ck.get("best_score", best_score)), int(ck.get("epoch", 0)) + 1, int(ck.get("global_step", 0))
+    elif stream_path.exists():
+        # Fresh run: avoid mixing with previous monitoring session.
+        stream_path.write_text("", encoding="utf-8")
 
     th = make_thresholds(cfg)
     print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing}")
-    for ep in range(start_epoch, cfg.num_epochs):
+    for epoch_idx in range(start_epoch, cfg.num_epochs):
         t0 = time.time()
-        active_ortho_iters = resolve_ortho_n_iters(cfg, epoch_idx=ep, total_epochs=cfg.num_epochs)
+        epoch_timer_start = time.perf_counter()
+        last_window_time = epoch_timer_start
+        last_window_batch = 0
+        active_ortho_iters = resolve_ortho_n_iters(cfg, epoch_idx=epoch_idx, total_epochs=cfg.num_epochs)
         for m in [c1_base, c2_base, actor_base] + ([prior_base] if prior_base is not None else []):
             set_ortho_n_iters(m, active_ortho_iters)
         print(f"  Ortho schedule: n_iters={active_ortho_iters}")
@@ -797,13 +810,13 @@ def main() -> None:
                     with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
                         mdsm = conditional_mdsm(crit, q, pos, sigma, cfg)
                     with autocast():
-                        ep = crit(q, pos, sigma=sigma.detach())
-                        ea = crit(q, a_init.detach(), sigma=sigma.detach())
-                        eh = crit(q, hard.detach(), sigma=sigma.detach())
+                        e_pos = crit(q, pos, sigma=sigma.detach())
+                        e_actor = crit(q, a_init.detach(), sigma=sigma.detach())
+                        e_hard = crit(q, hard.detach(), sigma=sigma.detach())
                         rank = (
-                            F.relu(ep - ea + cfg.critic_margin_clean_actor)
-                            + F.relu(ea - eh + cfg.critic_margin_actor_noisy)
-                            + F.relu(ep - eh + cfg.critic_margin_clean_noisy)
+                            F.relu(e_pos - e_actor + cfg.critic_margin_clean_actor)
+                            + F.relu(e_actor - e_hard + cfg.critic_margin_actor_noisy)
+                            + F.relu(e_pos - e_hard + cfg.critic_margin_clean_noisy)
                         ).mean()
                         cql = torch.tensor(0.0, device=device)
                         if cfg.use_cql:
@@ -909,16 +922,16 @@ def main() -> None:
                     mdsm_acc += float(mdsm.item())
                     cql_acc += float(cql.item())
                     nce_acc += float(nce.item())
-                    rank_clean_actor = (ep < ea).float().mean().item()
-                    rank_actor_hard = (ea < eh).float().mean().item()
-                    rank_clean_hard = (ep < eh).float().mean().item()
+                    rank_clean_actor = (e_pos < e_actor).float().mean().item()
+                    rank_actor_hard = (e_actor < e_hard).float().mean().item()
+                    rank_clean_hard = (e_pos < e_hard).float().mean().item()
                     rank_ok_acc += float(
-                        ((ep < ea) & (ea < eh) & (ep < eh)).float().mean().item()
+                        ((e_pos < e_actor) & (e_actor < e_hard) & (e_pos < e_hard)).float().mean().item()
                     )
                     rank_clean_actor_acc += float(rank_clean_actor)
                     rank_actor_hard_acc += float(rank_actor_hard)
                     rank_clean_hard_acc += float(rank_clean_hard)
-                    viol_acc += float((ea < ep).float().mean().item())
+                    viol_acc += float((e_actor < e_pos).float().mean().item())
                 except torch.OutOfMemoryError:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1017,6 +1030,12 @@ def main() -> None:
             sums["clean_viol"] += viol_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["retrieval_cosine"] += retrieval_cos
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
+                now = time.perf_counter()
+                window_batches = max(1, (bi + 1) - last_window_batch)
+                sec_per_batch = (now - last_window_time) / float(window_batches)
+                eta_epoch_sec = max(0.0, float(len(loader) - (bi + 1)) * sec_per_batch)
+                last_window_time = now
+                last_window_batch = bi + 1
                 print(
                     f"  [{bi+1}/{len(loader)}] "
                     f"loss={sums['loss']/n_ok:.4f} "
@@ -1027,12 +1046,42 @@ def main() -> None:
                     f"rank(c<a)={sums['rank_clean_lt_actor']/n_ok:.3f} "
                     f"rank(a<h)={sums['rank_actor_lt_hard']/n_ok:.3f} "
                     f"rank(c<h)={sums['rank_clean_lt_hard']/n_ok:.3f} "
-                    f"viol={sums['clean_viol']/n_ok:.3f}"
+                    f"viol={sums['clean_viol']/n_ok:.3f} "
+                    f"sec/batch={sec_per_batch:.3f} "
+                    f"eta={eta_epoch_sec/60.0:.1f}m"
+                )
+                append_jsonl_record(
+                    stream_path,
+                    {
+                        "event": "batch",
+                        "epoch": int(epoch_idx + 1),
+                        "batch_idx": int(bi + 1),
+                        "num_batches": int(len(loader)),
+                        "global_step": int(global_step),
+                        "sec_per_batch_window": float(sec_per_batch),
+                        "eta_epoch_sec": float(eta_epoch_sec),
+                        "train_metrics": {
+                            "loss": float(sums["loss"] / n_ok),
+                            "critic": float(sums["critic"] / n_ok),
+                            "actor": float(sums["actor"] / n_ok),
+                            "rank_loss": float(sums["rank"] / n_ok),
+                            "rank_success": float(sums["rank_success"] / n_ok),
+                            "rank_clean_lt_actor": float(sums["rank_clean_lt_actor"] / n_ok),
+                            "rank_actor_lt_hard": float(sums["rank_actor_lt_hard"] / n_ok),
+                            "rank_clean_lt_hard": float(sums["rank_clean_lt_hard"] / n_ok),
+                            "clean_viol": float(sums["clean_viol"] / n_ok),
+                            "retrieval_cosine": float(sums["retrieval_cosine"] / n_ok),
+                            "mdsm": float(sums["mdsm"] / n_ok),
+                            "nce": float(sums["nce"] / n_ok),
+                            "cql": float(sums["cql"] / n_ok),
+                            "skip_rate": float(n_skip / max(len(loader), 1)),
+                        },
+                    },
                 )
 
         train = {k: (v / max(n_ok, 1)) for k, v in sums.items()}
         train["skip_rate"] = n_skip / max(len(loader), 1)
-        do_eval = ((ep + 1) % max(1, cfg.eval_every_epochs) == 0) or (ep == cfg.num_epochs - 1)
+        do_eval = ((epoch_idx + 1) % max(1, cfg.eval_every_epochs) == 0) or (epoch_idx == cfg.num_epochs - 1)
         if do_eval:
             eval_m = eval_model(
                 ef,
@@ -1049,7 +1098,7 @@ def main() -> None:
             eval_m["kill_criteria"] = kill
             score = float(kill["score"])
             print(
-                f"Epoch {ep+1}: train={train['loss']:.4f} score={score:+.6f} "
+                f"Epoch {epoch_idx+1}: train={train['loss']:.4f} score={score:+.6f} "
                 f"strict_pass={kill['passed']} skip={train['skip_rate']:.2%} ({time.time()-t0:.1f}s)"
             )
         else:
@@ -1057,37 +1106,40 @@ def main() -> None:
             kill = _not_evaluated_kill_stub()
             score = None
             print(
-                f"Epoch {ep+1}: train={train['loss']:.4f} "
+                f"Epoch {epoch_idx+1}: train={train['loss']:.4f} "
                 f"skip={train['skip_rate']:.2%} eval=skipped ({time.time()-t0:.1f}s)"
             )
         is_new_best = bool(do_eval and score is not None and score > best_score)
         if is_new_best:
             best_score = score
+        epoch_time_sec = float(time.perf_counter() - epoch_timer_start)
 
         payload = {
-            "epoch": ep, "global_step": global_step, "best_score": best_score,
+            "epoch": epoch_idx, "global_step": global_step, "best_score": best_score,
             "critic1_state": c1_base.state_dict(), "critic2_state": c2_base.state_dict(), "actor_state": actor_base.state_dict(),
             "prior_state": prior_base.state_dict() if prior_base is not None else None,
             "opt_c_state": opt_c.state_dict(), "opt_a_state": opt_a.state_dict(), "scaler_state": scaler.state_dict(),
             "train_metrics": train, "eval_metrics": eval_m, "config": asdict(cfg),
         }
-        torch.save(payload, ckpt_dir / f"epoch_{ep+1}.pt")
+        torch.save(payload, ckpt_dir / f"epoch_{epoch_idx+1}.pt")
         if is_new_best:
             payload["best_score"] = best_score
             torch.save(payload, ckpt_dir / "best.pt")
-        with open(log_dir / "training_metrics.jsonl", "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "epoch": ep + 1,
-                        "score": score,
-                        "eval_ran": do_eval,
-                        "train_metrics": train,
-                        "kill_criteria": kill,
-                    }
-                )
-                + "\n"
-            )
+        append_jsonl_record(
+            stream_path,
+            {
+                "event": "epoch",
+                "epoch": int(epoch_idx + 1),
+                "global_step": int(global_step),
+                "score": None if score is None else float(score),
+                "best_score": float(best_score),
+                "eval_ran": bool(do_eval),
+                "strict_pass": None if kill.get("passed", None) is None else bool(kill.get("passed")),
+                "train_metrics": {k: float(v) for k, v in train.items()},
+                "kill_criteria": kill,
+                "epoch_time_sec": epoch_time_sec,
+            },
+        )
 
     final_eval = eval_model(
         ef,
@@ -1101,6 +1153,15 @@ def main() -> None:
         eval_ids=eval_ids,
     )
     final_kill = summarize_conditional_eval(final_eval, th); final_eval["kill_criteria"] = final_kill
+    append_jsonl_record(
+        stream_path,
+        {
+            "event": "final",
+            "epoch": int(cfg.num_epochs),
+            "best_score": float(best_score),
+            "final_kill": final_kill,
+        },
+    )
     torch.save(
         {
             "critic1_state": c1_base.state_dict(), "critic2_state": c2_base.state_dict(), "actor_state": actor_base.state_dict(),

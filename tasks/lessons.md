@@ -375,3 +375,17 @@ For checkpoint scoring:
 1) freeze a deterministic eval index subset at run start (seeded generator),
 2) reuse the same subset for all periodic eval calls and final eval,
 3) explicitly log when eval is skipped and keep schema stable (`status=not_evaluated`).
+
+## 2026-03-26 - Never reuse epoch loop variable names for tensor metrics
+
+### Pattern
+In `train_stage1_5.py`, `ep` was used both as epoch index and as tensor `E(pos)`.
+Python function scope allowed reassignment, so later boolean logic (`do_eval`) read a tensor and crashed with:
+`RuntimeError: Boolean value of Tensor with more than one value is ambiguous`.
+
+### Rule
+For all training loops:
+1) use explicit names for loop indices (`epoch_idx`, `batch_idx`, `critic_step_idx`),
+2) reserve energy tensor names as `e_pos`, `e_actor`, `e_hard` (never `ep`, `ea`, `eh` if loop vars can collide),
+3) run a post-edit grep/lint check for reused short symbols before launch,
+4) treat tensor-vs-scalar name collision as P0 runtime blocker.

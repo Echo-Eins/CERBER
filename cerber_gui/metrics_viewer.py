@@ -51,6 +51,21 @@ def load_training_metrics(path: str | Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Metrics file not found: {path}")
 
+    if path.suffix.lower() == ".jsonl":
+        events: list[dict] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    events.append(row)
+        return {"source": "jsonl", "events": events}
+
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -72,6 +87,71 @@ def metrics_to_dataframe(metrics_path: str | Path) -> pd.DataFrame:
         DataFrame с метриками по эпохам
     """
     data = load_training_metrics(metrics_path)
+
+    events = data.get("events")
+    if isinstance(events, list):
+        rows: list[dict] = []
+        for rec in events:
+            if not isinstance(rec, dict):
+                continue
+            event_type = str(rec.get("event", "unknown"))
+            train = rec.get("train_metrics", {})
+            if not isinstance(train, dict):
+                train = {}
+            kill = rec.get("kill_criteria", {})
+            if not isinstance(kill, dict):
+                kill = {}
+            agg = kill.get("aggregate", {})
+            if not isinstance(agg, dict):
+                agg = {}
+
+            epoch = rec.get("epoch")
+            batch_idx = rec.get("batch_idx")
+            num_batches = rec.get("num_batches")
+            progress = None
+            try:
+                if epoch is not None and batch_idx is not None and num_batches and float(num_batches) > 0:
+                    progress = float(epoch) - 1.0 + float(batch_idx) / float(num_batches)
+                elif epoch is not None:
+                    progress = float(epoch)
+            except Exception:
+                progress = None
+
+            rows.append(
+                {
+                    "event": event_type,
+                    "epoch": float(epoch) if epoch is not None else None,
+                    "progress": progress,
+                    "batch_idx": float(batch_idx) if batch_idx is not None else None,
+                    "num_batches": float(num_batches) if num_batches is not None else None,
+                    "global_step": float(rec.get("global_step")) if rec.get("global_step") is not None else None,
+                    "train_loss": float(train.get("loss")) if train.get("loss") is not None else None,
+                    "critic_loss": float(train.get("critic")) if train.get("critic") is not None else None,
+                    "actor_loss": float(train.get("actor")) if train.get("actor") is not None else None,
+                    "rank_loss": float(train.get("rank_loss")) if train.get("rank_loss") is not None else None,
+                    "rank_success": float(train.get("rank_success")) if train.get("rank_success") is not None else None,
+                    "rank_clean_lt_actor": float(train.get("rank_clean_lt_actor")) if train.get("rank_clean_lt_actor") is not None else None,
+                    "rank_actor_lt_hard": float(train.get("rank_actor_lt_hard")) if train.get("rank_actor_lt_hard") is not None else None,
+                    "rank_clean_lt_hard": float(train.get("rank_clean_lt_hard")) if train.get("rank_clean_lt_hard") is not None else None,
+                    "clean_viol": float(train.get("clean_viol")) if train.get("clean_viol") is not None else None,
+                    "retrieval_cosine": float(train.get("retrieval_cosine")) if train.get("retrieval_cosine") is not None else None,
+                    "mdsm": float(train.get("mdsm")) if train.get("mdsm") is not None else None,
+                    "nce": float(train.get("nce")) if train.get("nce") is not None else None,
+                    "cql": float(train.get("cql")) if train.get("cql") is not None else None,
+                    "skip_rate": float(train.get("skip_rate")) if train.get("skip_rate") is not None else None,
+                    "sec_per_batch_window": float(rec.get("sec_per_batch_window")) if rec.get("sec_per_batch_window") is not None else None,
+                    "eta_epoch_sec": float(rec.get("eta_epoch_sec")) if rec.get("eta_epoch_sec") is not None else None,
+                    "epoch_time_sec": float(rec.get("epoch_time_sec")) if rec.get("epoch_time_sec") is not None else None,
+                    "score": float(rec.get("score")) if rec.get("score") is not None else None,
+                    "success_rate": float(agg.get("mean_cos_success_rate")) if agg.get("mean_cos_success_rate") is not None else None,
+                    "cos_improvement_eval": float(agg.get("mean_cos_improvement")) if agg.get("mean_cos_improvement") is not None else None,
+                    "energy_success_eval": float(agg.get("mean_energy_success_rate")) if agg.get("mean_energy_success_rate") is not None else None,
+                    "clean_violation_eval": float(agg.get("mean_clean_min_violation_rate")) if agg.get("mean_clean_min_violation_rate") is not None else None,
+                }
+            )
+        if not rows:
+            raise ValueError("No valid events found in JSONL metrics file")
+        return pd.DataFrame(rows)
 
     # Находим ключи со списками одинаковой длины
     arrays = {k: v for k, v in data.items() if isinstance(v, list)}
