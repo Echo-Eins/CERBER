@@ -45,9 +45,11 @@ def _evaluate_energy_exact(
     if model_type == "unconditional":
         return energy_fn(vectors).detach()
 
-    # Fallback for wrappers/adapters.
-    sig = inspect.signature(energy_fn.forward)
-    if len(sig.parameters) >= 2:
+    # Fallback for wrappers/adapters (may not be nn.Module).
+    _callable = getattr(energy_fn, 'forward', None) or energy_fn.__call__
+    sig = inspect.signature(_callable)
+    params = [p for p in sig.parameters.values() if p.name != 'self']
+    if len(params) >= 2:
         v_query = v_clean.expand(vectors.shape[0], -1)
         return energy_fn(v_query, vectors).detach()
     return energy_fn(vectors).detach()

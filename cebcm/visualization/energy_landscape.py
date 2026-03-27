@@ -196,8 +196,11 @@ def scan_energy_landscape(
         # SimpleEnergy: energy_fn(v_query, v_candidate) -> [B]
         # UnconditionalEnergy: energy_fn(v_candidate) -> [B]
         import inspect
-        sig = inspect.signature(energy_fn.forward)
-        if len(sig.parameters) >= 2:
+        _callable = getattr(energy_fn, 'forward', None) or energy_fn.__call__
+        sig = inspect.signature(_callable)
+        # Exclude 'self' from parameter count
+        params = [p for p in sig.parameters.values() if p.name != 'self']
+        if len(params) >= 2:
             # Pairwise model (SimpleEnergy)
             v_q = v_clean.expand(batch.shape[0], -1)
             e = energy_fn(v_q, batch)  # [B]

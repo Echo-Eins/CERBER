@@ -283,7 +283,7 @@ class TrainingMetricsWatcher:
                     "sec_per_batch_window": float(rec.get("sec_per_batch_window", np.nan)),
                     "eta_epoch_sec": float(rec.get("eta_epoch_sec", np.nan)),
                     "epoch_time_sec": float(rec.get("epoch_time_sec", np.nan)),
-                    "score": float(rec.get("score", np.nan)),
+                    "score": float(rec.get("score") if rec.get("score") is not None else np.nan),
                     "strict_pass": (
                         float(1.0 if bool(rec.get("strict_pass", False)) else 0.0)
                         if rec.get("strict_pass", None) is not None else np.nan
