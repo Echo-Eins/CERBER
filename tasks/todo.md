@@ -1,3 +1,47 @@
+# Stage 1.5 Loss Recovery Plan (2026-03-28)
+
+## Context
+Pure ranking ablation (norm_mode=none, SiLU, lr=1e-3) proved ranking CAN learn energy separation:
+- rank_success=0.569, spread=0.236, E[c/a/h]=-1.62/-1.47/-1.39
+- BUT inference fails: cosine 0.454→0.164 (WORSE), 0% success rate
+- Root cause: ranking only teaches relative order, not WHERE the minimum should be
+- Energy landscape shows deep well (E=-4.19) at wrong location, Langevin goes there
+
+## Strategy: Add losses ONE AT A TIME, verify each doesn't break ranking
+
+### Phase 1: Anchored Ranking (NEXT)
+Config: `configs/ablation_phase1_anchored_ranking.json`
+- Keep: ranking (λ=1.0), unconstrained MLP, SiLU, lr=1e-3
+- Add: `clean_min` (λ=0.3, margin=0.1) — forces E(clean) to be the minimum
+- Add: `energy_reg` (λ=0.01) — prevents unbounded energy wells
+- [ ] Run 20 epochs
+- [ ] Check: rank_success ≥ 0.5 (ranking not broken)
+- [ ] Check: spread ≥ 0.15
+- [ ] Check: cosine improvement > 0 in GUI inference
+- [ ] Check: energy landscape — minimum near clean target, not spurious
+
+### Phase 2: Conservative Boundary
+- Add: `CQL` (λ=0.1, noise=0.5) — penalizes low energy on OOD points
+- [ ] Verify ranking preserved, inference improved
+- [ ] Check energy landscape for tighter wells around data
+
+### Phase 3: Contrastive Signal
+- Add: `InfoNCE` (λ=0.1, temp=0.07, 4 random negatives)
+- [ ] Verify ranking preserved
+- [ ] Check batch eval success rate
+
+### Phase 4: Score Matching (if needed)
+- Add: `MDSM` with warmup (warmup_epochs=10, λ_mdsm=0.1)
+- Only if gradient DIRECTION is wrong after Phase 3
+- [ ] Verify ranking not destroyed (rank_success ≥ 0.45)
+
+### Kill Criteria (abandon approach if)
+- Phase 1 ranking breaks (rank_success < 0.3) → weights too high, halve them
+- Phase 1+2 inference still 0% → fundamental architecture problem
+- Any phase: spread collapses to 0 → loss conflict, debug
+
+---
+
 # CERBER GUI Web Debug Plan (2026-03-25)
 
 ## Goal
