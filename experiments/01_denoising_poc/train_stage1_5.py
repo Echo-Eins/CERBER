@@ -388,31 +388,38 @@ def gradient_direction_loss(
     providing a direct supervision signal on gradient direction.
 
     L = (1 - cos_sim(F.normalize(-grad_E), F.normalize(v_clean - v_noisy))).mean()
+
+    When direction_num_samples > 1, generates multiple noise perturbations per
+    clean sample and averages the loss — more gradient supervision per step.
     """
-    noise = torch.randn_like(pos)
+    num_samples = getattr(cfg, "direction_num_samples", 1)
     nrm = pos.norm(dim=-1, keepdim=True).clamp(min=cfg.mdsm_norm_floor)
-    noisy = pos + noise * sigma * nrm
-    noisy_req = noisy.detach().requires_grad_(True)
-    e = critic(q, noisy_req, sigma=sigma.detach())
-    # create_graph=True needed: backprop through g to update critic params θ
-    g = torch.autograd.grad(e.sum(), noisy_req, create_graph=True)[0]
-    g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
-    # Target direction: from noisy toward clean
-    target_dir = pos - noisy.detach()
-    # Tangent projection on sphere if configured
-    if cfg.mdsm_tangent_projection:
-        vh = F.normalize(noisy.detach(), dim=-1)
-        g = g - (g * vh).sum(dim=-1, keepdim=True) * vh
-        target_dir = target_dir - (target_dir * vh).sum(dim=-1, keepdim=True) * vh
-    # Cosine similarity between negative gradient and target direction
-    neg_g = -g
-    cos = F.cosine_similarity(
-        F.normalize(neg_g, dim=-1, eps=1e-8),
-        F.normalize(target_dir, dim=-1, eps=1e-8),
-        dim=-1,
-        eps=cfg.mdsm_cosine_eps,
-    ).clamp(-1.0, 1.0)
-    return (1.0 - cos).mean()
+    cos_accum = []
+    for _ in range(num_samples):
+        noise = torch.randn_like(pos)
+        noisy = pos + noise * sigma * nrm
+        noisy_req = noisy.detach().requires_grad_(True)
+        e = critic(q, noisy_req, sigma=sigma.detach())
+        # create_graph=True needed: backprop through g to update critic params θ
+        g = torch.autograd.grad(e.sum(), noisy_req, create_graph=True)[0]
+        g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
+        # Target direction: from noisy toward clean
+        target_dir = pos - noisy.detach()
+        # Tangent projection on sphere if configured
+        if cfg.mdsm_tangent_projection:
+            vh = F.normalize(noisy.detach(), dim=-1)
+            g = g - (g * vh).sum(dim=-1, keepdim=True) * vh
+            target_dir = target_dir - (target_dir * vh).sum(dim=-1, keepdim=True) * vh
+        # Cosine similarity between negative gradient and target direction
+        neg_g = -g
+        cos = F.cosine_similarity(
+            F.normalize(neg_g, dim=-1, eps=1e-8),
+            F.normalize(target_dir, dim=-1, eps=1e-8),
+            dim=-1,
+            eps=cfg.mdsm_cosine_eps,
+        ).clamp(-1.0, 1.0)
+        cos_accum.append(cos)
+    return (1.0 - torch.stack(cos_accum).mean())
 
 
 def inbatch_cross_negative_nce(
