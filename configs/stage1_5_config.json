@@ -103,11 +103,11 @@
   "actor_energy_margin_hard": 0.05,
   "actor_barrier_normalize_by_std": true,
 
-  "actor_step_size": 0.5,
+  "actor_step_size": 0.3,
   "actor_tangent_projection": true,
   "actor_seed_mix_query": 0.5,
   "actor_seed_noise_scale": 1.0,
-  "actor_eval_steps": 1,
+  "actor_eval_steps": 3,
   "critic_eval_langevin_steps": 10,
   "eval_langevin_batch_size": 16,
   "eval_noise_scales": [0.05, 0.1, 0.2, 0.3],
