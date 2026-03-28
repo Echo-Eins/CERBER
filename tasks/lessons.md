@@ -627,3 +627,51 @@ which pushes energies larger, which makes energy_reg grow → positive feedback 
 - **Start with MDSM + RANK only**, add auxiliary losses one at a time, verify each helps
 - **Log E(clean)/E(actor)/E(hard)/spread** — monitor energy separation, not just loss values
 - **Check that energy spread grows over training** — flat spread = critic not discriminating
+
+## 2026-03-28 - Cayley + GroupSort collapses to constant function: spread=0.000
+
+### Pattern
+After removing conflicting losses (energy_reg, direction_loss), retrained from scratch with
+Cayley orthogonal parametrization + GroupSort activation (strict L=1 Lipschitz). Result:
+energy magnitudes grew (0.14 → 1.93 over 4 epochs) but **spread stayed at 0.000** — the
+network outputs identical energy for clean, actor, and hard negatives. rank_success fell
+from 13% to 0.9%. The critic learned a constant function scaled by `log_energy_scale`.
+
+### Root Cause Analysis
+1. **GroupSort preserves information but doesn't create new features**: GroupSort(2) outputs
+   (max(a,b), min(a,b)) — an isometry that reorders but cannot create asymmetric nonlinear
+   responses. For inputs on a sphere (SONAR R≈0.2051) that are close in L2, GroupSort can't
+   amplify small differences into large energy differences.
+
+2. **MDSM dominates rank loss (4:1 ratio)**: MDSM (λ=1.0) trains gradients at noisy points.
+   Rank loss (λ=0.25) trains absolute energy values. With MDSM dominating, the network
+   prioritizes correct gradient direction while energy VALUES collapse to a constant.
+
+3. **rank_std_floor=0.001 causes gradient explosion during collapse**: When all energies are
+   equal, std→0, clipped to 0.001. Normalized gradient = 1/0.001 = 1000x amplification.
+   This creates chaotic updates that prevent recovery from the collapsed state.
+
+### Diagnosis Signals
+- `spread=0.000` — THE smoking gun. Energy values grow but spread stays zero
+- `E[c/a/h]=1.93/1.92/1.93` — all three nearly identical
+- `rank_success` falling (13% → 0.9%) — worse than random
+- `viol` rising (33% → 56%) — ordering degrading
+- `log_energy_scale` growing — network scales output but underlying function is constant
+
+### Fix Applied
+1. **Switch from Cayley+GroupSort to SpectralNorm+SiLU** — SiLU is not strictly 1-Lipschitz
+   (L≈1.1) but can create asymmetric nonlinear features. Spectral norm gives soft L≤1 per
+   layer. More expressive, can actually separate energies.
+2. **Rebalance λ_rank: 0.25 → 1.0** — equal weight with MDSM so both objectives matter
+3. **Increase rank_std_floor: 0.001 → 0.1** — cap normalization gradient at 10x instead of 1000x
+4. **actor_step_size: 0.5 → 0.3** — more conservative steps for stability
+
+### Rule
+- **Monitor `spread` as primary health metric** — if spread=0 for >50 batches, architecture is wrong
+- **Strict L=1 Lipschitz (Cayley+GroupSort) can be TOO restrictive** for conditional energy functions
+  on manifolds — prefer spectral norm + expressive activation for EBMs on SONAR embeddings
+- **Never let MDSM dominate rank loss** — they train different aspects (gradients vs values);
+  keep λ_mdsm ≈ λ_rank
+- **rank_std_floor must be ≥ 0.05** to prevent gradient explosion during energy collapse
+- **When changing architecture, always start from scratch** — old checkpoints encode wrong
+  energy landscape patterns

@@ -115,6 +115,8 @@ class UnconditionalEnergy(nn.Module):
             return LipschitzLinearSpline(num_features=dim, num_knots=spline_num_knots)
         elif activation == "relu":
             return nn.ReLU()
+        elif activation == "silu":
+            return nn.SiLU()
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
