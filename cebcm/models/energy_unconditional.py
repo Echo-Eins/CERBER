@@ -85,7 +85,8 @@ class UnconditionalEnergy(nn.Module):
         self.net = nn.Sequential(*layers)
 
         # Learnable energy scale (log-parameterized)
-        self.log_energy_scale = nn.Parameter(torch.tensor(0.0))
+        # Fixed energy scale — see energy.py for rationale.
+        self.register_buffer("log_energy_scale", torch.tensor(0.0))
 
     @staticmethod
     def _make_linear(

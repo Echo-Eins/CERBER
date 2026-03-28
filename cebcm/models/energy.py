@@ -121,7 +121,11 @@ class SimpleEnergy(nn.Module):
         # Learnable energy scale (log-parameterized for fast adaptation).
         # With σ-conditioning, the network adapts magnitude per noise level,
         # but a global scale factor still helps match the overall DSM target range.
-        self.log_energy_scale = nn.Parameter(torch.tensor(0.0))
+        # Fixed energy scale — NOT learnable. A learnable scale decouples
+        # MDSM (gradient-based) from ranking (value-based) losses: MDSM pushes
+        # the scale up to match target gradient magnitudes, inflating ALL
+        # energies equally, which keeps spread=0 and kills ranking.
+        self.register_buffer("log_energy_scale", torch.tensor(0.0))
 
     def _embed_sigma(self, sigma: Tensor) -> Tensor:
         """

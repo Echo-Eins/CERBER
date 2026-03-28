@@ -668,10 +668,50 @@ from 13% to 0.9%. The critic learned a constant function scaled by `log_energy_s
 
 ### Rule
 - **Monitor `spread` as primary health metric** — if spread=0 for >50 batches, architecture is wrong
-- **Strict L=1 Lipschitz (Cayley+GroupSort) can be TOO restrictive** for conditional energy functions
-  on manifolds — prefer spectral norm + expressive activation for EBMs on SONAR embeddings
 - **Never let MDSM dominate rank loss** — they train different aspects (gradients vs values);
   keep λ_mdsm ≈ λ_rank
 - **rank_std_floor must be ≥ 0.05** to prevent gradient explosion during energy collapse
 - **When changing architecture, always start from scratch** — old checkpoints encode wrong
   energy landscape patterns
+
+## 2026-03-28 - SpectralNorm+SiLU ALSO collapses: log_energy_scale is the root cause
+
+### Pattern
+After switching from Cayley+GroupSort to SpectralNorm+SiLU, the EXACT same collapse occurred:
+spread=0.000, E[c/a/h] growing in lockstep (0.02→7.26 over 11 epochs), rank_success=0.000.
+The architecture change was irrelevant — the real culprit is `log_energy_scale`.
+
+### Root Cause
+`log_energy_scale` is a learnable scalar `nn.Parameter(torch.tensor(0.0))` that multiplies ALL
+energy outputs: `E = exp(log_scale) * net(x)`. This creates a fatal decoupling:
+
+1. **MDSM wants large gradients**: target score `(noisy-clean)/σ²` has large magnitude.
+   MDSM loss pushes `log_energy_scale` upward to match gradient magnitude → all energies inflate.
+2. **RANK wants value separation**: `E_clean < E_actor < E_hard`. But `log_energy_scale` multiplies
+   ALL outputs equally → spread stays exactly 0 regardless of scale.
+3. **Result**: MDSM is happy (gradient direction correct, magnitude grows via scale), rank is dead
+   (all values identical, just scaled up). Energy 0.02→7.26 but spread=-0.001 to +0.001.
+
+The network's internal function `net(x)` outputs ~constant for all inputs. A global scalar cannot
+fix this — it can only inflate the constant. The network has no incentive to create value
+separation because MDSM doesn't require it.
+
+### Diagnosis Signals
+- Energy magnitudes growing monotonically across epochs (log_energy_scale learning)
+- spread ≈ 0 throughout (net(x) is constant)
+- rank_success = 0.000 (zero separation)
+- rank(c<a) falling toward 0 (ranking impossible with equal energies)
+- Same failure with Cayley+GroupSort AND SpectralNorm+SiLU → architecture-independent
+
+### Fix Applied
+- **Freeze log_energy_scale**: change from `nn.Parameter` to `register_buffer` (scale=1.0 fixed)
+- Forces the network weights themselves to learn energy separation
+- MDSM must achieve gradient quality through weight updates, not through a global scalar shortcut
+
+### Rule
+- **NEVER use a learnable global energy scale in EBMs with mixed MDSM+ranking losses** — it creates
+  a shortcut where MDSM inflates the scale while ranking gets zero gradient signal
+- **Learnable scalars that multiply outputs are dangerous** — they decouple gradient-based and
+  value-based losses, making one trivially satisfiable without helping the other
+- **If spread=0 persists across architecture changes**, the problem is NOT the architecture —
+  look for global parameters (scales, biases) that affect all outputs uniformly
