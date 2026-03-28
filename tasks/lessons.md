@@ -799,3 +799,24 @@ When `rank_normalize_by_std=true` and `rank_std_floor=0.01`, the normalization a
 1. Disable `rank_normalize_by_std` unless there's a specific reason (e.g., highly varying energy scales)
 2. If normalization is needed, use std_floor ≥ 1.0 or adjust clip_grad_norm proportionally
 3. Always check effective gradient magnitude after normalization + clipping
+
+## 2026-03-28 - Ranking teaches VALUES not GRADIENTS — direction_loss is essential for Langevin inference
+
+### Pattern
+Ranking loss (triplet hinge) teaches E(clean) < E(actor) < E(hard) — correct value ordering.
+But Langevin inference follows -∇E, so it needs correct gradient DIRECTION, not just values.
+Without gradient supervision, the energy surface between training points has arbitrary shape.
+Result: Phase 1 (ranking + clean_min + energy_reg) gets rank_success=0.714 but cosine success=0.39%.
+
+### Evidence
+- Phase 1 (ranking only): cosine improvement = -0.232, success = 0.39%
+- Phase 1.5 (+ direction_loss λ=0.3): cosine improvement = +0.011 (batch), success = 60.55%
+- direction_loss: `L = (1 - cos(-∇E, clean - noisy)).mean()` — cosine-based, bounded [0,2]
+- Direction loss is safer than MDSM: bounded output → bounded Hessian-vector products
+- But direction_loss converges slowly: 0.76 → 0.69 over 20 epochs (max=2.0, random=1.0)
+
+### Rule
+1. **Always include gradient direction supervision** when training an energy function for Langevin inference
+2. `direction_loss` (cosine) preferred over MDSM (MSE) because bounded output prevents gradient dominance
+3. Ranking alone is never sufficient for inference — it only teaches at training points
+4. If direction_loss stalls, increase its weight or add complementary losses (CQL, energy_reg)
