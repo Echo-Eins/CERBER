@@ -287,6 +287,10 @@ class TrainingMetricsWatcher:
                     "support": float(train_metrics.get("support", np.nan)),
                     "knn_dist": float(train_metrics.get("knn_dist", np.nan)),
                     "energy_reg": float(train_metrics.get("energy_reg", np.nan)),
+                    "e_pos_mean": float(train_metrics.get("e_pos_mean", np.nan)),
+                    "e_actor_mean": float(train_metrics.get("e_actor_mean", np.nan)),
+                    "e_hard_mean": float(train_metrics.get("e_hard_mean", np.nan)),
+                    "e_spread": float(train_metrics.get("e_spread", np.nan)),
                     "skip_rate": float(train_metrics.get("skip_rate", np.nan)),
                     "sec_per_batch_window": float(rec.get("sec_per_batch_window", np.nan)),
                     "eta_epoch_sec": float(rec.get("eta_epoch_sec", np.nan)),
@@ -368,6 +372,10 @@ class TrainingMetricsWatcher:
                     "support": np.nan,
                     "knn_dist": np.nan,
                     "energy_reg": np.nan,
+                    "e_pos_mean": np.nan,
+                    "e_actor_mean": np.nan,
+                    "e_hard_mean": np.nan,
+                    "e_spread": np.nan,
                     "skip_rate": np.nan,
                     "sec_per_batch_window": np.nan,
                     "eta_epoch_sec": np.nan,
@@ -603,6 +611,10 @@ def create_live_metrics_plot(
         "support",
         "knn_dist",
         "energy_reg",
+        "e_pos_mean",
+        "e_actor_mean",
+        "e_hard_mean",
+        "e_spread",
         "skip_rate",
         "sec_per_batch_window",
         "eta_epoch_sec",
@@ -637,14 +649,15 @@ def create_live_metrics_plot(
     epoch_df = df[df.get("event", pd.Series(index=df.index, dtype=object)).astype(str) == "epoch"]
 
     fig = make_subplots(
-        rows=4,
+        rows=5,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
+        vertical_spacing=0.05,
         subplot_titles=(
             "Core Losses",
             "Ranking + Violation Metrics",
             "Regularizers + P0/P1 Losses",
+            "Energy Diagnostics (E_clean / E_actor / E_hard / spread)",
             "Speed + Eval/Kill Signals",
         ),
     )
@@ -694,8 +707,14 @@ def create_live_metrics_plot(
     _add_trace(batch_df, "energy_reg", 3, "Energy Reg", "#d6616b")
     _add_trace(batch_df, "skip_rate", 3, "Skip Rate", "#7f7f7f", dash="dot")
 
-    # Row 4: speed + eval
-    _add_trace(batch_df, "sec_per_batch_window", 4, "sec/batch", "#1f77b4")
+    # Row 4: energy diagnostics
+    _add_trace(batch_df, "e_pos_mean", 4, "E(clean)", "#2ca02c")
+    _add_trace(batch_df, "e_actor_mean", 4, "E(actor)", "#ff7f0e")
+    _add_trace(batch_df, "e_hard_mean", 4, "E(hard)", "#d62728")
+    _add_trace(batch_df, "e_spread", 4, "E(spread)", "#1f77b4", dash="dash")
+
+    # Row 5: speed + eval
+    _add_trace(batch_df, "sec_per_batch_window", 5, "sec/batch", "#1f77b4")
     if "eta_epoch_sec" in batch_df.columns and batch_df["eta_epoch_sec"].notna().any():
         eta_minutes = pd.to_numeric(batch_df["eta_epoch_sec"], errors="coerce") / 60.0
         fig.add_trace(
@@ -706,13 +725,13 @@ def create_live_metrics_plot(
                 name="ETA (min)",
                 line=dict(color="#ff7f0e", width=2, dash="dash"),
             ),
-            row=4,
+            row=5,
             col=1,
         )
-    _add_trace(epoch_df, "score", 4, "Kill Score", "#2ca02c")
-    _add_trace(epoch_df, "cos_improvement_eval", 4, "Eval Cos Improvement", "#9467bd")
-    _add_trace(epoch_df, "energy_success_eval", 4, "Eval Energy Success", "#00cc96")
-    _add_trace(epoch_df, "clean_violation_eval", 4, "Eval Clean Violation", "#ef553b")
+    _add_trace(epoch_df, "score", 5, "Kill Score", "#2ca02c")
+    _add_trace(epoch_df, "cos_improvement_eval", 5, "Eval Cos Improvement", "#9467bd")
+    _add_trace(epoch_df, "energy_success_eval", 5, "Eval Energy Success", "#00cc96")
+    _add_trace(epoch_df, "clean_violation_eval", 5, "Eval Clean Violation", "#ef553b")
 
     # Mark epoch boundaries with light markers on row 1
     if not epoch_df.empty and x_col in epoch_df.columns:
@@ -730,16 +749,17 @@ def create_live_metrics_plot(
 
     fig.update_layout(
         title="Live Stage1.5 Metrics Dashboard",
-        height=1200,
+        height=1500,
         width=1200,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
         margin=dict(l=60, r=30, t=90, b=60),
     )
-    fig.update_xaxes(title_text=x_title, row=4, col=1)
+    fig.update_xaxes(title_text=x_title, row=5, col=1)
     fig.update_yaxes(title_text="Loss", row=1, col=1)
     fig.update_yaxes(title_text="Rate", row=2, col=1)
     fig.update_yaxes(title_text="Aux/Reg", row=3, col=1)
-    fig.update_yaxes(title_text="Time / Eval", row=4, col=1)
+    fig.update_yaxes(title_text="Energy", row=4, col=1)
+    fig.update_yaxes(title_text="Time / Eval", row=5, col=1)
     return fig
 
 

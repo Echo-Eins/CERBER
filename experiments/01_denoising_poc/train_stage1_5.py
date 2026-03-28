@@ -1057,6 +1057,10 @@ def main() -> None:
             "support": 0.0,
             "knn_dist": 0.0,
             "energy_reg": 0.0,
+            "e_pos_mean": 0.0,
+            "e_actor_mean": 0.0,
+            "e_hard_mean": 0.0,
+            "e_spread": 0.0,
         }
         n_ok, n_skip, bad_streak = 0, 0, 0
         ema_c, ema_a = None, None
@@ -1113,6 +1117,10 @@ def main() -> None:
             direction_acc = 0.0
             inbatch_nce_acc = 0.0
             energy_reg_acc = 0.0
+            e_pos_mean_acc = 0.0
+            e_actor_mean_acc = 0.0
+            e_hard_mean_acc = 0.0
+            e_spread_acc = 0.0
             critic_failed = False
             for cstep in range(max(1, cfg.critic_steps_per_actor)):
                 try:
@@ -1306,6 +1314,10 @@ def main() -> None:
                     rank_actor_hard_acc += float(rank_actor_hard)
                     rank_clean_hard_acc += float(rank_clean_hard)
                     viol_acc += float((e_actor < e_pos).float().mean().item())
+                    e_pos_mean_acc += float(e_pos.detach().mean().item())
+                    e_actor_mean_acc += float(e_actor.detach().mean().item())
+                    e_hard_mean_acc += float(e_hard.detach().mean().item())
+                    e_spread_acc += float((e_hard.detach().mean() - e_pos.detach().mean()).item())
                 except torch.OutOfMemoryError:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1450,6 +1462,10 @@ def main() -> None:
             sums["support"] += float(l_support.item())
             sums["knn_dist"] += knn_dist_val
             sums["energy_reg"] += energy_reg_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["e_pos_mean"] += e_pos_mean_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["e_actor_mean"] += e_actor_mean_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["e_hard_mean"] += e_hard_mean_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["e_spread"] += e_spread_acc / float(max(1, cfg.critic_steps_per_actor))
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
                 now = time.perf_counter()
                 window_batches = max(1, (bi + 1) - last_window_batch)
@@ -1475,6 +1491,8 @@ def main() -> None:
                     f"ibnce={sums['inbatch_nce']/n_ok:.3f} "
                     f"supp={sums['support']/n_ok:.4f} "
                     f"ereg={sums['energy_reg']/n_ok:.3f} "
+                    f"E[c/a/h]={sums['e_pos_mean']/n_ok:.2f}/{sums['e_actor_mean']/n_ok:.2f}/{sums['e_hard_mean']/n_ok:.2f} "
+                    f"spread={sums['e_spread']/n_ok:.3f} "
                     f"sec/batch={sec_per_batch:.3f} "
                     f"eta={eta_epoch_sec/60.0:.1f}m"
                 )
@@ -1510,6 +1528,10 @@ def main() -> None:
                             "support": float(sums["support"] / n_ok),
                             "knn_dist": float(sums["knn_dist"] / n_ok),
                             "energy_reg": float(sums["energy_reg"] / n_ok),
+                            "e_pos_mean": float(sums["e_pos_mean"] / n_ok),
+                            "e_actor_mean": float(sums["e_actor_mean"] / n_ok),
+                            "e_hard_mean": float(sums["e_hard_mean"] / n_ok),
+                            "e_spread": float(sums["e_spread"] / n_ok),
                             "skip_rate": float(n_skip / max(len(loader), 1)),
                         },
                     },

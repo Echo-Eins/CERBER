@@ -590,3 +590,40 @@ For multi-head/multi-critic checkpoints:
 1) GUI/runtime evaluators must reconstruct the exact training aggregation graph,
 2) keep fallback-to-single-model only for genuinely single-model checkpoints,
 3) treat visualization/runtime architecture mismatch as P0 diagnostics defect.
+
+## 2026-03-28 - Conflicting loss terms cause EBM training collapse
+
+### Pattern
+When an EBM critic has 8+ loss terms with antagonistic gradient directions, training enters an unstable equilibrium:
+- **energy_reg (L2 penalty on E²)** fights ranking losses (which need energy separation)
+- **direction_loss** duplicates MDSM gradient supervision → conflicting backprop signals
+- **clean_min_penalty** duplicates ranking loss constraint → redundant gradient pressure
+- Result: energy magnitudes oscillate chaotically, rank_success stuck at random (5%), inference cosine collapses
+
+### Diagnosis Signals
+- `ereg` growing exponentially (0.03 → 2.15 over 6 epochs) while energy range stays flat ([1.38, 1.60])
+- `rank_success` stuck at ~5% (random chance for triple ordering)
+- `rank(c<a)` FALLING — critic can't distinguish clean from actor
+- `viol` INCREASING — more ordering violations over time
+- Inference cosine degrading (0.57 → 0.04)
+
+### Root Cause
+energy_reg wants ALL energies → 0. Ranking wants E_clean < E_actor < E_hard with margins.
+These are mathematically incompatible. The normalized ranking loss creates a moving target:
+as energy_reg shrinks magnitudes, normalized margins also shrink, so ranking loss grows,
+which pushes energies larger, which makes energy_reg grow → positive feedback loop.
+
+### Fix Applied
+1. **Disable energy_reg entirely** (λ=0.01 → 0.0) — energy should scale freely
+2. **Disable direction_loss** (λ=0.15 → 0.0) — redundant with MDSM
+3. **Reduce clean_min** (λ=0.3 → 0.05) — partially redundant with ranking
+4. **Reduce margins** (0.2/0.1/0.3 → 0.1/0.05/0.15) — smaller targets, easier to satisfy
+5. **Align sigma range** (0.5 → 0.3) — match training to eval distribution
+6. **Soften twin temperature** (0.1 → 0.3) — smoother gradient flow through logsumexp
+
+### Rule
+- **Never add L2 energy regularization when using ranking losses** — they have antagonistic objectives
+- **Never duplicate gradient supervision** (MDSM + direction = double supervision → conflict)
+- **Start with MDSM + RANK only**, add auxiliary losses one at a time, verify each helps
+- **Log E(clean)/E(actor)/E(hard)/spread** — monitor energy separation, not just loss values
+- **Check that energy spread grows over training** — flat spread = critic not discriminating
