@@ -1153,7 +1153,10 @@ def main() -> None:
                             tangent_projection=cfg.actor_tangent_projection,
                         )
                     with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
-                        mdsm = conditional_mdsm(crit, q, pos, sigma, cfg)
+                        if effective_lambda_mdsm > 0:
+                            mdsm = conditional_mdsm(crit, q, pos, sigma, cfg)
+                        else:
+                            mdsm = torch.tensor(0.0, device=device)
                     with autocast():
                         e_pos = crit(q, pos, sigma=sigma.detach())
                         e_actor = crit(q, a_init.detach(), sigma=sigma.detach())
