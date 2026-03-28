@@ -1,5 +1,56 @@
 # Lessons
 
+## 2026-03-28 - Tamed Langevin as safety net for non-Lipschitz or poorly-conditioned gradients
+
+### Pattern
+Standard Langevin dynamics `v += -lr * grad_E + noise` assumes bounded gradients. When gradients explode (due to weak Lipschitz constraint, low ortho iterations, or out-of-distribution inputs), the step diverges catastrophically. Tamed Langevin (Benko et al., AAAI 2025) replaces raw gradient with `grad_tamed = grad / (1 + lr * ||grad||)`, automatically bounding the step size.
+
+### Key Properties
+- **Convergence guarantee**: Proven convergence even with superlinear (non-Lipschitz) gradients
+- **Trivial implementation**: One line change in Langevin update
+- **No architectural constraint**: Works with any energy network, no orthonormalization required
+- **Magnitude-only**: Only bounds gradient magnitude, does NOT fix gradient direction
+- **Compatible with sphere projection**: Taming happens before projection, so target_norm constraint still applies
+
+### When to Use
+1. As a **safety fallback** in all Langevin inference (costs nothing when gradients are already bounded)
+2. If relaxing Lipschitz constraint (e.g., switching critic to spectral norm only)
+3. If experimenting with unconstrained architectures (attention-based energy, etc.)
+
+### When NOT Sufficient Alone
+1. Taming does not help if gradient DIRECTION is wrong (model not trained well)
+2. Does not replace proper noise_scale calibration (noise is not tamed)
+3. Training stability still benefits from Lipschitz — taming is primarily an inference technique
+4. Score matching loss targets can have wildly varying magnitudes without Lipschitz
+
+### Implementation
+```python
+# In langevin.py, after computing grad:
+grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+grad = grad / (1.0 + lr * grad_norm)  # tamed gradient
+```
+
+### References
+- Benko et al., "Kinetic Langevin MCMC sampling without gradient Lipschitz continuity" (AAAI 2025)
+- Also: "Langevin Monte Carlo Beyond Lipschitz Gradient Continuity" (J. Complexity, 2024)
+
+## 2026-03-28 - PyTorch Cayley parametrization superior to Björck for our architecture
+
+### Pattern
+Custom Björck orthonormalization with 15 iterations costs ~30 matmuls per layer per forward pass, creates deep autograd graph under create_graph=True (MDSM loss), and provides only approximate orthogonality. PyTorch's built-in `torch.nn.utils.parametrizations.orthogonal` with `cayley` map provides exact orthogonality at ~3 matmul-equivalent cost.
+
+### Rule
+1. Prefer `torch.nn.utils.parametrizations.orthogonal(linear, orthogonal_map="cayley")` over custom Björck
+2. For very rectangular matrices (e.g., 512×1), use `orthogonal_map="householder"`
+3. Dynamic trivialization (built-in) improves optimizer convergence
+4. Cayley cannot represent det=-1 matrices (eigenvalue=-1), but this is dense in O(n) — not a practical issue
+5. When migrating: old Björck checkpoints need weight key remapping (parametrizations changes key structure)
+
+### Evidence
+- Björck-15: ~30 matmuls/layer, approximate, deep create_graph graph
+- Cayley: ~3 matmul-equiv/layer, exact, shallow create_graph graph
+- Sources: CVPR 2024 "1-Lipschitz Layers Compared", ICML 2019 "Cheap Orthogonal Constraints"
+
 ## 2026-03-26 - Björck ortho_n_iters=1 causes immediate rank degradation
 
 ### Pattern

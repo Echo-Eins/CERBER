@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from cebcm.models.activations import GroupSort, LipschitzLinearSpline
-from cebcm.models.normalization import OrthoLinear
+from cebcm.models.normalization import OrthoLinear, make_cayley_linear
 
 
 # Number of sinusoidal frequencies for σ embedding
@@ -146,11 +146,11 @@ class SimpleEnergy(nn.Module):
         in_dim: int,
         out_dim: int,
         norm_mode: str,
-        ortho_n_iters: int,
+        ortho_n_iters: int = 0,
     ) -> nn.Module:
         """Create a linear layer with the specified normalization."""
         if norm_mode == "orthonorm":
-            return OrthoLinear(in_dim, out_dim, bias=True, n_iters=ortho_n_iters)
+            return make_cayley_linear(in_dim, out_dim, bias=True)
         elif norm_mode == "spectral_norm":
             linear = nn.Linear(in_dim, out_dim)
             return nn.utils.parametrizations.spectral_norm(linear)

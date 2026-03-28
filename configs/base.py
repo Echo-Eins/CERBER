@@ -53,6 +53,12 @@ class LangevinConfig:
     # Underdamped-specific (GAUL, SIAM JUQ 2025)
     underdamped_friction: float = 0.5
     underdamped_mass: float = 1.0
+    # Adaptive sigma schedule (NCSN-style annealing during Langevin)
+    sigma_anneal: bool = True
+    sigma_anneal_mode: str = "hybrid"  # "geometric", "adaptive", "hybrid"
+    sigma_anneal_max: float = 0.3
+    sigma_anneal_min: float = 0.01
+    sigma_anneal_blend: float = 0.5  # for hybrid mode
 
 
 @dataclass

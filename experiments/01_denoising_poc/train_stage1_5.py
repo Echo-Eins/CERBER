@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.inference.langevin import run_langevin
+from cebcm.inference.sigma_schedule import AdaptiveSigmaEnergyWrapper, SigmaScheduleConfig
 from cebcm.models.actor import LatentDenoiseActor
 from cebcm.models.energy import SimpleEnergy
 from cebcm.models.energy_unconditional import UnconditionalEnergy
@@ -26,6 +27,41 @@ from cebcm.models.normalization import OrthoLinear
 from cebcm.training.kill_criteria import ConditionalThresholds, summarize_conditional_eval
 from cebcm.training.losses import gradient_penalty
 from configs.base import LangevinConfig, Stage1_5Config
+
+
+def migrate_bjorck_state_dict(model: torch.nn.Module, old_sd: dict) -> dict:
+    """
+    Migrate old Björck (OrthoLinear) checkpoint to Cayley parametrization format.
+
+    Old keys: "net.0.weight", "net.0.bias"
+    New keys: "net.0.parametrizations.weight.original", "net.0.parametrizations.weight.0.base", "net.0.bias"
+
+    If old_sd already has "parametrizations" keys, returns it unchanged.
+    """
+    has_parametrizations = any("parametrizations" in k for k in old_sd)
+    if has_parametrizations:
+        return old_sd
+
+    # Build mapping from current model's expected keys
+    new_sd = model.state_dict()
+    migrated = {}
+    for new_key in new_sd:
+        if "parametrizations.weight.original" in new_key:
+            # Map from old bare weight: strip "parametrizations.weight.original" → "weight"
+            old_key = new_key.replace("parametrizations.weight.original", "weight")
+            if old_key in old_sd:
+                migrated[new_key] = old_sd[old_key]
+            else:
+                migrated[new_key] = new_sd[new_key]
+        elif "parametrizations.weight.0.base" in new_key:
+            # The base matrix is initialized by the parametrization, keep model default
+            migrated[new_key] = new_sd[new_key]
+        elif new_key in old_sd:
+            migrated[new_key] = old_sd[new_key]
+        else:
+            migrated[new_key] = new_sd[new_key]
+
+    return migrated
 
 
 def append_jsonl_record(path: Path, payload: dict) -> None:
@@ -82,27 +118,17 @@ def clip_grads(mods: list[torch.nn.Module], max_norm: float) -> torch.Tensor:
 
 
 def set_ortho_n_iters(model: torch.nn.Module, n_iters: int) -> None:
+    """Legacy no-op. Cayley parametrization provides exact orthogonality."""
+    # With Cayley parametrization, n_iters is irrelevant.
+    # Kept for backward compatibility with old OrthoLinear checkpoints.
     for module in model.modules():
         if isinstance(module, OrthoLinear):
             module.n_iters = n_iters
 
 
 def resolve_ortho_n_iters(cfg: Stage1_5Config, epoch_idx: int, total_epochs: int) -> int:
-    base = max(1, int(cfg.ortho_n_iters))
-    if not cfg.ortho_schedule_enabled:
-        return base
-    if not cfg.ortho_schedule_iters:
-        return base
-
-    iters = [max(2, int(v)) for v in cfg.ortho_schedule_iters]
-    bounds = [float(v) for v in cfg.ortho_schedule_boundaries]
-    progress = float(epoch_idx + 1) / float(max(1, total_epochs))
-    stage = 0
-    for b in bounds:
-        if progress > b:
-            stage += 1
-    stage = min(stage, len(iters) - 1)
-    return int(iters[stage])
+    """Legacy no-op. Returns 0 — Cayley parametrization needs no iterations."""
+    return 0
 
 
 def build_bank(
@@ -603,7 +629,20 @@ def eval_model(
                         target_norm=cfg.langevin.target_norm,
                         tangent_projection=cfg.actor_tangent_projection,
                     )
-            sigma_bound_ef = SigmaBoundEnergy(ef, sigma=sigma.detach())
+            # Use adaptive sigma if enabled, else fixed sigma
+            if getattr(cfg.langevin, 'sigma_anneal', False):
+                sigma_sched_cfg = SigmaScheduleConfig(
+                    enabled=True,
+                    mode=getattr(cfg.langevin, 'sigma_anneal_mode', 'hybrid'),
+                    sigma_max=getattr(cfg.langevin, 'sigma_anneal_max', 0.3),
+                    sigma_min=getattr(cfg.langevin, 'sigma_anneal_min', 0.01),
+                    adaptive_blend=getattr(cfg.langevin, 'sigma_anneal_blend', 0.5),
+                )
+                sigma_bound_ef = AdaptiveSigmaEnergyWrapper(
+                    ef, sigma_sched_cfg, max_steps=cfg.critic_eval_langevin_steps,
+                )
+            else:
+                sigma_bound_ef = SigmaBoundEnergy(ef, sigma=sigma.detach())
             if cfg.critic_eval_langevin_steps > 0:
                 # Keep eval math sample-independent when batched: fixed-step rollout,
                 # no batch-coupled early stop by mean energy.
@@ -950,8 +989,11 @@ def main() -> None:
     best_score, start_epoch, global_step = float("-inf"), 0, 0
     if args.resume:
         ck = torch.load(args.resume, weights_only=False, map_location=device)
-        c1_base.load_state_dict(ck["critic1_state"]); c2_base.load_state_dict(ck["critic2_state"]); actor_base.load_state_dict(ck["actor_state"])
-        if prior_base is not None and ck.get("prior_state") is not None: prior_base.load_state_dict(ck["prior_state"])
+        c1_base.load_state_dict(migrate_bjorck_state_dict(c1_base, ck["critic1_state"]))
+        c2_base.load_state_dict(migrate_bjorck_state_dict(c2_base, ck["critic2_state"]))
+        actor_base.load_state_dict(migrate_bjorck_state_dict(actor_base, ck["actor_state"]))
+        if prior_base is not None and ck.get("prior_state") is not None:
+            prior_base.load_state_dict(migrate_bjorck_state_dict(prior_base, ck["prior_state"]))
         opt_c.load_state_dict(ck["opt_c_state"]); opt_a.load_state_dict(ck["opt_a_state"]); scaler.load_state_dict(ck["scaler_state"])
         best_score, start_epoch, global_step = float(ck.get("best_score", best_score)), int(ck.get("epoch", 0)) + 1, int(ck.get("global_step", 0))
     elif stream_path.exists():

@@ -59,6 +59,7 @@ from cerber_gui.sota_eval import (
 from configs.base import Stage1Config
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.inference.langevin import run_langevin
+from cebcm.inference.sigma_schedule import AdaptiveSigmaEnergyWrapper, SigmaScheduleConfig
 
 
 # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…â€œÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã¢â‚¬ËœÃƒâ€¦Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸
@@ -974,7 +975,19 @@ def run_langevin_denoise(
         energy_fn = _UnconditionalEnergyAdapter(model)
         v_query = torch.zeros_like(v_clean)
     else:
-        if sigma_override is not None:
+        # Check if adaptive sigma is enabled in the config
+        _langevin_cfg = getattr(stage1_cfg, 'langevin', None)
+        _sigma_anneal = getattr(_langevin_cfg, 'sigma_anneal', False) if _langevin_cfg else False
+        if _sigma_anneal and sigma_override is not None:
+            _sched = SigmaScheduleConfig(
+                enabled=True,
+                mode=getattr(_langevin_cfg, 'sigma_anneal_mode', 'hybrid'),
+                sigma_max=getattr(_langevin_cfg, 'sigma_anneal_max', 0.3),
+                sigma_min=getattr(_langevin_cfg, 'sigma_anneal_min', 0.01),
+                adaptive_blend=getattr(_langevin_cfg, 'sigma_anneal_blend', 0.5),
+            )
+            energy_fn = AdaptiveSigmaEnergyWrapper(model, _sched, max_steps=max_steps)
+        elif sigma_override is not None:
             energy_fn = _SigmaBoundPairEnergyAdapter(model, sigma=sigma_override)
         else:
             energy_fn = model

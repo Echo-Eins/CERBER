@@ -13,12 +13,18 @@ This gives:
     - 1-Lipschitz guarantee by construction
     - Maximum expressiveness within the Lipschitz constraint
 
-Implementation uses Bjorck orthonormalization (iterative), which is
-differentiable and converges quadratically.
+Two implementations:
+    1. **Cayley parametrization** (preferred): Uses PyTorch's built-in
+       `torch.nn.utils.parametrizations.orthogonal` with Cayley map.
+       Exact orthogonality by construction, clean create_graph=True support,
+       ~10x cheaper than Bjorck-15.
+    2. **Bjorck orthonormalization** (legacy): Iterative projection, approximate.
+       Kept for backward compatibility with old checkpoints.
 
 References:
-    - "Improving Lipschitz-Constrained Neural Networks by Learning Activation
-      Functions" (JMLR 2024)
+    - Lezcano-Casado & Martinez-Rubio, "Cheap Orthogonal Constraints in
+      Neural Networks" (ICML 2019)
+    - "1-Lipschitz Layers Compared" (CVPR 2024)
     - Bjorck & Bowie, "An Iterative Algorithm for Computing the Best Estimate
       of an Orthogonal Matrix" (1971)
     - Li et al., "Preventing Gradient Attenuation in Lipschitz Constrained
@@ -30,6 +36,34 @@ Spec reference: §5.6 (regularization)
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+
+def make_cayley_linear(
+    in_features: int,
+    out_features: int,
+    bias: bool = True,
+) -> nn.Linear:
+    """
+    Create a linear layer with exact orthogonal weights via Cayley parametrization.
+
+    Uses `torch.nn.utils.parametrizations.orthogonal` which:
+    - Provides EXACT orthogonality (all singular values = 1)
+    - Supports create_graph=True for second-order gradients (MDSM)
+    - Costs ~3 matmul-equivalents per forward (vs ~30 for Bjorck-15)
+    - Handles rectangular matrices via Stiefel manifold
+
+    Args:
+        in_features: Input dimension.
+        out_features: Output dimension.
+        bias: Whether to include a bias term.
+
+    Returns:
+        nn.Linear with orthogonal parametrization applied.
+    """
+    linear = nn.Linear(in_features, out_features, bias=bias)
+    nn.init.orthogonal_(linear.weight)
+    torch.nn.utils.parametrizations.orthogonal(linear, orthogonal_map="cayley")
+    return linear
 
 
 def _power_iteration_sigma_max(W: Tensor, n_steps: int = 2) -> Tensor:

@@ -165,6 +165,10 @@ def langevin_dynamics(
         v_trajectory.append(v_current.detach().cpu().clone())
 
     for step in range(max_steps):
+        # Adaptive sigma: notify wrapper of current step
+        if hasattr(energy_fn, 'set_step'):
+            energy_fn.set_step(step)
+
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
         e_mean = energy.mean().item()
         trajectory.append(e_mean)
@@ -309,6 +313,10 @@ def pid_langevin_dynamics(
         v_trajectory.append(v_current.detach().cpu().clone())
 
     for step in range(max_steps):
+        # Adaptive sigma: notify wrapper of current step
+        if hasattr(energy_fn, 'set_step'):
+            energy_fn.set_step(step)
+
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
         e_mean = energy.mean().item()
         trajectory.append(e_mean)
@@ -467,6 +475,10 @@ def underdamped_langevin_dynamics(
         v_trajectory.append(v_current.detach().cpu().clone())
 
     for step in range(max_steps):
+        # Adaptive sigma: notify wrapper of current step
+        if hasattr(energy_fn, 'set_step'):
+            energy_fn.set_step(step)
+
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
         e_mean = energy.mean().item()
         trajectory.append(e_mean)
