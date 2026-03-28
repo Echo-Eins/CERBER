@@ -755,3 +755,47 @@ products) that dominate ranking's first-order gradients in the shared parameter 
 - **Monitor MDSM and ranking loss separately** — if ranking loss stays constant while MDSM
   decreases, MDSM is dominating the gradient
 - **ibnce = ln(batch_size) is a red flag** — means the network is effectively constant
+
+## 2026-03-28 - Unconstrained MLP dramatically outperforms Lipschitz-constrained architectures for ranking
+
+### Pattern
+Cayley+GroupSort (exact orthogonal + 1-Lipschitz activation) makes optimization on the orthogonal manifold extremely slow: 1700 sec/epoch vs 10 sec/epoch unconstrained, and spread grows from 0.001→0.006 over 5 epochs (4% of needed separation). Plain nn.Linear + SiLU with 10x higher lr (1e-3 vs 1e-4) achieves rank_success=0.569, spread=0.236 in 10 epochs.
+
+### Evidence
+| Config | 5 epochs | 10 epochs | sec/epoch |
+|--------|----------|-----------|-----------|
+| Cayley+GroupSort, lr=1e-4 | spread=0.006, rs=0.265 | N/A | 1700 |
+| None+SiLU, lr=1e-3 | spread=0.100, rs=0.445 | spread=0.236, rs=0.569 | 10 |
+
+### Rule
+1. Start with unconstrained MLP (norm_mode="none", activation="silu") for all new experiments
+2. Only add Lipschitz constraints AFTER ranking is established and for specific reasons (inference stability)
+3. Higher lr (1e-3) is critical for unconstrained — orthonorm constrains the landscape, plain Linear needs faster exploration
+4. If inference Langevin diverges with unconstrained critic, use Tamed Langevin as safety net instead of constraining architecture
+
+## 2026-03-28 - Auxiliary losses actively destroy ranking when added simultaneously
+
+### Pattern
+With 8+ auxiliary losses active (CQL, NCE, in-batch NCE, clean_min, support, barrier, descent, bc_reg, geo, align), rank_success DECREASES over training (0.206→0.071). Each loss competes for gradient space, and the combined signal overwhelms the ranking objective.
+
+### Evidence
+- Pure ranking only: rank_success 0.247→0.569 over 10 epochs
+- All losses active (stage1_5_config.json): rank_success 0.206→0.071 (WORSE than random)
+- Disabling all but ranking immediately fixed training
+
+### Rule
+1. **NEVER activate all losses simultaneously** — start with ranking only, add ONE loss at a time
+2. Each new loss must be validated: rank_success must not drop more than 5% when added
+3. If rank_success drops when adding a loss, the loss weight is too high OR the loss is fundamentally conflicting
+4. Prioritize losses by their direct contribution to the end goal (inference quality), not by theoretical appeal
+5. The "kitchen sink" approach to losses is an anti-pattern — more losses ≠ better training
+
+## 2026-03-28 - rank_normalize_by_std + clip_grad_norm creates gradient bottleneck
+
+### Pattern
+When `rank_normalize_by_std=true` and `rank_std_floor=0.01`, the normalization amplifies gradients by ~100x (dividing by a small std). Combined with `clip_grad_norm=1.0`, the effective learning rate becomes lr/100, making ranking unable to learn.
+
+### Rule
+1. Disable `rank_normalize_by_std` unless there's a specific reason (e.g., highly varying energy scales)
+2. If normalization is needed, use std_floor ≥ 1.0 or adjust clip_grad_norm proportionally
+3. Always check effective gradient magnitude after normalization + clipping
