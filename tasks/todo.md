@@ -20,6 +20,16 @@ Config: `configs/ablation_phase1_anchored_ranking.json`
 - [ ] Check: cosine improvement > 0 in GUI inference
 - [ ] Check: energy landscape — minimum near clean target, not spurious
 
+### Phase 1.5: Gradient Direction (CURRENT)
+Config: `configs/ablation_phase1_5_direction.json`
+- Keep: everything from Phase 1
+- Add: `direction_loss` (λ=0.3) — teaches -∇E to point toward clean target
+- Direction loss uses cosine (bounded [0,2]) — much safer than MDSM's MSE
+- [ ] Run 20 epochs
+- [ ] Check: rank_success ≥ 0.6 (shouldn't hurt ranking)
+- [ ] Check: cosine improvement > 0 in GUI inference (THE KEY TEST)
+- [ ] Check: direction loss value decreasing over training
+
 ### Phase 2: Conservative Boundary
 - Add: `CQL` (λ=0.1, noise=0.5) — penalizes low energy on OOD points
 - [ ] Verify ranking preserved, inference improved
