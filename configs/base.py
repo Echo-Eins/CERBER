@@ -255,6 +255,7 @@ class Stage1_5Config:
 
     # Loss weights
     lambda_mdsm: float = 1.0
+    mdsm_warmup_epochs: int = 0  # Epochs of pure ranking before MDSM ramps in (0=disabled)
     lambda_rank: float = 0.25
     lambda_nce: float = 0.10
     lambda_cql: float = 0.1

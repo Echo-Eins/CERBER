@@ -715,3 +715,43 @@ separation because MDSM doesn't require it.
   value-based losses, making one trivially satisfiable without helping the other
 - **If spread=0 persists across architecture changes**, the problem is NOT the architecture —
   look for global parameters (scales, biases) that affect all outputs uniformly
+
+## 2026-03-28 - MDSM second-order gradients dominate ranking first-order gradients
+
+### Pattern
+Even after freezing `log_energy_scale`, SpectralNorm+SiLU with `lambda_mdsm=1.0` and
+`lambda_rank=1.0` still produces spread=0.000 over 7+ epochs. Energies grow identically
+for clean/actor/hard (E[c/a/h]=2.61/2.60/2.61). ibnce=3.466=ln(32) confirms the network
+is a near-constant function over candidate inputs.
+
+### Root Cause
+MDSM (directional, `create_graph=True`) produces **second-order gradients** (Hessian-vector
+products) that dominate ranking's first-order gradients in the shared parameter space:
+1. MDSM loss ≈ 0.7-1.0, ranking loss ≈ 0.3, but MDSM gradient magnitude is amplified
+   10-100x by the second-order chain rule through the Hessian
+2. MDSM trains gradient DIRECTION at noisy points — does NOT require energy VALUE separation
+3. Ranking trains value ordering E_clean < E_actor < E_hard — needs value separation
+4. MDSM's dominant gradient reshapes the network faster than ranking can establish separation
+5. Result: network learns correct local gradient directions but constant energy values
+
+### Diagnosis Signals
+- rank_loss ≈ 0.3 = sum(margins) = constant — all hinge terms ALWAYS active but can't move weights
+- ibnce = 3.466 = ln(batch_size) — random chance, zero discrimination
+- rank(c<a) dropping from 0.882 to 0.095 — getting WORSE over training
+- E[c/a/h] growing but always equal — network depends on (q, σ), ignores candidate
+- Same pattern with Cayley+GroupSort AND SpectralNorm+SiLU AND frozen log_energy_scale
+
+### Fix Applied
+- **MDSM warmup curriculum**: `mdsm_warmup_epochs=5` — first 5 epochs pure ranking
+  (effective_lambda_mdsm=0.0), then linear ramp to target lambda_mdsm
+- Gives ranking loss exclusive access to network weights initially
+- Once energy separation is established (spread > 0), MDSM can refine gradient directions
+  without destroying the ranking structure
+
+### Rule
+- **NEVER combine second-order (MDSM/score matching) and first-order (ranking/contrastive)
+  losses from the start** — second-order gradients will dominate and prevent value learning
+- **Always use a warmup curriculum** when mixing gradient-matching and value-matching objectives
+- **Monitor MDSM and ranking loss separately** — if ranking loss stays constant while MDSM
+  decreases, MDSM is dominating the gradient
+- **ibnce = ln(batch_size) is a red flag** — means the network is effectively constant

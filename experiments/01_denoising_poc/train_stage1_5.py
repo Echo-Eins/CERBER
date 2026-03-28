@@ -1033,7 +1033,16 @@ def main() -> None:
         active_ortho_iters = resolve_ortho_n_iters(cfg, epoch_idx=epoch_idx, total_epochs=cfg.num_epochs)
         for m in [c1_base, c2_base, actor_base] + ([prior_base] if prior_base is not None else []):
             set_ortho_n_iters(m, active_ortho_iters)
+        # MDSM warmup: pure ranking for first N epochs, then linear ramp-up
+        mdsm_warmup = getattr(cfg, "mdsm_warmup_epochs", 0)
+        if mdsm_warmup > 0 and epoch_idx < mdsm_warmup:
+            mdsm_scale = float(epoch_idx) / float(mdsm_warmup)
+        else:
+            mdsm_scale = 1.0
+        effective_lambda_mdsm = cfg.lambda_mdsm * mdsm_scale
         print(f"  Ortho schedule: n_iters={active_ortho_iters}")
+        if mdsm_warmup > 0:
+            print(f"  MDSM warmup: scale={mdsm_scale:.3f} effective_lambda={effective_lambda_mdsm:.4f}")
         c1.train(); c2.train(); actor.train(); prior.train() if prior is not None else None
         sums = {
             "loss": 0.0,
@@ -1198,7 +1207,7 @@ def main() -> None:
                                 + F.relu(nrm - r * (1 + m)).pow(2)
                             ).mean()
                         loss_c = (
-                            cfg.lambda_mdsm * mdsm
+                            effective_lambda_mdsm * mdsm
                             + cfg.lambda_rank * rank
                             + cfg.lambda_nce * nce
                             + cfg.lambda_cql * cql
@@ -1479,6 +1488,7 @@ def main() -> None:
                     f"critic={sums['critic']/n_ok:.4f} "
                     f"actor={sums['actor']/n_ok:.4f} "
                     f"rank_loss={sums['rank']/n_ok:.4f} "
+                    f"mdsm={sums['mdsm']/n_ok:.4f} "
                     f"rank_success={sums['rank_success']/n_ok:.3f} "
                     f"rank(c<a)={sums['rank_clean_lt_actor']/n_ok:.3f} "
                     f"rank(a<h)={sums['rank_actor_lt_hard']/n_ok:.3f} "
