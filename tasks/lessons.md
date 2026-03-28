@@ -819,4 +819,25 @@ Result: Phase 1 (ranking + clean_min + energy_reg) gets rank_success=0.714 but c
 1. **Always include gradient direction supervision** when training an energy function for Langevin inference
 2. `direction_loss` (cosine) preferred over MDSM (MSE) because bounded output prevents gradient dominance
 3. Ranking alone is never sufficient for inference — it only teaches at training points
-4. If direction_loss stalls, increase its weight or add complementary losses (CQL, energy_reg)
+4. If direction_loss stalls, increase its weight or train longer — do NOT add landscape-flattening losses (CQL, strong energy_reg)
+
+## 2026-03-28 - CQL + strong energy_reg FLATTEN the energy landscape and suppress direction_loss
+
+### Pattern
+CQL penalizes low energy on OOD points (`softplus(-E_ood)`), and strong energy_reg penalizes `E_clean²`.
+Together they push ALL energies toward zero, creating a flat landscape with weak gradients.
+Direction_loss needs strong gradients to teach direction — flattening destroys its signal.
+
+### Evidence
+- Phase 1.5 (direction_loss only): cosine success = 60.55%, batch improvement = +0.011
+- Phase 2 (+ CQL λ=0.1, energy_reg λ=0.01→0.1): cosine success = 40.23%, batch improvement = -0.015
+- Phase 2 direction_loss converged WORSE: 0.703 vs 0.688 (Phase 1.5)
+- Phase 2 energy spread SMALLER: 0.339 vs 0.408 (Phase 1.5) — confirming flattening
+- Phase 2 rank_success also dropped: 0.708 vs 0.747
+
+### Rule
+1. **Never add CQL or strong energy_reg alongside direction_loss** — they compete for landscape shape
+2. energy_reg λ=0.01 is safe (prevents unbounded wells), λ=0.1 is too strong (flattens gradients)
+3. CQL is designed for offline RL where Q-values explode — EBM ranking doesn't have that problem
+4. When adding a new loss, check energy SPREAD — if it decreases, the loss is flattening the landscape
+5. Test ONE change at a time. Phase 2 changed TWO things (CQL + 10× energy_reg) making diagnosis harder

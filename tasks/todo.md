@@ -9,41 +9,40 @@ Pure ranking ablation (norm_mode=none, SiLU, lr=1e-3) proved ranking CAN learn e
 
 ## Strategy: Add losses ONE AT A TIME, verify each doesn't break ranking
 
-### Phase 1: Anchored Ranking (NEXT)
+### Phase 1: Anchored Ranking ✅
 Config: `configs/ablation_phase1_anchored_ranking.json`
-- Keep: ranking (λ=1.0), unconstrained MLP, SiLU, lr=1e-3
-- Add: `clean_min` (λ=0.3, margin=0.1) — forces E(clean) to be the minimum
-- Add: `energy_reg` (λ=0.01) — prevents unbounded energy wells
-- [ ] Run 20 epochs
-- [ ] Check: rank_success ≥ 0.5 (ranking not broken)
-- [ ] Check: spread ≥ 0.15
-- [ ] Check: cosine improvement > 0 in GUI inference
-- [ ] Check: energy landscape — minimum near clean target, not spurious
+- Ranking (λ=1.0) + clean_min (λ=0.3) + energy_reg (λ=0.01)
+- Result: rank_success=0.714, spread=0.359, BUT inference cosine=-0.232, success=0.39%
+- Diagnosis: ranking teaches VALUES not GRADIENTS — Langevin can't follow
 
-### Phase 1.5: Gradient Direction (CURRENT)
+### Phase 1.5: Gradient Direction ✅ ← BEST CONFIG
 Config: `configs/ablation_phase1_5_direction.json`
-- Keep: everything from Phase 1
-- Add: `direction_loss` (λ=0.3) — teaches -∇E to point toward clean target
-- Direction loss uses cosine (bounded [0,2]) — much safer than MDSM's MSE
-- [ ] Run 20 epochs
-- [ ] Check: rank_success ≥ 0.6 (shouldn't hurt ranking)
-- [ ] Check: cosine improvement > 0 in GUI inference (THE KEY TEST)
-- [ ] Check: direction loss value decreasing over training
+- Phase 1 + direction_loss (λ=0.3)
+- Result: rank_success=0.747, spread=0.408, batch cosine=+0.011, success=60.55%
+- **BREAKTHROUGH**: first positive cosine improvement, 60% success
+- Direction loss still converging slowly: 0.76 → 0.69 over 20 epochs
 
-### Phase 2: Conservative Boundary
-- Add: `CQL` (λ=0.1, noise=0.5) — penalizes low energy on OOD points
-- [ ] Verify ranking preserved, inference improved
-- [ ] Check energy landscape for tighter wells around data
+### Phase 2: CQL + Strong energy_reg ✗ REGRESSION
+Config: `configs/ablation_phase2_cql_ereg.json`
+- Phase 1.5 + CQL (λ=0.1) + energy_reg (λ=0.01→0.1)
+- Result: rank_success=0.708, spread=0.339, batch cosine=-0.015, success=40.23%
+- **WORSE than Phase 1.5** — CQL + strong energy_reg flatten the landscape, suppress direction signal
+- ABANDONED: do not add landscape-flattening losses alongside direction_loss
 
-### Phase 3: Contrastive Signal
-- Add: `InfoNCE` (λ=0.1, temp=0.07, 4 random negatives)
-- [ ] Verify ranking preserved
-- [ ] Check batch eval success rate
+### Phase 2b: Improve Phase 1.5 (CURRENT)
+Goal: Push cosine success from 60.55% toward 80%+ without breaking what works
+- [ ] **Option A**: Train Phase 1.5 longer (40-60 epochs) — direction_loss was still improving at epoch 20
+- [ ] **Option B**: Increase lambda_direction (0.3 → 0.5) — give gradient direction more weight
+- [ ] **Option C**: Multi-sample direction_loss (direction_num_samples=1 → 4) — more gradient supervision per step
+- [ ] **Option D**: Noise schedule tuning — direction_loss may work better at specific sigma ranges
+- [ ] **Option E**: Higher noise_scale at inference (0.15 gave 93.75% success vs 60.55% at 0.0002)
 
-### Phase 4: Score Matching (if needed)
-- Add: `MDSM` with warmup (warmup_epochs=10, λ_mdsm=0.1)
-- Only if gradient DIRECTION is wrong after Phase 3
-- [ ] Verify ranking not destroyed (rank_success ≥ 0.45)
+### Phase 3: Contrastive Signal (DEFERRED)
+- InfoNCE — only if Phase 2b doesn't reach 80%+
+- Must check it doesn't flatten landscape like CQL did
+
+### Phase 4: Score Matching (DEFERRED)
+- MDSM — last resort, unbounded MSE is dangerous
 
 ### Kill Criteria (abandon approach if)
 - Phase 1 ranking breaks (rank_success < 0.3) → weights too high, halve them
