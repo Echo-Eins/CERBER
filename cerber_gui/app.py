@@ -723,12 +723,32 @@ def select_checkpoint_fn(
     sota_eval_batch_size=32,
     sota_eval_bank_size=512,
 ):
-    """Render checkpoint summary and default landscape preview."""
+    """Render checkpoint summary and default landscape preview.
+
+    Also returns updated slider values (noise_scale, steps, lr) extracted
+    from the checkpoint's persisted config so the GUI always reflects the
+    parameters the model was trained with.
+    """
+    empty_sliders = (
+        gr.update(),  # noise_scale
+        gr.update(),  # num_steps
+        gr.update(),  # lr
+    )
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
-        return "No checkpoint selected", None, "No metrics available", None
+        return "No checkpoint selected", None, "No metrics available", None, *empty_sliders
 
     checkpoint = session_state["checkpoints"][checkpoint_path]
     session_state["current_checkpoint"] = checkpoint_path
+
+    # --- Extract Langevin config from checkpoint to update sliders ---
+    cfg = build_stage1_config(checkpoint)
+    langevin_cfg = getattr(cfg, "langevin", None)
+    if langevin_cfg is not None:
+        slider_noise = gr.update(value=getattr(langevin_cfg, "noise_scale", 0.0002))
+        slider_steps = gr.update(value=getattr(langevin_cfg, "max_steps", 100))
+        slider_lr = gr.update(value=getattr(langevin_cfg, "lr", 0.01))
+    else:
+        slider_noise, slider_steps, slider_lr = empty_sliders
 
     grid, rf, abs_range = _resolve_scan_params(grid_size, range_factor, absolute_half_range)
 
@@ -756,7 +776,7 @@ def select_checkpoint_fn(
     except Exception as e:
         info = f"Landscape generation error: {e}"
 
-    return summary, landscape_fig, info, trajectory_plot
+    return summary, landscape_fig, info, trajectory_plot, slider_noise, slider_steps, slider_lr
 
 
 def _extract_hidden_dims_from_state_dict(model_state: dict) -> list[int]:
@@ -2633,7 +2653,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
-        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot, noise_scale_slider, num_steps_slider, lr_slider],
     )
 
     # ÃƒÆ’Ã‚ÂÃƒâ€¦Ã‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â±ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â»ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âµ backend
@@ -2648,7 +2668,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
-        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot, noise_scale_slider, num_steps_slider, lr_slider],
     )
 
     grid_size_slider.change(
@@ -2662,7 +2682,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
-        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot, noise_scale_slider, num_steps_slider, lr_slider],
     )
 
     range_factor_slider.change(
@@ -2676,7 +2696,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
-        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot, noise_scale_slider, num_steps_slider, lr_slider],
     )
 
     landscape_abs_range_slider.change(
@@ -2690,7 +2710,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
-        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot, noise_scale_slider, num_steps_slider, lr_slider],
     )
 
     sota_eval_batch_size_slider.change(
@@ -2704,7 +2724,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
-        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot, noise_scale_slider, num_steps_slider, lr_slider],
     )
 
     sota_eval_bank_size_slider.change(
@@ -2718,7 +2738,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
         ],
-        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot],
+        outputs=[checkpoint_summary, landscape_plot, inference_output, trajectory_plot, noise_scale_slider, num_steps_slider, lr_slider],
     )
 
     # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Âº ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒâ€šÃ‚ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°
