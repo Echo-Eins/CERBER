@@ -841,3 +841,23 @@ Direction_loss needs strong gradients to teach direction — flattening destroys
 3. CQL is designed for offline RL where Q-values explode — EBM ranking doesn't have that problem
 4. When adding a new loss, check energy SPREAD — if it decreases, the loss is flattening the landscape
 5. Test ONE change at a time. Phase 2 changed TWO things (CQL + 10× energy_reg) making diagnosis harder
+
+## 2026-03-29 - Spectral norm is TOO restrictive for EBM ranking — kills all energy separation
+
+### Pattern
+Spectral norm bounds σ_max(W) ≤ 1 per layer. For a 4-layer MLP, total Lipschitz ≤ 1.
+This means |E(x) - E(y)| ≤ ||x - y||. With SONAR norms ~0.2, max energy spread ≈ 0.
+Result: spread=0.000, rank_success=0.000, model cannot learn ANY energy ordering.
+
+### Evidence
+- Phase 2c (spectral_norm, n_power_iterations=5): spread=0.000 from epoch 1 through 5+
+- E[c/a/h] = 0.05/0.05/0.05 — perfectly flat, no separation at all
+- rank(c<a) dropping: 0.955 → 0.198 (random chance, model can't distinguish)
+- direction_loss still improving (0.734→0.646) — gradients CAN be learned, but have zero magnitude
+- Phase 2b (none): spread=0.559, rank_success=0.884 — unconstrained works for ranking
+
+### Rule
+1. **Never use spectral_norm for EBM ranking** — it hard-caps energy range too aggressively
+2. Lipschitz constraint spectrum: spectral_norm (too hard) → gradient_penalty (soft, tunable) → none (too free)
+3. For Lipschitz control, prefer gradient penalty: penalizes ||∇E||² without hard-bounding capacity
+4. If spread=0 after epoch 1, the constraint is too tight — don't wait for more epochs

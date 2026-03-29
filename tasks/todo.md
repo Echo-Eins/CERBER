@@ -29,16 +29,31 @@ Config: `configs/ablation_phase2_cql_ereg.json`
 - **WORSE than Phase 1.5** — CQL + strong energy_reg flatten the landscape, suppress direction signal
 - ABANDONED: do not add landscape-flattening losses alongside direction_loss
 
-### Phase 2b: Improve Phase 1.5 (CURRENT)
-Goal: Push cosine success from 60.55% toward 80%+ without breaking what works
-- [ ] **Option A**: Train Phase 1.5 longer (40-60 epochs) — direction_loss was still improving at epoch 20
-- [ ] **Option B**: Increase lambda_direction (0.3 → 0.5) — give gradient direction more weight
-- [ ] **Option C**: Multi-sample direction_loss (direction_num_samples=1 → 4) — more gradient supervision per step
-- [ ] **Option D**: Noise schedule tuning — direction_loss may work better at specific sigma ranges
-- [ ] **Option E**: Higher noise_scale at inference (0.15 gave 93.75% success vs 60.55% at 0.0002)
+### Phase 2b: Longer training + multi-sample ✅ (PARTIAL SUCCESS)
+Config: `configs/ablation_phase2b_longer_multisample.json`
+- Phase 1.5 + 50 epochs + direction_num_samples=4
+- Result: rank_success=0.884, spread=0.559, dir=0.643, cosine success=74.22%
+- **Improved** over Phase 1.5 (60.55%→74.22%), but landscape has E=-16 spurious wells
+- Unconstrained MLP creates deep wells in unexplored regions of 1024D
+
+### Phase 2c: Spectral norm ✗ TOO RESTRICTIVE
+Config: `configs/ablation_phase2c_specnorm.json`
+- Phase 2b + norm_mode=spectral_norm
+- Result: spread=0.000, rank_success=0.000 — model can't learn ANY energy separation
+- σ_max(W)≤1 per layer → total Lipschitz≤1 → energy range ~0 for SONAR embeddings
+- ABANDONED: hard Lipschitz kills capacity
+
+### Phase 2d: Gradient penalty (CURRENT)
+Config: `configs/ablation_phase2d_gradpenalty.json`
+- Phase 2b + gradient_penalty (λ=0.1) — soft Lipschitz via ||∇E||² penalty
+- norm_mode=none (full capacity) + GP penalizes steep gradients at actor points (OOD)
+- [ ] Run 50 epochs
+- [ ] Check: spread > 0.3 (not killed like spectral_norm)
+- [ ] Check: energy range bounded (no E=-16 wells)
+- [ ] Check: cosine success ≥ 74% (not worse than Phase 2b)
 
 ### Phase 3: Contrastive Signal (DEFERRED)
-- InfoNCE — only if Phase 2b doesn't reach 80%+
+- InfoNCE — only if Phase 2d doesn't reach 80%+
 - Must check it doesn't flatten landscape like CQL did
 
 ### Phase 4: Score Matching (DEFERRED)
