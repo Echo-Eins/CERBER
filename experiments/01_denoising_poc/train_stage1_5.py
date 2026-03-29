@@ -1073,6 +1073,7 @@ def main() -> None:
             "support": 0.0,
             "knn_dist": 0.0,
             "energy_reg": 0.0,
+            "interp_gp": 0.0,
             "e_pos_mean": 0.0,
             "e_actor_mean": 0.0,
             "e_hard_mean": 0.0,
@@ -1136,6 +1137,7 @@ def main() -> None:
             direction_acc = 0.0
             inbatch_nce_acc = 0.0
             energy_reg_acc = 0.0
+            interp_gp_acc = 0.0
             e_pos_mean_acc = 0.0
             e_actor_mean_acc = 0.0
             e_hard_mean_acc = 0.0
@@ -1279,8 +1281,28 @@ def main() -> None:
                         # Energy scale regularization — penalize large absolute energies
                         l_energy_reg = torch.tensor(0.0, device=device)
                         if getattr(cfg, 'use_energy_reg', False):
-                            l_energy_reg = (e_pos ** 2).mean()
+                            if getattr(cfg, 'energy_reg_universal', False):
+                                # Universal: penalize all energies, not just clean
+                                w = getattr(cfg, 'energy_reg_actor_weight', 2.0)
+                                l_energy_reg = (
+                                    (e_pos ** 2).mean()
+                                    + w * (e_actor ** 2).mean()
+                                    + w * (e_hard ** 2).mean()
+                                ) / (1.0 + 2.0 * w)
+                            else:
+                                l_energy_reg = (e_pos ** 2).mean()
                             loss_c = loss_c + cfg.lambda_energy_reg * l_energy_reg
+
+                        # Interpolated gradient penalty (WGAN-GP style)
+                        l_interp_gp = torch.tensor(0.0, device=device)
+                        if getattr(cfg, 'use_interp_gp', False) and getattr(cfg, 'lambda_interp_gp', 0) > 0:
+                            alpha = torch.rand(q.shape[0], 1, device=device)
+                            interp = alpha * pos.detach() + (1.0 - alpha) * hard.detach()
+                            tn = cfg.langevin.target_norm
+                            if tn is not None:
+                                interp = F.normalize(interp, dim=-1) * tn
+                            l_interp_gp = gradient_penalty(crit, q, interp, sigma=sigma.detach())
+                            loss_c = loss_c + cfg.lambda_interp_gp * l_interp_gp
 
                     lc = float(loss_c.detach().item())
                     if (
@@ -1329,6 +1351,7 @@ def main() -> None:
                     direction_acc += float(l_direction.item())
                     inbatch_nce_acc += float(l_inbatch.item())
                     energy_reg_acc += float(l_energy_reg.item())
+                    interp_gp_acc += float(l_interp_gp.item())
                     rank_clean_actor = (e_pos < e_actor).float().mean().item()
                     rank_actor_hard = (e_actor < e_hard).float().mean().item()
                     rank_clean_hard = (e_pos < e_hard).float().mean().item()
@@ -1494,6 +1517,7 @@ def main() -> None:
             sums["support"] += float(l_support.item())
             sums["knn_dist"] += knn_dist_val
             sums["energy_reg"] += energy_reg_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["interp_gp"] += interp_gp_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["e_pos_mean"] += e_pos_mean_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["e_actor_mean"] += e_actor_mean_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["e_hard_mean"] += e_hard_mean_acc / float(max(1, cfg.critic_steps_per_actor))
@@ -1527,6 +1551,7 @@ def main() -> None:
                     f"ibnce={sums['inbatch_nce']/n_ok:.3f} "
                     f"supp={sums['support']/n_ok:.4f} "
                     f"ereg={sums['energy_reg']/n_ok:.3f} "
+                    f"igp={sums['interp_gp']/n_ok:.3f} "
                     f"E[c/a/h]={sums['e_pos_mean']/n_ok:.2f}/{sums['e_actor_mean']/n_ok:.2f}/{sums['e_hard_mean']/n_ok:.2f} "
                     f"spread={sums['e_spread']/n_ok:.3f} "
                     f"cos(p/a)={cos_pos_actor:.3f} "
@@ -1567,6 +1592,7 @@ def main() -> None:
                             "support": float(sums["support"] / n_ok),
                             "knn_dist": float(sums["knn_dist"] / n_ok),
                             "energy_reg": float(sums["energy_reg"] / n_ok),
+                            "interp_gp": float(sums["interp_gp"] / n_ok),
                             "e_pos_mean": float(sums["e_pos_mean"] / n_ok),
                             "e_actor_mean": float(sums["e_actor_mean"] / n_ok),
                             "e_hard_mean": float(sums["e_hard_mean"] / n_ok),

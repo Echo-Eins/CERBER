@@ -297,6 +297,11 @@ class Stage1_5Config:
     # Energy scale regularization (prevent unbounded energy growth)
     use_energy_reg: bool = True
     lambda_energy_reg: float = 0.01
+    energy_reg_universal: bool = False  # True = regularize e_pos, e_actor, e_hard; False = only e_pos
+    energy_reg_actor_weight: float = 2.0  # relative weight for actor/hard vs clean in universal mode
+    # Interpolated gradient penalty (WGAN-GP style) — prevents spurious wells in clean-to-hard corridor
+    use_interp_gp: bool = False
+    lambda_interp_gp: float = 0.1
 
     # Regularization params
     cql_noise_scale: float = 0.5
