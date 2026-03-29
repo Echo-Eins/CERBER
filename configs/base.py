@@ -53,6 +53,9 @@ class LangevinConfig:
     # Underdamped-specific (GAUL, SIAM JUQ 2025)
     underdamped_friction: float = 0.5
     underdamped_mass: float = 1.0
+    # Tamed gradient (Benko et al., AAAI 2025): grad / (1 + lr*||grad||)
+    # Safety net for non-Lipschitz architectures (norm_mode=none)
+    tamed: bool = False
     # Adaptive sigma schedule (NCSN-style annealing during Langevin)
     sigma_anneal: bool = True
     sigma_anneal_mode: str = "hybrid"  # "geometric", "adaptive", "hybrid"

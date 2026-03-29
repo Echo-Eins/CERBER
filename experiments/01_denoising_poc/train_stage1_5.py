@@ -667,6 +667,7 @@ def eval_model(
                     plateau_delta=cfg.langevin.plateau_delta,
                     tangent_noise=cfg.langevin_tangent_noise,
                     v_target=None,
+                    tamed=getattr(cfg.langevin, 'tamed', False),
                     **kw,
                 )
                 final = res.v_last if res.v_last is not None else res.v_final

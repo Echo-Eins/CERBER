@@ -106,6 +106,17 @@ def _tangent_projection(update: Tensor, v_current: Tensor) -> Tensor:
     return update - radial
 
 
+def _tame_gradient(grad: Tensor, lr: float) -> Tensor:
+    """Tamed gradient: grad / (1 + lr * ||grad||).
+
+    Bounds the effective step size even when ||grad|| is large,
+    guaranteeing convergence without Lipschitz architecture constraint.
+    Ref: Benko et al., "Kinetic Langevin MCMC without Lipschitz" (AAAI 2025).
+    """
+    grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    return grad / (1.0 + lr * grad_norm)
+
+
 # ============================================================
 # Method 1: Classic Overdamped Langevin
 # ============================================================
@@ -125,6 +136,7 @@ def langevin_dynamics(
     plateau_delta: float = 1e-4,
     v_target: Tensor | None = None,
     track_vectors: bool = False,
+    tamed: bool = False,
 ) -> LangevinResult:
     """
     Classic overdamped Langevin dynamics.
@@ -172,6 +184,9 @@ def langevin_dynamics(
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
         e_mean = energy.mean().item()
         trajectory.append(e_mean)
+
+        if tamed:
+            grad = _tame_gradient(grad, lr)
 
         if v_target is not None:
             cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
@@ -255,6 +270,7 @@ def pid_langevin_dynamics(
     kd: float = 0.1,
     integral_decay: float = 0.95,
     track_vectors: bool = False,
+    tamed: bool = False,
 ) -> LangevinResult:
     """
     PID-Controlled Langevin Dynamics (PIDLD).
@@ -320,6 +336,9 @@ def pid_langevin_dynamics(
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
         e_mean = energy.mean().item()
         trajectory.append(e_mean)
+
+        if tamed:
+            grad = _tame_gradient(grad, lr)
 
         if v_target is not None:
             cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
@@ -412,6 +431,7 @@ def underdamped_langevin_dynamics(
     friction: float = 0.5,
     mass: float = 1.0,
     track_vectors: bool = False,
+    tamed: bool = False,
 ) -> LangevinResult:
     """
     Underdamped (second-order) Langevin Dynamics.
@@ -482,6 +502,9 @@ def underdamped_langevin_dynamics(
         energy, grad = energy_fn.energy_and_grad(v_query, v_current)
         e_mean = energy.mean().item()
         trajectory.append(e_mean)
+
+        if tamed:
+            grad = _tame_gradient(grad, lr)
 
         if v_target is not None:
             cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
@@ -568,6 +591,7 @@ def run_langevin(
     plateau_delta: float = 1e-4,
     v_target: Tensor | None = None,
     track_vectors: bool = False,
+    tamed: bool = False,
     **method_kwargs,
 ) -> LangevinResult:
     """
@@ -590,6 +614,7 @@ def run_langevin(
         lr=lr, noise_scale=noise_scale, max_steps=max_steps,
         target_norm=target_norm, tangent_noise=tangent_noise, energy_threshold=energy_threshold,
         plateau_patience=plateau_patience, plateau_delta=plateau_delta,
+        tamed=tamed,
         v_target=v_target,
         track_vectors=track_vectors,
     )
