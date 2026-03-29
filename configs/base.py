@@ -253,6 +253,16 @@ class Stage1_5Config:
     clip_grad_norm: float = 1.0
     critic_steps_per_actor: int = 2
 
+    # LR scheduler: "none", "cosine_warmup", "cosine_warm_restarts"
+    lr_scheduler: str = "none"
+    lr_warmup_epochs: int = 5           # linear warmup from lr_warmup_start_factor to 1.0
+    lr_warmup_start_factor: float = 0.1 # initial LR multiplier during warmup
+    lr_min_factor: float = 0.01         # minimum LR as fraction of base LR
+    lr_restart_period: int = 10         # T_0 for CosineAnnealingWarmRestarts (epochs)
+    lr_restart_mult: int = 2            # T_mult — each restart period grows by this factor
+    lr_plateau_patience: int = 0        # 0=disabled; >0: boost LR if no improvement for N epochs
+    lr_plateau_boost: float = 3.0       # multiply LR by this factor on plateau detection
+
     # Loss weights
     lambda_mdsm: float = 1.0
     mdsm_warmup_epochs: int = 0  # Epochs of pure ranking before MDSM ramps in (0=disabled)

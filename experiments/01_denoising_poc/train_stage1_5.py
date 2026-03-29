@@ -912,6 +912,53 @@ def load_config(path: str) -> Stage1_5Config:
     return cfg
 
 
+def _build_lr_schedulers(
+    opt_c: torch.optim.Optimizer,
+    opt_a: torch.optim.Optimizer,
+    cfg,
+) -> tuple:
+    """Build LR schedulers for critic and actor optimizers.
+
+    Modes:
+      - "none": no scheduling (default)
+      - "cosine_warmup": linear warmup + cosine decay to lr_min_factor
+      - "cosine_warm_restarts": linear warmup + cosine annealing with warm restarts
+    """
+    mode = getattr(cfg, "lr_scheduler", "none")
+    if mode == "none":
+        return None, None
+
+    warmup = getattr(cfg, "lr_warmup_epochs", 5)
+    start_factor = getattr(cfg, "lr_warmup_start_factor", 0.1)
+    min_factor = getattr(cfg, "lr_min_factor", 0.01)
+    total = cfg.num_epochs
+
+    def _make(opt):
+        from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, CosineAnnealingWarmRestarts, SequentialLR
+        if warmup > 0:
+            warmup_sched = LinearLR(opt, start_factor=start_factor, end_factor=1.0, total_iters=warmup)
+        if mode == "cosine_warmup":
+            cos_epochs = max(1, total - warmup)
+            cos_sched = CosineAnnealingLR(opt, T_max=cos_epochs, eta_min=min_factor * opt.defaults["lr"])
+            if warmup > 0:
+                return SequentialLR(opt, schedulers=[warmup_sched, cos_sched], milestones=[warmup])
+            return cos_sched
+        elif mode == "cosine_warm_restarts":
+            t0 = getattr(cfg, "lr_restart_period", 10)
+            t_mult = getattr(cfg, "lr_restart_mult", 2)
+            cos_sched = CosineAnnealingWarmRestarts(opt, T_0=t0, T_mult=t_mult, eta_min=min_factor * opt.defaults["lr"])
+            if warmup > 0:
+                return SequentialLR(opt, schedulers=[warmup_sched, cos_sched], milestones=[warmup])
+            return cos_sched
+        else:
+            raise ValueError(f"Unknown lr_scheduler: {mode}")
+
+    sc = _make(opt_c)
+    sa = _make(opt_a)
+    print(f"  LR scheduler: {mode} (warmup={warmup}, min_factor={min_factor})")
+    return sc, sa
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/stage1_5_config.json")
@@ -989,11 +1036,16 @@ def main() -> None:
         groups.append({"params": list(prior_base.parameters()), "lr": cfg.prior_critic_lr})
     opt_c = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
     opt_a = torch.optim.AdamW(actor_base.parameters(), lr=cfg.actor_lr, weight_decay=cfg.weight_decay)
+
+    # LR scheduler
+    sched_c, sched_a = _build_lr_schedulers(opt_c, opt_a, cfg)
+
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     ckpt_dir, log_dir = Path(cfg.checkpoint_dir), Path(cfg.logs_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True); log_dir.mkdir(parents=True, exist_ok=True)
     stream_path = log_dir / "training_metrics.jsonl"
     best_score, start_epoch, global_step = float("-inf"), 0, 0
+    plateau_counter = 0  # for LR plateau boost
     if args.resume:
         ck = torch.load(args.resume, weights_only=False, map_location=device)
         c1_base.load_state_dict(migrate_bjorck_state_dict(c1_base, ck["critic1_state"]))
@@ -1002,7 +1054,12 @@ def main() -> None:
         if prior_base is not None and ck.get("prior_state") is not None:
             prior_base.load_state_dict(migrate_bjorck_state_dict(prior_base, ck["prior_state"]))
         opt_c.load_state_dict(ck["opt_c_state"]); opt_a.load_state_dict(ck["opt_a_state"]); scaler.load_state_dict(ck["scaler_state"])
+        if sched_c is not None and ck.get("sched_c_state") is not None:
+            sched_c.load_state_dict(ck["sched_c_state"])
+        if sched_a is not None and ck.get("sched_a_state") is not None:
+            sched_a.load_state_dict(ck["sched_a_state"])
         best_score, start_epoch, global_step = float(ck.get("best_score", best_score)), int(ck.get("epoch", 0)) + 1, int(ck.get("global_step", 0))
+        plateau_counter = int(ck.get("plateau_counter", 0))
     elif stream_path.exists():
         # Fresh run: avoid mixing with previous monitoring session.
         stream_path.write_text("", encoding="utf-8")
@@ -1640,11 +1697,34 @@ def main() -> None:
             best_score = score
         epoch_time_sec = float(time.perf_counter() - epoch_timer_start)
 
+        # LR scheduler step + plateau boost
+        if sched_c is not None:
+            sched_c.step()
+            sched_a.step()
+            cur_lr = opt_c.param_groups[0]["lr"]
+            print(f"  LR: {cur_lr:.6f}")
+        plat_patience = getattr(cfg, "lr_plateau_patience", 0)
+        if plat_patience > 0 and do_eval and score is not None:
+            if is_new_best:
+                plateau_counter = 0
+            else:
+                plateau_counter += 1
+            if plateau_counter >= plat_patience:
+                boost = getattr(cfg, "lr_plateau_boost", 3.0)
+                for opt in [opt_c, opt_a]:
+                    for pg in opt.param_groups:
+                        pg["lr"] = min(pg["lr"] * boost, cfg.critic_lr * 2.0)
+                plateau_counter = 0
+                print(f"  Plateau boost! LR *= {boost} → {opt_c.param_groups[0]['lr']:.6f}")
+
         payload = {
             "epoch": epoch_idx, "global_step": global_step, "best_score": best_score,
             "critic1_state": c1_base.state_dict(), "critic2_state": c2_base.state_dict(), "actor_state": actor_base.state_dict(),
             "prior_state": prior_base.state_dict() if prior_base is not None else None,
             "opt_c_state": opt_c.state_dict(), "opt_a_state": opt_a.state_dict(), "scaler_state": scaler.state_dict(),
+            "sched_c_state": sched_c.state_dict() if sched_c is not None else None,
+            "sched_a_state": sched_a.state_dict() if sched_a is not None else None,
+            "plateau_counter": plateau_counter,
             "train_metrics": train, "eval_metrics": eval_m, "config": asdict(cfg),
         }
         current_epoch_1b = int(epoch_idx + 1)
