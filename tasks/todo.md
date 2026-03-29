@@ -52,12 +52,53 @@ Config: `configs/ablation_phase2d_gradpenalty.json`
 - [ ] Check: energy range bounded (no E=-16 wells)
 - [ ] Check: cosine success ≥ 74% (not worse than Phase 2b)
 
-### Phase 3: Contrastive Signal (DEFERRED)
-- InfoNCE — only if Phase 2d doesn't reach 80%+
-- Must check it doesn't flatten landscape like CQL did
+### Phase 2e: Universal energy_reg + interpolated GP ✅ (PARTIAL)
+Config: `configs/ablation_phase2e_universal_ereg_igp.json`
+- Phase 2b + universal energy_reg + WGAN-GP style interpolated gradient penalty
+- direction_loss (λ=0.3) still enabled, mdsm still λ=0.0
+- PID and underdamped Langevin both tried → identical poor results
+- E[c/a/h] converges to ~0.98/0.99/0.99 — spread only ~0.017
+- Energy landscape INVERTED: minimum at noisy point, not clean target
+- Diagnosis: direction_loss teaches WHERE gradients point but not HOW MUCH
 
-### Phase 4: Score Matching (DEFERRED)
-- MDSM — last resort, unbounded MSE is dangerous
+### ROOT CAUSE ANALYSIS (2026-03-29)
+**`lambda_mdsm=0.0` in ALL configs — the gradient field was never trained.**
+
+Sign audit: ALL signs are mathematically correct:
+- Energy: lower = better ✅
+- Ranking: E(clean) < E(actor) < E(hard) ✅
+- Langevin: v ← v - lr·∇E (descent toward lower energy) ✅
+- DSM target: (noisy-clean)/σ² → ∇E should point clean→noisy → -∇E points noisy→clean ✅
+
+The problem is NOT a sign error. The problem is that **no loss ever trains the gradient field ∇E**:
+- Ranking loss: teaches energy VALUES at training points only
+- Energy regularization: pushes VALUES toward 0
+- Direction loss (Phase 1.5+): teaches gradient DIRECTION but not MAGNITUDE
+- **MDSM (λ=0.0)**: the ONLY loss that teaches both direction AND magnitude of ∇E — DISABLED
+
+Why noise_scale=0.5 "works": at high noise, the Langevin step is dominated by √(2lr·noise_scale)·ε (random walk), not the gradient. The ranking-trained basin around the clean point is enough for random search. At noise_scale=0.0002, dynamics is purely gradient-driven, and those gradients are untrained.
+
+### Phase 2f: Full MDSM (CURRENT)
+Config: `configs/ablation_phase2f_mdsm.json` (overdamped)
+Config: `configs/ablation_phase2f_mdsm_pid.json` (PID variant)
+- **lambda_mdsm=1.0**: enable denoising score matching with directional mode (cosine, bounded)
+- mdsm_directional=true: cosine similarity is safe (bounded [0,2]), not "unbounded MSE"
+- mdsm_magnitude_aux_weight=0.05: mild magnitude supervision via smooth_l1 on log norms
+- mdsm_warmup_epochs=3: let ranking stabilize before adding gradient supervision
+- norm_mode=orthonorm + groupsort: 1-Lipschitz architecture for natural gradient control
+- direction_loss REMOVED (mdsm subsumes it — both direction and magnitude)
+- Overdamped variant: lr=0.01, noise_scale=0.005
+- PID variant: lr=0.005, noise_scale=0.001
+- [ ] Run overdamped 50 epochs
+- [ ] Run PID 50 epochs
+- [ ] Check: mdsm loss decreasing (cos similarity increasing)
+- [ ] Check: energy landscape monotonic from clean→noisy (no spurious wells)
+- [ ] Check: cosine success > 74% (beat Phase 2b)
+- [ ] Compare overdamped vs PID with properly trained gradients
+
+### Phase 3: Contrastive Signal (DEFERRED)
+- InfoNCE — only if Phase 2f doesn't reach 85%+
+- Must check it doesn't flatten landscape like CQL did
 
 ### Kill Criteria (abandon approach if)
 - Phase 1 ranking breaks (rank_success < 0.3) → weights too high, halve them

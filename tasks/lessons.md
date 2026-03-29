@@ -1,5 +1,28 @@
 # Lessons
 
+## 2026-03-29 - CRITICAL: Always enable gradient field supervision (MDSM) for Langevin dynamics
+
+### Pattern
+If Langevin dynamics follows -∇E, the gradient field ∇E MUST be explicitly trained. Ranking loss trains energy VALUES at specific training points but says NOTHING about the gradient field between them. Direction loss is a partial fix (teaches direction but not magnitude). Only full MDSM (denoising score matching) trains both direction and magnitude of ∇E.
+
+### The Bug
+`lambda_mdsm=0.0` was set in ALL configs across ALL phases. The gradient field was never trained. Langevin dynamics navigated an untrained gradient landscape. Changing the Langevin variant (overdamped, PID, underdamped) made zero difference because the underlying gradient field was the same untrained garbage.
+
+### Root Cause of Confusion
+- MDSM was labeled "last resort, unbounded MSE is dangerous" in the plan
+- But directional mode (cosine similarity) IS bounded [0,2] — the danger only applies to L2 DSM
+- This fear caused MDSM to be deferred indefinitely while other losses were tried
+- Direction loss was treated as sufficient, but it only teaches direction, not magnitude
+
+### Rule
+**Never run Langevin inference without lambda_mdsm > 0 (or equivalent gradient field supervision).** Ranking/NCE/CQL/energy_reg are all VALUE-based losses — they cannot teach the gradient field. If the inference method uses ∇E, the training MUST include a loss on ∇E.
+
+### Diagnostic Signs
+- E[c/a/h] nearly identical (spread < 0.05) despite ranking loss converging
+- Langevin goes AWAY from clean target (inverted landscape)
+- noise_scale=0.5 works but noise_scale=0.0002 doesn't (random walk vs gradient-driven)
+- PID and underdamped produce identical results (dynamics variant doesn't matter if gradients are untrained)
+
 ## 2026-03-29 - Removing ALL energy_reg causes scale inflation → crash (Phase 2f v1)
 
 ### Pattern
