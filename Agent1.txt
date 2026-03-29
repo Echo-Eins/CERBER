@@ -1,0 +1,727 @@
+Первый агент нашел следующее:
+
+Perfect! Now I have enough information to provide a comprehensive analysis. Let me create a detailed report of the issues.
+
+## COMPREHENSIVE ANALYSIS: CERBER TRAINING FAILURE ROOT CAUSES
+
+
+
+Based on my thorough review of the training script, energy model, actor model, loss functions, and configuration, I've identified **multiple critical design conflicts** that are causing your training failure. Here's the complete diagnostic:
+
+---
+
+## **SYMPTOM SUMMARY**
+
+- **rank_success at 5%** (random chance): Ranking triplet loss failing
+
+- **rank(c<a) falling**: E_actor becoming lower than E_clean (violating the ordering)
+
+- **ereg exploding**: Energy regularization 0.03 → 2.15 (uncontrolled energy magnitudes)
+
+- **Inference cosine collapsing**: 0.57 → 0.04 (energy landscape misaligned with targets)
+
+- **Energy landscape has well but misaligned**: Critic learning but not pointing toward correct targets
+
+---
+
+## **ROOT CAUSE 1: CATASTROPHIC LOSS FUNCTION CONFLICTS**
+
+### The Core Problem
+
+Your critic loss has **multiple competing objectives that directly contradict each other**:
+
+```python
+
+loss_c = (
+
+    cfg.lambda_mdsm * mdsm              # Directional gradient matching
+
+    + cfg.lambda_rank * rank             # Triplet energy ordering
+
+    + cfg.lambda_nce * nce               # Contrastive (energy as distance metric)
+
+    + cfg.lambda_cql * cql               # Q-learning regularization
+
+    + cfg.lambda_clean_min * l_clean_min # E_clean < E_actor constraint
+
+    + cfg.lambda_direction * l_direction # Gradient direction matching (redundant to MDSM)
+
+    + cfg.lambda_inbatch_nce * l_inbatch # In-batch cross-negatives
+
+    + cfg.lambda_energy_reg * l_energy_reg  # ENERGY MAGNITUDE PENALTY
+
+)
+
+```
+
+**The conflicts:**
+
+1. **MDSM vs RANK**: MDSM trains the energy gradient: `∇_v E(q, v, σ) ≈ (noisy - clean) / σ²`. This is **first-order gradient matching**. But RANK enforces absolute energy ordering: `E(clean) < E(actor) < E(hard)`. These can conflict because:
+
+   - MDSM only cares about gradient **direction** and magnitude at noisy points
+
+   - RANK cares about absolute energy values at clean points
+
+   - The energy function can have zero gradient at certain points while still failing ranking
+
+2. **CLEAN_MIN_PENALTY vs RANK**: 
+
+   - `clean_min_penalty = relu(E_clean - E_actor + margin)` ← forces E_clean < E_actor
+
+   - But `rank` loss includes: `relu(E_pos - E_actor + margin)` ← same thing
+
+   - **You have duplicate constraints fighting each other with different weight schedules**
+
+3. **RANK + ENERGY_REG (THE KILLER)**:
+
+   ```python
+
+   l_energy_reg = (e_pos ** 2).mean()  # Line 1249
+
+   ```
+
+   This penalizes **all positive energies** without discrimination. Combined with rank loss:
+
+   - RANK wants: E_clean ~ -margin, E_actor ~ 0, E_hard ~ +margin
+
+   - ENERGY_REG wants: ALL energies → 0
+
+   - **These directly oppose each other** → energy scales collapse → gradient magnitudes collapse
+
+4. **DIRECTION (redundant) vs MDSM**:
+
+   - Both compute `∇_v E` at noisy points
+
+   - Both measure cosine similarity to target direction
+
+   - **You're doing gradient supervision twice** → conflicting signal back-propagation
+
+---
+
+## **ROOT CAUSE 2: ENERGY REGULARIZATION DESIGN ERROR**
+
+Lines 1247-1250 in train_stage1_5.py:
+
+```python
+
+l_energy_reg = torch.tensor(0.0, device=device)
+
+if getattr(cfg, 'use_energy_reg', False):
+
+    l_energy_reg = (e_pos ** 2).mean()  # ← L2 penalty on E_pos
+
+    loss_c = loss_c + cfg.lambda_energy_reg * l_energy_reg
+
+```
+
+**The problem:**
+
+- You penalize `E_pos²` uniformly
+
+- This prevents the energy from **ever growing large enough to create meaningful rankings**
+
+- With `lambda_energy_reg=0.01`, after normalization by batch size:
+
+  - If you want `rank_margin = 0.2` between {E_clean, E_actor, E_hard}
+
+  - But `energy_reg` punishes anything > √(0.01/batch_size) ≈ √(0.01/32) ≈ 0.018
+
+  - **The penalty completely dominates ranking margins!**
+
+**Why energy explodes from 0.03 → 2.15:**
+
+- Initially, energy scale is tiny (< 0.1), energy_reg is near zero
+
+- Ranking loss pushes for larger separations, energy_reg initially allows it
+
+- Once E values exceed ~0.2, energy_reg penalty becomes huge
+
+- Gradient flow oscillates between "grow energy for ranking" and "shrink energy for reg"
+
+- This causes the explosive growth you see
+
+---
+
+## **ROOT CAUSE 3: RANK LOSS NORMALIZATION MISMATCH**
+
+Lines 283-303 in train_stage1_5.py:
+
+```python
+
+def normalize_triplet_energies(
+
+    e_pos, e_actor, e_hard,
+
+    enabled: bool,
+
+    std_floor: float,
+
+) -> tuple[Tensor, Tensor, Tensor]:
+
+    if not enabled:
+
+        return e_pos, e_actor, e_hard
+
+    with torch.no_grad():
+
+        stacked = torch.cat([e_pos, e_actor, e_hard], dim=0)
+
+        mu = stacked.mean()
+
+        std = stacked.std(unbiased=False).clamp(min=float(std_floor))
+
+    mu = mu.detach()
+
+    std = std.detach()
+
+    return (e_pos - mu) / std, (e_actor - mu) / std, (e_hard - mu) / std
+
+```
+
+**The problem:**
+
+- You normalize by **detached batch statistics** (no gradient flow through normalization)
+
+- This is mathematically sound for making margins scale-invariant
+
+- BUT: Combined with energy_reg, it creates a **moving target problem**:
+
+  - Energy_reg tries to minimize absolute magnitudes
+
+  - Normalization tries to center energies at 0 with unit variance
+
+  - Ranking margins are then relative to this centered distribution
+
+  - **When energy_reg shrinks all energies, the normalized ranking margins also shrink**
+
+  - This creates positive feedback: shrinking energies → tighter margins → rank loss increases → but energy_reg increases too
+
+---
+
+## **ROOT CAUSE 4: MDSM LOSS GRADIENT DIRECTION MISMATCH**
+
+Line 252 in train_stage1_5.py:
+
+```python
+
+tgt = (noisy.detach() - pos) / sigma_eff_sq
+
+```
+
+The target score points from `clean → noisy`. For energy-based denoising via gradient descent:
+
+```
+
+v_next = v - α · ∇_v E(q, v, σ)
+
+```
+
+This is **uphill in energy** (v moves opposite to gradient). So:
+
+- Target direction: (noisy - clean) — pointing AWAY from clean
+
+- Actual gradient: ∇_v E — whatever the network learns
+
+- **The network is trained to make gradients point in a direction that moves AWAY from clean**
+
+For convergence to clean, you need:
+
+```
+
+v_next = v - α · ∇_v E  →  clean
+
+```
+
+This requires:
+
+```
+
+∇_v E(q, noisy, σ) ∝ (noisy - clean)  [points away from clean]
+
+```
+
+BUT then during inference with Langevin:
+
+```
+
+v_next = v - α · ∇_v E(q, v, σ)
+
+```
+
+This moves v in direction `-(noisy - clean)`, which is **toward clean** ✓
+
+**The architectural issue:** This only works if the energy landscape is convex-like around the noisy point. With your other losses fighting the gradient direction, the energy landscape becomes multi-modal or non-convex, breaking the assumption.
+
+---
+
+## **ROOT CAUSE 5: ACTOR vs CRITIC TRAINING TIMING**
+
+Lines 1117-1316 in train_stage1_5.py:
+
+```python
+
+for cstep in range(max(1, cfg.critic_steps_per_actor)):  # 2 steps
+
+    # Train critic on e_pos, e_actor, e_hard
+
+    # This samples sigma, computes actor output a_init
+
+    ...
+
+# THEN train actor separately
+
+for _ in range(actor steps):
+
+    # Train actor on DIFFERENT sigma_a sample
+
+    # Sees energy landscape from same critic
+
+```
+
+**The problem:**
+
+- **Critic trains on actor output from stale actor** (lines 1124-1131 sample sigma and run actor.predict_step with no_grad)
+
+- Then **actor trains on newly sampled sigma** (line 1319)
+
+- The critic never sees what the actor actually produces after its gradient step
+
+- This breaks the tightness of the actor-critic coupling
+
+---
+
+## **ROOT CAUSE 6: ENERGY FUNCTION ARCHITECTURE LIMITATIONS**
+
+From energy.py lines 177-208:
+
+```python
+
+def forward(self, v_query, v_candidate, sigma=None) -> Tensor:
+
+    # Concatenate features
+
+    x = torch.cat([v_query, v_candidate, diff, prod, sigma_emb], dim=-1)
+
+    
+
+    # MLP with 1-Lipschitz layers
+
+    scale = torch.exp(self.log_energy_scale.clamp(min=-8.0, max=8.0))
+
+    raw = scale * self.net(x).squeeze(-1)
+
+    
+
+    if self.energy_output_clamp is not None:
+
+        raw = raw.clamp(min=-clip, max=clip)
+
+    return raw
+
+```
+
+**The architectural issue:**
+
+1. **4d + σ_embed features** → the network sees 1024×4 + 8 = 4104 input features
+
+2. **Hidden layers [2048, 1024, 512]** — decreasing capacity with depth
+
+3. **Orthonormal layers** — each layer has σ_max(W) = 1, so gradients cannot amplify through depth
+
+4. **GroupSort activation** — further constrains gradient flow (1-Lipschitz by construction)
+
+5. **Result:** The MLP can only represent functions with bounded Lipschitz constant, making it **impossible to learn sharp energy wells with fast transitions**
+
+For your ranking margins (0.1 - 0.3), you need energy to change quickly across the embedding space. With 1-Lipschitz constraints throughout, the energy function cannot change fast enough.
+
+---
+
+## **ROOT CAUSE 7: SIGMA SAMPLING DURING TRAINING VS INFERENCE MISMATCH**
+
+Line 95-103 in train_stage1_5.py:
+
+```python
+
+def sample_sigma(cfg: Stage1_5Config, batch: int, device: torch.device) -> torch.Tensor:
+
+    if cfg.sigma_sampling == "loguniform":
+
+        lo, hi = math.log(cfg.sigma_curriculum_start), math.log(cfg.sigma_curriculum_end)
+
+        return (torch.rand(batch, 1, device=device) * (hi - lo) + lo).exp()
+
+```
+
+Config:
+
+```json
+
+"sigma_curriculum_start": 0.01,
+
+"sigma_curriculum_end": 0.5,
+
+```
+
+**The problem:**
+
+- Training: σ sampled from [0.01, 0.5]
+
+- **Inference:** Actor runs 1-step from noisy point at noise scale σ_eval ∈ [0.05, 0.3]
+
+- The actor **is trained on much larger noise scales (up to 0.5)** than it sees at inference
+
+- This distribution mismatch causes **poor generalization** — actor doesn't know how to handle low-noise regime
+
+---
+
+## **ROOT CAUSE 8: TWIN CRITIC AGGREGATION OBSCURES FAILURES**
+
+Lines 489-522 in train_stage1_5.py:
+
+```python
+
+class TwinHybridEnergy:
+
+    def cond(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None):
+
+        e1, e2 = self.c1(q, v, sigma=sigma), self.c2(q, v, sigma=sigma)
+
+        if self.aggregate == "softmax":
+
+            tau = max(1e-6, float(self.softmax_temperature))
+
+            stacked = torch.stack([e1, e2], dim=0)
+
+            return tau * torch.logsumexp(stacked / tau, dim=0)  # ← log-sum-exp
+
+        ...
+
+```
+
+**The problem:**
+
+- **Softmax aggregation:** `E_twin = τ · logsumexp([E1, E2] / τ)` with τ=0.1
+
+- For **tight temperature** (τ=0.1): `logsumexp([e1, e2]/0.1) ≈ max(e1, e2) + small correction`
+
+- **This turns energy ranking into MAX operation** — the bigger of the two energies dominates
+
+- When critic 1 outputs -0.3 and critic 2 outputs 0.2, the twin uses 0.2
+
+- One critic can learn garbage while the other maintains learning ✓ (robustness), BUT
+
+- **The max operation is non-smooth, creating gradient flow discontinuities**
+
+- Makes it harder for gradients to flow meaningfully through the softmax aggregation
+
+---
+
+## **ROOT CAUSE 9: COSINE SIMILARITY METRIC COLLAPSE**
+
+Symptom: "Inference cosine collapsing: 0.57 → 0.04"
+
+This happens because:
+
+1. **Energy landscape becomes flat** (due to conflicts above) → all energies nearly equal
+
+2. **Actor can't distinguish which direction to move** → outputs move in random directions
+
+3. **Endpoint cosine similarity drops catastrophically**
+
+The inference process (lines 620-667 in train_stage1_5.py):
+
+```python
+
+# Start with noisy seed
+
+v = noisy
+
+for _ in range(max(1, cfg.actor_eval_steps)):  # cfg.actor_eval_steps=1
+
+    v, _ = actor.predict_step(...)  # Single step from actor
+
+# Then run Langevin for refinement
+
+res = run_langevin(..., max_steps=20)
+
+final = res.v_last
+
+```
+
+**Why it fails:**
+
+- If **energy landscape is flat** (energy_reg forcing all E → 0), Langevin gradient is ≈0
+
+- Actor's single step has no energy signal to follow
+
+- Langevin refinement has near-zero gradients → v barely moves
+
+- **Result: Final output stays near the noisy initialization, cosine drops**
+
+---
+
+## **CONFIGURATION ANALYSIS**
+
+Problematic hyperparameters in `stage1_5_config.json`:
+
+| Parameter | Value | Issue |
+
+|-----------|-------|-------|
+
+| `lambda_energy_reg` | 0.01 | Too large — dominates ranking signal |
+
+| `lambda_clean_min` | 0.3 | Redundant with ranking loss, creates oscillation |
+
+| `lambda_direction` | 0.15 | Redundant with MDSM (gradient supervision twice) |
+
+| `sigma_curriculum_end` | 0.5 | Too large — training on σ∉[0.05, 0.3] eval range |
+
+| `critic_margin_clean_actor` | 0.5 | Too large relative to energy scale |
+
+| `critic_margin_actor_noisy` | 0.3 | Too large |
+
+| `twin_softmax_temperature` | 0.10 | Too tight — creates max-like behavior |
+
+| `mdsm_directional` | true | ✓ Correct, but conflicts with energy_reg |
+
+| `rank_normalize_by_std` | true | ✓ Mathematically sound, but conflicts with energy_reg |
+
+---
+
+## **THE FULL PICTURE: HOW TRAINING FAILS**
+
+```
+
+Epoch 1-5:
+
+  Energy scales small (~0.01-0.1)
+
+  Energy_reg penalty is tiny → doesn't interfere
+
+  MDSM + RANK losses push energies larger
+
+  rank_success ≈ 30-50% ✓
+
+Epoch 6-15:
+
+  Energies grow to ~0.2-0.4
+
+  Energy_reg penalty now significant
+
+  Normalization re-centers: (E - μ)/σ
+
+  
+
+  EQUILIBRIUM FIGHT:
+
+    - RANK wants: E_c ≈ -0.2, E_a ≈ 0, E_h ≈ +0.2
+
+    - ENERGY_REG wants: all E ≈ 0
+
+    - Normalization: (E - mean(E))/std(E) ≈ [-1, 0, +1]
+
+    
+
+  Gradient updates oscillate between:
+
+    - "Grow energies" (ranking loss grad)
+
+    - "Shrink energies" (energy_reg grad)
+
+    
+
+  Result: Chaotic loss landscape, unstable training
+
+Epoch 16+:
+
+  Energy magnitude explodes: 0.03 → 2.15
+
+  OR energy scale collapses to near-zero
+
+  rank_success → 5% (random)
+
+  
+
+  This is because:
+
+    - When E values explode, energy_reg becomes huge (E² term)
+
+    - Gradient clipping (norm=1.0) activates, suppressing all updates
+
+    - Training becomes gridlocked
+
+Inference:
+
+  Energy landscape is either:
+
+    - Too flat (energy_reg won) → all E ≈ 0 → no gradient to follow
+
+    - Chaotic/non-convex → Langevin has no coherent basin
+
+  
+
+  Result:
+
+    - Actor's single step has no signal → moves randomly
+
+    - Langevin refines with near-zero gradients
+
+    - Final output far from clean target
+
+    - Cosine similarity: 0.57 → 0.04 (drops to random)
+
+```
+
+---
+
+## **WHAT NEEDS TO CHANGE**
+
+### **CRITICAL FIXES (Must Do):**
+
+1. **Remove or drastically reduce `lambda_energy_reg`**
+
+   - Change from `0.01` to `0.0` (disable entirely)
+
+   - Energy should be free to scale naturally
+
+   - Replace with **SCALE-FREE ranking losses** (use normalized margins)
+
+2. **Remove `lambda_direction` loss** (0.15 → 0.0)
+
+   - MDSM already supervises gradient direction
+
+   - This is redundant and creates conflicting gradients
+
+   - Keep only MDSM for gradient matching
+
+3. **Reduce or remove `lambda_clean_min`** (0.3 → 0.05)
+
+   - This is already enforced by ranking loss
+
+   - Keep at low weight as a tiebreaker, not primary objective
+
+4. **Fix sigma sampling to match inference range:**
+
+   ```json
+
+   "sigma_curriculum_start": 0.02,
+
+   "sigma_curriculum_end": 0.30,  // Match eval range
+
+   ```
+
+5. **Reduce ranking margins:**
+
+   ```json
+
+   "critic_margin_clean_actor": 0.1,  // Was 0.5
+
+   "critic_margin_actor_noisy": 0.05,  // Was 0.3
+
+   "critic_margin_clean_noisy": 0.15,  // Was 0.8
+
+   ```
+
+### **IMPORTANT IMPROVEMENTS (Should Do):**
+
+6. **Reduce `twin_softmax_temperature`** from 0.10 → 0.3 or use "mean" aggregation
+
+   - Less aggressive smoothing
+
+   - Allows both critics to learn independently
+
+7. **Increase actor steps in training:**
+
+   ```python
+
+   actor_eval_steps: 5  // Was 1
+
+   actor_step_size: 0.3  // Was 1.0 (too aggressive)
+
+   ```
+
+8. **Better actor-critic synchronization:**
+
+   - Critic should see SAME actor output it trains on
+
+   - Current code trains critic on stale actor
+
+9. **Ablate to core losses:**
+
+   - Start with ONLY: MDSM + RANK
+
+   - Add other losses one at a time
+
+   - Verify each improves performance
+
+### **DIAGNOSTIC CHANGES (For Debugging):**
+
+10. **Disable energy clamping initially:**
+
+    ```python
+
+    # In energy.py initialization:
+
+    energy_output_clamp=None  # Was 100.0
+
+    ```
+
+    This lets you see the true energy scales being learned
+
+11. **Log energy statistics per batch:**
+
+    ```python
+
+    e_pos_stats = {
+
+        "mean": float(e_pos.mean()),
+
+        "std": float(e_pos.std()),
+
+        "min": float(e_pos.min()),
+
+        "max": float(e_pos.max()),
+
+    }
+
+    ```
+
+12. **Separate critic evaluation from training losses:**
+
+    - Track rank metrics (c<a, a<h, c<h) independently
+
+    - Verify normalization isn't hiding failures
+
+---
+
+## **FILE LOCATIONS FOR FIXES**
+
+1. **Config changes:** `/home/user/CERBER/configs/stage1_5_config.json`
+
+   - Lines for lambda weights, margins, sigma ranges
+
+2. **Training loop:** `/home/user/CERBER/experiments/01_denoising_poc/train_stage1_5.py`
+
+   - Lines 1192-1244: Loss aggregation (remove direction, clean_min, energy_reg)
+
+   - Lines 1247-1250: Energy regularization (DELETE)
+
+   - Lines 95-103: Sigma sampling (adjust range)
+
+3. **Energy model:** `/home/user/CERBER/cebcm/models/energy.py`
+
+   - Lines 205-207: Remove clamping
+
+   - Line 124: Log-scale factor (may need initialization adjustment)
+
+---
+
+## **SUMMARY**
+
+Your training is failing due to **five conflicting loss terms** (MDSM, RANK, CLEAN_MIN, DIRECTION, ENERGY_REG) that have **antagonistic gradients**. The energy regularization is the worst offender — it forces energies toward zero while ranking losses need large separations. This creates an unstable equilibrium where energy scales oscillate chaotically, eventually exploding or collapsing. The inference phase then fails because the energy landscape is either flat (no gradient signal) or non-convex (Langevin diverges).
+
+**The fix is ruthless simplification:** Remove energy_reg and direction loss, reduce margins, align sigma ranges, and focus on MDSM + RANK as the core objective. Only add auxiliary losses after the primary signal stabilizes.
+
+
+
+И я с этим согласен. Необходима переработка и повторный diagnostic agentic loop.

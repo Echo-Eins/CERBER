@@ -98,7 +98,7 @@ class LatentDenoiseActor(nn.Module):
             return make_cayley_linear(in_dim, out_dim, bias=True)
         if norm_mode == "spectral_norm":
             linear = nn.Linear(in_dim, out_dim)
-            return nn.utils.parametrizations.spectral_norm(linear)
+            return nn.utils.parametrizations.spectral_norm(linear, n_power_iterations=5)
         return nn.Linear(in_dim, out_dim)
 
     @staticmethod
