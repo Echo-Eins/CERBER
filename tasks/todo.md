@@ -78,32 +78,135 @@ The problem is NOT a sign error. The problem is that **no loss ever trains the g
 
 Why noise_scale=0.5 "works": at high noise, the Langevin step is dominated by √(2lr·noise_scale)·ε (random walk), not the gradient. The ranking-trained basin around the clean point is enough for random search. At noise_scale=0.0002, dynamics is purely gradient-driven, and those gradients are untrained.
 
-### Phase 2f: Full MDSM (CURRENT)
+### Phase 2f: Full MDSM ✗ FAILED — ARCHITECTURE KILLED CAPACITY
 Config: `configs/ablation_phase2f_mdsm.json` (overdamped)
-Config: `configs/ablation_phase2f_mdsm_pid.json` (PID variant)
-- **lambda_mdsm=1.0**: enable denoising score matching with directional mode (cosine, bounded)
-- mdsm_directional=true: cosine similarity is safe (bounded [0,2]), not "unbounded MSE"
-- mdsm_magnitude_aux_weight=0.05: mild magnitude supervision via smooth_l1 on log norms
-- mdsm_warmup_epochs=3: let ranking stabilize before adding gradient supervision
-- norm_mode=orthonorm + groupsort: 1-Lipschitz architecture for natural gradient control
-- direction_loss REMOVED (mdsm subsumes it — both direction and magnitude)
-- Overdamped variant: lr=0.01, noise_scale=0.005
-- PID variant: lr=0.005, noise_scale=0.001
-- [ ] Run overdamped 50 epochs
-- [ ] Run PID 50 epochs
-- [ ] Check: mdsm loss decreasing (cos similarity increasing)
-- [ ] Check: energy landscape monotonic from clean→noisy (no spurious wells)
-- [ ] Check: cosine success > 74% (beat Phase 2b)
-- [ ] Compare overdamped vs PID with properly trained gradients
+- **lambda_mdsm=1.0** + norm_mode=orthonorm + activation=groupsort
+- **RESULT**: rank_success=0.001, spread=-0.001, E[c/a/h]=0.12/0.18/0.12, energy range [0.23, 0.36] = **only 0.13**
+- MDSM loss stuck at ~0.9 (barely above random cosine), ranking saturated at rank(c<a)=0.999 (degenerate)
+- **Root cause**: NOT MDSM itself, but **4 simultaneous changes** from Phase 2b:
+  1. norm_mode: none → orthonorm (1-Lipschitz crushed capacity)
+  2. activation: silu → groupsort (piecewise-constant ≠ smooth landscape)
+  3. critic_lr: 0.001 → 0.0003 (3× slower learning)
+  4. direction_loss: removed (replaced by untested MDSM on crippled architecture)
+  5. energy_reg_universal: false → true (**known from Phase 2e lesson to flatten landscape!**)
+- Phase 2b had spread=0.56, energy range [-0.03, 0.53] = 0.56 — **4× more landscape depth**
+- **Violated core principle**: change ONE thing at a time
 
-### Phase 3: Contrastive Signal (DEFERRED)
-- InfoNCE — only if Phase 2f doesn't reach 85%+
-- Must check it doesn't flatten landscape like CQL did
+### CORRECTED ROOT CAUSE ANALYSIS (2026-03-29, post Phase 2f)
 
-### Kill Criteria (abandon approach if)
-- Phase 1 ranking breaks (rank_success < 0.3) → weights too high, halve them
-- Phase 1+2 inference still 0% → fundamental architecture problem
-- Any phase: spread collapses to 0 → loss conflict, debug
+**The REAL problem is not "no gradient field supervision". It's "gradient field not smooth BETWEEN training points".**
+
+Evidence:
+- Phase 2b achieved rank_success=88%, spread=0.56, dir=0.643 (direction loss partially learned)
+- But strict inference: mean_cos_success=19%, cos_improvement at noise=0.05: **-0.107** (WORSE)
+- At noise=0.3: cos_improvement=+0.003 (barely positive), 53% success
+- This means: **at fine noise (where Langevin is deterministic), gradients are unreliable**
+- The unconstrained MLP creates correct values at training points but wild gradients in between
+- Spurious energy wells (E=-16) confirmed in Phase 2b analysis
+
+**Why MDSM was the wrong diagnosis:**
+- direction_loss already trains gradient DIRECTION at sampled noisy points → 64% cosine loss (dir=0.643)
+- MDSM adds magnitude supervision, but magnitude alone doesn't fix inter-point smoothness
+- The real gap: gradient field quality between training distribution points → need either:
+  a) Smoother architecture (soft Lipschitz, not hard 1-Lipschitz)
+  b) Denser gradient supervision (more points, wider noise coverage)
+  c) Fundamentally different inference approach
+
+---
+
+## CORRECTED PLAN: Phase 2g+ (2026-03-29)
+
+### Strategy: Fix inference, not training (training is already 88% rank success)
+
+Phase 2b TRAINS well but INFERS poorly. The gradient field between training
+points is chaotic for the unconstrained MLP. Three orthogonal approaches:
+
+### Phase 2g: MDSM on Phase 2b Architecture (ONE CHANGE ONLY)
+Config: `configs/ablation_phase2g_mdsm_on_2b.json`
+- **Start from Phase 2b EXACTLY** (norm_mode=none, silu, lr=0.001, direction_loss=0.3)
+- **ONLY addition**: lambda_mdsm=0.3 (mild, NOT 1.0), mdsm_directional=true
+- Keep direction_loss active (complementary — simpler target for direction, MDSM for magnitude)
+- mdsm_warmup_epochs=5, mdsm_magnitude_aux_weight=0.1
+- energy_reg_universal=false (LESSON: universal kills ranking!)
+- Tamed Langevin for inference safety (no Lipschitz guarantee):
+  `grad_tamed = grad / (1 + lr * ||grad||)`
+- **Hypothesis**: MDSM adds magnitude supervision WITHOUT killing capacity
+- [ ] Create config
+- [ ] Implement Tamed Langevin in langevin.py
+- [ ] Run 50 epochs
+- [ ] Check: spread ≥ 0.4 (not killed), dir ≤ 0.65 (improved)
+- [ ] Check: cosine_success at noise=0.1 > 19% (beat Phase 2b)
+- [ ] If success: run 80 epochs with cosine LR schedule
+
+### Phase 2h: Soft Lipschitz (weight decay + GP at OOD only)
+Config: `configs/ablation_phase2h_soft_lip.json`
+- Start from Phase 2b architecture (norm_mode=none, silu)
+- Increase weight_decay: 0.01 → 0.05 (smoother weights → smoother gradients)
+- Add mild gradient penalty at RANDOM points (NOT on clean→noisy corridor):
+  lambda_gp=0.05, GP sampled at random perturbations of actor outputs
+- Keep direction_loss + clean_min + energy_reg (clean-only)
+- **Hypothesis**: soft Lipschitz via weight decay smooths gradient field without killing capacity
+- **Key difference from Phase 2d**: GP at random OOD points, not along training corridor
+- [ ] Create config
+- [ ] Run 50 epochs
+- [ ] Check: spread ≥ 0.4, no spurious wells (E < -5)
+- [ ] Check: cosine_success at noise=0.1 > 19%
+
+### Phase 2i: Dual-Critic (Angular + Radial Decomposition) ★ NOVEL
+- **Architecture**: two separate energy critics trained on different aspects
+- **Critic_ang (angular)**: operates on normalized vectors, learns angular energy
+  - Input: (q/||q||, x/||x||) → scalar E_ang
+  - Loss: ranking on angular proximity + direction_loss in tangent space
+  - Learns: which direction on the hypersphere to move
+- **Critic_rad (radial)**: operates on norms/distances, learns magnitude energy
+  - Input: (||x||, ||x-q||, cos(x,q)) → scalar E_rad
+  - Loss: ranking on distance-to-target + magnitude supervision
+  - Learns: how far to move (step size)
+- **Inference**: Langevin uses combined gradient:
+  - Angular step: project -∇E_ang onto tangent plane of sphere
+  - Radial step: -∇E_rad along radial direction
+  - Separate step sizes for each (angular and radial dynamics have different scales)
+- **Why this might work**:
+  - Each critic has a SIMPLER task → easier to train
+  - No conflict between angular and radial objectives
+  - Angular critic naturally Lipschitz on compact sphere → better gradient field
+  - Radial critic is 1D → trivially smooth
+  - Decomposes 1024D navigation into two well-conditioned subproblems
+- [ ] Design architecture (new model classes)
+- [ ] Implement training loop changes
+- [ ] Create config
+- [ ] Run 50 epochs
+- [ ] Compare gradient field smoothness vs single-critic
+
+### Phase 2j: Score Distillation Network (if 2g-2i insufficient)
+- Train energy critic as Phase 2b (ranking, direction_loss, clean_min)
+- Add separate lightweight score network s_θ(x) ≈ -∇E(x)
+- s_θ trained with L2 regression: ||s_θ(x) - sg(-∇E(x))||² at noisy points
+  (sg = stop_gradient — distill FROM critic, don't backprop through)
+- At inference: use s_θ(x) for Langevin, not autograd ∇E
+- **Why**: s_θ is smooth MLP trained explicitly to predict gradients → naturally interpolates
+- **Bonus**: no create_graph at inference → faster inference
+
+### Phase 2k: Flow Matching Hybrid (EXPLORATORY)
+- Instead of energy-based Langevin, train conditional velocity field v(x_t, t)
+- v = (x_clean - x_noisy) / (1 - t) for t ∈ [0, 1]
+- ODE integration: dx/dt = v(x_t, t) — no noise, deterministic path
+- Keep energy critic for quality scoring/reranking, not for navigation
+- **Radical departure**: separates SCORING (energy) from NAVIGATION (flow)
+- Only try if energy-gradient approaches plateau
+
+### Kill Criteria (updated)
+- Phase 2g/2h: if spread < 0.3 or cosine_success worse than Phase 2b → architecture issue, try 2i
+- Phase 2i: if dual-critic training unstable for 10 epochs → decomposition doesn't work, try 2j
+- All phases: if inference cosine_success < 25% after 50 epochs → consider Phase 2k (flow matching)
+- If Phase 2k also fails: fundamental SONAR embedding geometry problem, need different representation
+
+### Priority Order
+1. **Phase 2g** (highest priority — tests the obvious: MDSM on working arch, ONE change)
+2. **Phase 2h** (parallel — tests soft Lipschitz, independent approach)
+3. **Phase 2i** (after 2g/2h results — user's dual-critic idea, novel but promising)
+4. **Phase 2j** (if gradient-based approaches plateau — score distillation)
+5. **Phase 2k** (last resort — paradigm shift to flow matching)
 
 ---
 

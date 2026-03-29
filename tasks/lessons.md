@@ -1,5 +1,41 @@
 # Lessons
 
+## 2026-03-29 - CRITICAL: Never change multiple variables at once (Phase 2f post-mortem)
+
+### Pattern
+Phase 2f changed 5 things simultaneously from Phase 2b: norm_mode (none→orthonorm), activation (silu→groupsort), critic_lr (0.001→0.0003), direction_loss (removed), energy_reg_universal (false→true). Result: total failure (rank_success=0.001, spread=-0.001). Impossible to diagnose which change caused the collapse.
+
+### Evidence
+- Phase 2b (norm_mode=none, silu, lr=0.001): spread=0.56, rank_success=88%, E range [-0.03, 0.53]
+- Phase 2f (orthonorm, groupsort, lr=0.0003): spread=0.002, rank_success=0.1%, E range [0.23, 0.36]
+- 1-Lipschitz (orthonorm+groupsort) crushed energy capacity to 0.13 range (4× less than Phase 2b)
+- energy_reg_universal=true was ALREADY known to kill ranking (Phase 2e lesson!)
+
+### Rule
+1. **ONE change per experiment**. If Phase 2b is the baseline, the next experiment changes ONLY lambda_mdsm
+2. NEVER reuse a parameter combination that already failed (energy_reg_universal=true)
+3. If an experiment fails, identify which single variable caused it before trying the next
+4. Architecture changes (norm_mode, activation) are the MOST impactful — never combine with loss changes
+
+## 2026-03-29 - Phase 2b training success ≠ inference success
+
+### Pattern
+Phase 2b achieved 88% rank_success, 0.56 spread, dir=0.643 in training. But strict inference evaluation: mean_cos_success=19%, cos_improvement at noise=0.05: -0.107 (NEGATIVE). Training metrics can look excellent while the actual Langevin navigation fails completely.
+
+### Why
+- Ranking trains energy VALUES at discrete training points
+- Direction loss trains gradient DIRECTION at sampled noisy points
+- Neither guarantees smooth gradient field BETWEEN training points
+- Unconstrained MLP (norm_mode=none) creates wild gradients in unexplored regions
+- At fine noise (0.05), Langevin is purely gradient-driven → navigates the untrained wild field
+- At coarse noise (0.3), random walk component dominates → partially compensates bad gradients
+
+### Rule
+1. **Never trust training rank_success for inference quality** — always check strict Langevin eval
+2. The gap between training and inference = gradient field smoothness problem
+3. Solutions: (a) smooth the field (soft Lipschitz), (b) supervise the field (MDSM), (c) bypass the field (flow matching, score distillation)
+4. Test at noise_scale=0.05 to expose gradient field quality (removes random walk compensation)
+
 ## 2026-03-29 - CRITICAL: Always enable gradient field supervision (MDSM) for Langevin dynamics
 
 ### Pattern
