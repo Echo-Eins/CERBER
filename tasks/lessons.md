@@ -1,5 +1,21 @@
 # Lessons
 
+## 2026-03-29 - Removing ALL energy_reg causes scale inflation → crash (Phase 2f v1)
+
+### Pattern
+Phase 2f v1 disabled energy_reg entirely (λ=0). Without ANY scale anchor, unconstrained MLP energies grew exponentially: E=0.13 (epoch 1) → 2678 (epoch 11) → crash. Ranking hinge margins (0.1/0.05/0.15) are FIXED — at E=2678, margin 0.15 is 0.005% of scale → zero gradient → ranking stops teaching.
+
+### Key Distinction
+- **BAD**: `energy_reg_universal=true` + `interp_gp` (Phase 2e) — flattens separation
+- **GOOD**: `energy_reg=true, λ=0.01, universal=false` (Phase 2b) — mild scale anchor on clean points only
+- **BAD**: `energy_reg=false` entirely (Phase 2f v1) — unconstrained scale explosion
+
+### Rule
+1. **ALWAYS keep clean-only energy_reg at λ=0.01** as scale anchor (NOT universal)
+2. **Enable rank_normalize_by_std=true** as second defense — makes margins relative to batch std
+3. Never confuse "universal ereg kills ranking" with "clean-only ereg kills ranking" — they are different
+4. Monitor E[clean] growth rate: if doubling every 2 epochs, scale is unconstrained
+
 ## 2026-03-29 - energy_reg_universal + interp_gp = plateau+cliff landscape that kills Langevin
 
 ### Pattern

@@ -1,5 +1,5 @@
 {
-  "_comment": "Phase 2f-ud: Same as 2f-clean but with Underdamped Langevin (physical momentum) instead of PID.",
+  "_comment": "Phase 2f-ud v2: Same as 2f-clean v2 but with Underdamped Langevin.",
   "_changes_from_phase2f_clean": [
     "langevin.method: pid → underdamped",
     "Added friction=0.5, mass=1.0 (balanced inertia/damping)",
@@ -78,8 +78,8 @@
   "use_direction_loss": true,
   "use_support_penalty": false,
   "use_inbatch_negatives": false,
-  "use_energy_reg": false,
-  "lambda_energy_reg": 0.0,
+  "use_energy_reg": true,
+  "lambda_energy_reg": 0.01,
   "energy_reg_universal": false,
   "energy_reg_actor_weight": 2.0,
   "use_interp_gp": false,
@@ -110,7 +110,7 @@
   "critic_margin_clean_actor": 0.1,
   "critic_margin_actor_noisy": 0.05,
   "critic_margin_clean_noisy": 0.15,
-  "rank_normalize_by_std": false,
+  "rank_normalize_by_std": true,
   "rank_std_floor": 0.01,
   "actor_energy_margin_pos": 0.05,
   "actor_energy_margin_hard": 0.05,

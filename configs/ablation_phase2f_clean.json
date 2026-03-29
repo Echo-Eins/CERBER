@@ -1,14 +1,15 @@
 {
-  "_comment": "Phase 2f: Clean config — remove ereg/GP that flatten landscape, enable actor, fix PID gains.",
+  "_comment": "Phase 2f v2: Clean-only ereg (scale anchor) + no GP + actor + fixed PID gains.",
   "_changes_from_phase2e": [
-    "use_energy_reg=false: ereg conflicts with ranking (lesson 2026-03-28)",
+    "energy_reg_universal=false: clean-only ereg is SCALE ANCHOR, universal+GP was the problem",
     "use_interp_gp=false: GP flattens Langevin corridor gradients",
     "lambda_geo=1.0: enable actor geometric (cosine-to-pos) loss",
+    "rank_normalize_by_std=true: margins scale with energy spread (prevents hinge becoming negligible)",
     "pid_kp=1.0: standard proportional gain (was 0.1 = 10× too low)",
     "pid_ki=0.1: meaningful integral accumulation (was 0.01)",
     "output_dir changed to experiments/08_Phase_2f_clean"
   ],
-  "_rationale": "Phase 2e: ereg_universal + interp_gp created plateau+cliff. Landscape images show E range [-299, 0.4] with all points stuck on plateau. Phase 2b (rank+dir+clean_min only) had spread=0.559 and rank_success=0.884. Phase 2f returns to that loss combo + actor training + correct PID gains.",
+  "_rationale": "Phase 2e: ereg_universal + interp_gp created plateau+cliff. Phase 2f v1 (no ereg at all) caused scale inflation to E=2678 → crash. Phase 2b had clean-only ereg λ=0.01 and spread=0.559 / rank_success=0.884. Phase 2f v2 restores that scale anchor + rank_normalize_by_std for double safety.",
 
   "seed": 42,
   "num_epochs": 50,
@@ -81,8 +82,8 @@
   "use_direction_loss": true,
   "use_support_penalty": false,
   "use_inbatch_negatives": false,
-  "use_energy_reg": false,
-  "lambda_energy_reg": 0.0,
+  "use_energy_reg": true,
+  "lambda_energy_reg": 0.01,
   "energy_reg_universal": false,
   "energy_reg_actor_weight": 2.0,
   "use_interp_gp": false,
@@ -113,7 +114,7 @@
   "critic_margin_clean_actor": 0.1,
   "critic_margin_actor_noisy": 0.05,
   "critic_margin_clean_noisy": 0.15,
-  "rank_normalize_by_std": false,
+  "rank_normalize_by_std": true,
   "rank_std_floor": 0.01,
   "actor_energy_margin_pos": 0.05,
   "actor_energy_margin_hard": 0.05,
