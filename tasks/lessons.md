@@ -1,5 +1,23 @@
 # Lessons
 
+## 2026-03-29 - energy_reg_universal + interp_gp = plateau+cliff landscape that kills Langevin
+
+### Pattern
+Phase 2e combined `energy_reg_universal` (penalize E² at clean, actor, AND hard) with `interp_gp` (WGAN-GP along clean→hard corridor). Together they created a flat plateau (energies ~0) with steep cliff edges (wells to -300). Langevin dynamics stuck on plateau — gradient magnitude crushed by GP while direction_loss teaches only direction. Over 50 epochs: spread grew to only 0.198 (vs Phase 2b's 0.559), inference cosine improvement = -0.148 (negative!), success rate = 0%.
+
+### Diagnosis Signals
+- Energy landscape: range [-299, 0.4] with plateau + cliff visible in 3D plots
+- `igp` growing every epoch (0.10→0.30) — GP punishment increasing = gradients being flattened more
+- `ereg` growing (0.003→0.051) — energy regularization fighting ranking
+- `dir` plateauing at 0.509 — direction learned but magnitude insufficient
+- E[clean] → -0.01, near zero — ereg successfully crushed clean energy
+
+### Rule
+1. **NEVER combine energy_reg with ranking losses** — THIRD time this lesson is recorded (2026-03-28 twice, now again)
+2. **NEVER use gradient penalty along the Langevin inference corridor** — it flattens exactly the gradients Langevin needs
+3. If you need Lipschitz-like stability without killing capacity, use Tamed Langevin (inference-side fix) not GP (training-side cripple)
+4. PID gains kp < 1.0 are dangerous with flat landscapes — standard kp=1.0 unless specific reason to dampen
+
 ## 2026-03-28 - Tamed Langevin as safety net for non-Lipschitz or poorly-conditioned gradients
 
 ### Pattern
