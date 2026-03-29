@@ -1070,6 +1070,9 @@ def main() -> None:
             "e_actor_mean": 0.0,
             "e_hard_mean": 0.0,
             "e_spread": 0.0,
+            "cos_pos_actor": 0.0,
+            "cos_pos_hard": 0.0,
+            "cos_actor_hard": 0.0,
         }
         n_ok, n_skip, bad_streak = 0, 0, 0
         ema_c, ema_a = None, None
@@ -1130,6 +1133,9 @@ def main() -> None:
             e_actor_mean_acc = 0.0
             e_hard_mean_acc = 0.0
             e_spread_acc = 0.0
+            cos_pos_actor_acc = 0.0
+            cos_pos_hard_acc = 0.0
+            cos_actor_hard_acc = 0.0
             critic_failed = False
             for cstep in range(max(1, cfg.critic_steps_per_actor)):
                 try:
@@ -1327,6 +1333,13 @@ def main() -> None:
                     e_actor_mean_acc += float(e_actor.detach().mean().item())
                     e_hard_mean_acc += float(e_hard.detach().mean().item())
                     e_spread_acc += float((e_hard.detach().mean() - e_pos.detach().mean()).item())
+                    # Diagnostic: cosine similarity between inputs
+                    cos_pos_actor = F.cosine_similarity(pos, a_init.detach(), dim=-1).mean().item()
+                    cos_pos_hard = F.cosine_similarity(pos, hard.detach(), dim=-1).mean().item()
+                    cos_actor_hard = F.cosine_similarity(a_init.detach(), hard.detach(), dim=-1).mean().item()
+                    cos_pos_actor_acc += cos_pos_actor
+                    cos_pos_hard_acc += cos_pos_hard
+                    cos_actor_hard_acc += cos_actor_hard
                 except torch.OutOfMemoryError:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1475,6 +1488,9 @@ def main() -> None:
             sums["e_actor_mean"] += e_actor_mean_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["e_hard_mean"] += e_hard_mean_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["e_spread"] += e_spread_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["cos_pos_actor"] += cos_pos_actor_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["cos_pos_hard"] += cos_pos_hard_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["cos_actor_hard"] += cos_actor_hard_acc / float(max(1, cfg.critic_steps_per_actor))
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
                 now = time.perf_counter()
                 window_batches = max(1, (bi + 1) - last_window_batch)
@@ -1503,6 +1519,9 @@ def main() -> None:
                     f"ereg={sums['energy_reg']/n_ok:.3f} "
                     f"E[c/a/h]={sums['e_pos_mean']/n_ok:.2f}/{sums['e_actor_mean']/n_ok:.2f}/{sums['e_hard_mean']/n_ok:.2f} "
                     f"spread={sums['e_spread']/n_ok:.3f} "
+                    f"cos(p/a)={cos_pos_actor:.3f} "
+                    f"cos(p/h)={cos_pos_hard:.3f} "
+                    f"cos(a/h)={cos_actor_hard:.3f} "
                     f"sec/batch={sec_per_batch:.3f} "
                     f"eta={eta_epoch_sec/60.0:.1f}m"
                 )
@@ -1542,6 +1561,9 @@ def main() -> None:
                             "e_actor_mean": float(sums["e_actor_mean"] / n_ok),
                             "e_hard_mean": float(sums["e_hard_mean"] / n_ok),
                             "e_spread": float(sums["e_spread"] / n_ok),
+                            "cos_pos_actor": float(sums["cos_pos_actor"] / n_ok),
+                            "cos_pos_hard": float(sums["cos_pos_hard"] / n_ok),
+                            "cos_actor_hard": float(sums["cos_actor_hard"] / n_ok),
                             "skip_rate": float(n_skip / max(len(loader), 1)),
                         },
                     },
