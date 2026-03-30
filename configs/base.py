@@ -312,6 +312,11 @@ class Stage1_5Config:
     lambda_energy_reg: float = 0.01
     energy_reg_universal: bool = False  # True = regularize e_pos, e_actor, e_hard; False = only e_pos
     energy_reg_actor_weight: float = 2.0  # relative weight for actor/hard vs clean in universal mode
+    # Energy floor: softplus penalty for E < -threshold (kills spurious wells)
+    use_energy_floor: bool = False
+    lambda_energy_floor: float = 0.1
+    energy_floor_threshold: float = 5.0   # penalize E < -5
+    energy_floor_sharpness: float = 2.0   # softplus sharpness (1=gentle, 5≈relu)
     # Interpolated gradient penalty (WGAN-GP style) — prevents spurious wells in clean-to-hard corridor
     use_interp_gp: bool = False
     lambda_interp_gp: float = 0.1
