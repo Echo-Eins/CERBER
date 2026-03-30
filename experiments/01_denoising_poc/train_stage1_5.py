@@ -1132,6 +1132,7 @@ def main() -> None:
             "knn_dist": 0.0,
             "energy_reg": 0.0,
             "energy_floor": 0.0,
+            "cd": 0.0,
             "interp_gp": 0.0,
             "e_pos_mean": 0.0,
             "e_actor_mean": 0.0,
@@ -1197,6 +1198,7 @@ def main() -> None:
             inbatch_nce_acc = 0.0
             energy_reg_acc = 0.0
             energy_floor_acc = 0.0
+            cd_acc = 0.0
             interp_gp_acc = 0.0
             e_pos_mean_acc = 0.0
             e_actor_mean_acc = 0.0
@@ -1359,19 +1361,66 @@ def main() -> None:
                             threshold = getattr(cfg, 'energy_floor_threshold', 5.0)
                             sharpness = getattr(cfg, 'energy_floor_sharpness', 2.0)
                             n_rand = getattr(cfg, 'energy_floor_num_random', 64)
+                            adv_steps = getattr(cfg, 'energy_floor_adversarial_steps', 0)
+                            adv_lr = getattr(cfg, 'energy_floor_adversarial_lr', 0.01)
                             # Sample random points on the embedding sphere
                             rand_pts = torch.randn(n_rand, q.shape[-1], device=device)
                             tn = cfg.langevin.target_norm
                             if tn is not None:
                                 rand_pts = F.normalize(rand_pts, dim=-1) * tn
+                            # Adversarial probing: gradient descent to FIND wells
+                            if adv_steps > 0:
+                                probe = rand_pts.detach().clone()
+                                q_probe = q[:1].expand(n_rand, -1).detach()
+                                sigma_probe = sigma[:1].expand(n_rand, -1) if sigma.dim() > 1 else sigma[:1].expand(n_rand)
+                                sigma_probe = sigma_probe.detach()
+                                for _adv in range(adv_steps):
+                                    probe.requires_grad_(True)
+                                    e_probe = crit(q_probe, probe, sigma=sigma_probe)
+                                    g_probe = torch.autograd.grad(e_probe.sum(), probe, create_graph=False)[0]
+                                    with torch.no_grad():
+                                        probe = probe - adv_lr * g_probe  # descend into wells
+                                        if tn is not None:
+                                            probe = F.normalize(probe, dim=-1) * tn
+                                rand_pts = probe.detach()
                             with torch.no_grad():
-                                q_rand = q[:1].expand(n_rand, -1)  # dummy query
+                                q_rand = q[:1].expand(n_rand, -1)
                             sigma_rand = sigma[:1].expand(n_rand, -1) if sigma.dim() > 1 else sigma[:1].expand(n_rand)
                             e_rand = crit(q_rand, rand_pts, sigma=sigma_rand)
-                            # Combine training + random energies
+                            # Combine training + probed energies
                             all_e = torch.cat([e_pos, e_actor, e_hard, e_rand], dim=0)
                             l_energy_floor = F.softplus((-all_e - threshold) * sharpness).mean()
                             loss_c = loss_c + cfg.lambda_energy_floor * l_energy_floor
+
+                        # Contrastive divergence: run Langevin, push up energy at endpoints
+                        l_cd = torch.tensor(0.0, device=device)
+                        if getattr(cfg, 'use_cd', False) and getattr(cfg, 'lambda_cd', 0) > 0:
+                            n_cd = getattr(cfg, 'cd_num_samples', 32)
+                            cd_steps = getattr(cfg, 'cd_num_steps', 10)
+                            cd_lr = getattr(cfg, 'cd_lr', 0.01)
+                            cd_noise = getattr(cfg, 'cd_noise_scale', 0.001)
+                            tn = cfg.langevin.target_norm
+                            # Start from random sphere points
+                            cd_pts = torch.randn(n_cd, q.shape[-1], device=device)
+                            if tn is not None:
+                                cd_pts = F.normalize(cd_pts, dim=-1) * tn
+                            cd_q = q[:1].expand(n_cd, -1).detach()
+                            cd_sigma = sigma[:1].expand(n_cd, -1) if sigma.dim() > 1 else sigma[:1].expand(n_cd)
+                            cd_sigma = cd_sigma.detach()
+                            # Run Langevin: particles flow into wells
+                            with torch.no_grad():
+                                for _cd_step in range(cd_steps):
+                                    cd_pts.requires_grad_(True)
+                                    e_cd_step = crit(cd_q, cd_pts, sigma=cd_sigma)
+                                    g_cd = torch.autograd.grad(e_cd_step.sum(), cd_pts, create_graph=False)[0]
+                                    cd_pts = cd_pts.detach() - cd_lr * g_cd + (2 * cd_lr * cd_noise) ** 0.5 * torch.randn_like(cd_pts)
+                                    if tn is not None:
+                                        cd_pts = F.normalize(cd_pts, dim=-1) * tn
+                            # Now compute energy at endpoints WITH gradients for critic
+                            e_cd_final = crit(cd_q, cd_pts.detach(), sigma=cd_sigma)
+                            # Push energy UP at well bottoms (negative energy = bad)
+                            l_cd = F.softplus(-e_cd_final * 2.0).mean()  # penalize E < 0 at CD endpoints
+                            loss_c = loss_c + cfg.lambda_cd * l_cd
 
                         # Interpolated gradient penalty (WGAN-GP style)
                         l_interp_gp = torch.tensor(0.0, device=device)
@@ -1432,6 +1481,7 @@ def main() -> None:
                     inbatch_nce_acc += float(l_inbatch.item())
                     energy_reg_acc += float(l_energy_reg.item())
                     energy_floor_acc += float(l_energy_floor.item())
+                    cd_acc += float(l_cd.item())
                     interp_gp_acc += float(l_interp_gp.item())
                     rank_clean_actor = (e_pos < e_actor).float().mean().item()
                     rank_actor_hard = (e_actor < e_hard).float().mean().item()
@@ -1599,6 +1649,7 @@ def main() -> None:
             sums["knn_dist"] += knn_dist_val
             sums["energy_reg"] += energy_reg_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["energy_floor"] += energy_floor_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["cd"] += cd_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["interp_gp"] += interp_gp_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["e_pos_mean"] += e_pos_mean_acc / float(max(1, cfg.critic_steps_per_actor))
             sums["e_actor_mean"] += e_actor_mean_acc / float(max(1, cfg.critic_steps_per_actor))
@@ -1634,6 +1685,7 @@ def main() -> None:
                     f"supp={sums['support']/n_ok:.4f} "
                     f"ereg={sums['energy_reg']/n_ok:.3f} "
                     f"efloor={sums['energy_floor']/n_ok:.3f} "
+                    f"cd={sums['cd']/n_ok:.3f} "
                     f"igp={sums['interp_gp']/n_ok:.3f} "
                     f"E[c/a/h]={sums['e_pos_mean']/n_ok:.2f}/{sums['e_actor_mean']/n_ok:.2f}/{sums['e_hard_mean']/n_ok:.2f} "
                     f"spread={sums['e_spread']/n_ok:.3f} "
@@ -1677,6 +1729,7 @@ def main() -> None:
                             "energy_reg": float(sums["energy_reg"] / n_ok),
                             "interp_gp": float(sums["interp_gp"] / n_ok),
                             "energy_floor": float(sums["energy_floor"] / n_ok),
+                            "cd": float(sums["cd"] / n_ok),
                             "e_pos_mean": float(sums["e_pos_mean"] / n_ok),
                             "e_actor_mean": float(sums["e_actor_mean"] / n_ok),
                             "e_hard_mean": float(sums["e_hard_mean"] / n_ok),

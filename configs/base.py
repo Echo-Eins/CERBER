@@ -318,6 +318,15 @@ class Stage1_5Config:
     energy_floor_threshold: float = 5.0   # penalize E < -5
     energy_floor_sharpness: float = 2.0   # softplus sharpness (1=gentle, 5≈relu)
     energy_floor_num_random: int = 64     # random sphere points to probe for spurious wells
+    energy_floor_adversarial_steps: int = 0  # 0=random only, >0=gradient descent steps to find wells
+    energy_floor_adversarial_lr: float = 0.01  # step size for adversarial well-finding
+    # Contrastive divergence: run Langevin in critic loop, push up energy at endpoints
+    use_cd: bool = False
+    lambda_cd: float = 0.1
+    cd_num_samples: int = 32             # number of particles to run
+    cd_num_steps: int = 10               # Langevin steps per particle
+    cd_lr: float = 0.01                  # Langevin step size for CD
+    cd_noise_scale: float = 0.001        # Langevin noise for CD (low = more adversarial)
     # Interpolated gradient penalty (WGAN-GP style) — prevents spurious wells in clean-to-hard corridor
     use_interp_gp: bool = False
     lambda_interp_gp: float = 0.1
