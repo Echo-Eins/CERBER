@@ -5,6 +5,7 @@
     "lambda_energy_floor=0.1: mild penalty weight",
     "energy_floor_threshold=5.0: penalize E < -5 (Phase 2g normal range was [-0.02, 0.62])",
     "energy_floor_sharpness=2.0: softplus sharpness (smooth, not relu-like)",
+    "energy_floor_num_random=64: sample 64 random sphere points to probe unexplored regions",
     "output_dir changed to experiments/12_Phase_2h_energy_floor",
     "EVERYTHING ELSE IDENTICAL TO PHASE 2G"
   ],
@@ -88,6 +89,7 @@
   "lambda_energy_floor": 0.1,
   "energy_floor_threshold": 5.0,
   "energy_floor_sharpness": 2.0,
+  "energy_floor_num_random": 64,
 
   "gradient_penalty_lambda": 0.0,
   "shell_barrier_margin": 0.1,

@@ -1358,8 +1358,17 @@ def main() -> None:
                         if getattr(cfg, 'use_energy_floor', False) and getattr(cfg, 'lambda_energy_floor', 0) > 0:
                             threshold = getattr(cfg, 'energy_floor_threshold', 5.0)
                             sharpness = getattr(cfg, 'energy_floor_sharpness', 2.0)
-                            # Penalize ALL energies that go below -threshold
-                            all_e = torch.cat([e_pos, e_actor, e_hard], dim=0)
+                            n_rand = getattr(cfg, 'energy_floor_num_random', 64)
+                            # Sample random points on the embedding sphere
+                            rand_pts = torch.randn(n_rand, q.shape[-1], device=device)
+                            tn = cfg.langevin.target_norm
+                            if tn is not None:
+                                rand_pts = F.normalize(rand_pts, dim=-1) * tn
+                            with torch.no_grad():
+                                q_rand = q[:1].expand(n_rand, -1)  # dummy query
+                            e_rand = crit(q_rand, rand_pts, sigma=sigma[:1].expand(n_rand))
+                            # Combine training + random energies
+                            all_e = torch.cat([e_pos, e_actor, e_hard, e_rand], dim=0)
                             l_energy_floor = F.softplus((-all_e - threshold) * sharpness).mean()
                             loss_c = loss_c + cfg.lambda_energy_floor * l_energy_floor
 
