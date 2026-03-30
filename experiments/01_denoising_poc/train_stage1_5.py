@@ -692,7 +692,10 @@ def eval_model(
             eb.extend(eb_batch.detach().cpu().tolist())
             ea.extend(ea_batch.detach().cpu().tolist())
             step.extend(step_batch.detach().cpu().tolist())
-            succ.extend((ea_batch < eb_batch).to(torch.float32).detach().cpu().tolist())
+            succ.extend(
+                ((ea_batch - ep_batch).abs() < (eb_batch - ep_batch).abs())
+                .to(torch.float32).detach().cpu().tolist()
+            )  # E(final) closer to E(target) than E(start) was
             viol.extend((ea_batch < ep_batch).to(torch.float32).detach().cpu().tolist())
         n = float(len(cb))
         out[f"noise_{ns}"] = {

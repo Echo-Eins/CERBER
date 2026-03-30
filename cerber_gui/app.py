@@ -1397,6 +1397,13 @@ def _compute_sota_eval_metrics(
     cos_before = F.cosine_similarity(v_target_batch, v_noisy_batch, dim=-1)
     cos_after = F.cosine_similarity(v_target_batch, v_denoised_batch, dim=-1)
 
+    e_target = _compute_energy_batch(
+        model=model,
+        model_type=model_type,
+        v_clean=eval_query_batch,
+        v_candidate=v_target_batch,
+        sigma_override=sigma_eval,
+    )
     e_noisy = _compute_energy_batch(
         model=model,
         model_type=model_type,
@@ -1463,7 +1470,9 @@ def _compute_sota_eval_metrics(
         "energy_before_mean": float(e_noisy.mean().item()),
         "energy_after_mean": float(e_final.mean().item()),
         "energy_improvement_mean": float((e_noisy - e_final).mean().item()),
-        "energy_success_rate": float((e_final < e_noisy).float().mean().item()),
+        "energy_success_rate": float(
+            ((e_final - e_target).abs() < (e_noisy - e_target).abs()).float().mean().item()
+        ),  # E(final) closer to E(target) than E(start) was
     }
     out.update(suite)
 
@@ -1577,7 +1586,9 @@ def _build_runtime_metrics(
         "energy_noisy": float(energies["noisy"]),
         "energy_final": float(energies["denoised"]),
         "energy_improvement": float(energies["noisy"] - energies["denoised"]),
-        "energy_success": bool(energies["denoised"] < energies["noisy"]),
+        "energy_success": bool(
+            abs(energies["denoised"] - energies["target"]) < abs(energies["noisy"] - energies["target"])
+        ),  # E(final) closer to E(target) than E(start) was
         "cosine_success": bool(cos_after > cos_before),
         "displacement": displacement,
         "query_target_cos": query_target_cos,
