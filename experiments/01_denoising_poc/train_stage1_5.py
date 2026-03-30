@@ -1397,8 +1397,10 @@ def main() -> None:
                         if getattr(cfg, 'use_cd', False) and getattr(cfg, 'lambda_cd', 0) > 0:
                             n_cd = getattr(cfg, 'cd_num_samples', 32)
                             cd_steps = getattr(cfg, 'cd_num_steps', 10)
-                            cd_lr = getattr(cfg, 'cd_lr', 0.01)
+                            cd_lr_val = getattr(cfg, 'cd_lr', 0.01)
                             cd_noise = getattr(cfg, 'cd_noise_scale', 0.001)
+                            cd_threshold = getattr(cfg, 'energy_floor_threshold', 5.0)
+                            cd_sharpness = getattr(cfg, 'energy_floor_sharpness', 2.0)
                             tn = cfg.langevin.target_norm
                             # Start from random sphere points
                             cd_pts = torch.randn(n_cd, q.shape[-1], device=device)
@@ -1408,18 +1410,19 @@ def main() -> None:
                             cd_sigma = sigma[:1].expand(n_cd, -1) if sigma.dim() > 1 else sigma[:1].expand(n_cd)
                             cd_sigma = cd_sigma.detach()
                             # Run Langevin: particles flow into wells
-                            with torch.no_grad():
-                                for _cd_step in range(cd_steps):
-                                    cd_pts.requires_grad_(True)
-                                    e_cd_step = crit(cd_q, cd_pts, sigma=cd_sigma)
-                                    g_cd = torch.autograd.grad(e_cd_step.sum(), cd_pts, create_graph=False)[0]
-                                    cd_pts = cd_pts.detach() - cd_lr * g_cd + (2 * cd_lr * cd_noise) ** 0.5 * torch.randn_like(cd_pts)
-                                    if tn is not None:
-                                        cd_pts = F.normalize(cd_pts, dim=-1) * tn
-                            # Now compute energy at endpoints WITH gradients for critic
+                            # No torch.no_grad — autograd.grad needs forward graph for cd_pts
+                            for _cd_step in range(cd_steps):
+                                cd_pts = cd_pts.detach().requires_grad_(True)
+                                e_cd_step = crit(cd_q, cd_pts, sigma=cd_sigma)
+                                g_cd = torch.autograd.grad(e_cd_step.sum(), cd_pts, create_graph=False)[0]
+                                cd_pts = cd_pts.detach() - cd_lr_val * g_cd.detach() + (2 * cd_lr_val * cd_noise) ** 0.5 * torch.randn_like(cd_pts)
+                                if tn is not None:
+                                    cd_pts = F.normalize(cd_pts, dim=-1) * tn
+                            # Compute energy at endpoints WITH gradients for critic update
                             e_cd_final = crit(cd_q, cd_pts.detach(), sigma=cd_sigma)
-                            # Push energy UP at well bottoms (negative energy = bad)
-                            l_cd = F.softplus(-e_cd_final * 2.0).mean()  # penalize E < 0 at CD endpoints
+                            # Same threshold as energy_floor: only penalize E < -threshold
+                            # Avoids conflict with ranking (E(clean) ≈ -0.03 is above -5)
+                            l_cd = F.softplus((-e_cd_final - cd_threshold) * cd_sharpness).mean()
                             loss_c = loss_c + cfg.lambda_cd * l_cd
 
                         # Interpolated gradient penalty (WGAN-GP style)
