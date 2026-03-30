@@ -1366,7 +1366,8 @@ def main() -> None:
                                 rand_pts = F.normalize(rand_pts, dim=-1) * tn
                             with torch.no_grad():
                                 q_rand = q[:1].expand(n_rand, -1)  # dummy query
-                            e_rand = crit(q_rand, rand_pts, sigma=sigma[:1].expand(n_rand))
+                            sigma_rand = sigma[:1].expand(n_rand, -1) if sigma.dim() > 1 else sigma[:1].expand(n_rand)
+                            e_rand = crit(q_rand, rand_pts, sigma=sigma_rand)
                             # Combine training + random energies
                             all_e = torch.cat([e_pos, e_actor, e_hard, e_rand], dim=0)
                             l_energy_floor = F.softplus((-all_e - threshold) * sharpness).mean()
