@@ -138,7 +138,46 @@ Config: `configs/ablation_phase2g_mdsm_on_2b.json`
 - [ ] Check: cosine_success at noise=0.1 > 19% (beat Phase 2b)
 - [ ] If success: run 80 epochs with cosine LR schedule
 
-### Phase 2h: Soft Lipschitz (weight decay + GP at OOD only)
+### Phase 2g Results ✅ (BEST BASELINE)
+- rank_success=89%, spread=0.65, dir=0.643
+- Inference at noise=0.15: 82% cosine success
+- Inference at noise=0.0002: 82% cosine success (but energy goes negative)
+- MDSM + direction_loss on unconstrained SiLU MLP = strong ranking + decent inference
+
+### Phase 2h: Energy Floor (random probing) ✗ INEFFECTIVE
+Config: `configs/ablation_phase2h_energy_floor.json`
+- Phase 2g + energy_floor with random sphere probing (64 points)
+- **Result**: efloor=0.000 for ALL 50 epochs — random points in 1024D never find structured wells
+- Inference unchanged from Phase 2g
+- **Lesson**: random probing useless in 1024D, need adversarial probing or CD
+
+### Phase 2i: CD + Adversarial Probing + Underdamped ✅ (IMPROVED)
+Config: `configs/ablation_phase2i_cd_underdamped.json`
+- Phase 2g + contrastive divergence (32 particles, 10 Langevin steps) + adversarial probing (10 gradient descent steps) + underdamped inference
+- **Result**: rank_success=89.5%, spread=0.674, best_score=+0.154
+- noise=0.15: cosine 0.084→0.417, **100% success** (+0.332 improvement)
+- noise=0.0002: cosine 0.403→0.427, **64% success** (+0.024 improvement)
+- CD and efloor both active and >0 throughout training
+- **Diagnosis**: low-noise inference still weak because training σ∈[0.01, 0.3] but inference at σ=0.0002 is 50x below training minimum. MDSM score not trained at near-zero σ.
+
+### Phase 2j: Extended σ Curriculum (CURRENT)
+Config: `configs/ablation_phase2j_sigma_extended.json`
+- Phase 2i + sigma_curriculum_start: 0.01→0.001 (10x lower)
+- sigma_anneal_min: 0.01→0.001 (inference annealing covers trained range)
+- **Hypothesis**: critic learns proper scores at σ→0, Langevin follows trained gradients at fine scale
+- **Single variable change** from Phase 2i: only σ range extended
+- [ ] Run 50 epochs
+- [ ] Check: rank_success ≥ 89% (no regression)
+- [ ] Check: noise=0.0002 cosine success > 64% (beat Phase 2i)
+- [ ] Check: noise=0.15 cosine success ≥ 100% (no regression)
+
+### Phase 2k (if 2j insufficient): Sigma-Annealed Inference
+- Enable sigma_anneal for inference (already implemented in sigma_schedule.py)
+- Start at σ=0.15 (where 100% success), geometrically anneal to σ_min
+- Step budget: 40 steps coarse (σ=0.15→0.01), 40 medium (0.01→0.001), 20 fine (0.001→σ_min)
+- Critic is σ-conditioned — this is what NCSN was designed for
+
+### Phase 2h (ORIGINAL): Soft Lipschitz (weight decay + GP at OOD only)
 Config: `configs/ablation_phase2h_soft_lip.json`
 - Start from Phase 2b architecture (norm_mode=none, silu)
 - Increase weight_decay: 0.01 → 0.05 (smoother weights → smoother gradients)

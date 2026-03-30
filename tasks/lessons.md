@@ -954,3 +954,90 @@ Result: spread=0.000, rank_success=0.000, model cannot learn ANY energy ordering
 2. Lipschitz constraint spectrum: spectral_norm (too hard) → gradient_penalty (soft, tunable) → none (too free)
 3. For Lipschitz control, prefer gradient penalty: penalizes ||∇E||² without hard-bounding capacity
 4. If spread=0 after epoch 1, the constraint is too tight — don't wait for more epochs
+
+---
+
+## Lesson: Random probing is useless in 1024D (Phase 2h, 2026-03-30)
+
+### Summary
+Sampling 64-512 random points on the 1024D sphere NEVER finds structured energy wells.
+efloor=0.000 for all 50 epochs despite deep wells (E=-31) in the landscape.
+
+### Pattern
+In high-dimensional spaces (D=1024), the probability of a random point landing near
+a structured energy well is essentially zero. Wells occupy negligible volume relative
+to the sphere surface. Random probing is a low-dimensional intuition that fails at D>100.
+
+### Evidence
+- Phase 2h: energy_floor with 64 random sphere points → efloor=0.000 every epoch
+- Energy landscape has wells at E=-31 (from Phase 2h analysis)
+- Increasing to 512 random points still gives efloor=0.000
+
+### Rule
+1. **Never use random probing to find wells in high dimensions** — use adversarial probing (gradient descent) or Contrastive Divergence
+2. CD (Langevin in critic loop) is the principled EBM approach: model's own dynamics find wells
+3. Adversarial probing (gradient descent from random starts) works because it FOLLOWS gradients into wells
+
+---
+
+## Lesson: Contrastive Divergence works for well suppression (Phase 2i, 2026-03-30)
+
+### Summary
+CD (run Langevin in critic loop, push up energy at endpoints) successfully suppresses
+spurious wells without hurting ranking. Combined with adversarial probing and underdamped
+inference, achieves 100% cosine success at noise=0.15.
+
+### Evidence
+- Phase 2i: cd≈0.003, efloor≈0.005 at end of training (both active and >0)
+- rank_success=89.5%, spread=0.674 (no regression from Phase 2g)
+- noise=0.15: 100% cosine success (+0.332 improvement)
+- Wells shallower than Phase 2h (E=-31 → much less)
+
+### Rule
+1. CD is safe to combine with ranking + MDSM + direction_loss
+2. Use softplus penalty with threshold (E < -5 only), NOT penalizing all E<0
+3. CD threshold must be well below training energy range (E[c]≈-0.03) to avoid conflicting with ranking
+
+---
+
+## Lesson: Training σ range must cover inference σ (Phase 2i→2j, 2026-03-30)
+
+### Summary
+If training uses σ∈[0.01, 0.3] but inference runs at σ=0.0002, the critic
+has never learned scores at that noise scale. MDSM teaches ∇E only for
+trained σ range. At untrained σ, gradients are extrapolation noise.
+
+### Evidence
+- Phase 2i: noise=0.15 (within training range) → 100% success
+- Phase 2i: noise=0.0002 (50x below training min) → 64% success
+- Energy goes to -1.456 at low noise — critic creates untrained wells at fine scale
+- σ-conditioned critic passes σ to all energy evaluations — at unseen σ, output is undefined
+
+### Rule
+1. **sigma_curriculum_start must be ≤ inference noise_scale** (or close to it)
+2. Sigma annealing at inference (NCSN-style) should stay within trained σ range
+3. If extending σ range, check numerical stability: sigma_eff_sq clamped at 1e-6 prevents overflow
+4. loguniform sampling naturally allocates density across scales — extending range costs minimal compute
+
+---
+
+## Lesson: GroupSort, NCE, CQL, inbatch_negatives — all disabled in successful phases (2026-03-30)
+
+### Summary
+Phase 2g (best baseline) and Phase 2i (best overall) both run with ALL of these disabled.
+Enabling any of them violates single-variable discipline and risks known failure modes.
+
+### Evidence
+- **GroupSort**: Phase 2f collapse (rank_success=0.001). With orthonorm, creates 1-Lipschitz = spread≈0.
+  Phase 2c (spectral_norm+groupsort): spread=0.000. Both successful phases use SiLU.
+- **NCE**: "VALUE-based loss — cannot teach gradient field" (root cause analysis).
+  Phase 2g/2i: lambda_nce=0.0, use_nce=false.
+- **CQL**: Phase 2 regression (74%→40%). Flattens landscape like energy_reg.
+  CD is strictly superior for the same purpose (finds real wells, not random OOD).
+- **inbatch_negatives**: Value-based contrastive. Phase 2g/2i: lambda_inbatch_nce=0.0.
+
+### Rule
+1. **Do NOT enable groupsort** — kills energy range on unconstrained MLP
+2. **Do NOT enable NCE/CQL** — value-based losses conflict with MDSM gradient supervision
+3. **Do NOT enable inbatch_negatives** — same category as NCE
+4. If ranking needs improvement, tune lambda_rank or margins, not add auxiliary contrastive losses
