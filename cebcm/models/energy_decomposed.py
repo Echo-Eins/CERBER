@@ -68,6 +68,8 @@ class _SigmaConditionedCritic(nn.Module):
         groupsort_size: int = 2,
         spline_num_knots: int = 4,
         energy_output_clamp: float | None = None,
+        trainable_energy_scale: bool = False,
+        energy_scale_init_log: float = 0.0,
     ):
         super().__init__()
         self.norm_mode = norm_mode
@@ -96,8 +98,12 @@ class _SigmaConditionedCritic(nn.Module):
         layers.append(_make_linear(prev, 1, norm_mode))
         self.net = nn.Sequential(*layers)
 
-        # Kept as buffer to avoid MDSM-vs-ranking scale decoupling pathologies.
-        self.register_buffer("log_energy_scale", torch.tensor(0.0))
+        # Global energy scale: fixed by default; optionally trainable.
+        init = torch.tensor(float(energy_scale_init_log))
+        if trainable_energy_scale:
+            self.log_energy_scale = nn.Parameter(init)
+        else:
+            self.register_buffer("log_energy_scale", init)
 
     def _feature_dim(self) -> int:
         raise NotImplementedError
@@ -163,6 +169,8 @@ class AngularEnergyCritic(_SigmaConditionedCritic):
         groupsort_size: int = 2,
         spline_num_knots: int = 4,
         energy_output_clamp: float | None = None,
+        trainable_energy_scale: bool = False,
+        energy_scale_init_log: float = 0.0,
     ):
         self.dim = int(dim)
         if hidden_dims is None:
@@ -174,6 +182,8 @@ class AngularEnergyCritic(_SigmaConditionedCritic):
             groupsort_size=groupsort_size,
             spline_num_knots=spline_num_knots,
             energy_output_clamp=energy_output_clamp,
+            trainable_energy_scale=trainable_energy_scale,
+            energy_scale_init_log=energy_scale_init_log,
         )
 
     def _feature_dim(self) -> int:
@@ -209,6 +219,8 @@ class RadialEnergyCritic(_SigmaConditionedCritic):
         groupsort_size: int = 2,
         spline_num_knots: int = 4,
         energy_output_clamp: float | None = None,
+        trainable_energy_scale: bool = False,
+        energy_scale_init_log: float = 0.0,
     ):
         self.dim = int(dim)
         self.target_norm = target_norm
@@ -221,6 +233,8 @@ class RadialEnergyCritic(_SigmaConditionedCritic):
             groupsort_size=groupsort_size,
             spline_num_knots=spline_num_knots,
             energy_output_clamp=energy_output_clamp,
+            trainable_energy_scale=trainable_energy_scale,
+            energy_scale_init_log=energy_scale_init_log,
         )
 
     def _feature_dim(self) -> int:
@@ -252,4 +266,3 @@ class RadialEnergyCritic(_SigmaConditionedCritic):
             dim=-1,
         )
         return torch.cat([geom, sigma_emb], dim=-1)
-

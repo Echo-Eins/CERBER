@@ -273,6 +273,7 @@ class Stage1_5Config:
     weight_decay: float = 0.01
     clip_grad_norm: float = 1.0
     critic_steps_per_actor: int = 2
+    critic_step_mode: str = "joint"  # "alternating" or "joint" (same-batch two-head update)
 
     # LR scheduler: "none", "cosine_warmup", "cosine_warm_restarts"
     lr_scheduler: str = "none"
@@ -342,6 +343,11 @@ class Stage1_5Config:
     route_direction_to_angular_only: bool = True
     route_clean_min_to_radial_only: bool = True
     use_support_penalty: bool = False
+    # Energy scale calibration
+    energy_scale_trainable: bool = False
+    energy_scale_init_log: float = 0.0
+    energy_scale_lr_multiplier: float = 1.0
+    lambda_energy_scale_reg: float = 0.0
     # Energy scale regularization (prevent unbounded energy growth)
     use_energy_reg: bool = True
     lambda_energy_reg: float = 0.01
@@ -351,6 +357,8 @@ class Stage1_5Config:
     use_energy_floor: bool = False
     lambda_energy_floor: float = 0.1
     energy_floor_threshold: float = 5.0   # penalize E < -5
+    energy_floor_relative_to_clean: bool = True
+    energy_floor_margin: float = 0.15
     energy_floor_sharpness: float = 2.0   # softplus sharpness (1=gentle, 5≈relu)
     energy_floor_num_random: int = 64     # random sphere points to probe for spurious wells
     energy_floor_adversarial_steps: int = 0  # 0=random only, >0=gradient descent steps to find wells
@@ -358,6 +366,8 @@ class Stage1_5Config:
     # Contrastive divergence: run Langevin in critic loop, push up energy at endpoints
     use_cd: bool = True
     lambda_cd: float = 0.1
+    cd_relative_to_clean: bool = True
+    cd_margin: float = 0.15
     cd_num_samples: int = 32             # number of particles to run
     cd_num_steps: int = 10               # Langevin steps per particle
     cd_lr: float = 0.01                  # Langevin step size for CD
@@ -459,6 +469,7 @@ class Stage1_5Config:
     min_l2_improvement: float = 0.005
     min_energy_success_rate: float = 0.65
     max_clean_min_violation_rate: float = 0.05
+    clean_min_violation_mode: str = "margin"  # "margin" or "strict"
     min_step_norm: float = 1e-3
 
     # Stability

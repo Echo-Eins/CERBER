@@ -1169,3 +1169,23 @@ An MLP with [2048, 1024, 512] hidden dims and SiLU activation creates exponentia
 2. No amount of CD/efloor can exhaustively suppress wells in 1024D — it's a whack-a-mole problem
 3. This points to an architectural limitation of unconstrained MLP for EBM in high dimensions
 4. Potential fixes require architectural change: dual-critic decomposition, score distillation, or flow matching
+
+## Process Lesson: Capture user diagnosis into TODO before deeper work (2026-03-31)
+
+### Summary
+When the user provides a concrete root-cause diagnosis and asks to continue, first convert that diagnosis into explicit checkboxes in `tasks/todo.md`, then proceed to analysis/implementation.
+
+### Rule
+1. User diagnosis/corrections are actionable requirements, not just discussion.
+2. Immediately write a dedicated TODO block with traceable items and priorities.
+3. Only after TODO capture continue with deeper technical analysis.
+
+## Process Lesson: Validate active run/log source before diagnostics (2026-03-31)
+
+### Summary
+If the user states that the active logs are those pasted in chat, do not infer root-cause from a different local run artifact even if it exists in `logs/`.
+
+### Rule
+1. Before drawing conclusions, confirm the exact log source for this diagnosis: in-chat stream vs local file path.
+2. If sources diverge, prioritize the user-provided active run and label local artifacts as potentially stale/different-run.
+3. Reflect the active-run conclusions in `tasks/todo.md` before continuing implementation.

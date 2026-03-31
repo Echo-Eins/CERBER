@@ -710,6 +710,9 @@ class SigmaBoundEnergy:
 
 
 def make_thresholds(cfg: Stage1_5Config) -> ConditionalThresholds:
+    clean_key = "clean_min_violation_rate"
+    if str(getattr(cfg, "clean_min_violation_mode", "margin")).lower() == "strict":
+        clean_key = "clean_min_violation_rate_strict"
     return ConditionalThresholds(
         min_cos_improvement=cfg.min_cosine_improvement,
         min_cos_success_rate=cfg.min_cosine_success_rate,
@@ -717,6 +720,7 @@ def make_thresholds(cfg: Stage1_5Config) -> ConditionalThresholds:
         min_l2_improvement=cfg.min_l2_improvement,
         min_energy_success_rate=cfg.min_energy_success_rate,
         max_clean_min_violation=cfg.max_clean_min_violation_rate,
+        clean_min_violation_key=clean_key,
         min_step_norm=cfg.min_step_norm,
     )
 
@@ -756,7 +760,21 @@ def eval_model(
     out = {}
     eval_batch = max(1, int(cfg.eval_langevin_batch_size))
     for ns in cfg.eval_noise_scales:
-        cb, ca, lb, la, eb, ea, ep, step, succ, viol, rcos = [], [], [], [], [], [], [], [], [], [], []
+        cb, ca, lb, la, eb, ea, ep, step, succ_target, succ_descent, viol, viol_strict, rcos = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
         h1_b, h1_a, h1_p = [], [], []
         h2_b, h2_a, h2_p = [], [], []
         head_corr = []
@@ -875,12 +893,14 @@ def eval_model(
             eb.extend(eb_batch.detach().cpu().tolist())
             ea.extend(ea_batch.detach().cpu().tolist())
             step.extend(step_batch.detach().cpu().tolist())
-            succ.extend(
+            succ_target.extend(
                 ((ea_batch - ep_batch).abs() < (eb_batch - ep_batch).abs())
                 .to(torch.float32).detach().cpu().tolist()
             )  # E(final) closer to E(target) than E(start) was
+            succ_descent.extend((ea_batch < eb_batch).to(torch.float32).detach().cpu().tolist())
             clean_margin = float(cfg.clean_min_margin) if cfg.use_clean_min_penalty else 0.0
             viol.extend((ea_batch < (ep_batch + clean_margin)).to(torch.float32).detach().cpu().tolist())
+            viol_strict.extend((ea_batch < ep_batch).to(torch.float32).detach().cpu().tolist())
         n = float(len(cb))
         out[f"noise_{ns}"] = {
             "cos_before_mean": sum(cb) / n,
@@ -899,8 +919,12 @@ def eval_model(
             "energy_before_mean": sum(eb) / n,
             "energy_after_mean": sum(ea) / n,
             "energy_improvement": (sum(eb) - sum(ea)) / n,
-            "energy_success_rate": sum(succ) / n,
+            # Backward-compatible alias: keep historical key mapped to target-proximity criterion.
+            "energy_success_rate": sum(succ_target) / n,
+            "energy_target_proximity_rate": sum(succ_target) / n,
+            "energy_descent_rate": sum(succ_descent) / n,
             "clean_min_violation_rate": sum(viol) / n,
+            "clean_min_violation_rate_strict": sum(viol_strict) / n,
             "step_norm_mean": sum(step) / n,
             # Backward-compatible alias:
             # `success_rate` historically meant cosine-gain success.
@@ -955,6 +979,7 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "eval_langevin_batch_size",
         "checkpoint_every_epochs",
         "head_weight_power",
+        "energy_scale_lr_multiplier",
     ]:
         _must_be_positive(name, float(getattr(cfg, name)))
 
@@ -983,6 +1008,7 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "lambda_angular_purity",
         "lambda_radial_purity",
         "lambda_head_corr",
+        "lambda_energy_scale_reg",
         "head_corr_target",
         "gradient_penalty_lambda",
         "shell_barrier_margin",
@@ -1005,6 +1031,8 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "retrieval_min_pos_similarity",
         "angular_weight_low_sigma",
         "angular_weight_high_sigma",
+        "energy_floor_margin",
+        "cd_margin",
         "non_finite_backoff_streak_trigger",
         "max_consecutive_non_finite_batches",
         "param_finite_check_interval",
@@ -1012,6 +1040,11 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         _must_be_non_negative(name, float(getattr(cfg, name)))
     if int(cfg.critic_steps_per_actor) < 1:
         raise ValueError(f"critic_steps_per_actor must be >= 1, got {cfg.critic_steps_per_actor}")
+    if str(getattr(cfg, "critic_step_mode", "alternating")) not in {"alternating", "joint"}:
+        raise ValueError(
+            "critic_step_mode must be one of {'alternating','joint'}, "
+            f"got {cfg.critic_step_mode}"
+        )
 
     if cfg.sigma_curriculum_start > cfg.sigma_curriculum_end:
         raise ValueError(
@@ -1090,6 +1123,11 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         raise ValueError("angular_weight_low_sigma and angular_weight_high_sigma must be <= 1.0")
     if cfg.head_corr_target > 1.0:
         raise ValueError("head_corr_target must be <= 1.0")
+    if str(getattr(cfg, "clean_min_violation_mode", "margin")) not in {"margin", "strict"}:
+        raise ValueError(
+            "clean_min_violation_mode must be one of {'margin','strict'}, "
+            f"got {cfg.clean_min_violation_mode}"
+        )
     if cfg.angular_norm_mode not in {"orthonorm", "spectral_norm", "none"}:
         raise ValueError(
             "angular_norm_mode must be one of {'orthonorm','spectral_norm','none'}, "
@@ -1294,6 +1332,8 @@ def main() -> None:
             norm_mode=cfg.angular_norm_mode,
             activation=cfg.angular_activation,
             energy_output_clamp=None,
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)
         c2_base = RadialEnergyCritic(
             dim=cfg.energy_dim,
@@ -1302,6 +1342,8 @@ def main() -> None:
             activation=cfg.radial_activation,
             target_norm=cfg.langevin.target_norm,
             energy_output_clamp=None,
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)
     else:
         c1_base = SimpleEnergy(
@@ -1311,6 +1353,8 @@ def main() -> None:
             cfg.activation,
             ortho_n_iters=cfg.ortho_n_iters,
             energy_output_clamp=None,
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)
         c2_base = SimpleEnergy(
             cfg.energy_dim,
@@ -1319,6 +1363,8 @@ def main() -> None:
             cfg.activation,
             ortho_n_iters=cfg.ortho_n_iters,
             energy_output_clamp=None,
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)
     actor_base = LatentDenoiseActor(
         cfg.energy_dim,
@@ -1368,7 +1414,26 @@ def main() -> None:
         head_weight_power=cfg.head_weight_power,
     )
 
-    groups = [{"params": list(c1_base.parameters()), "lr": cfg.critic_lr}, {"params": list(c2_base.parameters()), "lr": cfg.critic_lr}]
+    def _split_energy_scale_params(mod: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+        regular: list[torch.nn.Parameter] = []
+        scale: list[torch.nn.Parameter] = []
+        for name, p in mod.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.endswith("log_energy_scale"):
+                scale.append(p)
+            else:
+                regular.append(p)
+        return regular, scale
+
+    groups: list[dict] = []
+    energy_scale_lr_mult = float(getattr(cfg, "energy_scale_lr_multiplier", 1.0))
+    for crit_mod in [c1_base, c2_base]:
+        reg_params, scale_params = _split_energy_scale_params(crit_mod)
+        if reg_params:
+            groups.append({"params": reg_params, "lr": cfg.critic_lr})
+        if scale_params:
+            groups.append({"params": scale_params, "lr": cfg.critic_lr * energy_scale_lr_mult})
     if prior_base is not None:
         groups.append({"params": list(prior_base.parameters()), "lr": cfg.prior_critic_lr})
     opt_c = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
@@ -1423,7 +1488,11 @@ def main() -> None:
             )
         print(f"  kNN support threshold (p{cfg.support_threshold_percentile:.0f}): {support_threshold:.6f}")
 
-    print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing}")
+    print(
+        f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | "
+        f"compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing} | "
+        f"critic_step_mode={getattr(cfg, 'critic_step_mode', 'alternating')}"
+    )
     print(
         "Checkpoint policy: "
         f"periodic_every={int(cfg.checkpoint_every_epochs)} "
@@ -1472,6 +1541,7 @@ def main() -> None:
             "support": 0.0,
             "knn_dist": 0.0,
             "energy_reg": 0.0,
+            "energy_scale_reg": 0.0,
             "energy_floor": 0.0,
             "cd": 0.0,
             "interp_gp": 0.0,
@@ -1540,6 +1610,7 @@ def main() -> None:
             head_corr_acc = 0.0
             inbatch_nce_acc = 0.0
             energy_reg_acc = 0.0
+            energy_scale_reg_acc = 0.0
             energy_floor_acc = 0.0
             cd_acc = 0.0
             interp_gp_acc = 0.0
@@ -1551,7 +1622,15 @@ def main() -> None:
             cos_pos_hard_acc = 0.0
             cos_actor_hard_acc = 0.0
             critic_failed = False
-            for cstep in range(max(1, cfg.critic_steps_per_actor)):
+            joint_critic_mode = (
+                critic_arch == "radial_angular"
+                and str(getattr(cfg, "critic_step_mode", "alternating")) == "joint"
+            )
+            critic_update_count = max(1, int(cfg.critic_steps_per_actor)) * (2 if joint_critic_mode else 1)
+            shared_sigma = None
+            shared_seed = None
+            shared_a_init = None
+            for cstep in range(critic_update_count):
                 try:
                     is_head1 = (cstep % 2 == 0)
                     crit = c1 if is_head1 else c2
@@ -1578,17 +1657,27 @@ def main() -> None:
                         direction_lambda = float(cfg.lambda_direction_radial)
                         projection_mode = "radial"
 
-                    sigma = sample_sigma(cfg, q.shape[0], device)
-                    seed = seed_actor(q, hard, sigma, cfg)
-                    with torch.no_grad():
-                        a_init, _ = actor.predict_step(
-                            q,
-                            seed,
-                            sigma=sigma,
-                            step_size=cfg.actor_step_size,
-                            target_norm=cfg.langevin.target_norm,
-                            tangent_projection=cfg.actor_tangent_projection,
-                        )
+                    use_shared = joint_critic_mode and (cstep % 2 == 1) and shared_sigma is not None
+                    if use_shared:
+                        sigma = shared_sigma
+                        seed = shared_seed
+                        a_init = shared_a_init
+                    else:
+                        sigma = sample_sigma(cfg, q.shape[0], device)
+                        seed = seed_actor(q, hard, sigma, cfg)
+                        with torch.no_grad():
+                            a_init, _ = actor.predict_step(
+                                q,
+                                seed,
+                                sigma=sigma,
+                                step_size=cfg.actor_step_size,
+                                target_norm=cfg.langevin.target_norm,
+                                tangent_projection=cfg.actor_tangent_projection,
+                            )
+                        if joint_critic_mode:
+                            shared_sigma = sigma.detach()
+                            shared_seed = seed.detach()
+                            shared_a_init = a_init.detach()
                     with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
                         if mdsm_lambda > 0:
                             mdsm = conditional_mdsm(
@@ -1767,6 +1856,11 @@ def main() -> None:
                             else:
                                 l_energy_reg = (e_pos ** 2).mean()
                             loss_c = loss_c + cfg.lambda_energy_reg * l_energy_reg
+                        l_energy_scale_reg = torch.tensor(0.0, device=device)
+                        if float(getattr(cfg, "lambda_energy_scale_reg", 0.0)) > 0 and hasattr(crit_base, "log_energy_scale"):
+                            log_scale = getattr(crit_base, "log_energy_scale")
+                            l_energy_scale_reg = log_scale.float().pow(2)
+                            loss_c = loss_c + float(cfg.lambda_energy_scale_reg) * l_energy_scale_reg
 
                         # Energy floor: softplus penalty for spurious deep wells
                         l_energy_floor = torch.tensor(0.0, device=device)
@@ -1805,7 +1899,11 @@ def main() -> None:
                             e_rand = crit(q_rand, rand_pts, sigma=sigma_rand)
                             # Combine training + probed energies
                             all_e = torch.cat([e_pos, e_actor, e_hard, e_rand], dim=0)
-                            l_energy_floor = F.softplus((-all_e - threshold) * sharpness).mean()
+                            if bool(getattr(cfg, "energy_floor_relative_to_clean", False)):
+                                floor_ref = e_pos.detach().mean() - float(getattr(cfg, "energy_floor_margin", 0.15))
+                                l_energy_floor = F.softplus((floor_ref - all_e) * sharpness).mean()
+                            else:
+                                l_energy_floor = F.softplus((-all_e - threshold) * sharpness).mean()
                             loss_c = loss_c + cfg.lambda_energy_floor * l_energy_floor
 
                         # Contrastive divergence: run Langevin, push up energy at endpoints
@@ -1839,9 +1937,12 @@ def main() -> None:
                                     cd_pts = F.normalize(cd_pts, dim=-1) * tn
                             # Compute energy at endpoints WITH gradients for critic update
                             e_cd_final = crit(cd_q, cd_pts.detach(), sigma=cd_sigma)
-                            # Same threshold as energy_floor: only penalize E < -threshold
-                            # Avoids conflict with ranking (E(clean) ≈ -0.03 is above -5)
-                            l_cd = F.softplus((-e_cd_final - cd_threshold) * cd_sharpness).mean()
+                            if bool(getattr(cfg, "cd_relative_to_clean", False)):
+                                floor_ref = e_pos.detach().mean() - float(getattr(cfg, "cd_margin", 0.15))
+                                l_cd = F.softplus((floor_ref - e_cd_final) * cd_sharpness).mean()
+                            else:
+                                # Absolute floor: penalize E < -cd_threshold
+                                l_cd = F.softplus((-e_cd_final - cd_threshold) * cd_sharpness).mean()
                             loss_c = loss_c + cfg.lambda_cd * l_cd
 
                         # Interpolated gradient penalty (WGAN-GP style)
@@ -1904,6 +2005,7 @@ def main() -> None:
                     head_corr_acc += float(l_head_corr.item())
                     inbatch_nce_acc += float(l_inbatch.item())
                     energy_reg_acc += float(l_energy_reg.item())
+                    energy_scale_reg_acc += float(l_energy_scale_reg.item())
                     energy_floor_acc += float(l_energy_floor.item())
                     cd_acc += float(l_cd.item())
                     interp_gp_acc += float(l_interp_gp.item())
@@ -2056,38 +2158,40 @@ def main() -> None:
                 on_bad()
                 continue
             n_ok += 1; global_step += 1; bad_streak = 0
-            c_avg = c_loss_acc / float(max(1, cfg.critic_steps_per_actor))
+            critic_denom = float(max(1, critic_update_count))
+            c_avg = c_loss_acc / critic_denom
             sums["critic"] += c_avg; sums["actor"] += la; sums["loss"] += c_avg + la
-            sums["rank"] += rank_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["mdsm"] += mdsm_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cql"] += cql_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["nce"] += nce_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_success"] += rank_ok_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_clean_lt_actor"] += rank_clean_actor_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_actor_lt_hard"] += rank_actor_hard_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_clean_lt_hard"] += rank_clean_hard_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["clean_viol"] += viol_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["rank"] += rank_acc / critic_denom
+            sums["mdsm"] += mdsm_acc / critic_denom
+            sums["cql"] += cql_acc / critic_denom
+            sums["nce"] += nce_acc / critic_denom
+            sums["rank_success"] += rank_ok_acc / critic_denom
+            sums["rank_clean_lt_actor"] += rank_clean_actor_acc / critic_denom
+            sums["rank_actor_lt_hard"] += rank_actor_hard_acc / critic_denom
+            sums["rank_clean_lt_hard"] += rank_clean_hard_acc / critic_denom
+            sums["clean_viol"] += viol_acc / critic_denom
             sums["retrieval_cosine"] += retrieval_cos
             sums["actor_barrier"] += float(l_bar.item())
             sums["actor_descent"] += float(l_desc.item())
-            sums["clean_min"] += clean_min_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["direction"] += direction_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["purity"] += purity_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["head_corr"] += head_corr_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["inbatch_nce"] += inbatch_nce_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["clean_min"] += clean_min_acc / critic_denom
+            sums["direction"] += direction_acc / critic_denom
+            sums["purity"] += purity_acc / critic_denom
+            sums["head_corr"] += head_corr_acc / critic_denom
+            sums["inbatch_nce"] += inbatch_nce_acc / critic_denom
             sums["support"] += float(l_support.item())
             sums["knn_dist"] += knn_dist_val
-            sums["energy_reg"] += energy_reg_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["energy_floor"] += energy_floor_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cd"] += cd_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["interp_gp"] += interp_gp_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_pos_mean"] += e_pos_mean_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_actor_mean"] += e_actor_mean_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_hard_mean"] += e_hard_mean_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_spread"] += e_spread_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cos_pos_actor"] += cos_pos_actor_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cos_pos_hard"] += cos_pos_hard_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cos_actor_hard"] += cos_actor_hard_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["energy_reg"] += energy_reg_acc / critic_denom
+            sums["energy_scale_reg"] += energy_scale_reg_acc / critic_denom
+            sums["energy_floor"] += energy_floor_acc / critic_denom
+            sums["cd"] += cd_acc / critic_denom
+            sums["interp_gp"] += interp_gp_acc / critic_denom
+            sums["e_pos_mean"] += e_pos_mean_acc / critic_denom
+            sums["e_actor_mean"] += e_actor_mean_acc / critic_denom
+            sums["e_hard_mean"] += e_hard_mean_acc / critic_denom
+            sums["e_spread"] += e_spread_acc / critic_denom
+            sums["cos_pos_actor"] += cos_pos_actor_acc / critic_denom
+            sums["cos_pos_hard"] += cos_pos_hard_acc / critic_denom
+            sums["cos_actor_hard"] += cos_actor_hard_acc / critic_denom
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
                 now = time.perf_counter()
                 window_batches = max(1, (bi + 1) - last_window_batch)
@@ -2116,6 +2220,7 @@ def main() -> None:
                     f"ibnce={sums['inbatch_nce']/n_ok:.3f} "
                     f"supp={sums['support']/n_ok:.4f} "
                     f"ereg={sums['energy_reg']/n_ok:.3f} "
+                    f"esreg={sums['energy_scale_reg']/n_ok:.3f} "
                     f"efloor={sums['energy_floor']/n_ok:.3f} "
                     f"cd={sums['cd']/n_ok:.3f} "
                     f"igp={sums['interp_gp']/n_ok:.3f} "
@@ -2161,6 +2266,7 @@ def main() -> None:
                             "support": float(sums["support"] / n_ok),
                             "knn_dist": float(sums["knn_dist"] / n_ok),
                             "energy_reg": float(sums["energy_reg"] / n_ok),
+                            "energy_scale_reg": float(sums["energy_scale_reg"] / n_ok),
                             "interp_gp": float(sums["interp_gp"] / n_ok),
                             "energy_floor": float(sums["energy_floor"] / n_ok),
                             "cd": float(sums["cd"] / n_ok),
@@ -2197,12 +2303,19 @@ def main() -> None:
             failed_global_gates = [
                 k for k, v in kill.get("global_gates", {}).items() if v is False
             ]
+            failed_per_noise = []
+            for noise_key, noise_info in kill.get("per_noise", {}).items():
+                local_failed = [k for k, v in noise_info.get("gates", {}).items() if v is False]
+                if local_failed:
+                    failed_per_noise.append(f"{noise_key}:{','.join(local_failed)}")
             print(
                 f"Epoch {epoch_idx+1}: train={train['loss']:.4f} score={score:+.6f} "
                 f"strict_pass={kill['passed']} "
                 f"failed_gates={failed_global_gates if failed_global_gates else 'none'} "
                 f"skip={train['skip_rate']:.2%} ({time.time()-t0:.1f}s)"
             )
+            if failed_per_noise:
+                print(f"  per-noise failed gates: {' | '.join(failed_per_noise)}")
         else:
             eval_m = {"status": "not_evaluated"}
             kill = _not_evaluated_kill_stub()

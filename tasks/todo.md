@@ -1452,3 +1452,60 @@ Deliver a mathematically coherent, production-ready Stage1.5 baseline by closing
   - `python -c "import json, pathlib; json.load(open('configs/stage1_5_config.json', encoding='utf-8')); print('ok')"`
 - Limitation:
   - Full train/eval runtime verification requires user CUDA/Linux env (`.venv` with torch). Local desktop Python env in this session has no torch.
+
+# Stage1.5 Dual-Critic Plateau + Energy-Scale Audit (2026-03-31, Pass 24)
+
+## Goal
+Close the currently observed quality plateau in hybrid dual-critic training:
+- `dir` stagnation around ~0.31,
+- rank/success plateau,
+- unstable/off-scale energy ranges in GUI landscapes,
+- strict gates failing on `all_noise_scales_passed` and `mean_clean_min_violation_rate`.
+
+## Checklist
+- [x] Rebalance direction supervision for angular/radial split:
+  - [x] raise angular direction weight to Phase2i-equivalent regime
+  - [x] re-check low-sigma head weighting so low-noise inference is not radial-dominated without direction supervision
+- [x] Remove per-head update dilution from strict alternating head updates:
+  - [x] evaluate same-batch dual-head critic update vs alternating update
+  - [x] compare variance/stability and direction/rank metrics (added explicit mode + logging hooks)
+- [x] Stabilize energy scale behavior:
+  - [x] audit `log_energy_scale` buffer policy vs trainable scaling option
+  - [x] tighten regularization on off-manifold energies (relative floor / CD calibration + scale regularizer)
+- [x] Gate realism review:
+  - [x] extract exact per-noise failing gates from eval stream
+  - [x] verify clean-min violation semantics and threshold calibration against intended margin behavior
+- [x] Inference/eval parity verification:
+  - [x] confirm sigma/noise anneal consistency and objective semantics in GUI and train eval
+  - [x] ensure reported energy success metrics are semantically explicit (descent vs target-proximity)
+
+## Review
+- Implemented in code:
+  - `critic_step_mode` (`alternating`/`joint`) with joint same-batch paired critic updates.
+  - stronger angular-direction profile + low-sigma angular weighting in `configs/stage1_5_config.json`.
+  - optional trainable `log_energy_scale` (both simple and decomposed critics), separate optimizer LR group, and `lambda_energy_scale_reg`.
+  - anti-well penalties switched to relative-to-clean margins (`energy_floor_relative_to_clean`, `cd_relative_to_clean`) so penalties are active at realistic energy ranges.
+  - eval semantics made explicit:
+    - `energy_target_proximity_rate`
+    - `energy_descent_rate`
+    - `clean_min_violation_rate_strict`
+    - backward-compatible `energy_success_rate` retained as target-proximity alias.
+  - kill criteria clean-min gate now configurable via `clean_min_violation_mode` (`margin`/`strict`).
+  - epoch print now includes per-noise failed gates for actionable diagnostics.
+- Validation:
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py configs/base.py cebcm/training/kill_criteria.py cebcm/models/energy.py cebcm/models/energy_decomposed.py`
+  - `python -c "import json, pathlib; d=json.load(open('configs/stage1_5_config.json', encoding='utf-8')); print('ok', d.get('critic_step_mode'), d.get('energy_scale_trainable'), d.get('clean_min_violation_mode'))"`
+- Limitation:
+  - Full runtime train/eval verification is blocked in this desktop environment (`torch` is unavailable); needs user CUDA `.venv` run.
+
+## Pass 24 Log Audit Update (Current User-Provided Run, Epochs 1-24)
+- [x] Re-validated trend from current logs:
+  - `rank_success` climbs (`~0.16 -> ~0.80`) then saturates.
+  - `dir` drops (`~0.48 -> ~0.31`) then plateaus.
+  - `viol` improves but hovers near strict threshold region (`~0.05-0.07`).
+- [x] Re-validated strict-pass blockers for this run profile:
+  - `all_noise_scales_passed` remains failing.
+  - `mean_clean_min_violation_rate` remains sensitive around `max_clean_min_violation_rate=0.05`.
+- [x] Confirmed why `cd`/`efloor` are near-zero in this profile:
+  - With `energy_floor_threshold=5.0` and observed energy magnitudes around `O(1)`, both penalties are effectively inactive.
+  - This leaves anti-well shaping mostly dormant in the observed run.

@@ -69,6 +69,8 @@ class SimpleEnergy(nn.Module):
         groupsort_size: int = 2,
         spline_num_knots: int = 4,
         energy_output_clamp: float | None = 100.0,
+        trainable_energy_scale: bool = False,
+        energy_scale_init_log: float = 0.0,
     ):
         super().__init__()
 
@@ -118,14 +120,14 @@ class SimpleEnergy(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-        # Learnable energy scale (log-parameterized for fast adaptation).
-        # With σ-conditioning, the network adapts magnitude per noise level,
-        # but a global scale factor still helps match the overall DSM target range.
-        # Fixed energy scale — NOT learnable. A learnable scale decouples
-        # MDSM (gradient-based) from ranking (value-based) losses: MDSM pushes
-        # the scale up to match target gradient magnitudes, inflating ALL
-        # energies equally, which keeps spread=0 and kills ranking.
-        self.register_buffer("log_energy_scale", torch.tensor(0.0))
+        # Global energy scale (log-parameterized). Keep fixed by default to avoid
+        # degenerate "inflate all energies" behavior; can be enabled explicitly
+        # for calibration experiments with regularization.
+        init = torch.tensor(float(energy_scale_init_log))
+        if trainable_energy_scale:
+            self.log_energy_scale = nn.Parameter(init)
+        else:
+            self.register_buffer("log_energy_scale", init)
 
     def _embed_sigma(self, sigma: Tensor) -> Tensor:
         """

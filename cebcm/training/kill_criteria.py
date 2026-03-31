@@ -38,6 +38,7 @@ class ConditionalThresholds:
     min_l2_improvement: float = 0.0
     min_energy_success_rate: float = 0.55
     max_clean_min_violation: float = 0.25
+    clean_min_violation_key: str = "clean_min_violation_rate"
     min_step_norm: float = 1e-6
 
 
@@ -85,7 +86,12 @@ def summarize_conditional_eval(
         geo_imp = _safe_float(m.get("geodesic_improvement"))
         l2_imp = _safe_float(m.get("l2_improvement"))
         energy_success = _safe_float(m.get("energy_success_rate"))
-        clean_viol = _safe_float(m.get("clean_min_violation_rate"))
+        clean_viol = _safe_float(
+            m.get(
+                t.clean_min_violation_key,
+                m.get("clean_min_violation_rate"),
+            )
+        )
         step_norm = _safe_float(m.get("step_norm_mean"))
 
         gates = {
