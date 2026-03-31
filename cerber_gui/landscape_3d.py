@@ -33,6 +33,7 @@ def _evaluate_energy_exact(
     energy_fn,
     model_type: str,
     v_clean: torch.Tensor,
+    v_query: torch.Tensor | None,
     vectors: torch.Tensor,
 ) -> torch.Tensor:
     """Compute exact energy values at arbitrary vectors."""
@@ -40,8 +41,8 @@ def _evaluate_energy_exact(
         vectors = vectors.unsqueeze(0)
 
     if model_type == "simple":
-        v_query = v_clean.expand(vectors.shape[0], -1)
-        return energy_fn(v_query, vectors).detach()
+        query_anchor = (v_query if v_query is not None else v_clean).expand(vectors.shape[0], -1)
+        return energy_fn(query_anchor, vectors).detach()
     if model_type == "unconditional":
         return energy_fn(vectors).detach()
 
@@ -50,8 +51,8 @@ def _evaluate_energy_exact(
     sig = inspect.signature(_callable)
     params = [p for p in sig.parameters.values() if p.name != 'self']
     if len(params) >= 2:
-        v_query = v_clean.expand(vectors.shape[0], -1)
-        return energy_fn(v_query, vectors).detach()
+        query_anchor = (v_query if v_query is not None else v_clean).expand(vectors.shape[0], -1)
+        return energy_fn(query_anchor, vectors).detach()
     return energy_fn(vectors).detach()
 
 
@@ -59,6 +60,7 @@ def scan_energy_landscape_3d(
     energy_fn,
     v_clean: torch.Tensor,
     v_noisy: torch.Tensor,
+    v_query: torch.Tensor | None = None,
     grid_size: int = 50,
     range_factor: float = 1.5,
     absolute_half_range: float | None = None,
@@ -105,6 +107,7 @@ def scan_energy_landscape_3d(
         energy_fn=energy_fn,
         v_clean=v_clean,
         v_noisy=v_noisy,
+        v_query=v_query,
         grid_size=grid_size,
         grid_range=grid_range,
         v_denoised=v_denoised,
@@ -117,17 +120,17 @@ def scan_energy_landscape_3d(
     energy_min = float(energy_np.min())
     energy_max = float(energy_np.max())
 
-    clean_energy = float(_evaluate_energy_exact(energy_fn, model_type, v_clean, v_clean)[0].item())
-    noisy_energy = float(_evaluate_energy_exact(energy_fn, model_type, v_clean, v_noisy)[0].item())
+    clean_energy = float(_evaluate_energy_exact(energy_fn, model_type, v_clean, v_query, v_clean)[0].item())
+    noisy_energy = float(_evaluate_energy_exact(energy_fn, model_type, v_clean, v_query, v_noisy)[0].item())
     denoised_energy = None
     if v_denoised is not None:
-        denoised_energy = float(_evaluate_energy_exact(energy_fn, model_type, v_clean, v_denoised)[0].item())
+        denoised_energy = float(_evaluate_energy_exact(energy_fn, model_type, v_clean, v_query, v_denoised)[0].item())
 
     trajectory_energy = None
     if trajectory:
         traj_stack = torch.cat([t.reshape(1, -1) for t in trajectory], dim=0).to(v_clean.device)
         trajectory_energy = _evaluate_energy_exact(
-            energy_fn, model_type, v_clean, traj_stack
+            energy_fn, model_type, v_clean, v_query, traj_stack
         ).cpu().numpy().tolist()
 
     if model_type == "unconditional":
@@ -157,6 +160,7 @@ def scan_energy_landscape_3d(
         "denoised_point": landscape_data.v_denoised_xy,
         "trajectory_2d": landscape_data.trajectory_xy,  # Ð£Ð¶Ðµ ÑÐ¿Ñ€Ð¾ÐµÑ†Ð¸Ñ€Ð¾Ð²Ð°Ð½Ð¾ Ð² _scan_energy_landscape
         "v_clean": v_clean.squeeze(0).cpu().numpy(),
+        "v_query": (v_query if v_query is not None else v_clean).squeeze(0).cpu().numpy(),
         "v_noisy": v_noisy.squeeze(0).cpu().numpy(),
         "v_denoised": v_denoised.squeeze(0).cpu().numpy() if v_denoised is not None else None,
         "noise_scale": landscape_data.noise_scale,

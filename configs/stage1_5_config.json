@@ -170,7 +170,7 @@
   "actor_eval_steps": 3,
   "critic_eval_langevin_steps": 20,
   "eval_langevin_batch_size": 16,
-  "eval_noise_scales": [0.05, 0.1, 0.15, 0.2],
+  "eval_noise_scales": [0.0002, 0.05, 0.1, 0.15, 0.2],
 
   "retrieval_bank_size": 4096,
   "retrieval_topk_pos": 8,

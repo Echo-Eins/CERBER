@@ -1509,3 +1509,37 @@ Close the currently observed quality plateau in hybrid dual-critic training:
 - [x] Confirmed why `cd`/`efloor` are near-zero in this profile:
   - With `energy_floor_threshold=5.0` and observed energy magnitudes around `O(1)`, both penalties are effectively inactive.
   - This leaves anti-well shaping mostly dormant in the observed run.
+
+## Pass 50 Runtime Parity + Conditional Landscape Fix (2026-03-31, Epochs 1-50 user run)
+
+### Goal
+Close the remaining mismatch between reported metrics/plots and actual dynamics after the Pass 24 patchset:
+- low-noise runtime metrics not matching real Langevin controls in GUI path,
+- conditional landscape queried with wrong anchor (`target` instead of `query`),
+- strict gates not explicitly covering the real low-noise regime (`noise=0.0002`).
+
+### Checklist
+- [x] Fix GUI inference control parity:
+  - [x] `run_langevin_denoise(...)` now accepts `noise_scale_override`.
+  - [x] Runtime `sigma_override` now has priority over anneal wrapper (fixed sigma when explicitly requested).
+  - [x] `run_langevin(...)` receives actual runtime noise scale, not only checkpoint default.
+- [x] Fix conditional landscape semantics:
+  - [x] added explicit `v_query` anchor support to `scan_energy_landscape_3d(...)`.
+  - [x] added `v_query` passthrough to backend `scan_energy_landscape(...)`.
+  - [x] energy probes (`clean/noisy/final/trajectory`) now evaluate `E(query, candidate)` in conditional mode.
+  - [x] landscape scan now uses sigma-bound energy wrapper in GUI single-run paths for parity with runtime inference sigma.
+- [x] Fix gate realism for current failure mode:
+  - [x] included `0.0002` in `eval_noise_scales` for active Stage1.5 config.
+  - [x] updated Stage1.5 base default list to include low-noise scale.
+
+### Review
+- Code-level root causes confirmed from current run path:
+  - GUI previously passed fixed config noise into Langevin dynamics path even when runtime slider intended to probe low-noise behavior.
+  - Conditional landscape was visualized with `target` as query anchor, which can contradict true conditional objective.
+  - Strict evaluation grid did not include `0.0002`, so low-noise collapse could be underrepresented in gates.
+- Patched files:
+  - `cerber_gui/app.py`
+  - `cerber_gui/landscape_3d.py`
+  - `cebcm/visualization/energy_landscape.py`
+  - `configs/stage1_5_config.json`
+  - `configs/base.py`

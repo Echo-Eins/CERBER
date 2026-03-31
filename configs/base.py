@@ -432,7 +432,7 @@ class Stage1_5Config:
     actor_eval_steps: int = 3
     critic_eval_langevin_steps: int = 20
     eval_langevin_batch_size: int = 16
-    eval_noise_scales: list[float] = field(default_factory=lambda: [0.05, 0.1, 0.2, 0.3])
+    eval_noise_scales: list[float] = field(default_factory=lambda: [0.0002, 0.05, 0.1, 0.2, 0.3])
 
     # Retrieval conditioning
     retrieval_bank_size: int = 4096

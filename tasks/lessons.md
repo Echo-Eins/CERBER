@@ -1,5 +1,15 @@
 # Lessons
 
+## 2026-03-31 - GUI/runtime diagnostics must reflect the actual Langevin controls
+
+### Pattern
+User-facing logs showed low-noise inference collapse, but GUI path mixed runtime sliders with checkpoint-side anneal defaults in a way that could misrepresent actual dynamics. Conditional landscape probing also used `target` as query anchor, which is semantically wrong for retrieval objective `E(query, candidate)`.
+
+### Rule
+1. If runtime provides explicit sigma/noise overrides, those overrides must control the actual Langevin dynamics path.
+2. For conditional retrieval, any landscape/energy probe must evaluate with `query` anchor, never `target` anchor.
+3. Eval noise scales must include the real deployment/debug regime (for this project: `noise=0.0002`) or strict gates are not trustworthy.
+
 ## 2026-03-31 - "Twin critic" must not be mislabeled as radial+angular without explicit specialization
 
 ### Pattern
