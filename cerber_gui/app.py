@@ -1005,6 +1005,11 @@ def run_langevin_denoise(
                 sigma_max=getattr(_langevin_cfg, 'sigma_anneal_max', 0.3),
                 sigma_min=getattr(_langevin_cfg, 'sigma_anneal_min', 0.01),
                 adaptive_blend=getattr(_langevin_cfg, 'sigma_anneal_blend', 0.5),
+                noise_anneal=getattr(_langevin_cfg, 'noise_anneal', True),
+                noise_mode=getattr(_langevin_cfg, 'noise_anneal_mode', 'hybrid'),
+                noise_max=getattr(_langevin_cfg, 'noise_anneal_max', 0.15),
+                noise_min=getattr(_langevin_cfg, 'noise_anneal_min', stage1_cfg.langevin.noise_scale),
+                noise_sync_with_sigma=getattr(_langevin_cfg, 'noise_anneal_sync_with_sigma', True),
             )
             energy_fn = AdaptiveSigmaEnergyWrapper(model, _sched, max_steps=max_steps)
         elif sigma_override is not None:

@@ -27,6 +27,8 @@ All variants support:
 Spec reference: §8, §10, Appendix A.1/A.3/A.4
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -115,6 +117,34 @@ def _tame_gradient(grad: Tensor, lr: float) -> Tensor:
     """
     grad_norm = grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     return grad / (1.0 + lr * grad_norm)
+
+
+def _resolve_step_noise_scale(
+    energy_fn: torch.nn.Module,
+    v_query: Tensor,
+    v_current: Tensor,
+    base_noise_scale: float,
+) -> float:
+    """
+    Resolve per-step noise scale.
+
+    If the energy wrapper exposes `get_step_noise_scale(...)`, use it.
+    Otherwise fall back to the fixed `base_noise_scale`.
+    """
+    noise = float(base_noise_scale)
+    getter = getattr(energy_fn, "get_step_noise_scale", None)
+    if callable(getter):
+        try:
+            noise = float(
+                getter(v_query=v_query, v_candidate=v_current, base_noise_scale=base_noise_scale)
+            )
+        except TypeError:
+            noise = float(getter(v_query, v_current, base_noise_scale))
+        except Exception:
+            noise = float(base_noise_scale)
+    if not math.isfinite(noise):
+        return 0.0
+    return max(0.0, noise)
 
 
 # ============================================================
@@ -220,8 +250,9 @@ def langevin_dynamics(
         if target_norm is not None:
             update = _tangent_projection(update, v_current)
 
-        # Langevin step
-        langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
+        # Langevin step (optionally with step-dependent noise schedule)
+        step_noise_scale = _resolve_step_noise_scale(energy_fn, v_query, v_current, noise_scale)
+        langevin_noise = torch.randn_like(v_current) * (2 * lr * step_noise_scale) ** 0.5
         if tangent_noise and target_norm is not None:
             langevin_noise = _tangent_projection(langevin_noise, v_current)
         v_current = v_current - lr * update + langevin_noise
@@ -383,8 +414,9 @@ def pid_langevin_dynamics(
         if target_norm is not None:
             update = _tangent_projection(update, v_current)
 
-        # Langevin step with PID-controlled gradient
-        langevin_noise = torch.randn_like(v_current) * (2 * lr * noise_scale) ** 0.5
+        # Langevin step with PID-controlled gradient and optional step noise schedule
+        step_noise_scale = _resolve_step_noise_scale(energy_fn, v_query, v_current, noise_scale)
+        langevin_noise = torch.randn_like(v_current) * (2 * lr * step_noise_scale) ** 0.5
         if tangent_noise and target_norm is not None:
             langevin_noise = _tangent_projection(langevin_noise, v_current)
         v_current = v_current - lr * update + langevin_noise
@@ -529,8 +561,9 @@ def underdamped_langevin_dynamics(
 
         # Underdamped update:
         # p_{t+1} = (1-γ)·p_t - η·∇E + √(2γη/m)·ε
+        step_noise_scale = _resolve_step_noise_scale(energy_fn, v_query, v_current, noise_scale)
         thermal_noise = torch.randn_like(v_current) * (
-            2 * friction * lr * noise_scale / mass
+            2 * friction * lr * step_noise_scale / mass
         ) ** 0.5
         if tangent_noise and target_norm is not None:
             thermal_noise = _tangent_projection(thermal_noise, v_current)

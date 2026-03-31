@@ -62,6 +62,13 @@ class LangevinConfig:
     sigma_anneal_max: float = 0.3
     sigma_anneal_min: float = 0.01
     sigma_anneal_blend: float = 0.5  # for hybrid mode
+    # Optional synchronized noise annealing during inference:
+    # co-anneal Langevin noise with sigma schedule to avoid semantic mismatch.
+    noise_anneal: bool = True
+    noise_anneal_mode: str = "hybrid"  # "geometric", "adaptive", "hybrid"
+    noise_anneal_max: float = 0.15
+    noise_anneal_min: float = 0.0002
+    noise_anneal_sync_with_sigma: bool = True
 
 
 @dataclass

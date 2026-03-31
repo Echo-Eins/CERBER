@@ -644,6 +644,11 @@ def eval_model(
                     sigma_max=getattr(cfg.langevin, 'sigma_anneal_max', 0.3),
                     sigma_min=getattr(cfg.langevin, 'sigma_anneal_min', 0.01),
                     adaptive_blend=getattr(cfg.langevin, 'sigma_anneal_blend', 0.5),
+                    noise_anneal=getattr(cfg.langevin, 'noise_anneal', True),
+                    noise_mode=getattr(cfg.langevin, 'noise_anneal_mode', 'hybrid'),
+                    noise_max=getattr(cfg.langevin, 'noise_anneal_max', 0.15),
+                    noise_min=getattr(cfg.langevin, 'noise_anneal_min', cfg.langevin.noise_scale),
+                    noise_sync_with_sigma=getattr(cfg.langevin, 'noise_anneal_sync_with_sigma', True),
                 )
                 sigma_bound_ef = AdaptiveSigmaEnergyWrapper(
                     ef, sigma_sched_cfg, max_steps=cfg.critic_eval_langevin_steps,

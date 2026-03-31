@@ -161,6 +161,11 @@
     "sigma_anneal_mode": "hybrid",
     "sigma_anneal_max": 0.3,
     "sigma_anneal_min": 0.01,
-    "sigma_anneal_blend": 0.5
+    "sigma_anneal_blend": 0.5,
+    "noise_anneal": true,
+    "noise_anneal_mode": "hybrid",
+    "noise_anneal_max": 0.15,
+    "noise_anneal_min": 0.0002,
+    "noise_anneal_sync_with_sigma": true
   }
 }
