@@ -1041,3 +1041,114 @@ Enabling any of them violates single-variable discipline and risks known failure
 2. **Do NOT enable NCE/CQL** — value-based losses conflict with MDSM gradient supervision
 3. **Do NOT enable inbatch_negatives** — same category as NCE
 4. If ranking needs improvement, tune lambda_rank or margins, not add auxiliary contrastive losses
+
+## Lesson: Extended σ curriculum is a dead-end due to sigma_eff_sq clamp (Phase 2j, 2026-03-31)
+
+### Summary
+Phase 2j extended training σ from [0.01, 0.3] to [0.001, 0.3]. Result: no improvement at low noise (65% vs 64%), slight regression at high noise. The sigma_eff_sq clamp at 1e-6 makes training at σ<0.005 mathematically impossible.
+
+### Root Cause
+```python
+sigma_eff_sq = ((sigma * nrm) ** 2).clamp(min=1e-6)  # train_stage1_5.py:243
+```
+At σ=0.001, nrm≈0.2051: `(0.001 × 0.2051)² = 4.2e-8` → clamped to `1e-6` (24× inflation).
+- MDSM target `tgt = displacement / sigma_eff_sq` is 24× smaller than correct value
+- sigma2 weight `w = sigma_eff_sq = 1e-6` → near-zero contribution to loss
+- Double suppression: wrong target AND near-zero weight = critic learns NOTHING at σ<0.005
+- Additionally, loguniform over [0.001, 0.3] = 2.5 decades → less density per decade at important σ=[0.01, 0.3]
+
+### Evidence
+- Phase 2i (σ=[0.01, 0.3]): noise=0.0002 success 64%, noise=0.15 success 100%
+- Phase 2j (σ=[0.001, 0.3]): noise=0.0002 success 65%, noise=0.15 regressed (cosine -0.115 less improvement)
+
+### Rule
+1. **Never extend σ below 0.005** with current sigma_eff_sq clamp — the samples are dead weight
+2. If low-σ training is needed, fix the clamp first (adaptive floor or log-space MDSM formulation)
+3. Wider σ range with loguniform = diluted training density — always check samples-per-decade
+4. Extending training range is wrong lever when inference σ-conditioning doesn't match actual noise
+
+## Lesson: Stronger CD improves well suppression but competes with direction learning (Option A, 2026-03-31)
+
+### Summary
+Option A (cd_num_samples=64, cd_num_steps=40, lambda_cd=0.3) improved low-noise success 64%→75% but direction loss regressed significantly (dir 0.77→0.62). CD and direction loss have conflicting gradient objectives at overlapping spatial regions.
+
+### Root Cause
+CD pushes energy UP at Langevin endpoints (wells). Direction loss teaches gradient DIRECTION at noisy points (σ-perturbed training data). When CD particles land near training points, CD wants to flatten the landscape there while direction loss wants specific gradient orientations. Stronger CD = more particles competing for the same gradient space = worse direction learning.
+
+### Evidence
+- Phase 2i (CD: 32 samples, 10 steps, λ=0.1): dir=0.77, noise=0.0002 success 64%
+- Option A (CD: 64 samples, 40 steps, λ=0.3): dir=0.624, noise=0.0002 success 75.39%
+- Energy success still only 3.91% — wells near clean target persist despite stronger CD
+
+### Rule
+1. CD has diminishing returns — going from λ=0.1→0.3 gives +11% cosine success but -0.15 direction quality
+2. CD and direction/MDSM losses compete for the energy landscape shape near training points
+3. If CD is increased, expect direction loss regression — monitor both metrics together
+4. Energy success ~3% means clean target is NOT the energy minimum — CD alone cannot fix landscape topology
+
+## Lesson: More Langevin steps = deeper well trapping, not better convergence (Option B, 2026-03-31)
+
+### Summary
+Option B (500 Langevin steps instead of 100) produced WORSE results: 60.55% vs 65% cosine success at noise=0.0002. More steps gives more time to fall into and get trapped in structural local minima.
+
+### Evidence
+- 100 steps: noise=0.0002 success ~65%
+- 500 steps: noise=0.0002 success 60.55%, energy -1.121 (deeper than 100-step endpoint)
+- Energy success 2.73% — still overwhelmingly falling into wrong wells
+
+### Root Cause
+The energy landscape has structural local minima near clean targets (E_well < E_clean in 97% of cases). With noise_scale=0.0002, Langevin is deterministic gradient descent. More steps = deeper descent into the nearest well. The wells are structural features of the unconstrained MLP, not noise artifacts.
+
+### Rule
+1. **Do NOT increase Langevin steps** as a fix for low-noise inference — it makes things worse
+2. At noise_scale=0.0002, dynamics is purely gradient-driven → more steps = deeper well trapping
+3. If 100 steps don't converge, the problem is landscape topology, not insufficient iteration
+4. The only way more steps could help is with noise annealing (high→low) so early steps escape wells
+
+## CRITICAL Lesson: σ-conditioning is semantically broken at inference (2026-03-31)
+
+### Summary
+During training, σ truthfully describes the sample's noise level: `noisy = pos + noise * σ * norm`. During inference, σ is a schedule value (geometric anneal from σ_max→σ_min) that has NO relation to the sample's actual distance from clean. The critic learned `score(q, x, σ=actual_noise_level)` but inference asks for `score(q, x, σ=schedule_value)`.
+
+### Evidence
+- Training: σ sampled from [0.01, 0.3], `noisy` is literally at distance σ×norm from clean
+- Inference: σ_anneal=true anneals σ from 0.3→0.01, but Langevin noise_scale FIXED at 0.0002
+- The sample's actual distance from clean is unknown and constantly changing
+- At noise=0.15 (high Langevin noise): mismatch tolerable because random walk dominates
+- At noise=0.0002 (deterministic): mismatch fatal because gradients depend entirely on σ-conditioning
+
+### Root Cause
+This is the NCSN/diffusion inference paradigm done incorrectly:
+- NCSN anneals BOTH the σ-conditioning AND the sampling noise together
+- Our system anneals σ-conditioning but keeps sampling noise fixed at 0.0002
+- Result: critic receives σ=0.3 (early steps) but sample may be at distance 0.05 from clean → wrong gradients
+
+### Rule
+1. **σ-conditioning must match actual sample state** — either:
+   a) Anneal Langevin noise_scale in sync with σ-conditioning (true NCSN sampling)
+   b) Use distance-adaptive σ (sigma_schedule.py's "adaptive" mode) so σ reflects reality
+2. Fixed noise_scale + annealed σ-conditioning = semantic lie → critic gives wrong gradients
+3. High-noise success (100% at noise=0.15) is stochastic search DESPITE bad gradients, not gradient-guided
+4. The most promising fix: anneal noise FROM 0.15 TO 0.0002 synced with σ, leveraging the 100% success regime
+
+## Lesson: Energy success ~3% proves clean target is not energy-minimal (2026-03-31)
+
+### Summary
+Across ALL configurations (Phase 2i/2j/Option A/Option B), energy success rate at noise=0.0002 is 2.7-3.9%. This means the Langevin endpoint has HIGHER energy than the clean target in 96-97% of cases. The clean target is structurally not the energy minimum in its local neighborhood.
+
+### Evidence
+| Config | Energy Success | E_final |
+|--------|---------------|---------|
+| Phase 2i | low | -1.456 |
+| Phase 2j | 2.73% | -1.606 |
+| Option A | 3.91% | -1.104 |
+| Option B | 2.73% | -1.121 |
+
+### Root Cause
+An MLP with [2048, 1024, 512] hidden dims and SiLU activation creates exponentially many local minima in 1024D. clean_min_penalty only sees actor outputs during training, not the full neighborhood. CD explores a vanishing fraction of 1024D per step. Wells that neither actor nor CD finds during training persist at inference.
+
+### Rule
+1. 3% energy success = the energy landscape is fundamentally wrong near clean targets
+2. No amount of CD/efloor can exhaustively suppress wells in 1024D — it's a whack-a-mole problem
+3. This points to an architectural limitation of unconstrained MLP for EBM in high dimensions
+4. Potential fixes require architectural change: dual-critic decomposition, score distillation, or flow matching

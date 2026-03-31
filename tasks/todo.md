@@ -160,22 +160,54 @@ Config: `configs/ablation_phase2i_cd_underdamped.json`
 - CD and efloor both active and >0 throughout training
 - **Diagnosis**: low-noise inference still weak because training σ∈[0.01, 0.3] but inference at σ=0.0002 is 50x below training minimum. MDSM score not trained at near-zero σ.
 
-### Phase 2j: Extended σ Curriculum (CURRENT)
+### Phase 2j: Extended σ Curriculum ✗ FAILED (sigma_eff_sq clamp blocks low-σ learning)
 Config: `configs/ablation_phase2j_sigma_extended.json`
 - Phase 2i + sigma_curriculum_start: 0.01→0.001 (10x lower)
-- sigma_anneal_min: 0.01→0.001 (inference annealing covers trained range)
-- **Hypothesis**: critic learns proper scores at σ→0, Langevin follows trained gradients at fine scale
-- **Single variable change** from Phase 2i: only σ range extended
-- [ ] Run 50 epochs
-- [ ] Check: rank_success ≥ 89% (no regression)
-- [ ] Check: noise=0.0002 cosine success > 64% (beat Phase 2i)
-- [ ] Check: noise=0.15 cosine success ≥ 100% (no regression)
+- **Result**: rank_success=89.5%, noise=0.0002 success **65%** (no improvement from 64%)
+- noise=0.15 **regressed** (cosine improvement -0.115 less than Phase 2i)
+- **Root cause**: sigma_eff_sq clamp at 1e-6 makes σ<0.005 a dead zone for MDSM learning
+- Loguniform over 2.5 decades diluted training density at important σ=[0.01, 0.3]
 
-### Phase 2k (if 2j insufficient): Sigma-Annealed Inference
-- Enable sigma_anneal for inference (already implemented in sigma_schedule.py)
-- Start at σ=0.15 (where 100% success), geometrically anneal to σ_min
-- Step budget: 40 steps coarse (σ=0.15→0.01), 40 medium (0.01→0.001), 20 fine (0.001→σ_min)
-- Critic is σ-conditioned — this is what NCSN was designed for
+### Option A: Stronger CD (on Phase 2j base) — PARTIAL IMPROVEMENT
+Config: Phase 2j + cd_num_samples=64, cd_num_steps=40, lambda_cd=0.3
+- **Result**: rank_success=88.4%, noise=0.0002 cosine success **75.39%** (best at low noise)
+- But direction loss regressed: dir=0.624 vs 0.77 (Phase 2i)
+- Energy success only 3.91% — wells persist despite stronger CD
+- **Trade-off**: CD well suppression competes with direction/MDSM gradient quality
+
+### Option B: 500 Langevin Steps (on Option A base) ✗ WORSE
+Config: Option A + 500 Langevin steps instead of 100
+- **Result**: rank_success=89.7%, noise=0.0002 cosine success **60.55%** (WORSE than 100 steps)
+- Energy success 2.73% — more steps = deeper descent into structural wells
+- **Conclusion**: more steps at noise=0.0002 = more time to get trapped in local minima
+
+### Summary of All Low-Noise Results (noise=0.0002)
+| Config | Cosine Success | Cosine Δ | Energy Success | Dir |
+|--------|---------------|----------|----------------|-----|
+| Phase 2i (baseline) | 64% | +0.024 | low | 0.77 |
+| Phase 2j (σ extended) | 65% | +0.023 | 2.73% | ~0.77 |
+| Option A (strong CD) | **75.39%** | +0.038 | 3.91% | 0.624 |
+| Option B (500 steps) | 60.55% | +0.015 | 2.73% | ~0.62 |
+
+### Root Cause Analysis (2026-03-31)
+1. **σ-conditioning semantic mismatch**: Training σ = actual noise level; inference σ = schedule value unrelated to sample state. At low noise, dynamics is gradient-driven → mismatch is fatal.
+2. **sigma_eff_sq clamp**: Makes σ<0.005 dead zone for MDSM → extending training range is pointless.
+3. **Unconstrained MLP topology**: Exponential local minima in 1024D. CD explores vanishing fraction.
+4. **Energy success ~3%**: Clean target is NOT the energy minimum in 97% of neighborhoods.
+5. **High-noise success is stochastic**: 100% at noise=0.15 is random walk, not gradient quality.
+
+### Phase 2k: NCSN-Style Noise-Annealed Inference (NEXT — highest leverage)
+- Anneal BOTH Langevin noise_scale AND σ-conditioning together (true NCSN sampling)
+- First 50 steps: noise=0.15, σ=0.15 (stochastic search, 100% success regime)
+- Last 50 steps: noise→0.0002, σ→0.01 (deterministic refinement in trained regime)
+- **No retraining needed** — uses existing Phase 2i checkpoint
+- Fixes σ-conditioning semantic mismatch (issue #1)
+- Leverages proven 100% success at high noise as starting point
+- Already have infrastructure: AdaptiveSigmaEnergyWrapper + run_langevin
+
+### Phase 2l (if 2k insufficient): Architectural Shift
+- Options: dual-critic (angular + radial), score distillation network, flow matching
+- Addresses issues #3 and #4 (MLP topology, clean not energy-minimal)
 
 ### Phase 2h (ORIGINAL): Soft Lipschitz (weight decay + GP at OOD only)
 Config: `configs/ablation_phase2h_soft_lip.json`
