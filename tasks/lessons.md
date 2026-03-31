@@ -1,5 +1,22 @@
 # Lessons
 
+## 2026-03-31 - "Twin critic" must not be mislabeled as radial+angular without explicit specialization
+
+### Pattern
+User requested a true radial+angular twin-critic architecture. Current Stage1.5 had two homogeneous critics (`SimpleEnergy` + same features/losses), which is an ensemble, not geometric decomposition.
+
+### Rule
+1. Never call architecture "radial+angular" unless critics are explicitly specialized by design.
+2. Radial critic must consume radius/displacement features (or equivalent) and be supervised by radial objectives.
+3. Angular critic must consume normalized/geodesic features and be supervised by angular objectives.
+4. Trainer/eval must report per-head metrics (radial vs angular), not only aggregated twin score.
+
+### Verification checklist before claiming radial+angular
+1. Distinct critic modules/classes or distinct head pathways exist in code.
+2. Distinct loss terms are active and mapped to respective heads.
+3. Aggregator mixes the two heads in inference and training consistently.
+4. Ablations can independently disable radial or angular head.
+
 ## 2026-03-29 - CRITICAL: Never change multiple variables at once (Phase 2f post-mortem)
 
 ### Pattern

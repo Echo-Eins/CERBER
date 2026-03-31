@@ -235,25 +235,36 @@ class Stage1_5Config:
         max_steps=100,
         target_norm=0.2051,
         method="pid",
-        pid_kp=0.1,
-        pid_ki=0.01,
-        pid_kd=0.05,
+        pid_kp=1.0,
+        pid_ki=0.3,
+        pid_kd=0.1,
     ))
 
     # Architecture
     energy_dim: int = 1024
     energy_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
     actor_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
-    norm_mode: str = "orthonorm"
-    activation: str = "groupsort"
-    actor_norm_mode: str = "orthonorm"   # "orthonorm", "spectral_norm", "none"
+    critic_architecture: str = "radial_angular"  # "homogeneous" or "radial_angular"
+    angular_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024, 512])
+    radial_hidden_dims: list[int] = field(default_factory=lambda: [512, 256, 128])
+    norm_mode: str = "none"
+    activation: str = "silu"
+    angular_norm_mode: str = "none"
+    angular_activation: str = "silu"
+    radial_norm_mode: str = "none"
+    radial_activation: str = "silu"
+    actor_norm_mode: str = "none"   # "orthonorm", "spectral_norm", "none"
     actor_activation: str = "silu"       # "silu", "gelu", "relu", "groupsort", "lipschitz_spline"
-    ortho_n_iters: int = 4
-    ortho_schedule_enabled: bool = True
-    ortho_schedule_iters: list[int] = field(default_factory=lambda: [4, 2, 2])
-    ortho_schedule_boundaries: list[float] = field(default_factory=lambda: [0.34, 0.67])
+    ortho_n_iters: int = 2
+    ortho_schedule_enabled: bool = False
+    ortho_schedule_iters: list[int] = field(default_factory=lambda: [2])
+    ortho_schedule_boundaries: list[float] = field(default_factory=list)
     twin_aggregate: str = "softmax"  # "max", "mean", or "softmax"
     twin_softmax_temperature: float = 0.10
+    sigma_head_weighting_enabled: bool = True
+    angular_weight_low_sigma: float = 0.45
+    angular_weight_high_sigma: float = 0.75
+    head_weight_power: float = 1.0
 
     # Optimizer
     critic_lr: float = 1e-4
@@ -274,37 +285,50 @@ class Stage1_5Config:
     lr_plateau_boost: float = 3.0       # multiply LR by this factor on plateau detection
 
     # Loss weights
-    lambda_mdsm: float = 1.0
-    mdsm_warmup_epochs: int = 0  # Epochs of pure ranking before MDSM ramps in (0=disabled)
-    lambda_rank: float = 0.25
+    lambda_mdsm: float = 0.5
+    lambda_mdsm_angular: float = 0.5
+    lambda_mdsm_radial: float = 0.2
+    mdsm_warmup_epochs: int = 5  # Epochs of ranking-focused warmup before full MDSM
+    lambda_rank: float = 1.0
+    lambda_rank_angular: float = 1.0
+    lambda_rank_radial: float = 0.5
     lambda_nce: float = 0.10
     lambda_cql: float = 0.1
     lambda_shell: float = 0.1
     lambda_geo: float = 1.0
     lambda_align: float = 0.1
-    lambda_bc_reg: float = 0.5
+    lambda_bc_reg: float = 0.3
     lambda_prior: float = 0.1
     lambda_prior_nce: float = 0.05
     lambda_actor_barrier: float = 0.1
     lambda_actor_descent: float = 0.1
     # P0: Clean-minimum penalty — prevents sub-clean attractors
-    lambda_clean_min: float = 0.3
+    lambda_clean_min: float = 0.2
+    lambda_clean_min_angular: float = 0.0
+    lambda_clean_min_radial: float = 0.2
     clean_min_margin: float = 0.1
     # P0: Explicit gradient direction loss — teaches critic WHERE to point
-    lambda_direction: float = 0.15
-    direction_num_samples: int = 0  # 0 = reuse MDSM noisy sample; >0 = separate samples
+    lambda_direction: float = 0.1
+    lambda_direction_angular: float = 0.1
+    lambda_direction_radial: float = 0.0
+    direction_num_samples: int = 1
+    # Head specialization regularizers
+    lambda_angular_purity: float = 0.05
+    lambda_radial_purity: float = 0.05
+    lambda_head_corr: float = 0.02
+    head_corr_target: float = 0.20
     # P1: Support/manifold proximity penalty — kNN to retrieval bank
-    lambda_support: float = 0.1
+    lambda_support: float = 0.0
     support_k: int = 5
     support_threshold_percentile: float = 95.0  # auto-calibrate from bank distances
     # P1: Enhanced multi-negative contrastive — in-batch cross-negatives
-    lambda_inbatch_nce: float = 0.15
+    lambda_inbatch_nce: float = 0.0
     inbatch_nce_temperature: float = 0.07
-    use_inbatch_negatives: bool = True
+    use_inbatch_negatives: bool = False
 
     # Feature flags
-    use_cql: bool = True
-    use_nce: bool = True
+    use_cql: bool = False
+    use_nce: bool = False
     use_bc: bool = True
     use_grad_align: bool = True
     use_prior_critic: bool = False
@@ -313,7 +337,11 @@ class Stage1_5Config:
     use_shell_barrier: bool = False
     use_clean_min_penalty: bool = True
     use_direction_loss: bool = True
-    use_support_penalty: bool = True
+    route_cd_to_radial_only: bool = True
+    route_energy_floor_to_radial_only: bool = True
+    route_direction_to_angular_only: bool = True
+    route_clean_min_to_radial_only: bool = True
+    use_support_penalty: bool = False
     # Energy scale regularization (prevent unbounded energy growth)
     use_energy_reg: bool = True
     lambda_energy_reg: float = 0.01
@@ -328,7 +356,7 @@ class Stage1_5Config:
     energy_floor_adversarial_steps: int = 0  # 0=random only, >0=gradient descent steps to find wells
     energy_floor_adversarial_lr: float = 0.01  # step size for adversarial well-finding
     # Contrastive divergence: run Langevin in critic loop, push up energy at endpoints
-    use_cd: bool = False
+    use_cd: bool = True
     lambda_cd: float = 0.1
     cd_num_samples: int = 32             # number of particles to run
     cd_num_steps: int = 10               # Langevin steps per particle
@@ -347,13 +375,27 @@ class Stage1_5Config:
 
     # Noise and MDSM
     sigma_curriculum_start: float = 0.01
-    sigma_curriculum_end: float = 0.5
-    sigma_min: float = 0.001
-    sigma_max: float = 1.0
+    sigma_curriculum_end: float = 0.3
+    sigma_min: float = 0.01
+    sigma_max: float = 0.3
     sigma_sampling: str = "loguniform"
     sigma_weighting: str = "sigma2"
     edm_p_mean: float = -1.2
     edm_p_std: float = 1.2
+    # MDSM numeric safety / low-sigma handling.
+    # target_mode:
+    #   - "standard": classic target = (noisy-clean)/sigma_eff_sq
+    #   - "logspace": computes inverse sigma_eff_sq in log-space to avoid hard dead-zones
+    mdsm_target_mode: str = "logspace"
+    # sigma_eff floor mode for standard target:
+    #   - "constant": fixed absolute floor
+    #   - "adaptive": floor scales with ||x||^2 to keep relative geometry
+    #   - "none": no explicit floor (not recommended unless logspace mode is used)
+    mdsm_sigma_eff_floor_mode: str = "adaptive"
+    mdsm_sigma_eff_floor: float = 1e-10
+    mdsm_sigma_floor: float = 1e-8
+    mdsm_inv_sigma2_clip: float = 1e8
+    mdsm_weight_floor: float = 1e-8
     mdsm_tangent_projection: bool = True
     mdsm_directional: bool = True
     mdsm_magnitude_aux_weight: float = 0.05
@@ -363,27 +405,27 @@ class Stage1_5Config:
     mdsm_gradient_checkpointing: bool = True
 
     # Ranking margins
-    critic_margin_clean_actor: float = 0.5
-    critic_margin_actor_noisy: float = 0.3
-    critic_margin_clean_noisy: float = 0.8
-    rank_normalize_by_std: bool = True
-    rank_std_floor: float = 1e-3
+    critic_margin_clean_actor: float = 0.1
+    critic_margin_actor_noisy: float = 0.05
+    critic_margin_clean_noisy: float = 0.15
+    rank_normalize_by_std: bool = False
+    rank_std_floor: float = 1e-2
     actor_energy_margin_pos: float = 0.05
     actor_energy_margin_hard: float = 0.05
-    actor_barrier_normalize_by_std: bool = True
+    actor_barrier_normalize_by_std: bool = False
 
     # Actor/inference rollout
-    actor_step_size: float = 1.0
+    actor_step_size: float = 0.5
     actor_tangent_projection: bool = True
     actor_seed_mix_query: float = 0.5
     actor_seed_noise_scale: float = 1.0
-    actor_eval_steps: int = 1
+    actor_eval_steps: int = 3
     critic_eval_langevin_steps: int = 20
     eval_langevin_batch_size: int = 16
     eval_noise_scales: list[float] = field(default_factory=lambda: [0.05, 0.1, 0.2, 0.3])
 
     # Retrieval conditioning
-    retrieval_bank_size: int = 2048
+    retrieval_bank_size: int = 4096
     retrieval_topk_pos: int = 8
     retrieval_hard_start: int = 8
     retrieval_hard_end: int = 32
@@ -406,18 +448,18 @@ class Stage1_5Config:
     log_every: int = 50
     checkpoint_every_epochs: int = 10
     rolling_checkpoint_name: str = "latest_epoch.pt"
-    eval_num_samples: int = 64
+    eval_num_samples: int = 128
     eval_every_epochs: int = 2
     langevin_tangent_noise: bool = True
 
     # Kill criteria thresholds
-    min_cosine_improvement: float = 0.05
-    min_cosine_success_rate: float = 0.6
-    min_geodesic_improvement: float = 0.01
-    min_l2_improvement: float = 0.0
-    min_energy_success_rate: float = 0.5
-    max_clean_min_violation_rate: float = 0.1
-    min_step_norm: float = 1e-6
+    min_cosine_improvement: float = 0.06
+    min_cosine_success_rate: float = 0.70
+    min_geodesic_improvement: float = 0.02
+    min_l2_improvement: float = 0.005
+    min_energy_success_rate: float = 0.65
+    max_clean_min_violation_rate: float = 0.05
+    min_step_norm: float = 1e-3
 
     # Stability
     skip_non_finite_batches: bool = True

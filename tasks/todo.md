@@ -218,6 +218,41 @@ Config: `configs/ablation_phase2h_soft_lip.json`
 - Keep direction_loss + clean_min + energy_reg (clean-only)
 - **Hypothesis**: soft Lipschitz via weight decay smooths gradient field without killing capacity
 - **Key difference from Phase 2d**: GP at random OOD points, not along training corridor
+
+---
+
+# SOTA Radial+Angular Research Kickoff (2026-03-31)
+
+## Goal
+Build an implementation-ready SOTA blueprint for a true geometric twin critic:
+- Angular critic (tangential semantic guidance),
+- Radial critic (normal/shell/manifold control),
+- Shared inference protocol with mathematically consistent gradient composition.
+
+## Checklist
+- [x] Audit current Stage 1.5 codepath and verify whether current twin critics are truly specialized.
+- [x] Collect primary-source SOTA evidence for tangent/normal decomposition on manifold data.
+- [x] Write a concrete architecture blueprint with losses, inference math, and ablation protocol.
+- [x] Record anti-pattern in lessons to prevent relabeling homogeneous twin critics as radial+angular.
+- [x] Implement specialized critic modules and integrate into Stage 1.5 trainer.
+- [x] Add per-head eval metrics (angular vs radial) in eval outputs/log stream.
+- [ ] Add explicit disable-head ablation switches in config + trainer.
+- [ ] Validate low-noise inference stability with synchronized sigma/noise schedule via full run.
+
+## Artifacts
+- Research: `research4_radial_angular_sota.md`
+- Lessons: `tasks/lessons.md` (new rule: no fake radial+angular labeling)
+
+## Review
+- Current code has twin critics, but they are homogeneous (`SimpleEnergy` + same feature fusion).
+- This means current architecture is ensemble-style, not radial+angular geometric decomposition.
+- Implemented:
+  - `cebcm/models/energy_decomposed.py` (`AngularEnergyCritic`, `RadialEnergyCritic`)
+  - Stage1.5 trainer routing by critic role (angular/radial), role-specific losses, purity/correlation regularizers
+  - Sigma-dependent angular/radial head weighting in `TwinHybridEnergy`
+  - GUI loader support for `critic_architecture=radial_angular`
+- Pending:
+  - full ablation toggles and end-to-end long-run validation
 - [ ] Create config
 - [ ] Run 50 epochs
 - [ ] Check: spread ≥ 0.4, no spurious wells (E < -5)
@@ -1385,3 +1420,35 @@ Remove structural visualization/inference mismatch where Stage1.5 checkpoints we
 - This removes a major source of apparent "training vs landscape" contradictions in checkpoint inspection.
 - Validation run:
   - `python -m py_compile cerber_gui/app.py`
+
+# Stage1.5 SOTA Consolidation (2026-03-31, Pass 23)
+
+## Goal
+Deliver a mathematically coherent, production-ready Stage1.5 baseline by closing remaining known failure modes:
+- low-sigma MDSM dead-zone (`sigma_eff_sq` clamp pathology),
+- overloaded/conflicting default objective stack,
+- weak config safety for known anti-pattern combinations.
+
+## Checklist
+- [x] Re-audit current Stage1.5 critic/actor/inference math against `research3` failure analysis
+- [x] Implement robust MDSM sigma handling:
+  - [x] adaptive sigma floor mode
+  - [x] log-space target mode (no hard `1e-6` dead-zone behavior)
+  - [x] inverse-sigma clipping controls for numerical safety
+- [x] Add strict config validation gates for low-sigma + weighting anti-patterns
+- [x] Introduce SOTA-safe Stage1.5 default config profile (minimal conflicting losses)
+- [x] Validate static correctness (`py_compile`) for all touched modules
+- [x] Produce run commands and expected training-gate interpretation notes
+
+## Review
+- Done. Implemented:
+  - low-sigma MDSM stabilization (`logspace`/`adaptive` modes, weight floor, inv-sigma clip),
+  - eval/inference sigma-anneal metric parity,
+  - actor barrier manifold-consistent references,
+  - strict config validation for known failure combinations,
+  - stricter best-checkpoint policy (`best.pt` = strict-pass only; `best_any.pt` = best score regardless).
+- Validation passed:
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py configs/base.py cerber_gui/app.py cebcm/training/kill_criteria.py`
+  - `python -c "import json, pathlib; json.load(open('configs/stage1_5_config.json', encoding='utf-8')); print('ok')"`
+- Limitation:
+  - Full train/eval runtime verification requires user CUDA/Linux env (`.venv` with torch). Local desktop Python env in this session has no torch.

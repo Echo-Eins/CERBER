@@ -369,6 +369,13 @@ class _TwinConditionalEnergyAdapter:
         softmax_temperature: float = 0.1,
         prior=None,
         lambda_prior: float = 0.0,
+        critic_architecture: str = "homogeneous",
+        sigma_min: float = 0.01,
+        sigma_max: float = 0.3,
+        sigma_head_weighting_enabled: bool = False,
+        angular_weight_low_sigma: float = 0.5,
+        angular_weight_high_sigma: float = 0.5,
+        head_weight_power: float = 1.0,
     ):
         self.critic1 = critic1
         self.critic2 = critic2
@@ -376,6 +383,13 @@ class _TwinConditionalEnergyAdapter:
         self.softmax_temperature = float(softmax_temperature)
         self.prior = prior
         self.lambda_prior = float(lambda_prior)
+        self.critic_architecture = str(critic_architecture)
+        self.sigma_min = float(max(sigma_min, 1e-8))
+        self.sigma_max = float(max(sigma_max, self.sigma_min + 1e-8))
+        self.sigma_head_weighting_enabled = bool(sigma_head_weighting_enabled)
+        self.angular_weight_low_sigma = float(angular_weight_low_sigma)
+        self.angular_weight_high_sigma = float(angular_weight_high_sigma)
+        self.head_weight_power = float(max(head_weight_power, 1e-6))
 
     def eval(self):
         self.critic1.eval()
@@ -392,6 +406,24 @@ class _TwinConditionalEnergyAdapter:
     ) -> torch.Tensor:
         e1 = self.critic1(v_query, v_candidate, sigma=sigma)
         e2 = self.critic2(v_query, v_candidate, sigma=sigma)
+        if self.critic_architecture == "radial_angular":
+            sigma_use = sigma
+            if sigma_use is None:
+                with torch.no_grad():
+                    d = (v_candidate - v_query).norm(dim=-1, keepdim=True)
+                    qn = v_query.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    sigma_use = (d / qn).clamp(min=self.sigma_min, max=self.sigma_max)
+            if self.sigma_head_weighting_enabled:
+                log_s = sigma_use.clamp(min=self.sigma_min, max=self.sigma_max).log()
+                denom = max(np.log(self.sigma_max) - np.log(self.sigma_min), 1e-8)
+                t = ((log_s - np.log(self.sigma_min)) / denom).clamp(min=0.0, max=1.0).pow(self.head_weight_power)
+                w_ang = self.angular_weight_low_sigma + (
+                    self.angular_weight_high_sigma - self.angular_weight_low_sigma
+                ) * t
+            else:
+                w_ang = torch.full_like(sigma_use, 0.5 * (self.angular_weight_low_sigma + self.angular_weight_high_sigma))
+            w_ang = w_ang.clamp(min=0.0, max=1.0).squeeze(-1)
+            return w_ang * e1 + (1.0 - w_ang) * e2
         if self.aggregate == "mean":
             return 0.5 * (e1 + e2)
         if self.aggregate == "max":
@@ -526,7 +558,16 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
     metadata = checkpoint["metadata"]
     metrics = extract_metrics(checkpoint)
     resolved_dim, resolved_hidden, resolved_norm, resolved_activation = _resolve_model_hparams(checkpoint)
-    architecture = _fmt_hidden_chain(resolved_dim, resolved_hidden)
+    cfg = checkpoint.get("config", {}) or {}
+    if str(cfg.get("critic_architecture", "homogeneous")) == "radial_angular":
+        angular_hidden = [int(x) for x in cfg.get("angular_hidden_dims", resolved_hidden)]
+        radial_hidden = [int(x) for x in cfg.get("radial_hidden_dims", [512, 256, 128])]
+        architecture = (
+            f"Angular[{_fmt_hidden_chain(resolved_dim, angular_hidden)}] + "
+            f"Radial[{_fmt_hidden_chain(resolved_dim, radial_hidden)}]"
+        )
+    else:
+        architecture = _fmt_hidden_chain(resolved_dim, resolved_hidden)
     checkpoint_name = _safe_display_name(Path(checkpoint_path).name)
     runtime = session_state["runtime_metrics"].get(checkpoint_path)
 
@@ -563,8 +604,18 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
         f"**Epoch:** {metadata.epoch}",
         f"**Model Type:** {metadata.model_type}",
         f"**Architecture:** `{architecture}`",
-        f"**Normalization:** `{resolved_norm}`",
-        f"**Activation:** `{resolved_activation}`",
+        (
+            f"**Normalization:** `angular={cfg.get('angular_norm_mode', resolved_norm)}, "
+            f"radial={cfg.get('radial_norm_mode', resolved_norm)}`"
+            if str(cfg.get("critic_architecture", "homogeneous")) == "radial_angular"
+            else f"**Normalization:** `{resolved_norm}`"
+        ),
+        (
+            f"**Activation:** `angular={cfg.get('angular_activation', resolved_activation)}, "
+            f"radial={cfg.get('radial_activation', resolved_activation)}`"
+            if str(cfg.get("critic_architecture", "homogeneous")) == "radial_angular"
+            else f"**Activation:** `{resolved_activation}`"
+        ),
     ]
 
     if runtime is not None:
@@ -640,7 +691,8 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                 f"- Energy(start noisy): `{runtime['energy_noisy']:.6f}`",
                 f"- Energy(final): `{runtime['energy_final']:.6f}`",
                 f"- Energy improvement (start-final): `{_fmt_signed(runtime['energy_improvement'])}`",
-                f"- Success (energy descent): `{runtime['energy_success']}`",
+                f"- Success (energy descent): `{runtime.get('energy_descent_success', runtime['energy_success'])}`",
+                f"- Success (target-energy proximity): `{runtime.get('energy_target_closer_success', float('nan'))}`",
                 f"- Success (cosine gain): `{runtime['cosine_success']}`",
                 f"- Displacement ||x_T - x_0||: `{runtime['displacement']:.6f}`",
             ]
@@ -678,7 +730,8 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                         f"- L2 improvement mean: `{_fmt_signed(float(sota.get('l2_improvement_mean', float('nan'))), 8)}`",
                         f"- L2 success rate: `{float(sota.get('l2_success_rate', float('nan'))):.2%}`",
                         f"- Energy improvement mean: `{_fmt_signed(float(sota['energy_improvement_mean']), 8)}`",
-                        f"- Energy success rate: `{float(sota['energy_success_rate']):.2%}`",
+                        f"- Energy descent rate: `{float(sota.get('energy_descent_rate', float('nan'))):.2%}`",
+                        f"- Target-energy proximity rate: `{float(sota.get('energy_target_closer_rate', sota['energy_success_rate'])):.2%}`",
                         f"- MMD (RBF): `{float(sota['mmd_rbf']):.6f}`",
                         f"- C2ST accuracy: `{float(sota['c2st_acc']):.2%}`",
                         f"- C2ST raw accuracy: `{float(sota.get('c2st_raw_acc', float('nan'))):.2%}`",
@@ -850,6 +903,7 @@ def create_trajectory_plot(landscape_data: dict) -> go.Figure:
 def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
     """Instantiate and load an energy model from checkpoint payload."""
     from cebcm.models.energy import SimpleEnergy
+    from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
     from cebcm.models.energy_unconditional import UnconditionalEnergy
 
     def _load_state_or_raise(model_obj, state_dict: dict, label: str) -> None:
@@ -874,26 +928,44 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
         # hybrid energy used in training/eval, not a single critic fallback.
         has_twin = ("critic1_state" in checkpoint) or ("critic2_state" in checkpoint)
         if has_twin:
-            c1 = SimpleEnergy(
-                dim=dim,
-                hidden_dims=hidden_dims,
-                norm_mode=norm_mode,
-                activation=activation,
-                energy_output_clamp=None,
-            ).to(device)
-            c2 = SimpleEnergy(
-                dim=dim,
-                hidden_dims=hidden_dims,
-                norm_mode=norm_mode,
-                activation=activation,
-                energy_output_clamp=None,
-            ).to(device)
+            cfg = checkpoint.get("config", {}) or {}
+            critic_arch = str(cfg.get("critic_architecture", "homogeneous"))
+            if critic_arch == "radial_angular":
+                c1 = AngularEnergyCritic(
+                    dim=dim,
+                    hidden_dims=[int(x) for x in cfg.get("angular_hidden_dims", hidden_dims)],
+                    norm_mode=str(cfg.get("angular_norm_mode", norm_mode)),
+                    activation=str(cfg.get("angular_activation", activation)),
+                    energy_output_clamp=None,
+                ).to(device)
+                c2 = RadialEnergyCritic(
+                    dim=dim,
+                    hidden_dims=[int(x) for x in cfg.get("radial_hidden_dims", [512, 256, 128])],
+                    norm_mode=str(cfg.get("radial_norm_mode", norm_mode)),
+                    activation=str(cfg.get("radial_activation", activation)),
+                    target_norm=float(cfg.get("langevin", {}).get("target_norm", 0.0)) or None,
+                    energy_output_clamp=None,
+                ).to(device)
+            else:
+                c1 = SimpleEnergy(
+                    dim=dim,
+                    hidden_dims=hidden_dims,
+                    norm_mode=norm_mode,
+                    activation=activation,
+                    energy_output_clamp=None,
+                ).to(device)
+                c2 = SimpleEnergy(
+                    dim=dim,
+                    hidden_dims=hidden_dims,
+                    norm_mode=norm_mode,
+                    activation=activation,
+                    energy_output_clamp=None,
+                ).to(device)
             c1_state = checkpoint.get("critic1_state", model_state)
             c2_state = checkpoint.get("critic2_state", c1_state)
             _load_state_or_raise(c1, c1_state, "critic1")
             _load_state_or_raise(c2, c2_state, "critic2")
 
-            cfg = checkpoint.get("config", {}) or {}
             aggregate = str(cfg.get("twin_aggregate", "max"))
             softmax_temperature = float(cfg.get("twin_softmax_temperature", 0.1))
 
@@ -917,6 +989,13 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
                 softmax_temperature=softmax_temperature,
                 prior=prior,
                 lambda_prior=lambda_prior,
+                critic_architecture=critic_arch,
+                sigma_min=float(cfg.get("sigma_min", 0.01)),
+                sigma_max=float(cfg.get("sigma_max", 0.3)),
+                sigma_head_weighting_enabled=bool(cfg.get("sigma_head_weighting_enabled", False)),
+                angular_weight_low_sigma=float(cfg.get("angular_weight_low_sigma", 0.5)),
+                angular_weight_high_sigma=float(cfg.get("angular_weight_high_sigma", 0.5)),
+                head_weight_power=float(cfg.get("head_weight_power", 1.0)),
             )
             model.eval()
             return model, model_type
@@ -1475,9 +1554,16 @@ def _compute_sota_eval_metrics(
         "energy_before_mean": float(e_noisy.mean().item()),
         "energy_after_mean": float(e_final.mean().item()),
         "energy_improvement_mean": float((e_noisy - e_final).mean().item()),
+        # Canonical success for dynamics: descent from start noisy state.
+        "energy_descent_rate": float((e_final < e_noisy).float().mean().item()),
+        # Additional diagnostic: final energy is closer to target energy than start was.
+        "energy_target_closer_rate": float(
+            ((e_final - e_target).abs() < (e_noisy - e_target).abs()).float().mean().item()
+        ),
+        # Backward-compatible alias used by older UI/report paths.
         "energy_success_rate": float(
             ((e_final - e_target).abs() < (e_noisy - e_target).abs()).float().mean().item()
-        ),  # E(final) closer to E(target) than E(start) was
+        ),
     }
     out.update(suite)
 
@@ -1575,6 +1661,11 @@ def _build_runtime_metrics(
         F.cosine_similarity(v_query, v_target, dim=-1).mean().item()
     ) if model_type == "simple" else float("nan")
 
+    energy_descent_success = bool(energies["denoised"] < energies["noisy"])
+    energy_target_closer_success = bool(
+        abs(energies["denoised"] - energies["target"]) < abs(energies["noisy"] - energies["target"])
+    )
+
     return {
         "reference_source": reference_source,
         "target_label": str(target_label),
@@ -1591,9 +1682,11 @@ def _build_runtime_metrics(
         "energy_noisy": float(energies["noisy"]),
         "energy_final": float(energies["denoised"]),
         "energy_improvement": float(energies["noisy"] - energies["denoised"]),
-        "energy_success": bool(
-            abs(energies["denoised"] - energies["target"]) < abs(energies["noisy"] - energies["target"])
-        ),  # E(final) closer to E(target) than E(start) was
+        # Backward-compatible canonical field: true energy descent from start to final.
+        "energy_success": energy_descent_success,
+        # Explicit diagnostic for target-energy proximity (different criterion).
+        "energy_target_closer_success": energy_target_closer_success,
+        "energy_descent_success": energy_descent_success,
         "cosine_success": bool(cos_after > cos_before),
         "displacement": displacement,
         "query_target_cos": query_target_cos,
@@ -1719,7 +1812,10 @@ def _format_inference_info(
                 f"- Energy improvement mean: `{_fmt_signed(float(sota_metrics['energy_improvement_mean']), 8)}`"
             )
             lines.append(
-                f"- Energy success rate: `{float(sota_metrics['energy_success_rate']):.2%}`"
+                f"- Energy descent rate: `{float(sota_metrics.get('energy_descent_rate', float('nan'))):.2%}`"
+            )
+            lines.append(
+                f"- Target-energy proximity rate: `{float(sota_metrics.get('energy_target_closer_rate', sota_metrics.get('energy_success_rate', float('nan')))):.2%}`"
             )
             lines.append(f"- MMD (RBF): `{float(sota_metrics['mmd_rbf']):.6f}`")
             lines.append(f"- C2ST accuracy: `{float(sota_metrics['c2st_acc']):.2%}`")
@@ -2888,10 +2984,3 @@ if __name__ == "__main__":
         show_error=True,
         theme=gr.themes.Soft(),
     )
-
-
-
-
-
-
-
