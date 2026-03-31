@@ -1331,7 +1331,7 @@ def main() -> None:
             hidden_dims=cfg.angular_hidden_dims,
             norm_mode=cfg.angular_norm_mode,
             activation=cfg.angular_activation,
-            energy_output_clamp=None,
+            energy_output_clamp=getattr(cfg, 'angular_energy_output_clamp', None),
             trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
             energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)
@@ -1341,7 +1341,7 @@ def main() -> None:
             norm_mode=cfg.radial_norm_mode,
             activation=cfg.radial_activation,
             target_norm=cfg.langevin.target_norm,
-            energy_output_clamp=None,
+            energy_output_clamp=getattr(cfg, 'radial_energy_output_clamp', None),
             trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
             energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)

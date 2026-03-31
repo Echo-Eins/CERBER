@@ -253,6 +253,8 @@ class Stage1_5Config:
     angular_activation: str = "silu"
     radial_norm_mode: str = "none"
     radial_activation: str = "silu"
+    angular_energy_output_clamp: float | None = 50.0
+    radial_energy_output_clamp: float | None = 50.0
     actor_norm_mode: str = "none"   # "orthonorm", "spectral_norm", "none"
     actor_activation: str = "silu"       # "silu", "gelu", "relu", "groupsort", "lipschitz_spline"
     ortho_n_iters: int = 2

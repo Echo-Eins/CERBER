@@ -253,10 +253,30 @@ Build an implementation-ready SOTA blueprint for a true geometric twin critic:
   - GUI loader support for `critic_architecture=radial_angular`
 - Pending:
   - full ablation toggles and end-to-end long-run validation
-- [ ] Create config
+- [x] Create config
 - [ ] Run 50 epochs
 - [ ] Check: spread ≥ 0.4, no spurious wells (E < -5)
 - [ ] Check: cosine_success at noise=0.1 > 19%
+
+## Hybrid Dual-Critic v1 Results (24 epochs, 2026-03-31)
+- rank_success=0.805, spread=0.515, dir=0.313, cos(p/a)=0.497
+- Inference noise=0.15: 100% cosine success, +0.229 mean improvement
+- E_start=147, ereg spikes to 0.405
+- dir barely improves after epoch 6, rank_success plateaus after epoch 10
+
+### Bug Fixes Applied (v2 config):
+1. Zero-init output layer: `energy_decomposed.py` — prevents E=147 at OOD points
+2. CD on both heads: `route_cd_to_radial_only=false` — angular well suppression
+3. `lambda_direction_angular`: 0.1 → 0.3 (match Phase 2i proven value)
+4. `energy_reg_universal`: false → true (control energy at all points)
+5. `energy_output_clamp`: 50.0 for both heads (prevent gradient explosion)
+6. `critic_steps_per_actor`: 2 → 4 (each head gets 2 updates per actor step)
+
+### Expected Impact:
+- dir should approach 0.6+ (Phase 2i level) with stronger direction loss
+- E_start should be O(1) instead of O(100+) with zero-init + clamp
+- rank_success should improve past 0.85 with more critic steps
+- Wells should be suppressed on angular head via CD
 
 ### Phase 2i: Dual-Critic (Angular + Radial Decomposition) ★ NOVEL
 - **Architecture**: two separate energy critics trained on different aspects
