@@ -1,5 +1,21 @@
 # Lessons
 
+## 2026-03-31 - Standard MALA makes well-trapping WORSE, not better
+
+### Pattern
+Researched MALA (Metropolis-Adjusted Langevin) as inference improvement. Standard MALA rejects uphill moves (energy increases). But our failure mode is the OPPOSITE: particles fall into spurious low-energy wells. Standard MALA would ALWAYS accept steps into wells (energy decreases, α=1) and REJECT escape attempts (energy increases, α≈0).
+
+### Solution
+Trust-Region Metropolis (TRM): two-sided acceptance filter.
+- Standard MH part: reject discretization errors going uphill.
+- Trust region part: reject suspiciously large downhill jumps (well entry detection).
+- Combined: band-pass filter on per-step energy changes.
+
+### Rule
+- Before implementing any sampling algorithm, verify its assumptions match your failure mode.
+- For EBMs with spurious wells, standard MALA is counterproductive.
+- The trust-region bound (max descent per step) is the key ingredient for well prevention.
+
 ## 2026-03-31 - Hybrid dual-critic v1 diagnosis: 6 bugs causing dir plateau and E=147
 
 ### Symptoms

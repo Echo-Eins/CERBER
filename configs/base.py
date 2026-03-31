@@ -69,6 +69,24 @@ class LangevinConfig:
     noise_anneal_max: float = 0.15
     noise_anneal_min: float = 0.0002
     noise_anneal_sync_with_sigma: bool = True
+    # Trust-Region Metropolis (TRM): two-sided accept/reject filter.
+    # Prevents both discretization errors (uphill) and well trapping (downhill).
+    # Standard MALA rejects uphill moves; TRM also rejects suspiciously large
+    # downhill jumps that indicate entry into spurious energy wells.
+    #
+    # Math:
+    #   T = max(step_noise_scale, mala_temperature_floor)
+    #   descent = E_current - E_proposed  (positive = energy decreased)
+    #   log_α = descent / T               (standard MH acceptance ratio)
+    #   accept = (log(U) < log_α) AND (descent < trust_radius * T)
+    #
+    # The trust_radius parameter bounds the maximum per-step energy descent
+    # relative to T.  At T=0.01 with trust_radius=10, descents > 0.1 are
+    # rejected — catching well entries (ΔE ~ -1…-50) while allowing normal
+    # gradient progress (ΔE ~ -0.001…-0.01).
+    mala_enabled: bool = False
+    mala_temperature_floor: float = 0.01  # prevent division by ~0 at low noise
+    mala_trust_radius: float = 10.0       # max descent per step in units of T
 
 
 @dataclass

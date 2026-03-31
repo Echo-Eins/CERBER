@@ -227,6 +227,9 @@
     "noise_anneal_mode": "hybrid",
     "noise_anneal_max": 0.15,
     "noise_anneal_min": 0.0002,
-    "noise_anneal_sync_with_sigma": true
+    "noise_anneal_sync_with_sigma": true,
+    "mala_enabled": true,
+    "mala_temperature_floor": 0.01,
+    "mala_trust_radius": 10.0
   }
 }
