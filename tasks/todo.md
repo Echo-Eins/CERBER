@@ -78,32 +78,241 @@ The problem is NOT a sign error. The problem is that **no loss ever trains the g
 
 Why noise_scale=0.5 "works": at high noise, the Langevin step is dominated by √(2lr·noise_scale)·ε (random walk), not the gradient. The ranking-trained basin around the clean point is enough for random search. At noise_scale=0.0002, dynamics is purely gradient-driven, and those gradients are untrained.
 
-### Phase 2f: Full MDSM (CURRENT)
+### Phase 2f: Full MDSM ✗ FAILED — ARCHITECTURE KILLED CAPACITY
 Config: `configs/ablation_phase2f_mdsm.json` (overdamped)
-Config: `configs/ablation_phase2f_mdsm_pid.json` (PID variant)
-- **lambda_mdsm=1.0**: enable denoising score matching with directional mode (cosine, bounded)
-- mdsm_directional=true: cosine similarity is safe (bounded [0,2]), not "unbounded MSE"
-- mdsm_magnitude_aux_weight=0.05: mild magnitude supervision via smooth_l1 on log norms
-- mdsm_warmup_epochs=3: let ranking stabilize before adding gradient supervision
-- norm_mode=orthonorm + groupsort: 1-Lipschitz architecture for natural gradient control
-- direction_loss REMOVED (mdsm subsumes it — both direction and magnitude)
-- Overdamped variant: lr=0.01, noise_scale=0.005
-- PID variant: lr=0.005, noise_scale=0.001
-- [ ] Run overdamped 50 epochs
-- [ ] Run PID 50 epochs
-- [ ] Check: mdsm loss decreasing (cos similarity increasing)
-- [ ] Check: energy landscape monotonic from clean→noisy (no spurious wells)
-- [ ] Check: cosine success > 74% (beat Phase 2b)
-- [ ] Compare overdamped vs PID with properly trained gradients
+- **lambda_mdsm=1.0** + norm_mode=orthonorm + activation=groupsort
+- **RESULT**: rank_success=0.001, spread=-0.001, E[c/a/h]=0.12/0.18/0.12, energy range [0.23, 0.36] = **only 0.13**
+- MDSM loss stuck at ~0.9 (barely above random cosine), ranking saturated at rank(c<a)=0.999 (degenerate)
+- **Root cause**: NOT MDSM itself, but **4 simultaneous changes** from Phase 2b:
+  1. norm_mode: none → orthonorm (1-Lipschitz crushed capacity)
+  2. activation: silu → groupsort (piecewise-constant ≠ smooth landscape)
+  3. critic_lr: 0.001 → 0.0003 (3× slower learning)
+  4. direction_loss: removed (replaced by untested MDSM on crippled architecture)
+  5. energy_reg_universal: false → true (**known from Phase 2e lesson to flatten landscape!**)
+- Phase 2b had spread=0.56, energy range [-0.03, 0.53] = 0.56 — **4× more landscape depth**
+- **Violated core principle**: change ONE thing at a time
 
-### Phase 3: Contrastive Signal (DEFERRED)
-- InfoNCE — only if Phase 2f doesn't reach 85%+
-- Must check it doesn't flatten landscape like CQL did
+### CORRECTED ROOT CAUSE ANALYSIS (2026-03-29, post Phase 2f)
 
-### Kill Criteria (abandon approach if)
-- Phase 1 ranking breaks (rank_success < 0.3) → weights too high, halve them
-- Phase 1+2 inference still 0% → fundamental architecture problem
-- Any phase: spread collapses to 0 → loss conflict, debug
+**The REAL problem is not "no gradient field supervision". It's "gradient field not smooth BETWEEN training points".**
+
+Evidence:
+- Phase 2b achieved rank_success=88%, spread=0.56, dir=0.643 (direction loss partially learned)
+- But strict inference: mean_cos_success=19%, cos_improvement at noise=0.05: **-0.107** (WORSE)
+- At noise=0.3: cos_improvement=+0.003 (barely positive), 53% success
+- This means: **at fine noise (where Langevin is deterministic), gradients are unreliable**
+- The unconstrained MLP creates correct values at training points but wild gradients in between
+- Spurious energy wells (E=-16) confirmed in Phase 2b analysis
+
+**Why MDSM was the wrong diagnosis:**
+- direction_loss already trains gradient DIRECTION at sampled noisy points → 64% cosine loss (dir=0.643)
+- MDSM adds magnitude supervision, but magnitude alone doesn't fix inter-point smoothness
+- The real gap: gradient field quality between training distribution points → need either:
+  a) Smoother architecture (soft Lipschitz, not hard 1-Lipschitz)
+  b) Denser gradient supervision (more points, wider noise coverage)
+  c) Fundamentally different inference approach
+
+---
+
+## CORRECTED PLAN: Phase 2g+ (2026-03-29)
+
+### Strategy: Fix inference, not training (training is already 88% rank success)
+
+Phase 2b TRAINS well but INFERS poorly. The gradient field between training
+points is chaotic for the unconstrained MLP. Three orthogonal approaches:
+
+### Phase 2g: MDSM on Phase 2b Architecture (ONE CHANGE ONLY)
+Config: `configs/ablation_phase2g_mdsm_on_2b.json`
+- **Start from Phase 2b EXACTLY** (norm_mode=none, silu, lr=0.001, direction_loss=0.3)
+- **ONLY addition**: lambda_mdsm=0.3 (mild, NOT 1.0), mdsm_directional=true
+- Keep direction_loss active (complementary — simpler target for direction, MDSM for magnitude)
+- mdsm_warmup_epochs=5, mdsm_magnitude_aux_weight=0.1
+- energy_reg_universal=false (LESSON: universal kills ranking!)
+- Tamed Langevin for inference safety (no Lipschitz guarantee):
+  `grad_tamed = grad / (1 + lr * ||grad||)`
+- **Hypothesis**: MDSM adds magnitude supervision WITHOUT killing capacity
+- [ ] Create config
+- [ ] Implement Tamed Langevin in langevin.py
+- [ ] Run 50 epochs
+- [ ] Check: spread ≥ 0.4 (not killed), dir ≤ 0.65 (improved)
+- [ ] Check: cosine_success at noise=0.1 > 19% (beat Phase 2b)
+- [ ] If success: run 80 epochs with cosine LR schedule
+
+### Phase 2g Results ✅ (BEST BASELINE)
+- rank_success=89%, spread=0.65, dir=0.643
+- Inference at noise=0.15: 82% cosine success
+- Inference at noise=0.0002: 82% cosine success (but energy goes negative)
+- MDSM + direction_loss on unconstrained SiLU MLP = strong ranking + decent inference
+
+### Phase 2h: Energy Floor (random probing) ✗ INEFFECTIVE
+Config: `configs/ablation_phase2h_energy_floor.json`
+- Phase 2g + energy_floor with random sphere probing (64 points)
+- **Result**: efloor=0.000 for ALL 50 epochs — random points in 1024D never find structured wells
+- Inference unchanged from Phase 2g
+- **Lesson**: random probing useless in 1024D, need adversarial probing or CD
+
+### Phase 2i: CD + Adversarial Probing + Underdamped ✅ (IMPROVED)
+Config: `configs/ablation_phase2i_cd_underdamped.json`
+- Phase 2g + contrastive divergence (32 particles, 10 Langevin steps) + adversarial probing (10 gradient descent steps) + underdamped inference
+- **Result**: rank_success=89.5%, spread=0.674, best_score=+0.154
+- noise=0.15: cosine 0.084→0.417, **100% success** (+0.332 improvement)
+- noise=0.0002: cosine 0.403→0.427, **64% success** (+0.024 improvement)
+- CD and efloor both active and >0 throughout training
+- **Diagnosis**: low-noise inference still weak because training σ∈[0.01, 0.3] but inference at σ=0.0002 is 50x below training minimum. MDSM score not trained at near-zero σ.
+
+### Phase 2j: Extended σ Curriculum ✗ FAILED (sigma_eff_sq clamp blocks low-σ learning)
+Config: `configs/ablation_phase2j_sigma_extended.json`
+- Phase 2i + sigma_curriculum_start: 0.01→0.001 (10x lower)
+- **Result**: rank_success=89.5%, noise=0.0002 success **65%** (no improvement from 64%)
+- noise=0.15 **regressed** (cosine improvement -0.115 less than Phase 2i)
+- **Root cause**: sigma_eff_sq clamp at 1e-6 makes σ<0.005 a dead zone for MDSM learning
+- Loguniform over 2.5 decades diluted training density at important σ=[0.01, 0.3]
+
+### Option A: Stronger CD (on Phase 2j base) — PARTIAL IMPROVEMENT
+Config: Phase 2j + cd_num_samples=64, cd_num_steps=40, lambda_cd=0.3
+- **Result**: rank_success=88.4%, noise=0.0002 cosine success **75.39%** (best at low noise)
+- But direction loss regressed: dir=0.624 vs 0.77 (Phase 2i)
+- Energy success only 3.91% — wells persist despite stronger CD
+- **Trade-off**: CD well suppression competes with direction/MDSM gradient quality
+
+### Option B: 500 Langevin Steps (on Option A base) ✗ WORSE
+Config: Option A + 500 Langevin steps instead of 100
+- **Result**: rank_success=89.7%, noise=0.0002 cosine success **60.55%** (WORSE than 100 steps)
+- Energy success 2.73% — more steps = deeper descent into structural wells
+- **Conclusion**: more steps at noise=0.0002 = more time to get trapped in local minima
+
+### Summary of All Low-Noise Results (noise=0.0002)
+| Config | Cosine Success | Cosine Δ | Energy Success | Dir |
+|--------|---------------|----------|----------------|-----|
+| Phase 2i (baseline) | 64% | +0.024 | low | 0.77 |
+| Phase 2j (σ extended) | 65% | +0.023 | 2.73% | ~0.77 |
+| Option A (strong CD) | **75.39%** | +0.038 | 3.91% | 0.624 |
+| Option B (500 steps) | 60.55% | +0.015 | 2.73% | ~0.62 |
+
+### Root Cause Analysis (2026-03-31)
+1. **σ-conditioning semantic mismatch**: Training σ = actual noise level; inference σ = schedule value unrelated to sample state. At low noise, dynamics is gradient-driven → mismatch is fatal.
+2. **sigma_eff_sq clamp**: Makes σ<0.005 dead zone for MDSM → extending training range is pointless.
+3. **Unconstrained MLP topology**: Exponential local minima in 1024D. CD explores vanishing fraction.
+4. **Energy success ~3%**: Clean target is NOT the energy minimum in 97% of neighborhoods.
+5. **High-noise success is stochastic**: 100% at noise=0.15 is random walk, not gradient quality.
+
+### Phase 2k: NCSN-Style Noise-Annealed Inference (NEXT — highest leverage)
+- Anneal BOTH Langevin noise_scale AND σ-conditioning together (true NCSN sampling)
+- First 50 steps: noise=0.15, σ=0.15 (stochastic search, 100% success regime)
+- Last 50 steps: noise→0.0002, σ→0.01 (deterministic refinement in trained regime)
+- **No retraining needed** — uses existing Phase 2i checkpoint
+- Fixes σ-conditioning semantic mismatch (issue #1)
+- Leverages proven 100% success at high noise as starting point
+- Already have infrastructure: AdaptiveSigmaEnergyWrapper + run_langevin
+
+### Phase 2l (if 2k insufficient): Architectural Shift
+- Options: dual-critic (angular + radial), score distillation network, flow matching
+- Addresses issues #3 and #4 (MLP topology, clean not energy-minimal)
+
+### Phase 2h (ORIGINAL): Soft Lipschitz (weight decay + GP at OOD only)
+Config: `configs/ablation_phase2h_soft_lip.json`
+- Start from Phase 2b architecture (norm_mode=none, silu)
+- Increase weight_decay: 0.01 → 0.05 (smoother weights → smoother gradients)
+- Add mild gradient penalty at RANDOM points (NOT on clean→noisy corridor):
+  lambda_gp=0.05, GP sampled at random perturbations of actor outputs
+- Keep direction_loss + clean_min + energy_reg (clean-only)
+- **Hypothesis**: soft Lipschitz via weight decay smooths gradient field without killing capacity
+- **Key difference from Phase 2d**: GP at random OOD points, not along training corridor
+
+---
+
+# SOTA Radial+Angular Research Kickoff (2026-03-31)
+
+## Goal
+Build an implementation-ready SOTA blueprint for a true geometric twin critic:
+- Angular critic (tangential semantic guidance),
+- Radial critic (normal/shell/manifold control),
+- Shared inference protocol with mathematically consistent gradient composition.
+
+## Checklist
+- [x] Audit current Stage 1.5 codepath and verify whether current twin critics are truly specialized.
+- [x] Collect primary-source SOTA evidence for tangent/normal decomposition on manifold data.
+- [x] Write a concrete architecture blueprint with losses, inference math, and ablation protocol.
+- [x] Record anti-pattern in lessons to prevent relabeling homogeneous twin critics as radial+angular.
+- [x] Implement specialized critic modules and integrate into Stage 1.5 trainer.
+- [x] Add per-head eval metrics (angular vs radial) in eval outputs/log stream.
+- [ ] Add explicit disable-head ablation switches in config + trainer.
+- [ ] Validate low-noise inference stability with synchronized sigma/noise schedule via full run.
+
+## Artifacts
+- Research: `research4_radial_angular_sota.md`
+- Lessons: `tasks/lessons.md` (new rule: no fake radial+angular labeling)
+
+## Review
+- Current code has twin critics, but they are homogeneous (`SimpleEnergy` + same feature fusion).
+- This means current architecture is ensemble-style, not radial+angular geometric decomposition.
+- Implemented:
+  - `cebcm/models/energy_decomposed.py` (`AngularEnergyCritic`, `RadialEnergyCritic`)
+  - Stage1.5 trainer routing by critic role (angular/radial), role-specific losses, purity/correlation regularizers
+  - Sigma-dependent angular/radial head weighting in `TwinHybridEnergy`
+  - GUI loader support for `critic_architecture=radial_angular`
+- Pending:
+  - full ablation toggles and end-to-end long-run validation
+- [ ] Create config
+- [ ] Run 50 epochs
+- [ ] Check: spread ≥ 0.4, no spurious wells (E < -5)
+- [ ] Check: cosine_success at noise=0.1 > 19%
+
+### Phase 2i: Dual-Critic (Angular + Radial Decomposition) ★ NOVEL
+- **Architecture**: two separate energy critics trained on different aspects
+- **Critic_ang (angular)**: operates on normalized vectors, learns angular energy
+  - Input: (q/||q||, x/||x||) → scalar E_ang
+  - Loss: ranking on angular proximity + direction_loss in tangent space
+  - Learns: which direction on the hypersphere to move
+- **Critic_rad (radial)**: operates on norms/distances, learns magnitude energy
+  - Input: (||x||, ||x-q||, cos(x,q)) → scalar E_rad
+  - Loss: ranking on distance-to-target + magnitude supervision
+  - Learns: how far to move (step size)
+- **Inference**: Langevin uses combined gradient:
+  - Angular step: project -∇E_ang onto tangent plane of sphere
+  - Radial step: -∇E_rad along radial direction
+  - Separate step sizes for each (angular and radial dynamics have different scales)
+- **Why this might work**:
+  - Each critic has a SIMPLER task → easier to train
+  - No conflict between angular and radial objectives
+  - Angular critic naturally Lipschitz on compact sphere → better gradient field
+  - Radial critic is 1D → trivially smooth
+  - Decomposes 1024D navigation into two well-conditioned subproblems
+- [ ] Design architecture (new model classes)
+- [ ] Implement training loop changes
+- [ ] Create config
+- [ ] Run 50 epochs
+- [ ] Compare gradient field smoothness vs single-critic
+
+### Phase 2j: Score Distillation Network (if 2g-2i insufficient)
+- Train energy critic as Phase 2b (ranking, direction_loss, clean_min)
+- Add separate lightweight score network s_θ(x) ≈ -∇E(x)
+- s_θ trained with L2 regression: ||s_θ(x) - sg(-∇E(x))||² at noisy points
+  (sg = stop_gradient — distill FROM critic, don't backprop through)
+- At inference: use s_θ(x) for Langevin, not autograd ∇E
+- **Why**: s_θ is smooth MLP trained explicitly to predict gradients → naturally interpolates
+- **Bonus**: no create_graph at inference → faster inference
+
+### Phase 2k: Flow Matching Hybrid (EXPLORATORY)
+- Instead of energy-based Langevin, train conditional velocity field v(x_t, t)
+- v = (x_clean - x_noisy) / (1 - t) for t ∈ [0, 1]
+- ODE integration: dx/dt = v(x_t, t) — no noise, deterministic path
+- Keep energy critic for quality scoring/reranking, not for navigation
+- **Radical departure**: separates SCORING (energy) from NAVIGATION (flow)
+- Only try if energy-gradient approaches plateau
+
+### Kill Criteria (updated)
+- Phase 2g/2h: if spread < 0.3 or cosine_success worse than Phase 2b → architecture issue, try 2i
+- Phase 2i: if dual-critic training unstable for 10 epochs → decomposition doesn't work, try 2j
+- All phases: if inference cosine_success < 25% after 50 epochs → consider Phase 2k (flow matching)
+- If Phase 2k also fails: fundamental SONAR embedding geometry problem, need different representation
+
+### Priority Order
+1. **Phase 2g** (highest priority — tests the obvious: MDSM on working arch, ONE change)
+2. **Phase 2h** (parallel — tests soft Lipschitz, independent approach)
+3. **Phase 2i** (after 2g/2h results — user's dual-critic idea, novel but promising)
+4. **Phase 2j** (if gradient-based approaches plateau — score distillation)
+5. **Phase 2k** (last resort — paradigm shift to flow matching)
 
 ---
 
@@ -1211,3 +1420,205 @@ Remove structural visualization/inference mismatch where Stage1.5 checkpoints we
 - This removes a major source of apparent "training vs landscape" contradictions in checkpoint inspection.
 - Validation run:
   - `python -m py_compile cerber_gui/app.py`
+
+# Stage1.5 SOTA Consolidation (2026-03-31, Pass 23)
+
+## Goal
+Deliver a mathematically coherent, production-ready Stage1.5 baseline by closing remaining known failure modes:
+- low-sigma MDSM dead-zone (`sigma_eff_sq` clamp pathology),
+- overloaded/conflicting default objective stack,
+- weak config safety for known anti-pattern combinations.
+
+## Checklist
+- [x] Re-audit current Stage1.5 critic/actor/inference math against `research3` failure analysis
+- [x] Implement robust MDSM sigma handling:
+  - [x] adaptive sigma floor mode
+  - [x] log-space target mode (no hard `1e-6` dead-zone behavior)
+  - [x] inverse-sigma clipping controls for numerical safety
+- [x] Add strict config validation gates for low-sigma + weighting anti-patterns
+- [x] Introduce SOTA-safe Stage1.5 default config profile (minimal conflicting losses)
+- [x] Validate static correctness (`py_compile`) for all touched modules
+- [x] Produce run commands and expected training-gate interpretation notes
+
+## Review
+- Done. Implemented:
+  - low-sigma MDSM stabilization (`logspace`/`adaptive` modes, weight floor, inv-sigma clip),
+  - eval/inference sigma-anneal metric parity,
+  - actor barrier manifold-consistent references,
+  - strict config validation for known failure combinations,
+  - stricter best-checkpoint policy (`best.pt` = strict-pass only; `best_any.pt` = best score regardless).
+- Validation passed:
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py configs/base.py cerber_gui/app.py cebcm/training/kill_criteria.py`
+  - `python -c "import json, pathlib; json.load(open('configs/stage1_5_config.json', encoding='utf-8')); print('ok')"`
+- Limitation:
+  - Full train/eval runtime verification requires user CUDA/Linux env (`.venv` with torch). Local desktop Python env in this session has no torch.
+
+# Stage1.5 Dual-Critic Plateau + Energy-Scale Audit (2026-03-31, Pass 24)
+
+## Goal
+Close the currently observed quality plateau in hybrid dual-critic training:
+- `dir` stagnation around ~0.31,
+- rank/success plateau,
+- unstable/off-scale energy ranges in GUI landscapes,
+- strict gates failing on `all_noise_scales_passed` and `mean_clean_min_violation_rate`.
+
+## Checklist
+- [x] Rebalance direction supervision for angular/radial split:
+  - [x] raise angular direction weight to Phase2i-equivalent regime
+  - [x] re-check low-sigma head weighting so low-noise inference is not radial-dominated without direction supervision
+- [x] Remove per-head update dilution from strict alternating head updates:
+  - [x] evaluate same-batch dual-head critic update vs alternating update
+  - [x] compare variance/stability and direction/rank metrics (added explicit mode + logging hooks)
+- [x] Stabilize energy scale behavior:
+  - [x] audit `log_energy_scale` buffer policy vs trainable scaling option
+  - [x] tighten regularization on off-manifold energies (relative floor / CD calibration + scale regularizer)
+- [x] Gate realism review:
+  - [x] extract exact per-noise failing gates from eval stream
+  - [x] verify clean-min violation semantics and threshold calibration against intended margin behavior
+- [x] Inference/eval parity verification:
+  - [x] confirm sigma/noise anneal consistency and objective semantics in GUI and train eval
+  - [x] ensure reported energy success metrics are semantically explicit (descent vs target-proximity)
+
+## Review
+- Implemented in code:
+  - `critic_step_mode` (`alternating`/`joint`) with joint same-batch paired critic updates.
+  - stronger angular-direction profile + low-sigma angular weighting in `configs/stage1_5_config.json`.
+  - optional trainable `log_energy_scale` (both simple and decomposed critics), separate optimizer LR group, and `lambda_energy_scale_reg`.
+  - anti-well penalties switched to relative-to-clean margins (`energy_floor_relative_to_clean`, `cd_relative_to_clean`) so penalties are active at realistic energy ranges.
+  - eval semantics made explicit:
+    - `energy_target_proximity_rate`
+    - `energy_descent_rate`
+    - `clean_min_violation_rate_strict`
+    - backward-compatible `energy_success_rate` retained as target-proximity alias.
+  - kill criteria clean-min gate now configurable via `clean_min_violation_mode` (`margin`/`strict`).
+  - epoch print now includes per-noise failed gates for actionable diagnostics.
+- Validation:
+  - `python -m py_compile experiments/01_denoising_poc/train_stage1_5.py configs/base.py cebcm/training/kill_criteria.py cebcm/models/energy.py cebcm/models/energy_decomposed.py`
+  - `python -c "import json, pathlib; d=json.load(open('configs/stage1_5_config.json', encoding='utf-8')); print('ok', d.get('critic_step_mode'), d.get('energy_scale_trainable'), d.get('clean_min_violation_mode'))"`
+- Limitation:
+  - Full runtime train/eval verification is blocked in this desktop environment (`torch` is unavailable); needs user CUDA `.venv` run.
+
+## Pass 24 Log Audit Update (Current User-Provided Run, Epochs 1-24)
+- [x] Re-validated trend from current logs:
+  - `rank_success` climbs (`~0.16 -> ~0.80`) then saturates.
+  - `dir` drops (`~0.48 -> ~0.31`) then plateaus.
+  - `viol` improves but hovers near strict threshold region (`~0.05-0.07`).
+- [x] Re-validated strict-pass blockers for this run profile:
+  - `all_noise_scales_passed` remains failing.
+  - `mean_clean_min_violation_rate` remains sensitive around `max_clean_min_violation_rate=0.05`.
+- [x] Confirmed why `cd`/`efloor` are near-zero in this profile:
+  - With `energy_floor_threshold=5.0` and observed energy magnitudes around `O(1)`, both penalties are effectively inactive.
+  - This leaves anti-well shaping mostly dormant in the observed run.
+
+## Pass 50 Runtime Parity + Conditional Landscape Fix (2026-03-31, Epochs 1-50 user run)
+
+### Goal
+Close the remaining mismatch between reported metrics/plots and actual dynamics after the Pass 24 patchset:
+- low-noise runtime metrics not matching real Langevin controls in GUI path,
+- conditional landscape queried with wrong anchor (`target` instead of `query`),
+- strict gates not explicitly covering the real low-noise regime (`noise=0.0002`).
+
+### Checklist
+- [x] Fix GUI inference control parity:
+  - [x] `run_langevin_denoise(...)` now accepts `noise_scale_override`.
+  - [x] Runtime `sigma_override` now has priority over anneal wrapper (fixed sigma when explicitly requested).
+  - [x] `run_langevin(...)` receives actual runtime noise scale, not only checkpoint default.
+- [x] Fix conditional landscape semantics:
+  - [x] added explicit `v_query` anchor support to `scan_energy_landscape_3d(...)`.
+  - [x] added `v_query` passthrough to backend `scan_energy_landscape(...)`.
+  - [x] energy probes (`clean/noisy/final/trajectory`) now evaluate `E(query, candidate)` in conditional mode.
+  - [x] landscape scan now uses sigma-bound energy wrapper in GUI single-run paths for parity with runtime inference sigma.
+- [x] Fix gate realism for current failure mode:
+  - [x] included `0.0002` in `eval_noise_scales` for active Stage1.5 config.
+  - [x] updated Stage1.5 base default list to include low-noise scale.
+
+### Review
+- Code-level root causes confirmed from current run path:
+  - GUI previously passed fixed config noise into Langevin dynamics path even when runtime slider intended to probe low-noise behavior.
+  - Conditional landscape was visualized with `target` as query anchor, which can contradict true conditional objective.
+  - Strict evaluation grid did not include `0.0002`, so low-noise collapse could be underrepresented in gates.
+- Patched files:
+  - `cerber_gui/app.py`
+  - `cerber_gui/landscape_3d.py`
+  - `cebcm/visualization/energy_landscape.py`
+  - `configs/stage1_5_config.json`
+  - `configs/base.py`
+
+# Stage1.5 Far-Start Inference Stress Test (2026-03-31, Pass 51)
+
+## Goal
+Test true long-range navigation by starting `noisy` far from `target` instead of near-target default seeds.
+
+## Checklist
+- [x] Add noisy start modes for single-run inference:
+  - [x] `objective_seed` (current default)
+  - [x] `far_auto` (auto far start from target)
+  - [x] `manual_plane_xy` (manual XY start in target-centric 2D plane)
+- [x] Wire new parameters through `_sample_inference_triplet(...)` and `run_inference_fn(...)`
+- [x] Add GUI controls in Inference Settings
+- [x] Report selected start mode in Inference Results
+- [x] Preserve backward compatibility for preview/live paths (defaults unchanged)
+- [x] Validate syntax with `py_compile`
+
+## Review
+- Implemented in `cerber_gui/app.py`:
+  - new helper logic for target-plane basis and controlled start override:
+    - `_build_target_plane_basis(...)`
+    - `_apply_noisy_start_strategy(...)`
+  - extended `_sample_inference_triplet(...)` to support `start_mode`, `far_start_scale`, `manual_start_x`, `manual_start_y`, `project_start_to_target_norm`.
+  - extended `run_inference_fn(...)` to consume these controls and persist `start_mode` + initial distance metric.
+  - extended `_format_inference_info(...)` to print start mode and initial `||x0-target||`.
+  - added UI controls:
+    - `Noisy Start Mode`
+    - `Far Start Scale`
+    - `Manual Start X (plane)`
+    - `Manual Start Y (plane)`
+    - `Project Start To Target Norm`
+- Validation:
+  - `python -m py_compile cerber_gui/app.py`
+
+# Stage2 Modular Training Pipelines (2026-04-01)
+
+## Goal
+Replace monolithic Stage2 training usage with separate production-ready pipelines per module/stage:
+- `SurprisePredictor` pretrain,
+- `ContextEncoder` pretrain,
+- `IPP` pretrain on frozen `ContextEncoder`,
+- joint `ContextEncoder + IPP` fine-tune on frozen `SurprisePredictor`.
+
+## Checklist
+- [x] Add shared Stage2 training utilities module (builders, data loading, type IDs, schedulers, checkpoints).
+- [x] Add standalone `train_stage2_sp.py` (SP-only self-supervised training + eval + checkpoints).
+- [x] Add standalone `train_stage2_ce.py` (CE-only with contextual next-target objective + optional frozen SP surprise features).
+- [x] Add standalone `train_stage2_ipp.py` (IPP-only with frozen CE and optional frozen SP).
+- [x] Add standalone `train_stage2_ce_ipp_joint.py` (joint fine-tune with frozen SP).
+- [x] Add stage-specific JSON configs for each pipeline.
+- [x] Validate syntax (`py_compile`) for all added files.
+- [x] Document exact run order and commands in review notes.
+
+## Review
+- Added new shared utility module:
+  - `cebcm/training/stage2_utils.py`
+  - contains shared builders/config loading/device+AMP setup/data loading/type-ids/scheduler/ckpt helpers.
+- Added separate training scripts (existing monolithic `experiments/08_autoregressor/train_stage2.py` untouched):
+  - `experiments/08_autoregressor/train_stage2_sp.py`
+  - `experiments/08_autoregressor/train_stage2_ce.py`
+  - `experiments/08_autoregressor/train_stage2_ipp.py`
+  - `experiments/08_autoregressor/train_stage2_ce_ipp_joint.py`
+- Added dedicated configs:
+  - `configs/stage2_sp_config.json`
+  - `configs/stage2_ce_config.json`
+  - `configs/stage2_ipp_config.json`
+  - `configs/stage2_ce_ipp_joint_config.json`
+- Validation:
+  - `py -3 -m py_compile cebcm/training/stage2_utils.py experiments/08_autoregressor/train_stage2_sp.py experiments/08_autoregressor/train_stage2_ce.py experiments/08_autoregressor/train_stage2_ipp.py experiments/08_autoregressor/train_stage2_ce_ipp_joint.py`
+  - Note: `python -m py_compile ...` is not available in this Windows shell alias setup, `py -3` works.
+- Stage2 modular run order:
+  1. `py -3 experiments/08_autoregressor/train_stage2_sp.py --config configs/stage2_sp_config.json`
+  2. `py -3 experiments/08_autoregressor/train_stage2_ce.py --config configs/stage2_ce_config.json`
+  3. `py -3 experiments/08_autoregressor/train_stage2_ipp.py --config configs/stage2_ipp_config.json`
+  4. `py -3 experiments/08_autoregressor/train_stage2_ce_ipp_joint.py --config configs/stage2_ce_ipp_joint_config.json`
+- Optional overrides:
+  - CE script: `--sp-checkpoint <path>`
+  - IPP script: `--ce-checkpoint <path> --sp-checkpoint <path>`
+  - Joint script: `--sp-checkpoint <path> --ce-checkpoint <path> --ipp-checkpoint <path>`

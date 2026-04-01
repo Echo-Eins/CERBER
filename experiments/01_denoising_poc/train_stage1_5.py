@@ -22,6 +22,7 @@ from cebcm.inference.langevin import run_langevin
 from cebcm.inference.sigma_schedule import AdaptiveSigmaEnergyWrapper, SigmaScheduleConfig
 from cebcm.models.actor import LatentDenoiseActor
 from cebcm.models.energy import SimpleEnergy
+from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
 from cebcm.models.energy_unconditional import UnconditionalEnergy
 from cebcm.models.normalization import OrthoLinear
 from cebcm.training.kill_criteria import ConditionalThresholds, summarize_conditional_eval
@@ -95,12 +96,14 @@ def add_relative_noise(v: torch.Tensor, scale: float | torch.Tensor) -> torch.Te
 def sample_sigma(cfg: Stage1_5Config, batch: int, device: torch.device) -> torch.Tensor:
     if cfg.sigma_sampling == "loguniform":
         lo, hi = math.log(cfg.sigma_curriculum_start), math.log(cfg.sigma_curriculum_end)
-        return (torch.rand(batch, 1, device=device) * (hi - lo) + lo).exp()
-    if cfg.sigma_sampling == "edm":
-        return torch.exp(
+        sigma = (torch.rand(batch, 1, device=device) * (hi - lo) + lo).exp()
+    elif cfg.sigma_sampling == "edm":
+        sigma = torch.exp(
             torch.randn(batch, 1, device=device) * cfg.edm_p_std + cfg.edm_p_mean
         ).clamp(min=cfg.sigma_curriculum_start, max=cfg.sigma_curriculum_end)
-    raise ValueError(f"Unknown sigma sampling: {cfg.sigma_sampling}")
+    else:
+        raise ValueError(f"Unknown sigma sampling: {cfg.sigma_sampling}")
+    return sigma.clamp(min=cfg.sigma_min, max=cfg.sigma_max)
 
 
 def sanitize_grads(mods: list[torch.nn.Module]) -> None:
@@ -231,16 +234,56 @@ def seed_actor(q: torch.Tensor, hard: torch.Tensor, sigma: torch.Tensor, cfg: St
 
 
 def conditional_mdsm(
-    critic: SimpleEnergy,
+    critic: torch.nn.Module,
     q: torch.Tensor,
     pos: torch.Tensor,
     sigma: torch.Tensor,
     cfg: Stage1_5Config,
+    projection_mode: str = "auto",
 ) -> torch.Tensor:
+    def _sigma_scaling(
+        sigma_local: torch.Tensor,
+        norm_local: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            inv_sigma_eff_sq: multiplicative factor for score target
+            sigma_eff_sq_for_weight: stable sigma^2 tensor for loss weighting
+        """
+        raw_sigma_eff_sq = (sigma_local * norm_local).pow(2)
+        inv_clip = max(float(getattr(cfg, "mdsm_inv_sigma2_clip", 1e8)), 1.0)
+        weight_floor = max(float(getattr(cfg, "mdsm_weight_floor", 1e-8)), 1e-20)
+        mode = str(getattr(cfg, "mdsm_target_mode", "standard")).lower()
+
+        if mode == "logspace":
+            sigma_floor = max(float(getattr(cfg, "mdsm_sigma_floor", 1e-8)), 1e-20)
+            log_sigma = torch.log(sigma_local.clamp(min=sigma_floor))
+            log_norm = torch.log(norm_local.clamp(min=max(cfg.mdsm_norm_floor, sigma_floor)))
+            log_sigma_eff_sq = 2.0 * (log_sigma + log_norm)
+            inv_sigma_eff_sq = torch.exp((-log_sigma_eff_sq).clamp(max=math.log(inv_clip)))
+            sigma_eff_sq_for_weight = torch.exp(log_sigma_eff_sq).clamp(min=weight_floor)
+            return inv_sigma_eff_sq, sigma_eff_sq_for_weight
+
+        floor_mode = str(getattr(cfg, "mdsm_sigma_eff_floor_mode", "adaptive")).lower()
+        floor_base = max(float(getattr(cfg, "mdsm_sigma_eff_floor", 1e-10)), 0.0)
+        if floor_mode == "constant":
+            floor = torch.full_like(raw_sigma_eff_sq, floor_base)
+        elif floor_mode == "adaptive":
+            floor = norm_local.detach().pow(2) * floor_base
+        elif floor_mode == "none":
+            floor = torch.zeros_like(raw_sigma_eff_sq)
+        else:
+            raise ValueError(f"Unknown mdsm_sigma_eff_floor_mode: {floor_mode}")
+
+        sigma_eff_sq = torch.maximum(raw_sigma_eff_sq, floor)
+        sigma_eff_sq_for_weight = sigma_eff_sq.clamp(min=weight_floor)
+        inv_sigma_eff_sq = (1.0 / sigma_eff_sq_for_weight).clamp(max=inv_clip)
+        return inv_sigma_eff_sq, sigma_eff_sq_for_weight
+
     noise = torch.randn_like(pos)
     nrm = pos.norm(dim=-1, keepdim=True).clamp(min=cfg.mdsm_norm_floor)
     noisy = pos + noise * sigma * nrm
-    sigma_eff_sq = ((sigma * nrm) ** 2).clamp(min=1e-6)
+    inv_sigma_eff_sq, sigma_eff_sq = _sigma_scaling(sigma_local=sigma, norm_local=nrm)
     noisy_req = noisy.detach().requires_grad_(True)
     if cfg.mdsm_gradient_checkpointing:
         def _forward(inp: torch.Tensor) -> torch.Tensor:
@@ -249,13 +292,22 @@ def conditional_mdsm(
     else:
         e = critic(q, noisy_req, sigma=sigma.detach())
     g = torch.autograd.grad(e.sum(), noisy_req, create_graph=True)[0]
-    tgt = (noisy.detach() - pos) / sigma_eff_sq
+    tgt = (noisy.detach() - pos) * inv_sigma_eff_sq
     g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
     tgt = torch.nan_to_num(tgt, nan=0.0, posinf=1e4, neginf=-1e4)
-    if cfg.mdsm_tangent_projection:
+    mode = projection_mode
+    if mode == "auto":
+        mode = "tangent" if cfg.mdsm_tangent_projection else "none"
+    if mode == "tangent":
         vh = F.normalize(noisy.detach(), dim=-1)
         g = g - (g * vh).sum(dim=-1, keepdim=True) * vh
         tgt = tgt - (tgt * vh).sum(dim=-1, keepdim=True) * vh
+    elif mode == "radial":
+        vh = F.normalize(noisy.detach(), dim=-1)
+        g = (g * vh).sum(dim=-1, keepdim=True) * vh
+        tgt = (tgt * vh).sum(dim=-1, keepdim=True) * vh
+    elif mode != "none":
+        raise ValueError(f"Unknown projection_mode for conditional_mdsm: {projection_mode}")
     if cfg.mdsm_directional:
         c = F.cosine_similarity(g, tgt, dim=-1, eps=cfg.mdsm_cosine_eps).clamp(-1.0, 1.0)
         loss = 1.0 - c
@@ -268,9 +320,9 @@ def conditional_mdsm(
     else:
         loss = ((g - tgt) ** 2).sum(dim=-1)
     if cfg.sigma_weighting == "sigma2":
-        w = sigma_eff_sq.squeeze(-1)
+        w = sigma_eff_sq.squeeze(-1).clamp(min=max(float(getattr(cfg, "mdsm_weight_floor", 1e-8)), 1e-20))
     elif cfg.sigma_weighting == "inv_sigma2":
-        w = 1.0 / sigma_eff_sq.squeeze(-1).clamp(min=1e-8)
+        w = 1.0 / sigma_eff_sq.squeeze(-1).clamp(min=max(float(getattr(cfg, "mdsm_weight_floor", 1e-8)), 1e-20))
     elif cfg.sigma_weighting == "uniform":
         w = torch.ones_like(loss)
     else:
@@ -304,7 +356,7 @@ def normalize_triplet_energies(
 
 
 def conditional_nce_loss(
-    critic: SimpleEnergy,
+    critic: torch.nn.Module,
     q: torch.Tensor,
     pos: torch.Tensor,
     hard: torch.Tensor,
@@ -375,11 +427,12 @@ def clean_minimum_penalty(
 
 
 def gradient_direction_loss(
-    critic: SimpleEnergy,
+    critic: torch.nn.Module,
     q: torch.Tensor,
     pos: torch.Tensor,
     sigma: torch.Tensor,
     cfg: Stage1_5Config,
+    projection_mode: str = "auto",
 ) -> torch.Tensor:
     """P0.2: Explicit gradient direction loss — teaches critic WHERE to point.
 
@@ -392,7 +445,7 @@ def gradient_direction_loss(
     When direction_num_samples > 1, generates multiple noise perturbations per
     clean sample and averages the loss — more gradient supervision per step.
     """
-    num_samples = getattr(cfg, "direction_num_samples", 1)
+    num_samples = max(1, int(getattr(cfg, "direction_num_samples", 1)))
     nrm = pos.norm(dim=-1, keepdim=True).clamp(min=cfg.mdsm_norm_floor)
     cos_accum = []
     for _ in range(num_samples):
@@ -405,11 +458,19 @@ def gradient_direction_loss(
         g = torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
         # Target direction: from noisy toward clean
         target_dir = pos - noisy.detach()
-        # Tangent projection on sphere if configured
-        if cfg.mdsm_tangent_projection:
+        mode = projection_mode
+        if mode == "auto":
+            mode = "tangent" if cfg.mdsm_tangent_projection else "none"
+        if mode == "tangent":
             vh = F.normalize(noisy.detach(), dim=-1)
             g = g - (g * vh).sum(dim=-1, keepdim=True) * vh
             target_dir = target_dir - (target_dir * vh).sum(dim=-1, keepdim=True) * vh
+        elif mode == "radial":
+            vh = F.normalize(noisy.detach(), dim=-1)
+            g = (g * vh).sum(dim=-1, keepdim=True) * vh
+            target_dir = (target_dir * vh).sum(dim=-1, keepdim=True) * vh
+        elif mode != "none":
+            raise ValueError(f"Unknown projection_mode for gradient_direction_loss: {projection_mode}")
         # Cosine similarity between negative gradient and target direction
         neg_g = -g
         cos = F.cosine_similarity(
@@ -422,8 +483,34 @@ def gradient_direction_loss(
     return (1.0 - torch.stack(cos_accum).mean())
 
 
+def critic_gradient_purity_loss(
+    critic: torch.nn.Module,
+    q: torch.Tensor,
+    v: torch.Tensor,
+    sigma: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    """
+    Encourage geometric specialization of critic gradients.
+
+    mode="angular": penalize radial component of grad.
+    mode="radial":  penalize tangent component of grad.
+    """
+    v_req = v.detach().requires_grad_(True)
+    e = critic(q, v_req, sigma=sigma.detach())
+    g = torch.autograd.grad(e.sum(), v_req, create_graph=True)[0]
+    v_hat = F.normalize(v.detach(), dim=-1)
+    g_rad = (g * v_hat).sum(dim=-1, keepdim=True) * v_hat
+    if mode == "angular":
+        return (g_rad.pow(2).sum(dim=-1)).mean()
+    if mode == "radial":
+        g_tan = g - g_rad
+        return (g_tan.pow(2).sum(dim=-1)).mean()
+    raise ValueError(f"Unknown critic gradient purity mode: {mode}")
+
+
 def inbatch_cross_negative_nce(
-    critic: SimpleEnergy,
+    critic: torch.nn.Module,
     q: torch.Tensor,
     pos: torch.Tensor,
     sigma: torch.Tensor,
@@ -496,12 +583,19 @@ def knn_support_penalty(
 class TwinHybridEnergy:
     def __init__(
         self,
-        c1: SimpleEnergy,
-        c2: SimpleEnergy,
+        c1: torch.nn.Module,
+        c2: torch.nn.Module,
         prior: UnconditionalEnergy | None,
         lambda_prior: float,
         aggregate: str,
         softmax_temperature: float,
+        critic_architecture: str = "homogeneous",
+        sigma_min: float = 0.01,
+        sigma_max: float = 0.3,
+        sigma_head_weighting_enabled: bool = False,
+        angular_weight_low_sigma: float = 0.5,
+        angular_weight_high_sigma: float = 0.5,
+        head_weight_power: float = 1.0,
     ):
         self.c1 = c1
         self.c2 = c2
@@ -509,18 +603,76 @@ class TwinHybridEnergy:
         self.lambda_prior = lambda_prior
         self.aggregate = aggregate
         self.softmax_temperature = softmax_temperature
+        self.critic_architecture = critic_architecture
+        self.sigma_min = float(max(sigma_min, 1e-8))
+        self.sigma_max = float(max(sigma_max, self.sigma_min + 1e-8))
+        self.sigma_head_weighting_enabled = bool(sigma_head_weighting_enabled)
+        self.angular_weight_low_sigma = float(angular_weight_low_sigma)
+        self.angular_weight_high_sigma = float(angular_weight_high_sigma)
+        self.head_weight_power = float(max(head_weight_power, 1e-6))
 
-    def cond(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
-        e1, e2 = self.c1(q, v, sigma=sigma), self.c2(q, v, sigma=sigma)
+    def _estimate_sigma(self, q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            dist = (v - q).norm(dim=-1, keepdim=True)
+            q_norm = q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            sigma = dist / q_norm
+        return sigma.clamp(min=self.sigma_min, max=self.sigma_max)
+
+    def _head_weights(self, sigma: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.sigma_head_weighting_enabled:
+            w_ang_const = 0.5 * (self.angular_weight_low_sigma + self.angular_weight_high_sigma)
+            w_ang = torch.full_like(sigma, float(w_ang_const))
+        else:
+            log_s = sigma.clamp(min=self.sigma_min, max=self.sigma_max).log()
+            t = (log_s - math.log(self.sigma_min)) / max(
+                math.log(self.sigma_max) - math.log(self.sigma_min),
+                1e-8,
+            )
+            t = t.clamp(min=0.0, max=1.0).pow(self.head_weight_power)
+            w_ang = self.angular_weight_low_sigma + (
+                self.angular_weight_high_sigma - self.angular_weight_low_sigma
+            ) * t
+        w_ang = w_ang.clamp(min=0.0, max=1.0)
+        w_rad = 1.0 - w_ang
+        return w_ang, w_rad
+
+    def cond_components(
+        self,
+        q: torch.Tensor,
+        v: torch.Tensor,
+        sigma: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        sigma_use = sigma if sigma is not None else self._estimate_sigma(q, v)
+        e1 = self.c1(q, v, sigma=sigma_use)
+        e2 = self.c2(q, v, sigma=sigma_use)
+        if self.critic_architecture == "radial_angular":
+            w1, w2 = self._head_weights(sigma_use)
+            cond = w1.squeeze(-1) * e1 + w2.squeeze(-1) * e2
+            return {
+                "head1": e1,
+                "head2": e2,
+                "w1": w1.squeeze(-1),
+                "w2": w2.squeeze(-1),
+                "cond": cond,
+                "sigma": sigma_use,
+            }
+
         if self.aggregate == "mean":
-            return 0.5 * (e1 + e2)
-        if self.aggregate == "softmax":
+            cond = 0.5 * (e1 + e2)
+        elif self.aggregate == "softmax":
             tau = max(1e-6, float(self.softmax_temperature))
             stacked = torch.stack([e1, e2], dim=0)
-            return tau * torch.logsumexp(stacked / tau, dim=0)
-        if self.aggregate == "max":
-            return torch.maximum(e1, e2)
-        raise ValueError(f"Unknown twin aggregation mode: {self.aggregate}")
+            cond = tau * torch.logsumexp(stacked / tau, dim=0)
+        elif self.aggregate == "max":
+            cond = torch.maximum(e1, e2)
+        else:
+            raise ValueError(f"Unknown twin aggregation mode: {self.aggregate}")
+
+        w = torch.full_like(cond, 0.5)
+        return {"head1": e1, "head2": e2, "w1": w, "w2": w, "cond": cond, "sigma": sigma_use}
+
+    def cond(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
+        return self.cond_components(q=q, v=v, sigma=sigma)["cond"]
 
     def __call__(self, q: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
         e = self.cond(q, v, sigma=sigma)
@@ -558,6 +710,9 @@ class SigmaBoundEnergy:
 
 
 def make_thresholds(cfg: Stage1_5Config) -> ConditionalThresholds:
+    clean_key = "clean_min_violation_rate"
+    if str(getattr(cfg, "clean_min_violation_mode", "margin")).lower() == "strict":
+        clean_key = "clean_min_violation_rate_strict"
     return ConditionalThresholds(
         min_cos_improvement=cfg.min_cosine_improvement,
         min_cos_success_rate=cfg.min_cosine_success_rate,
@@ -565,6 +720,7 @@ def make_thresholds(cfg: Stage1_5Config) -> ConditionalThresholds:
         min_l2_improvement=cfg.min_l2_improvement,
         min_energy_success_rate=cfg.min_energy_success_rate,
         max_clean_min_violation=cfg.max_clean_min_violation_rate,
+        clean_min_violation_key=clean_key,
         min_step_norm=cfg.min_step_norm,
     )
 
@@ -601,10 +757,32 @@ def eval_model(
         kw = dict(friction=cfg.langevin.underdamped_friction, mass=cfg.langevin.underdamped_mass)
     else:
         kw = dict(momentum_beta=cfg.langevin.momentum_beta)
+    # Trust-Region Metropolis (TRM) acceptance filter
+    if getattr(cfg.langevin, 'mala_enabled', False):
+        kw['mala_enabled'] = True
+        kw['mala_temperature_floor'] = float(getattr(cfg.langevin, 'mala_temperature_floor', 0.01))
+        kw['mala_trust_radius'] = float(getattr(cfg.langevin, 'mala_trust_radius', 10.0))
     out = {}
     eval_batch = max(1, int(cfg.eval_langevin_batch_size))
     for ns in cfg.eval_noise_scales:
-        cb, ca, lb, la, eb, ea, ep, step, succ, viol, rcos = [], [], [], [], [], [], [], [], [], [], []
+        cb, ca, lb, la, eb, ea, ep, step, succ_target, succ_descent, viol, viol_strict, rcos = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        h1_b, h1_a, h1_p = [], [], []
+        h2_b, h2_a, h2_p = [], [], []
+        head_corr = []
         for start in range(0, len(ids), eval_batch):
             batch_ids = ids[start:start + eval_batch]
             q_idx = batch_ids.to(device=device, dtype=torch.long)
@@ -644,6 +822,11 @@ def eval_model(
                     sigma_max=getattr(cfg.langevin, 'sigma_anneal_max', 0.3),
                     sigma_min=getattr(cfg.langevin, 'sigma_anneal_min', 0.01),
                     adaptive_blend=getattr(cfg.langevin, 'sigma_anneal_blend', 0.5),
+                    noise_anneal=getattr(cfg.langevin, 'noise_anneal', True),
+                    noise_mode=getattr(cfg.langevin, 'noise_anneal_mode', 'hybrid'),
+                    noise_max=getattr(cfg.langevin, 'noise_anneal_max', 0.15),
+                    noise_min=getattr(cfg.langevin, 'noise_anneal_min', cfg.langevin.noise_scale),
+                    noise_sync_with_sigma=getattr(cfg.langevin, 'noise_anneal_sync_with_sigma', True),
                 )
                 sigma_bound_ef = AdaptiveSigmaEnergyWrapper(
                     ef, sigma_sched_cfg, max_steps=cfg.critic_eval_langevin_steps,
@@ -653,6 +836,7 @@ def eval_model(
             if cfg.critic_eval_langevin_steps > 0:
                 # Keep eval math sample-independent when batched: fixed-step rollout,
                 # no batch-coupled early stop by mean energy.
+                _cos_es = getattr(cfg.langevin, 'cosine_early_stop', False)
                 res = run_langevin(
                     method=cfg.langevin.method,
                     energy_fn=sigma_bound_ef,
@@ -666,12 +850,18 @@ def eval_model(
                     plateau_patience=max(cfg.critic_eval_langevin_steps + 1, cfg.langevin.plateau_patience),
                     plateau_delta=cfg.langevin.plateau_delta,
                     tangent_noise=cfg.langevin_tangent_noise,
-                    v_target=None,
+                    v_target=pos if _cos_es else None,
+                    tamed=getattr(cfg.langevin, 'tamed', False),
+                    cosine_early_stop=_cos_es,
+                    cosine_patience=int(getattr(cfg.langevin, 'cosine_patience', 20)),
+                    cosine_delta=float(getattr(cfg.langevin, 'cosine_delta', 0.001)),
                     **kw,
                 )
                 final = res.v_last if res.v_last is not None else res.v_final
+                metric_step = max(0, int(res.num_steps) - 1)
             else:
                 final = v
+                metric_step = 0
 
             cb_batch = F.cosine_similarity(pos, noisy, dim=-1)
             ca_batch = F.cosine_similarity(pos, final, dim=-1)
@@ -679,9 +869,30 @@ def eval_model(
             la_batch = torch.norm(pos - final, dim=-1)
             step_batch = torch.norm(final - noisy, dim=-1)
             with torch.no_grad():
-                ep_batch = ef(q, pos, sigma=sigma.detach()).detach()
-                eb_batch = ef(q, noisy, sigma=sigma.detach()).detach()
-                ea_batch = ef(q, final, sigma=sigma.detach()).detach()
+                if getattr(cfg.langevin, "sigma_anneal", False):
+                    sigma_bound_ef.set_step(metric_step)
+                    ep_batch = sigma_bound_ef(q, pos).detach()
+                    eb_batch = sigma_bound_ef(q, noisy).detach()
+                    ea_batch = sigma_bound_ef(q, final).detach()
+                else:
+                    ep_batch = ef(q, pos, sigma=sigma.detach()).detach()
+                    eb_batch = ef(q, noisy, sigma=sigma.detach()).detach()
+                    ea_batch = ef(q, final, sigma=sigma.detach()).detach()
+
+                comp_pos = ef.cond_components(q, pos, sigma=sigma.detach())
+                comp_noisy = ef.cond_components(q, noisy, sigma=sigma.detach())
+                comp_final = ef.cond_components(q, final, sigma=sigma.detach())
+                h1_p.extend(comp_pos["head1"].detach().cpu().tolist())
+                h1_b.extend(comp_noisy["head1"].detach().cpu().tolist())
+                h1_a.extend(comp_final["head1"].detach().cpu().tolist())
+                h2_p.extend(comp_pos["head2"].detach().cpu().tolist())
+                h2_b.extend(comp_noisy["head2"].detach().cpu().tolist())
+                h2_a.extend(comp_final["head2"].detach().cpu().tolist())
+                h1c = comp_pos["head1"].detach()
+                h2c = comp_pos["head2"].detach()
+                h1z = (h1c - h1c.mean()) / h1c.std(unbiased=False).clamp(min=1e-6)
+                h2z = (h2c - h2c.mean()) / h2c.std(unbiased=False).clamp(min=1e-6)
+                head_corr.append(float((h1z * h2z).mean().abs().item()))
 
             cb.extend(cb_batch.detach().cpu().tolist())
             ca.extend(ca_batch.detach().cpu().tolist())
@@ -691,8 +902,14 @@ def eval_model(
             eb.extend(eb_batch.detach().cpu().tolist())
             ea.extend(ea_batch.detach().cpu().tolist())
             step.extend(step_batch.detach().cpu().tolist())
-            succ.extend((ea_batch < eb_batch).to(torch.float32).detach().cpu().tolist())
-            viol.extend((ea_batch < ep_batch).to(torch.float32).detach().cpu().tolist())
+            succ_target.extend(
+                ((ea_batch - ep_batch).abs() < (eb_batch - ep_batch).abs())
+                .to(torch.float32).detach().cpu().tolist()
+            )  # E(final) closer to E(target) than E(start) was
+            succ_descent.extend((ea_batch < eb_batch).to(torch.float32).detach().cpu().tolist())
+            clean_margin = float(cfg.clean_min_margin) if cfg.use_clean_min_penalty else 0.0
+            viol.extend((ea_batch < (ep_batch + clean_margin)).to(torch.float32).detach().cpu().tolist())
+            viol_strict.extend((ea_batch < ep_batch).to(torch.float32).detach().cpu().tolist())
         n = float(len(cb))
         out[f"noise_{ns}"] = {
             "cos_before_mean": sum(cb) / n,
@@ -711,14 +928,27 @@ def eval_model(
             "energy_before_mean": sum(eb) / n,
             "energy_after_mean": sum(ea) / n,
             "energy_improvement": (sum(eb) - sum(ea)) / n,
-            "energy_success_rate": sum(succ) / n,
+            # Backward-compatible alias: keep historical key mapped to target-proximity criterion.
+            "energy_success_rate": sum(succ_target) / n,
+            "energy_target_proximity_rate": sum(succ_target) / n,
+            "energy_descent_rate": sum(succ_descent) / n,
             "clean_min_violation_rate": sum(viol) / n,
+            "clean_min_violation_rate_strict": sum(viol_strict) / n,
             "step_norm_mean": sum(step) / n,
             # Backward-compatible alias:
             # `success_rate` historically meant cosine-gain success.
             "success_rate": sum(1.0 for b, a in zip(cb, ca) if a > b) / n,
             "cos_success_rate": sum(1.0 for b, a in zip(cb, ca) if a > b) / n,
             "retrieval_cosine_mean": sum(rcos) / n,
+            "head1_energy_before_mean": sum(h1_b) / n,
+            "head1_energy_after_mean": sum(h1_a) / n,
+            "head1_energy_clean_mean": sum(h1_p) / n,
+            "head1_energy_improvement": (sum(h1_b) - sum(h1_a)) / n,
+            "head2_energy_before_mean": sum(h2_b) / n,
+            "head2_energy_after_mean": sum(h2_a) / n,
+            "head2_energy_clean_mean": sum(h2_p) / n,
+            "head2_energy_improvement": (sum(h2_b) - sum(h2_a)) / n,
+            "head_corr_abs_mean": sum(head_corr) / n if head_corr else 0.0,
         }
     return out
 
@@ -757,13 +987,19 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "ortho_n_iters",
         "eval_langevin_batch_size",
         "checkpoint_every_epochs",
+        "head_weight_power",
+        "energy_scale_lr_multiplier",
     ]:
         _must_be_positive(name, float(getattr(cfg, name)))
 
     for name in [
         "weight_decay",
         "lambda_mdsm",
+        "lambda_mdsm_angular",
+        "lambda_mdsm_radial",
         "lambda_rank",
+        "lambda_rank_angular",
+        "lambda_rank_radial",
         "lambda_nce",
         "lambda_cql",
         "lambda_shell",
@@ -774,12 +1010,25 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "lambda_prior_nce",
         "lambda_actor_barrier",
         "lambda_actor_descent",
+        "lambda_clean_min_angular",
+        "lambda_clean_min_radial",
+        "lambda_direction_angular",
+        "lambda_direction_radial",
+        "lambda_angular_purity",
+        "lambda_radial_purity",
+        "lambda_head_corr",
+        "lambda_energy_scale_reg",
+        "head_corr_target",
         "gradient_penalty_lambda",
         "shell_barrier_margin",
         "cql_noise_scale",
         "nce_num_random_negatives",
         "sigma_curriculum_start",
         "sigma_min",
+        "mdsm_sigma_eff_floor",
+        "mdsm_sigma_floor",
+        "mdsm_inv_sigma2_clip",
+        "mdsm_weight_floor",
         "mdsm_magnitude_aux_weight",
         "critic_margin_clean_actor",
         "critic_margin_actor_noisy",
@@ -789,6 +1038,10 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         "actor_energy_margin_hard",
         "retrieval_self_sim_exclude",
         "retrieval_min_pos_similarity",
+        "angular_weight_low_sigma",
+        "angular_weight_high_sigma",
+        "energy_floor_margin",
+        "cd_margin",
         "non_finite_backoff_streak_trigger",
         "max_consecutive_non_finite_batches",
         "param_finite_check_interval",
@@ -796,6 +1049,11 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
         _must_be_non_negative(name, float(getattr(cfg, name)))
     if int(cfg.critic_steps_per_actor) < 1:
         raise ValueError(f"critic_steps_per_actor must be >= 1, got {cfg.critic_steps_per_actor}")
+    if str(getattr(cfg, "critic_step_mode", "alternating")) not in {"alternating", "joint"}:
+        raise ValueError(
+            "critic_step_mode must be one of {'alternating','joint'}, "
+            f"got {cfg.critic_step_mode}"
+        )
 
     if cfg.sigma_curriculum_start > cfg.sigma_curriculum_end:
         raise ValueError(
@@ -829,10 +1087,75 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
             "sigma_weighting must be one of {'sigma2','uniform','inv_sigma2'}, "
             f"got {cfg.sigma_weighting}"
         )
+    if cfg.mdsm_target_mode not in {"standard", "logspace"}:
+        raise ValueError(
+            "mdsm_target_mode must be one of {'standard','logspace'}, "
+            f"got {cfg.mdsm_target_mode}"
+        )
+    if cfg.mdsm_sigma_eff_floor_mode not in {"constant", "adaptive", "none"}:
+        raise ValueError(
+            "mdsm_sigma_eff_floor_mode must be one of {'constant','adaptive','none'}, "
+            f"got {cfg.mdsm_sigma_eff_floor_mode}"
+        )
+    if cfg.sigma_curriculum_start < 0.005 and cfg.sigma_weighting == "sigma2":
+        if cfg.mdsm_target_mode != "logspace":
+            raise ValueError(
+                "Low-sigma training with sigma2 weighting requires mdsm_target_mode='logspace' "
+                "to avoid sigma_eff dead-zones."
+            )
+        if cfg.mdsm_weight_floor <= 0.0:
+            raise ValueError(
+                "For low-sigma sigma2 weighting, mdsm_weight_floor must be > 0."
+            )
+    direction_any = max(float(cfg.lambda_direction), float(cfg.lambda_direction_angular), float(cfg.lambda_direction_radial))
+    if cfg.use_direction_loss and direction_any > 0 and int(cfg.direction_num_samples) < 1:
+        raise ValueError(
+            "direction_num_samples must be >= 1 when direction loss is enabled."
+        )
+    mdsm_any = max(float(cfg.lambda_mdsm), float(cfg.lambda_mdsm_angular), float(cfg.lambda_mdsm_radial))
+    if mdsm_any <= 0 and (not cfg.use_direction_loss or direction_any <= 0):
+        raise ValueError(
+            "At least one gradient-field supervision term must be active "
+            "(mdsm lambda > 0 or direction loss enabled with lambda_direction > 0)."
+        )
     if cfg.twin_aggregate not in {"max", "mean", "softmax"}:
         raise ValueError(
             "twin_aggregate must be one of {'max','mean','softmax'}, "
             f"got {cfg.twin_aggregate}"
+        )
+    if cfg.critic_architecture not in {"homogeneous", "radial_angular"}:
+        raise ValueError(
+            "critic_architecture must be one of {'homogeneous','radial_angular'}, "
+            f"got {cfg.critic_architecture}"
+        )
+    if cfg.angular_weight_low_sigma > 1.0 or cfg.angular_weight_high_sigma > 1.0:
+        raise ValueError("angular_weight_low_sigma and angular_weight_high_sigma must be <= 1.0")
+    if cfg.head_corr_target > 1.0:
+        raise ValueError("head_corr_target must be <= 1.0")
+    if str(getattr(cfg, "clean_min_violation_mode", "margin")) not in {"margin", "strict"}:
+        raise ValueError(
+            "clean_min_violation_mode must be one of {'margin','strict'}, "
+            f"got {cfg.clean_min_violation_mode}"
+        )
+    if cfg.angular_norm_mode not in {"orthonorm", "spectral_norm", "none"}:
+        raise ValueError(
+            "angular_norm_mode must be one of {'orthonorm','spectral_norm','none'}, "
+            f"got {cfg.angular_norm_mode}"
+        )
+    if cfg.radial_norm_mode not in {"orthonorm", "spectral_norm", "none"}:
+        raise ValueError(
+            "radial_norm_mode must be one of {'orthonorm','spectral_norm','none'}, "
+            f"got {cfg.radial_norm_mode}"
+        )
+    if cfg.angular_activation not in {"silu", "gelu", "relu", "groupsort", "lipschitz_spline"}:
+        raise ValueError(
+            "angular_activation must be one of {'silu','gelu','relu','groupsort','lipschitz_spline'}, "
+            f"got {cfg.angular_activation}"
+        )
+    if cfg.radial_activation not in {"silu", "gelu", "relu", "groupsort", "lipschitz_spline"}:
+        raise ValueError(
+            "radial_activation must be one of {'silu','gelu','relu','groupsort','lipschitz_spline'}, "
+            f"got {cfg.radial_activation}"
         )
     if cfg.actor_norm_mode not in {"orthonorm", "spectral_norm", "none"}:
         raise ValueError(
@@ -890,6 +1213,25 @@ def _validate_stage15_config(cfg: Stage1_5Config) -> None:
             raise ValueError(
                 f"langevin.underdamped_friction must be in (0,1], got {cfg.langevin.underdamped_friction}"
             )
+    if bool(getattr(cfg.langevin, "sigma_anneal", False)):
+        s_min = float(getattr(cfg.langevin, "sigma_anneal_min", cfg.sigma_curriculum_start))
+        s_max = float(getattr(cfg.langevin, "sigma_anneal_max", cfg.sigma_curriculum_end))
+        if s_min <= 0.0 or s_max <= 0.0 or s_min > s_max:
+            raise ValueError(
+                f"langevin sigma anneal range must satisfy 0 < min <= max, got [{s_min}, {s_max}]"
+            )
+        if s_min < cfg.sigma_curriculum_start or s_max > cfg.sigma_curriculum_end:
+            raise ValueError(
+                "langevin sigma anneal range must stay inside training sigma_curriculum range: "
+                f"anneal=[{s_min},{s_max}] vs train=[{cfg.sigma_curriculum_start},{cfg.sigma_curriculum_end}]"
+            )
+    if bool(getattr(cfg.langevin, "noise_anneal", False)):
+        n_min = float(getattr(cfg.langevin, "noise_anneal_min", 0.0))
+        n_max = float(getattr(cfg.langevin, "noise_anneal_max", 0.0))
+        if n_min < 0.0 or n_max < 0.0 or n_min > n_max:
+            raise ValueError(
+                f"langevin noise anneal range must satisfy 0 <= min <= max, got [{n_min}, {n_max}]"
+            )
 
 
 def load_config(path: str) -> Stage1_5Config:
@@ -906,8 +1248,11 @@ def load_config(path: str) -> Stage1_5Config:
     if isinstance(kill, dict):
         cfg.min_cosine_improvement = float(kill.get("min_cosine_improvement", cfg.min_cosine_improvement))
         cfg.min_cosine_success_rate = float(kill.get("min_cosine_success_rate", cfg.min_cosine_success_rate))
+        cfg.min_geodesic_improvement = float(kill.get("min_geodesic_improvement", cfg.min_geodesic_improvement))
+        cfg.min_l2_improvement = float(kill.get("min_l2_improvement", cfg.min_l2_improvement))
         cfg.min_energy_success_rate = float(kill.get("min_energy_success_rate", cfg.min_energy_success_rate))
         cfg.max_clean_min_violation_rate = float(kill.get("max_clean_min_violation_rate", cfg.max_clean_min_violation_rate))
+        cfg.min_step_norm = float(kill.get("min_step_norm", cfg.min_step_norm))
     _validate_stage15_config(cfg)
     return cfg
 
@@ -988,8 +1333,48 @@ def main() -> None:
     eval_gen = torch.Generator(device="cpu").manual_seed(int(cfg.seed) + 1009)
     eval_ids = torch.randperm(len(ds_val), generator=eval_gen)[: min(cfg.eval_num_samples, len(ds_val))]
 
-    c1_base = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
-    c2_base = SimpleEnergy(cfg.energy_dim, cfg.energy_hidden_dims, cfg.norm_mode, cfg.activation, ortho_n_iters=cfg.ortho_n_iters, energy_output_clamp=None).to(device)
+    critic_arch = str(getattr(cfg, "critic_architecture", "homogeneous"))
+    if critic_arch == "radial_angular":
+        c1_base = AngularEnergyCritic(
+            dim=cfg.energy_dim,
+            hidden_dims=cfg.angular_hidden_dims,
+            norm_mode=cfg.angular_norm_mode,
+            activation=cfg.angular_activation,
+            energy_output_clamp=getattr(cfg, 'angular_energy_output_clamp', None),
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
+        ).to(device)
+        c2_base = RadialEnergyCritic(
+            dim=cfg.energy_dim,
+            hidden_dims=cfg.radial_hidden_dims,
+            norm_mode=cfg.radial_norm_mode,
+            activation=cfg.radial_activation,
+            target_norm=cfg.langevin.target_norm,
+            energy_output_clamp=getattr(cfg, 'radial_energy_output_clamp', None),
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
+        ).to(device)
+    else:
+        c1_base = SimpleEnergy(
+            cfg.energy_dim,
+            cfg.energy_hidden_dims,
+            cfg.norm_mode,
+            cfg.activation,
+            ortho_n_iters=cfg.ortho_n_iters,
+            energy_output_clamp=None,
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
+        ).to(device)
+        c2_base = SimpleEnergy(
+            cfg.energy_dim,
+            cfg.energy_hidden_dims,
+            cfg.norm_mode,
+            cfg.activation,
+            ortho_n_iters=cfg.ortho_n_iters,
+            energy_output_clamp=None,
+            trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
+            energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
+        ).to(device)
     actor_base = LatentDenoiseActor(
         cfg.energy_dim,
         cfg.actor_hidden_dims,
@@ -1029,9 +1414,35 @@ def main() -> None:
         cfg.lambda_prior if cfg.use_prior_critic else 0.0,
         cfg.twin_aggregate,
         cfg.twin_softmax_temperature,
+        critic_architecture=critic_arch,
+        sigma_min=cfg.sigma_min,
+        sigma_max=cfg.sigma_max,
+        sigma_head_weighting_enabled=cfg.sigma_head_weighting_enabled,
+        angular_weight_low_sigma=cfg.angular_weight_low_sigma,
+        angular_weight_high_sigma=cfg.angular_weight_high_sigma,
+        head_weight_power=cfg.head_weight_power,
     )
 
-    groups = [{"params": list(c1_base.parameters()), "lr": cfg.critic_lr}, {"params": list(c2_base.parameters()), "lr": cfg.critic_lr}]
+    def _split_energy_scale_params(mod: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+        regular: list[torch.nn.Parameter] = []
+        scale: list[torch.nn.Parameter] = []
+        for name, p in mod.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.endswith("log_energy_scale"):
+                scale.append(p)
+            else:
+                regular.append(p)
+        return regular, scale
+
+    groups: list[dict] = []
+    energy_scale_lr_mult = float(getattr(cfg, "energy_scale_lr_multiplier", 1.0))
+    for crit_mod in [c1_base, c2_base]:
+        reg_params, scale_params = _split_energy_scale_params(crit_mod)
+        if reg_params:
+            groups.append({"params": reg_params, "lr": cfg.critic_lr})
+        if scale_params:
+            groups.append({"params": scale_params, "lr": cfg.critic_lr * energy_scale_lr_mult})
     if prior_base is not None:
         groups.append({"params": list(prior_base.parameters()), "lr": cfg.prior_critic_lr})
     opt_c = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
@@ -1044,7 +1455,8 @@ def main() -> None:
     ckpt_dir, log_dir = Path(cfg.checkpoint_dir), Path(cfg.logs_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True); log_dir.mkdir(parents=True, exist_ok=True)
     stream_path = log_dir / "training_metrics.jsonl"
-    best_score, start_epoch, global_step = float("-inf"), 0, 0
+    best_score_strict, best_score_any = float("-inf"), float("-inf")
+    start_epoch, global_step = 0, 0
     plateau_counter = 0  # for LR plateau boost
     if args.resume:
         ck = torch.load(args.resume, weights_only=False, map_location=device)
@@ -1058,7 +1470,9 @@ def main() -> None:
             sched_c.load_state_dict(ck["sched_c_state"])
         if sched_a is not None and ck.get("sched_a_state") is not None:
             sched_a.load_state_dict(ck["sched_a_state"])
-        best_score, start_epoch, global_step = float(ck.get("best_score", best_score)), int(ck.get("epoch", 0)) + 1, int(ck.get("global_step", 0))
+        best_score_strict = float(ck.get("best_score_strict", ck.get("best_score", best_score_strict)))
+        best_score_any = float(ck.get("best_score_any", best_score_any))
+        start_epoch, global_step = int(ck.get("epoch", 0)) + 1, int(ck.get("global_step", 0))
         plateau_counter = int(ck.get("plateau_counter", 0))
     elif stream_path.exists():
         # Fresh run: avoid mixing with previous monitoring session.
@@ -1083,7 +1497,11 @@ def main() -> None:
             )
         print(f"  kNN support threshold (p{cfg.support_threshold_percentile:.0f}): {support_threshold:.6f}")
 
-    print(f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing}")
+    print(
+        f"Device: {device} | Train: {len(ds)} | Val: {len(ds_val)} | "
+        f"compile={compile_enabled} | grad_checkpointing={cfg.mdsm_gradient_checkpointing} | "
+        f"critic_step_mode={getattr(cfg, 'critic_step_mode', 'alternating')}"
+    )
     print(
         "Checkpoint policy: "
         f"periodic_every={int(cfg.checkpoint_every_epochs)} "
@@ -1126,10 +1544,15 @@ def main() -> None:
             "actor_descent": 0.0,
             "clean_min": 0.0,
             "direction": 0.0,
+            "purity": 0.0,
+            "head_corr": 0.0,
             "inbatch_nce": 0.0,
             "support": 0.0,
             "knn_dist": 0.0,
             "energy_reg": 0.0,
+            "energy_scale_reg": 0.0,
+            "energy_floor": 0.0,
+            "cd": 0.0,
             "interp_gp": 0.0,
             "e_pos_mean": 0.0,
             "e_actor_mean": 0.0,
@@ -1192,8 +1615,13 @@ def main() -> None:
             rank_clean_hard_acc = 0.0
             clean_min_acc = 0.0
             direction_acc = 0.0
+            purity_acc = 0.0
+            head_corr_acc = 0.0
             inbatch_nce_acc = 0.0
             energy_reg_acc = 0.0
+            energy_scale_reg_acc = 0.0
+            energy_floor_acc = 0.0
+            cd_acc = 0.0
             interp_gp_acc = 0.0
             e_pos_mean_acc = 0.0
             e_actor_mean_acc = 0.0
@@ -1203,24 +1631,72 @@ def main() -> None:
             cos_pos_hard_acc = 0.0
             cos_actor_hard_acc = 0.0
             critic_failed = False
-            for cstep in range(max(1, cfg.critic_steps_per_actor)):
+            joint_critic_mode = (
+                critic_arch == "radial_angular"
+                and str(getattr(cfg, "critic_step_mode", "alternating")) == "joint"
+            )
+            critic_update_count = max(1, int(cfg.critic_steps_per_actor)) * (2 if joint_critic_mode else 1)
+            shared_sigma = None
+            shared_seed = None
+            shared_a_init = None
+            for cstep in range(critic_update_count):
                 try:
-                    crit = c1 if (cstep % 2 == 0) else c2
-                    crit_base = c1_base if (cstep % 2 == 0) else c2_base
-                    sigma = sample_sigma(cfg, q.shape[0], device)
-                    seed = seed_actor(q, hard, sigma, cfg)
-                    with torch.no_grad():
-                        a_init, _ = actor.predict_step(
-                            q,
-                            seed,
-                            sigma=sigma,
-                            step_size=cfg.actor_step_size,
-                            target_norm=cfg.langevin.target_norm,
-                            tangent_projection=cfg.actor_tangent_projection,
-                        )
+                    is_head1 = (cstep % 2 == 0)
+                    crit = c1 if is_head1 else c2
+                    crit_base = c1_base if is_head1 else c2_base
+                    role = "generic"
+                    if critic_arch == "radial_angular":
+                        role = "angular" if is_head1 else "radial"
+
+                    mdsm_lambda = effective_lambda_mdsm
+                    rank_lambda = cfg.lambda_rank
+                    clean_min_lambda = cfg.lambda_clean_min
+                    direction_lambda = cfg.lambda_direction
+                    projection_mode = "auto"
+                    if role == "angular":
+                        mdsm_lambda = float(cfg.lambda_mdsm_angular) * mdsm_scale
+                        rank_lambda = float(cfg.lambda_rank_angular)
+                        clean_min_lambda = float(cfg.lambda_clean_min_angular)
+                        direction_lambda = float(cfg.lambda_direction_angular)
+                        projection_mode = "tangent"
+                    elif role == "radial":
+                        mdsm_lambda = float(cfg.lambda_mdsm_radial) * mdsm_scale
+                        rank_lambda = float(cfg.lambda_rank_radial)
+                        clean_min_lambda = float(cfg.lambda_clean_min_radial)
+                        direction_lambda = float(cfg.lambda_direction_radial)
+                        projection_mode = "radial"
+
+                    use_shared = joint_critic_mode and (cstep % 2 == 1) and shared_sigma is not None
+                    if use_shared:
+                        sigma = shared_sigma
+                        seed = shared_seed
+                        a_init = shared_a_init
+                    else:
+                        sigma = sample_sigma(cfg, q.shape[0], device)
+                        seed = seed_actor(q, hard, sigma, cfg)
+                        with torch.no_grad():
+                            a_init, _ = actor.predict_step(
+                                q,
+                                seed,
+                                sigma=sigma,
+                                step_size=cfg.actor_step_size,
+                                target_norm=cfg.langevin.target_norm,
+                                tangent_projection=cfg.actor_tangent_projection,
+                            )
+                        if joint_critic_mode:
+                            shared_sigma = sigma.detach()
+                            shared_seed = seed.detach()
+                            shared_a_init = a_init.detach()
                     with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
-                        if effective_lambda_mdsm > 0:
-                            mdsm = conditional_mdsm(crit, q, pos, sigma, cfg)
+                        if mdsm_lambda > 0:
+                            mdsm = conditional_mdsm(
+                                crit,
+                                q,
+                                pos,
+                                sigma,
+                                cfg,
+                                projection_mode=projection_mode,
+                            )
                         else:
                             mdsm = torch.tensor(0.0, device=device)
                     with autocast():
@@ -1282,8 +1758,8 @@ def main() -> None:
                                 + F.relu(nrm - r * (1 + m)).pow(2)
                             ).mean()
                         loss_c = (
-                            effective_lambda_mdsm * mdsm
-                            + cfg.lambda_rank * rank
+                            mdsm_lambda * mdsm
+                            + rank_lambda * rank
                             + cfg.lambda_nce * nce
                             + cfg.lambda_cql * cql
                             + cfg.gradient_penalty_lambda * gp
@@ -1302,17 +1778,23 @@ def main() -> None:
 
                         # P0.1: Clean-minimum penalty
                         l_clean_min = torch.tensor(0.0, device=device)
-                        if cfg.use_clean_min_penalty and cfg.lambda_clean_min > 0:
+                        apply_clean_min = cfg.use_clean_min_penalty and clean_min_lambda > 0
+                        if role == "angular" and cfg.route_clean_min_to_radial_only:
+                            apply_clean_min = False
+                        if apply_clean_min:
                             l_clean_min = clean_minimum_penalty(
                                 e_clean=e_pos,
                                 e_actor=e_actor,
                                 margin=cfg.clean_min_margin,
                             )
-                            loss_c = loss_c + cfg.lambda_clean_min * l_clean_min
+                            loss_c = loss_c + clean_min_lambda * l_clean_min
 
                         # P0.2: Gradient direction loss (auxiliary to MDSM)
                         l_direction = torch.tensor(0.0, device=device)
-                        if cfg.use_direction_loss and cfg.lambda_direction > 0:
+                        apply_direction = cfg.use_direction_loss and direction_lambda > 0
+                        if role == "radial" and cfg.route_direction_to_angular_only:
+                            apply_direction = False
+                        if apply_direction:
                             with (nullcontext() if cfg.mdsm_force_fp32 else autocast()):
                                 l_direction = gradient_direction_loss(
                                     critic=crit,
@@ -1320,8 +1802,42 @@ def main() -> None:
                                     pos=pos,
                                     sigma=sigma,
                                     cfg=cfg,
+                                    projection_mode=projection_mode,
                                 )
-                            loss_c = loss_c + cfg.lambda_direction * l_direction
+                            loss_c = loss_c + direction_lambda * l_direction
+
+                        # Head purity: keep angular gradients tangent and radial gradients radial.
+                        l_purity = torch.tensor(0.0, device=device)
+                        if role == "angular" and cfg.lambda_angular_purity > 0:
+                            l_purity = critic_gradient_purity_loss(
+                                critic=crit,
+                                q=q,
+                                v=a_init.detach(),
+                                sigma=sigma,
+                                mode="angular",
+                            )
+                            loss_c = loss_c + cfg.lambda_angular_purity * l_purity
+                        elif role == "radial" and cfg.lambda_radial_purity > 0:
+                            l_purity = critic_gradient_purity_loss(
+                                critic=crit,
+                                q=q,
+                                v=a_init.detach(),
+                                sigma=sigma,
+                                mode="radial",
+                            )
+                            loss_c = loss_c + cfg.lambda_radial_purity * l_purity
+
+                        # Head output decorrelation (batch-level).
+                        l_head_corr = torch.tensor(0.0, device=device)
+                        if critic_arch == "radial_angular" and cfg.lambda_head_corr > 0:
+                            other = c2 if role == "angular" else c1
+                            with torch.no_grad():
+                                e_other = other(q, pos, sigma=sigma.detach())
+                            e_self_z = (e_pos - e_pos.mean()) / e_pos.std(unbiased=False).clamp(min=1e-6)
+                            e_other_z = (e_other - e_other.mean()) / e_other.std(unbiased=False).clamp(min=1e-6)
+                            corr = (e_self_z * e_other_z).mean().abs()
+                            l_head_corr = F.relu(corr - float(cfg.head_corr_target))
+                            loss_c = loss_c + cfg.lambda_head_corr * l_head_corr
 
                         # P1.3: In-batch cross-negative NCE
                         l_inbatch = torch.tensor(0.0, device=device)
@@ -1349,6 +1865,94 @@ def main() -> None:
                             else:
                                 l_energy_reg = (e_pos ** 2).mean()
                             loss_c = loss_c + cfg.lambda_energy_reg * l_energy_reg
+                        l_energy_scale_reg = torch.tensor(0.0, device=device)
+                        if float(getattr(cfg, "lambda_energy_scale_reg", 0.0)) > 0 and hasattr(crit_base, "log_energy_scale"):
+                            log_scale = getattr(crit_base, "log_energy_scale")
+                            l_energy_scale_reg = log_scale.float().pow(2)
+                            loss_c = loss_c + float(cfg.lambda_energy_scale_reg) * l_energy_scale_reg
+
+                        # Energy floor: softplus penalty for spurious deep wells
+                        l_energy_floor = torch.tensor(0.0, device=device)
+                        apply_energy_floor = bool(getattr(cfg, 'use_energy_floor', False) and getattr(cfg, 'lambda_energy_floor', 0) > 0)
+                        if role == "angular" and cfg.route_energy_floor_to_radial_only:
+                            apply_energy_floor = False
+                        if apply_energy_floor:
+                            threshold = getattr(cfg, 'energy_floor_threshold', 5.0)
+                            sharpness = getattr(cfg, 'energy_floor_sharpness', 2.0)
+                            n_rand = getattr(cfg, 'energy_floor_num_random', 64)
+                            adv_steps = getattr(cfg, 'energy_floor_adversarial_steps', 0)
+                            adv_lr = getattr(cfg, 'energy_floor_adversarial_lr', 0.01)
+                            # Sample random points on the embedding sphere
+                            rand_pts = torch.randn(n_rand, q.shape[-1], device=device)
+                            tn = cfg.langevin.target_norm
+                            if tn is not None:
+                                rand_pts = F.normalize(rand_pts, dim=-1) * tn
+                            # Adversarial probing: gradient descent to FIND wells
+                            if adv_steps > 0:
+                                probe = rand_pts.detach().clone()
+                                q_probe = q[:1].expand(n_rand, -1).detach()
+                                sigma_probe = sigma[:1].expand(n_rand, -1) if sigma.dim() > 1 else sigma[:1].expand(n_rand)
+                                sigma_probe = sigma_probe.detach()
+                                for _adv in range(adv_steps):
+                                    probe.requires_grad_(True)
+                                    e_probe = crit(q_probe, probe, sigma=sigma_probe)
+                                    g_probe = torch.autograd.grad(e_probe.sum(), probe, create_graph=False)[0]
+                                    with torch.no_grad():
+                                        probe = probe - adv_lr * g_probe  # descend into wells
+                                        if tn is not None:
+                                            probe = F.normalize(probe, dim=-1) * tn
+                                rand_pts = probe.detach()
+                            with torch.no_grad():
+                                q_rand = q[:1].expand(n_rand, -1)
+                            sigma_rand = sigma[:1].expand(n_rand, -1) if sigma.dim() > 1 else sigma[:1].expand(n_rand)
+                            e_rand = crit(q_rand, rand_pts, sigma=sigma_rand)
+                            # Combine training + probed energies
+                            all_e = torch.cat([e_pos, e_actor, e_hard, e_rand], dim=0)
+                            if bool(getattr(cfg, "energy_floor_relative_to_clean", False)):
+                                floor_ref = e_pos.detach().mean() - float(getattr(cfg, "energy_floor_margin", 0.15))
+                                l_energy_floor = F.softplus((floor_ref - all_e) * sharpness).mean()
+                            else:
+                                l_energy_floor = F.softplus((-all_e - threshold) * sharpness).mean()
+                            loss_c = loss_c + cfg.lambda_energy_floor * l_energy_floor
+
+                        # Contrastive divergence: run Langevin, push up energy at endpoints
+                        l_cd = torch.tensor(0.0, device=device)
+                        apply_cd = bool(getattr(cfg, 'use_cd', False) and getattr(cfg, 'lambda_cd', 0) > 0)
+                        if role == "angular" and cfg.route_cd_to_radial_only:
+                            apply_cd = False
+                        if apply_cd:
+                            n_cd = getattr(cfg, 'cd_num_samples', 32)
+                            cd_steps = getattr(cfg, 'cd_num_steps', 10)
+                            cd_lr_val = getattr(cfg, 'cd_lr', 0.01)
+                            cd_noise = getattr(cfg, 'cd_noise_scale', 0.001)
+                            cd_threshold = getattr(cfg, 'energy_floor_threshold', 5.0)
+                            cd_sharpness = getattr(cfg, 'energy_floor_sharpness', 2.0)
+                            tn = cfg.langevin.target_norm
+                            # Start from random sphere points
+                            cd_pts = torch.randn(n_cd, q.shape[-1], device=device)
+                            if tn is not None:
+                                cd_pts = F.normalize(cd_pts, dim=-1) * tn
+                            cd_q = q[:1].expand(n_cd, -1).detach()
+                            cd_sigma = sigma[:1].expand(n_cd, -1) if sigma.dim() > 1 else sigma[:1].expand(n_cd)
+                            cd_sigma = cd_sigma.detach()
+                            # Run Langevin: particles flow into wells
+                            # No torch.no_grad — autograd.grad needs forward graph for cd_pts
+                            for _cd_step in range(cd_steps):
+                                cd_pts = cd_pts.detach().requires_grad_(True)
+                                e_cd_step = crit(cd_q, cd_pts, sigma=cd_sigma)
+                                g_cd = torch.autograd.grad(e_cd_step.sum(), cd_pts, create_graph=False)[0]
+                                cd_pts = cd_pts.detach() - cd_lr_val * g_cd.detach() + (2 * cd_lr_val * cd_noise) ** 0.5 * torch.randn_like(cd_pts)
+                                if tn is not None:
+                                    cd_pts = F.normalize(cd_pts, dim=-1) * tn
+                            # Compute energy at endpoints WITH gradients for critic update
+                            e_cd_final = crit(cd_q, cd_pts.detach(), sigma=cd_sigma)
+                            if bool(getattr(cfg, "cd_relative_to_clean", False)):
+                                floor_ref = e_pos.detach().mean() - float(getattr(cfg, "cd_margin", 0.15))
+                                l_cd = F.softplus((floor_ref - e_cd_final) * cd_sharpness).mean()
+                            else:
+                                # Absolute floor: penalize E < -cd_threshold
+                                l_cd = F.softplus((-e_cd_final - cd_threshold) * cd_sharpness).mean()
+                            loss_c = loss_c + cfg.lambda_cd * l_cd
 
                         # Interpolated gradient penalty (WGAN-GP style)
                         l_interp_gp = torch.tensor(0.0, device=device)
@@ -1406,8 +2010,13 @@ def main() -> None:
                     nce_acc += float(nce.item())
                     clean_min_acc += float(l_clean_min.item())
                     direction_acc += float(l_direction.item())
+                    purity_acc += float(l_purity.item())
+                    head_corr_acc += float(l_head_corr.item())
                     inbatch_nce_acc += float(l_inbatch.item())
                     energy_reg_acc += float(l_energy_reg.item())
+                    energy_scale_reg_acc += float(l_energy_scale_reg.item())
+                    energy_floor_acc += float(l_energy_floor.item())
+                    cd_acc += float(l_cd.item())
                     interp_gp_acc += float(l_interp_gp.item())
                     rank_clean_actor = (e_pos < e_actor).float().mean().item()
                     rank_actor_hard = (e_actor < e_hard).float().mean().item()
@@ -1470,11 +2079,15 @@ def main() -> None:
                     e_next = ef(q, nxt, sigma=sigma_a.detach())
                     if cfg.langevin.target_norm is not None:
                         seed_ref = F.normalize(seed_a, dim=-1) * cfg.langevin.target_norm
+                        pos_ref = F.normalize(pos, dim=-1) * cfg.langevin.target_norm
+                        hard_ref = F.normalize(hard.detach(), dim=-1) * cfg.langevin.target_norm
                     else:
                         seed_ref = seed_a
+                        pos_ref = pos
+                        hard_ref = hard.detach()
                     e_seed = ef(q, seed_ref, sigma=sigma_a.detach()).detach()
-                    e_pos_ref = ef(q, pos, sigma=sigma_a.detach()).detach()
-                    e_hard_ref = ef(q, hard.detach(), sigma=sigma_a.detach()).detach()
+                    e_pos_ref = ef(q, pos_ref, sigma=sigma_a.detach()).detach()
+                    e_hard_ref = ef(q, hard_ref, sigma=sigma_a.detach()).detach()
                     e_pos_bar, e_next_bar, e_hard_bar = normalize_triplet_energies(
                         e_pos=e_pos_ref,
                         e_actor=e_next,
@@ -1554,34 +2167,40 @@ def main() -> None:
                 on_bad()
                 continue
             n_ok += 1; global_step += 1; bad_streak = 0
-            c_avg = c_loss_acc / float(max(1, cfg.critic_steps_per_actor))
+            critic_denom = float(max(1, critic_update_count))
+            c_avg = c_loss_acc / critic_denom
             sums["critic"] += c_avg; sums["actor"] += la; sums["loss"] += c_avg + la
-            sums["rank"] += rank_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["mdsm"] += mdsm_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cql"] += cql_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["nce"] += nce_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_success"] += rank_ok_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_clean_lt_actor"] += rank_clean_actor_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_actor_lt_hard"] += rank_actor_hard_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["rank_clean_lt_hard"] += rank_clean_hard_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["clean_viol"] += viol_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["rank"] += rank_acc / critic_denom
+            sums["mdsm"] += mdsm_acc / critic_denom
+            sums["cql"] += cql_acc / critic_denom
+            sums["nce"] += nce_acc / critic_denom
+            sums["rank_success"] += rank_ok_acc / critic_denom
+            sums["rank_clean_lt_actor"] += rank_clean_actor_acc / critic_denom
+            sums["rank_actor_lt_hard"] += rank_actor_hard_acc / critic_denom
+            sums["rank_clean_lt_hard"] += rank_clean_hard_acc / critic_denom
+            sums["clean_viol"] += viol_acc / critic_denom
             sums["retrieval_cosine"] += retrieval_cos
             sums["actor_barrier"] += float(l_bar.item())
             sums["actor_descent"] += float(l_desc.item())
-            sums["clean_min"] += clean_min_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["direction"] += direction_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["inbatch_nce"] += inbatch_nce_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["clean_min"] += clean_min_acc / critic_denom
+            sums["direction"] += direction_acc / critic_denom
+            sums["purity"] += purity_acc / critic_denom
+            sums["head_corr"] += head_corr_acc / critic_denom
+            sums["inbatch_nce"] += inbatch_nce_acc / critic_denom
             sums["support"] += float(l_support.item())
             sums["knn_dist"] += knn_dist_val
-            sums["energy_reg"] += energy_reg_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["interp_gp"] += interp_gp_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_pos_mean"] += e_pos_mean_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_actor_mean"] += e_actor_mean_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_hard_mean"] += e_hard_mean_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["e_spread"] += e_spread_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cos_pos_actor"] += cos_pos_actor_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cos_pos_hard"] += cos_pos_hard_acc / float(max(1, cfg.critic_steps_per_actor))
-            sums["cos_actor_hard"] += cos_actor_hard_acc / float(max(1, cfg.critic_steps_per_actor))
+            sums["energy_reg"] += energy_reg_acc / critic_denom
+            sums["energy_scale_reg"] += energy_scale_reg_acc / critic_denom
+            sums["energy_floor"] += energy_floor_acc / critic_denom
+            sums["cd"] += cd_acc / critic_denom
+            sums["interp_gp"] += interp_gp_acc / critic_denom
+            sums["e_pos_mean"] += e_pos_mean_acc / critic_denom
+            sums["e_actor_mean"] += e_actor_mean_acc / critic_denom
+            sums["e_hard_mean"] += e_hard_mean_acc / critic_denom
+            sums["e_spread"] += e_spread_acc / critic_denom
+            sums["cos_pos_actor"] += cos_pos_actor_acc / critic_denom
+            sums["cos_pos_hard"] += cos_pos_hard_acc / critic_denom
+            sums["cos_actor_hard"] += cos_actor_hard_acc / critic_denom
             if cfg.log_every > 0 and (bi + 1) % cfg.log_every == 0 and n_ok > 0:
                 now = time.perf_counter()
                 window_batches = max(1, (bi + 1) - last_window_batch)
@@ -1605,15 +2224,20 @@ def main() -> None:
                     f"a_desc={sums['actor_descent']/n_ok:.3f} "
                     f"cmin={sums['clean_min']/n_ok:.3f} "
                     f"dir={sums['direction']/n_ok:.3f} "
+                    f"pur={sums['purity']/n_ok:.3f} "
+                    f"hcorr={sums['head_corr']/n_ok:.3f} "
                     f"ibnce={sums['inbatch_nce']/n_ok:.3f} "
                     f"supp={sums['support']/n_ok:.4f} "
                     f"ereg={sums['energy_reg']/n_ok:.3f} "
+                    f"esreg={sums['energy_scale_reg']/n_ok:.3f} "
+                    f"efloor={sums['energy_floor']/n_ok:.3f} "
+                    f"cd={sums['cd']/n_ok:.3f} "
                     f"igp={sums['interp_gp']/n_ok:.3f} "
                     f"E[c/a/h]={sums['e_pos_mean']/n_ok:.2f}/{sums['e_actor_mean']/n_ok:.2f}/{sums['e_hard_mean']/n_ok:.2f} "
                     f"spread={sums['e_spread']/n_ok:.3f} "
-                    f"cos(p/a)={cos_pos_actor:.3f} "
-                    f"cos(p/h)={cos_pos_hard:.3f} "
-                    f"cos(a/h)={cos_actor_hard:.3f} "
+                    f"cos(p/a)={sums['cos_pos_actor']/n_ok:.3f} "
+                    f"cos(p/h)={sums['cos_pos_hard']/n_ok:.3f} "
+                    f"cos(a/h)={sums['cos_actor_hard']/n_ok:.3f} "
                     f"sec/batch={sec_per_batch:.3f} "
                     f"eta={eta_epoch_sec/60.0:.1f}m"
                 )
@@ -1645,11 +2269,16 @@ def main() -> None:
                             "cql": float(sums["cql"] / n_ok),
                             "clean_min": float(sums["clean_min"] / n_ok),
                             "direction": float(sums["direction"] / n_ok),
+                            "purity": float(sums["purity"] / n_ok),
+                            "head_corr": float(sums["head_corr"] / n_ok),
                             "inbatch_nce": float(sums["inbatch_nce"] / n_ok),
                             "support": float(sums["support"] / n_ok),
                             "knn_dist": float(sums["knn_dist"] / n_ok),
                             "energy_reg": float(sums["energy_reg"] / n_ok),
+                            "energy_scale_reg": float(sums["energy_scale_reg"] / n_ok),
                             "interp_gp": float(sums["interp_gp"] / n_ok),
+                            "energy_floor": float(sums["energy_floor"] / n_ok),
+                            "cd": float(sums["cd"] / n_ok),
                             "e_pos_mean": float(sums["e_pos_mean"] / n_ok),
                             "e_actor_mean": float(sums["e_actor_mean"] / n_ok),
                             "e_hard_mean": float(sums["e_hard_mean"] / n_ok),
@@ -1680,10 +2309,22 @@ def main() -> None:
             kill = summarize_conditional_eval(eval_m, th)
             eval_m["kill_criteria"] = kill
             score = float(kill["score"])
+            failed_global_gates = [
+                k for k, v in kill.get("global_gates", {}).items() if v is False
+            ]
+            failed_per_noise = []
+            for noise_key, noise_info in kill.get("per_noise", {}).items():
+                local_failed = [k for k, v in noise_info.get("gates", {}).items() if v is False]
+                if local_failed:
+                    failed_per_noise.append(f"{noise_key}:{','.join(local_failed)}")
             print(
                 f"Epoch {epoch_idx+1}: train={train['loss']:.4f} score={score:+.6f} "
-                f"strict_pass={kill['passed']} skip={train['skip_rate']:.2%} ({time.time()-t0:.1f}s)"
+                f"strict_pass={kill['passed']} "
+                f"failed_gates={failed_global_gates if failed_global_gates else 'none'} "
+                f"skip={train['skip_rate']:.2%} ({time.time()-t0:.1f}s)"
             )
+            if failed_per_noise:
+                print(f"  per-noise failed gates: {' | '.join(failed_per_noise)}")
         else:
             eval_m = {"status": "not_evaluated"}
             kill = _not_evaluated_kill_stub()
@@ -1692,9 +2333,15 @@ def main() -> None:
                 f"Epoch {epoch_idx+1}: train={train['loss']:.4f} "
                 f"skip={train['skip_rate']:.2%} eval=skipped ({time.time()-t0:.1f}s)"
             )
-        is_new_best = bool(do_eval and score is not None and score > best_score)
-        if is_new_best:
-            best_score = score
+        is_new_best_any = bool(do_eval and score is not None and score > best_score_any)
+        if is_new_best_any:
+            best_score_any = float(score)
+        strict_pass = bool(kill.get("passed") is True)
+        is_new_best_strict = bool(
+            do_eval and strict_pass and score is not None and score > best_score_strict
+        )
+        if is_new_best_strict:
+            best_score_strict = float(score)
         epoch_time_sec = float(time.perf_counter() - epoch_timer_start)
 
         # LR scheduler step + plateau boost
@@ -1705,20 +2352,26 @@ def main() -> None:
             print(f"  LR: {cur_lr:.6f}")
         plat_patience = getattr(cfg, "lr_plateau_patience", 0)
         if plat_patience > 0 and do_eval and score is not None:
-            if is_new_best:
+            if is_new_best_any:
                 plateau_counter = 0
             else:
                 plateau_counter += 1
             if plateau_counter >= plat_patience:
                 boost = getattr(cfg, "lr_plateau_boost", 3.0)
-                for opt in [opt_c, opt_a]:
-                    for pg in opt.param_groups:
-                        pg["lr"] = min(pg["lr"] * boost, cfg.critic_lr * 2.0)
+                for pg in opt_c.param_groups:
+                    pg["lr"] = min(pg["lr"] * boost, cfg.critic_lr * 2.0)
+                for pg in opt_a.param_groups:
+                    pg["lr"] = min(pg["lr"] * boost, cfg.actor_lr * 2.0)
                 plateau_counter = 0
                 print(f"  Plateau boost! LR *= {boost} → {opt_c.param_groups[0]['lr']:.6f}")
 
         payload = {
-            "epoch": epoch_idx, "global_step": global_step, "best_score": best_score,
+            "epoch": epoch_idx,
+            "global_step": global_step,
+            # Backward-compatible key: strict best score.
+            "best_score": best_score_strict,
+            "best_score_strict": best_score_strict,
+            "best_score_any": best_score_any,
             "critic1_state": c1_base.state_dict(), "critic2_state": c2_base.state_dict(), "actor_state": actor_base.state_dict(),
             "prior_state": prior_base.state_dict() if prior_base is not None else None,
             "opt_c_state": opt_c.state_dict(), "opt_a_state": opt_a.state_dict(), "scaler_state": scaler.state_dict(),
@@ -1749,8 +2402,12 @@ def main() -> None:
             if prev_epoch_file.exists():
                 prev_epoch_file.unlink(missing_ok=True)
 
-        if is_new_best:
-            payload["best_score"] = best_score
+        if is_new_best_any:
+            payload["best_score_any"] = best_score_any
+            torch.save(payload, ckpt_dir / "best_any.pt")
+        if is_new_best_strict:
+            payload["best_score"] = best_score_strict
+            payload["best_score_strict"] = best_score_strict
             torch.save(payload, ckpt_dir / "best.pt")
         append_jsonl_record(
             stream_path,
@@ -1759,11 +2416,14 @@ def main() -> None:
                 "epoch": int(epoch_idx + 1),
                 "global_step": int(global_step),
                 "score": None if score is None else float(score),
-                "best_score": float(best_score),
+                "best_score": float(best_score_strict),
+                "best_score_strict": float(best_score_strict),
+                "best_score_any": float(best_score_any),
                 "eval_ran": bool(do_eval),
                 "strict_pass": None if kill.get("passed", None) is None else bool(kill.get("passed")),
                 "train_metrics": {k: float(v) for k, v in train.items()},
                 "kill_criteria": kill,
+                "thresholds": asdict(th),
                 "epoch_time_sec": epoch_time_sec,
             },
         )
@@ -1785,7 +2445,9 @@ def main() -> None:
         {
             "event": "final",
             "epoch": int(cfg.num_epochs),
-            "best_score": float(best_score),
+            "best_score": float(best_score_strict),
+            "best_score_strict": float(best_score_strict),
+            "best_score_any": float(best_score_any),
             "final_kill": final_kill,
         },
     )
@@ -1793,13 +2455,29 @@ def main() -> None:
         {
             "critic1_state": c1_base.state_dict(), "critic2_state": c2_base.state_dict(), "actor_state": actor_base.state_dict(),
             "prior_state": prior_base.state_dict() if prior_base is not None else None,
-            "eval_metrics": final_eval, "config": asdict(cfg), "best_score": best_score,
+            "eval_metrics": final_eval, "config": asdict(cfg),
+            "best_score": best_score_strict,
+            "best_score_strict": best_score_strict,
+            "best_score_any": best_score_any,
         },
         ckpt_dir / "final.pt",
     )
     with open(log_dir / "training_summary.json", "w", encoding="utf-8") as f:
-        json.dump({"best_score": best_score, "final_kill": final_kill, "config": asdict(cfg)}, f, indent=2)
-    print(f"Final strict pass: {final_kill['passed']} | best_score={best_score:+.6f}")
+        json.dump(
+            {
+                "best_score": best_score_strict,
+                "best_score_strict": best_score_strict,
+                "best_score_any": best_score_any,
+                "final_kill": final_kill,
+                "config": asdict(cfg),
+            },
+            f,
+            indent=2,
+        )
+    print(
+        f"Final strict pass: {final_kill['passed']} | "
+        f"best_score_strict={best_score_strict:+.6f} | best_score_any={best_score_any:+.6f}"
+    )
 
 
 if __name__ == "__main__":

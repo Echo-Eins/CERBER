@@ -369,6 +369,13 @@ class _TwinConditionalEnergyAdapter:
         softmax_temperature: float = 0.1,
         prior=None,
         lambda_prior: float = 0.0,
+        critic_architecture: str = "homogeneous",
+        sigma_min: float = 0.01,
+        sigma_max: float = 0.3,
+        sigma_head_weighting_enabled: bool = False,
+        angular_weight_low_sigma: float = 0.5,
+        angular_weight_high_sigma: float = 0.5,
+        head_weight_power: float = 1.0,
     ):
         self.critic1 = critic1
         self.critic2 = critic2
@@ -376,6 +383,13 @@ class _TwinConditionalEnergyAdapter:
         self.softmax_temperature = float(softmax_temperature)
         self.prior = prior
         self.lambda_prior = float(lambda_prior)
+        self.critic_architecture = str(critic_architecture)
+        self.sigma_min = float(max(sigma_min, 1e-8))
+        self.sigma_max = float(max(sigma_max, self.sigma_min + 1e-8))
+        self.sigma_head_weighting_enabled = bool(sigma_head_weighting_enabled)
+        self.angular_weight_low_sigma = float(angular_weight_low_sigma)
+        self.angular_weight_high_sigma = float(angular_weight_high_sigma)
+        self.head_weight_power = float(max(head_weight_power, 1e-6))
 
     def eval(self):
         self.critic1.eval()
@@ -392,6 +406,24 @@ class _TwinConditionalEnergyAdapter:
     ) -> torch.Tensor:
         e1 = self.critic1(v_query, v_candidate, sigma=sigma)
         e2 = self.critic2(v_query, v_candidate, sigma=sigma)
+        if self.critic_architecture == "radial_angular":
+            sigma_use = sigma
+            if sigma_use is None:
+                with torch.no_grad():
+                    d = (v_candidate - v_query).norm(dim=-1, keepdim=True)
+                    qn = v_query.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    sigma_use = (d / qn).clamp(min=self.sigma_min, max=self.sigma_max)
+            if self.sigma_head_weighting_enabled:
+                log_s = sigma_use.clamp(min=self.sigma_min, max=self.sigma_max).log()
+                denom = max(np.log(self.sigma_max) - np.log(self.sigma_min), 1e-8)
+                t = ((log_s - np.log(self.sigma_min)) / denom).clamp(min=0.0, max=1.0).pow(self.head_weight_power)
+                w_ang = self.angular_weight_low_sigma + (
+                    self.angular_weight_high_sigma - self.angular_weight_low_sigma
+                ) * t
+            else:
+                w_ang = torch.full_like(sigma_use, 0.5 * (self.angular_weight_low_sigma + self.angular_weight_high_sigma))
+            w_ang = w_ang.clamp(min=0.0, max=1.0).squeeze(-1)
+            return w_ang * e1 + (1.0 - w_ang) * e2
         if self.aggregate == "mean":
             return 0.5 * (e1 + e2)
         if self.aggregate == "max":
@@ -526,7 +558,16 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
     metadata = checkpoint["metadata"]
     metrics = extract_metrics(checkpoint)
     resolved_dim, resolved_hidden, resolved_norm, resolved_activation = _resolve_model_hparams(checkpoint)
-    architecture = _fmt_hidden_chain(resolved_dim, resolved_hidden)
+    cfg = checkpoint.get("config", {}) or {}
+    if str(cfg.get("critic_architecture", "homogeneous")) == "radial_angular":
+        angular_hidden = [int(x) for x in cfg.get("angular_hidden_dims", resolved_hidden)]
+        radial_hidden = [int(x) for x in cfg.get("radial_hidden_dims", [512, 256, 128])]
+        architecture = (
+            f"Angular[{_fmt_hidden_chain(resolved_dim, angular_hidden)}] + "
+            f"Radial[{_fmt_hidden_chain(resolved_dim, radial_hidden)}]"
+        )
+    else:
+        architecture = _fmt_hidden_chain(resolved_dim, resolved_hidden)
     checkpoint_name = _safe_display_name(Path(checkpoint_path).name)
     runtime = session_state["runtime_metrics"].get(checkpoint_path)
 
@@ -563,8 +604,18 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
         f"**Epoch:** {metadata.epoch}",
         f"**Model Type:** {metadata.model_type}",
         f"**Architecture:** `{architecture}`",
-        f"**Normalization:** `{resolved_norm}`",
-        f"**Activation:** `{resolved_activation}`",
+        (
+            f"**Normalization:** `angular={cfg.get('angular_norm_mode', resolved_norm)}, "
+            f"radial={cfg.get('radial_norm_mode', resolved_norm)}`"
+            if str(cfg.get("critic_architecture", "homogeneous")) == "radial_angular"
+            else f"**Normalization:** `{resolved_norm}`"
+        ),
+        (
+            f"**Activation:** `angular={cfg.get('angular_activation', resolved_activation)}, "
+            f"radial={cfg.get('radial_activation', resolved_activation)}`"
+            if str(cfg.get("critic_architecture", "homogeneous")) == "radial_angular"
+            else f"**Activation:** `{resolved_activation}`"
+        ),
     ]
 
     if runtime is not None:
@@ -640,7 +691,8 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                 f"- Energy(start noisy): `{runtime['energy_noisy']:.6f}`",
                 f"- Energy(final): `{runtime['energy_final']:.6f}`",
                 f"- Energy improvement (start-final): `{_fmt_signed(runtime['energy_improvement'])}`",
-                f"- Success (energy descent): `{runtime['energy_success']}`",
+                f"- Success (energy descent): `{runtime.get('energy_descent_success', runtime['energy_success'])}`",
+                f"- Success (target-energy proximity): `{runtime.get('energy_target_closer_success', float('nan'))}`",
                 f"- Success (cosine gain): `{runtime['cosine_success']}`",
                 f"- Displacement ||x_T - x_0||: `{runtime['displacement']:.6f}`",
             ]
@@ -678,7 +730,8 @@ def _build_checkpoint_summary(checkpoint_path: str, checkpoint: dict) -> str:
                         f"- L2 improvement mean: `{_fmt_signed(float(sota.get('l2_improvement_mean', float('nan'))), 8)}`",
                         f"- L2 success rate: `{float(sota.get('l2_success_rate', float('nan'))):.2%}`",
                         f"- Energy improvement mean: `{_fmt_signed(float(sota['energy_improvement_mean']), 8)}`",
-                        f"- Energy success rate: `{float(sota['energy_success_rate']):.2%}`",
+                        f"- Energy descent rate: `{float(sota.get('energy_descent_rate', float('nan'))):.2%}`",
+                        f"- Target-energy proximity rate: `{float(sota.get('energy_target_closer_rate', sota['energy_success_rate'])):.2%}`",
                         f"- MMD (RBF): `{float(sota['mmd_rbf']):.6f}`",
                         f"- C2ST accuracy: `{float(sota['c2st_acc']):.2%}`",
                         f"- C2ST raw accuracy: `{float(sota.get('c2st_raw_acc', float('nan'))):.2%}`",
@@ -850,6 +903,7 @@ def create_trajectory_plot(landscape_data: dict) -> go.Figure:
 def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
     """Instantiate and load an energy model from checkpoint payload."""
     from cebcm.models.energy import SimpleEnergy
+    from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
     from cebcm.models.energy_unconditional import UnconditionalEnergy
 
     def _load_state_or_raise(model_obj, state_dict: dict, label: str) -> None:
@@ -874,26 +928,44 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
         # hybrid energy used in training/eval, not a single critic fallback.
         has_twin = ("critic1_state" in checkpoint) or ("critic2_state" in checkpoint)
         if has_twin:
-            c1 = SimpleEnergy(
-                dim=dim,
-                hidden_dims=hidden_dims,
-                norm_mode=norm_mode,
-                activation=activation,
-                energy_output_clamp=None,
-            ).to(device)
-            c2 = SimpleEnergy(
-                dim=dim,
-                hidden_dims=hidden_dims,
-                norm_mode=norm_mode,
-                activation=activation,
-                energy_output_clamp=None,
-            ).to(device)
+            cfg = checkpoint.get("config", {}) or {}
+            critic_arch = str(cfg.get("critic_architecture", "homogeneous"))
+            if critic_arch == "radial_angular":
+                c1 = AngularEnergyCritic(
+                    dim=dim,
+                    hidden_dims=[int(x) for x in cfg.get("angular_hidden_dims", hidden_dims)],
+                    norm_mode=str(cfg.get("angular_norm_mode", norm_mode)),
+                    activation=str(cfg.get("angular_activation", activation)),
+                    energy_output_clamp=None,
+                ).to(device)
+                c2 = RadialEnergyCritic(
+                    dim=dim,
+                    hidden_dims=[int(x) for x in cfg.get("radial_hidden_dims", [512, 256, 128])],
+                    norm_mode=str(cfg.get("radial_norm_mode", norm_mode)),
+                    activation=str(cfg.get("radial_activation", activation)),
+                    target_norm=float(cfg.get("langevin", {}).get("target_norm", 0.0)) or None,
+                    energy_output_clamp=None,
+                ).to(device)
+            else:
+                c1 = SimpleEnergy(
+                    dim=dim,
+                    hidden_dims=hidden_dims,
+                    norm_mode=norm_mode,
+                    activation=activation,
+                    energy_output_clamp=None,
+                ).to(device)
+                c2 = SimpleEnergy(
+                    dim=dim,
+                    hidden_dims=hidden_dims,
+                    norm_mode=norm_mode,
+                    activation=activation,
+                    energy_output_clamp=None,
+                ).to(device)
             c1_state = checkpoint.get("critic1_state", model_state)
             c2_state = checkpoint.get("critic2_state", c1_state)
             _load_state_or_raise(c1, c1_state, "critic1")
             _load_state_or_raise(c2, c2_state, "critic2")
 
-            cfg = checkpoint.get("config", {}) or {}
             aggregate = str(cfg.get("twin_aggregate", "max"))
             softmax_temperature = float(cfg.get("twin_softmax_temperature", 0.1))
 
@@ -917,6 +989,13 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
                 softmax_temperature=softmax_temperature,
                 prior=prior,
                 lambda_prior=lambda_prior,
+                critic_architecture=critic_arch,
+                sigma_min=float(cfg.get("sigma_min", 0.01)),
+                sigma_max=float(cfg.get("sigma_max", 0.3)),
+                sigma_head_weighting_enabled=bool(cfg.get("sigma_head_weighting_enabled", False)),
+                angular_weight_low_sigma=float(cfg.get("angular_weight_low_sigma", 0.5)),
+                angular_weight_high_sigma=float(cfg.get("angular_weight_high_sigma", 0.5)),
+                head_weight_power=float(cfg.get("head_weight_power", 1.0)),
             )
             model.eval()
             return model, model_type
@@ -1005,6 +1084,11 @@ def run_langevin_denoise(
                 sigma_max=getattr(_langevin_cfg, 'sigma_anneal_max', 0.3),
                 sigma_min=getattr(_langevin_cfg, 'sigma_anneal_min', 0.01),
                 adaptive_blend=getattr(_langevin_cfg, 'sigma_anneal_blend', 0.5),
+                noise_anneal=getattr(_langevin_cfg, 'noise_anneal', True),
+                noise_mode=getattr(_langevin_cfg, 'noise_anneal_mode', 'hybrid'),
+                noise_max=getattr(_langevin_cfg, 'noise_anneal_max', 0.15),
+                noise_min=getattr(_langevin_cfg, 'noise_anneal_min', stage1_cfg.langevin.noise_scale),
+                noise_sync_with_sigma=getattr(_langevin_cfg, 'noise_anneal_sync_with_sigma', True),
             )
             energy_fn = AdaptiveSigmaEnergyWrapper(model, _sched, max_steps=max_steps)
         elif sigma_override is not None:
@@ -1059,6 +1143,79 @@ def _sample_clean_noisy_pair(
     return v_clean, v_noisy, reference_source
 
 
+def _build_target_plane_basis(
+    v_query: torch.Tensor,
+    v_target: torch.Tensor,
+    v_noisy_default: torch.Tensor,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    target = v_target.squeeze(0)
+    primary = v_noisy_default.squeeze(0) - target
+    if float(primary.norm().item()) < 1e-8:
+        primary = v_query.squeeze(0) - target
+    if float(primary.norm().item()) < 1e-8:
+        gen = torch.Generator(device=target.device)
+        gen.manual_seed(int(seed) + 17)
+        primary = torch.randn(target.shape, generator=gen, device=target.device, dtype=target.dtype)
+
+    u1 = F.normalize(primary.unsqueeze(0), dim=-1).squeeze(0)
+
+    secondary = v_query.squeeze(0) - target
+    secondary = secondary - (secondary * u1).sum() * u1
+    if float(secondary.norm().item()) < 1e-8:
+        gen = torch.Generator(device=target.device)
+        gen.manual_seed(int(seed) + 29)
+        secondary = torch.randn(target.shape, generator=gen, device=target.device, dtype=target.dtype)
+        secondary = secondary - (secondary * u1).sum() * u1
+    if float(secondary.norm().item()) < 1e-8:
+        # Last-resort deterministic orthogonal direction.
+        secondary = torch.roll(u1, shifts=1)
+        secondary = secondary - (secondary * u1).sum() * u1
+
+    u2 = F.normalize(secondary.unsqueeze(0), dim=-1).squeeze(0)
+    base_dist = max(float((v_noisy_default.squeeze(0) - target).norm().item()), 1e-6)
+    return u1, u2, base_dist
+
+
+def _apply_noisy_start_strategy(
+    v_query: torch.Tensor,
+    v_target: torch.Tensor,
+    v_noisy_default: torch.Tensor,
+    stage1_cfg: Stage1Config,
+    start_mode: str,
+    far_scale: float,
+    manual_x: float,
+    manual_y: float,
+    project_to_target_norm: bool,
+    seed: int,
+) -> tuple[torch.Tensor, str]:
+    mode = str(start_mode or "objective_seed").strip().lower()
+    if mode not in {"objective_seed", "far_auto", "manual_plane_xy"}:
+        mode = "objective_seed"
+
+    if mode == "objective_seed":
+        return v_noisy_default, mode
+
+    u1, u2, base_dist = _build_target_plane_basis(
+        v_query=v_query,
+        v_target=v_target,
+        v_noisy_default=v_noisy_default,
+        seed=seed,
+    )
+    target = v_target.squeeze(0)
+
+    if mode == "far_auto":
+        scale = max(1.0, float(far_scale))
+        delta = scale * base_dist * u1
+    else:  # manual_plane_xy
+        delta = (float(manual_x) * base_dist) * u1 + (float(manual_y) * base_dist) * u2
+
+    v_noisy = (target + delta).unsqueeze(0).to(device=v_target.device, dtype=v_target.dtype)
+    if bool(project_to_target_norm) and stage1_cfg.langevin.target_norm is not None:
+        v_noisy = F.normalize(v_noisy, dim=-1) * float(stage1_cfg.langevin.target_norm)
+    return v_noisy, mode
+
+
 def _is_stage15_conditional_checkpoint(checkpoint_payload: dict, model_type: str) -> bool:
     if model_type != "simple" or not isinstance(checkpoint_payload, dict):
         return False
@@ -1077,7 +1234,12 @@ def _sample_inference_triplet(
     noise_scale: float,
     seed: int,
     retrieval_bank_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str, str]:
+    start_mode: str = "objective_seed",
+    far_start_scale: float = 8.0,
+    manual_start_x: float = 8.0,
+    manual_start_y: float = 0.0,
+    project_start_to_target_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str, str, str]:
     """
     Unified sampler for single-run inference:
     returns (v_query, v_target, v_noisy, reference_source, target_label, objective).
@@ -1098,16 +1260,40 @@ def _sample_inference_triplet(
             seed_mix = float(rt["actor_seed_mix_query"])
             seed_scale = float(rt["actor_seed_noise_scale"])
             seed_vec = seed_mix * q + (1.0 - seed_mix) * hard
-            noisy = _add_relative_noise(seed_vec, float(noise_scale) * seed_scale, seed=seed + 1)
-            return q, pos, noisy, src, "retrieved_pos", "conditional_retrieval"
+            noisy_default = _add_relative_noise(seed_vec, float(noise_scale) * seed_scale, seed=seed + 1)
+            noisy, mode_used = _apply_noisy_start_strategy(
+                v_query=q,
+                v_target=pos,
+                v_noisy_default=noisy_default,
+                stage1_cfg=stage1_cfg,
+                start_mode=start_mode,
+                far_scale=far_start_scale,
+                manual_x=manual_start_x,
+                manual_y=manual_start_y,
+                project_to_target_norm=project_start_to_target_norm,
+                seed=seed,
+            )
+            return q, pos, noisy, src, "retrieved_pos", "conditional_retrieval", mode_used
 
-    v_clean, v_noisy, src = _sample_clean_noisy_pair(
+    v_clean, v_noisy_default, src = _sample_clean_noisy_pair(
         stage1_cfg=stage1_cfg,
         device=device,
         noise_scale=float(noise_scale),
         seed=int(seed),
     )
-    return v_clean, v_clean, v_noisy, src, "clean", "self_denoise"
+    v_noisy, mode_used = _apply_noisy_start_strategy(
+        v_query=v_clean,
+        v_target=v_clean,
+        v_noisy_default=v_noisy_default,
+        stage1_cfg=stage1_cfg,
+        start_mode=start_mode,
+        far_scale=far_start_scale,
+        manual_x=manual_start_x,
+        manual_y=manual_start_y,
+        project_to_target_norm=project_start_to_target_norm,
+        seed=seed,
+    )
+    return v_clean, v_clean, v_noisy, src, "clean", "self_denoise", mode_used
 
 
 @torch.no_grad()
@@ -1397,6 +1583,13 @@ def _compute_sota_eval_metrics(
     cos_before = F.cosine_similarity(v_target_batch, v_noisy_batch, dim=-1)
     cos_after = F.cosine_similarity(v_target_batch, v_denoised_batch, dim=-1)
 
+    e_target = _compute_energy_batch(
+        model=model,
+        model_type=model_type,
+        v_clean=eval_query_batch,
+        v_candidate=v_target_batch,
+        sigma_override=sigma_eval,
+    )
     e_noisy = _compute_energy_batch(
         model=model,
         model_type=model_type,
@@ -1463,7 +1656,16 @@ def _compute_sota_eval_metrics(
         "energy_before_mean": float(e_noisy.mean().item()),
         "energy_after_mean": float(e_final.mean().item()),
         "energy_improvement_mean": float((e_noisy - e_final).mean().item()),
-        "energy_success_rate": float((e_final < e_noisy).float().mean().item()),
+        # Canonical success for dynamics: descent from start noisy state.
+        "energy_descent_rate": float((e_final < e_noisy).float().mean().item()),
+        # Additional diagnostic: final energy is closer to target energy than start was.
+        "energy_target_closer_rate": float(
+            ((e_final - e_target).abs() < (e_noisy - e_target).abs()).float().mean().item()
+        ),
+        # Backward-compatible alias used by older UI/report paths.
+        "energy_success_rate": float(
+            ((e_final - e_target).abs() < (e_noisy - e_target).abs()).float().mean().item()
+        ),
     }
     out.update(suite)
 
@@ -1561,6 +1763,11 @@ def _build_runtime_metrics(
         F.cosine_similarity(v_query, v_target, dim=-1).mean().item()
     ) if model_type == "simple" else float("nan")
 
+    energy_descent_success = bool(energies["denoised"] < energies["noisy"])
+    energy_target_closer_success = bool(
+        abs(energies["denoised"] - energies["target"]) < abs(energies["noisy"] - energies["target"])
+    )
+
     return {
         "reference_source": reference_source,
         "target_label": str(target_label),
@@ -1577,7 +1784,11 @@ def _build_runtime_metrics(
         "energy_noisy": float(energies["noisy"]),
         "energy_final": float(energies["denoised"]),
         "energy_improvement": float(energies["noisy"] - energies["denoised"]),
-        "energy_success": bool(energies["denoised"] < energies["noisy"]),
+        # Backward-compatible canonical field: true energy descent from start to final.
+        "energy_success": energy_descent_success,
+        # Explicit diagnostic for target-energy proximity (different criterion).
+        "energy_target_closer_success": energy_target_closer_success,
+        "energy_descent_success": energy_descent_success,
         "cosine_success": bool(cos_after > cos_before),
         "displacement": displacement,
         "query_target_cos": query_target_cos,
@@ -1604,6 +1815,8 @@ def _format_inference_info(
     target_label: str = "clean",
     eval_objective: str = "self_denoise",
     query_target_cos: float | None = None,
+    start_mode: str | None = None,
+    start_distance_to_target: float | None = None,
 ) -> str:
     energy_min = float(landscape_data.get("energy_min", np.nan))
     energy_max = float(landscape_data.get("energy_max", np.nan))
@@ -1620,6 +1833,12 @@ def _format_inference_info(
         f"- Forced full steps (GUI debug mode): `{force_full_steps}`",
         f"- Reference source: `{reference_source}`",
         f"- Eval objective: `{eval_objective}` (target=`{target_label}`)",
+        f"- Noisy start mode: `{start_mode or 'objective_seed'}`",
+        (
+            f"- Initial distance ||x0-target||: `{float(start_distance_to_target):.6f}`"
+            if start_distance_to_target is not None
+            else "- Initial distance ||x0-target||: `N/A`"
+        ),
         f"- Energy range on scanned plane: `[{energy_min:.4f}, {energy_max:.4f}]`",
         f"- Energy(target ref): `{energies['clean']:.6f}`",
         f"- Energy(noisy start): `{energies['noisy']:.6f}`",
@@ -1703,7 +1922,10 @@ def _format_inference_info(
                 f"- Energy improvement mean: `{_fmt_signed(float(sota_metrics['energy_improvement_mean']), 8)}`"
             )
             lines.append(
-                f"- Energy success rate: `{float(sota_metrics['energy_success_rate']):.2%}`"
+                f"- Energy descent rate: `{float(sota_metrics.get('energy_descent_rate', float('nan'))):.2%}`"
+            )
+            lines.append(
+                f"- Target-energy proximity rate: `{float(sota_metrics.get('energy_target_closer_rate', sota_metrics.get('energy_success_rate', float('nan')))):.2%}`"
             )
             lines.append(f"- MMD (RBF): `{float(sota_metrics['mmd_rbf']):.6f}`")
             lines.append(f"- C2ST accuracy: `{float(sota_metrics['c2st_acc']):.2%}`")
@@ -1737,6 +1959,11 @@ def run_inference_fn(
     absolute_half_range,
     sota_eval_batch_size,
     sota_eval_bank_size,
+    start_mode,
+    far_start_scale,
+    manual_start_x,
+    manual_start_y,
+    project_start_to_target_norm,
 ):
     """Run denoising/refinement inference and refresh both surface + trajectory plots."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
@@ -1748,7 +1975,7 @@ def run_inference_fn(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
-    v_query, v_target, v_noisy, reference_source, target_label, eval_objective = _sample_inference_triplet(
+    v_query, v_target, v_noisy, reference_source, target_label, eval_objective, start_mode_used = _sample_inference_triplet(
         checkpoint_payload=checkpoint,
         model_type=model_type,
         stage1_cfg=stage1_cfg,
@@ -1756,6 +1983,11 @@ def run_inference_fn(
         noise_scale=float(noise_scale),
         seed=42,
         retrieval_bank_size=int(sota_eval_bank_size),
+        start_mode=str(start_mode),
+        far_start_scale=float(far_start_scale),
+        manual_start_x=float(manual_start_x),
+        manual_start_y=float(manual_start_y),
+        project_start_to_target_norm=bool(project_start_to_target_norm),
     )
     sigma_infer = (
         torch.full((v_noisy.shape[0], 1), float(noise_scale), device=device, dtype=v_noisy.dtype)
@@ -1826,6 +2058,8 @@ def run_inference_fn(
             v_denoised=v_denoised,
         )
     )
+    runtime_metrics["start_mode"] = str(start_mode_used)
+    runtime_metrics["start_distance_to_target"] = float((v_target - v_noisy).norm().item())
     runtime_metrics["sota"] = _compute_sota_eval_metrics(
         checkpoint_path=checkpoint_path,
         model=model,
@@ -1874,6 +2108,8 @@ def run_inference_fn(
         query_target_cos=float(runtime_metrics.get("query_target_cos"))
         if runtime_metrics.get("query_target_cos") is not None
         else None,
+        start_mode=str(runtime_metrics.get("start_mode", start_mode_used)),
+        start_distance_to_target=float(runtime_metrics.get("start_distance_to_target", float("nan"))),
     )
 
     summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
@@ -1915,7 +2151,7 @@ def generate_landscape_for_checkpoint(
     stage1_cfg = build_stage1_config(checkpoint)
     stage15_rt = _extract_stage15_runtime_options(checkpoint)
 
-    v_query, v_target, v_noisy, reference_source, target_label, eval_objective = _sample_inference_triplet(
+    v_query, v_target, v_noisy, reference_source, target_label, eval_objective, _ = _sample_inference_triplet(
         checkpoint_payload=checkpoint,
         model_type=model_type,
         stage1_cfg=stage1_cfg,
@@ -2465,6 +2701,47 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 run_inference_btn = gr.Button("Run Inference", variant="primary")
 
             with gr.Row():
+                start_mode_dropdown = gr.Dropdown(
+                    choices=[
+                        ("Objective Seed (Default)", "objective_seed"),
+                        ("Far Auto From Target", "far_auto"),
+                        ("Manual XY (Target Plane)", "manual_plane_xy"),
+                    ],
+                    value="objective_seed",
+                    label="Noisy Start Mode",
+                    info="Use far/manual start to stress-test long-range navigation to target.",
+                )
+                far_start_scale_slider = gr.Slider(
+                    minimum=1.0,
+                    maximum=40.0,
+                    value=8.0,
+                    step=0.5,
+                    label="Far Start Scale",
+                    info="Multiplier for baseline ||seed-target|| distance in `far_auto` mode.",
+                )
+                manual_start_x_slider = gr.Slider(
+                    minimum=-40.0,
+                    maximum=40.0,
+                    value=8.0,
+                    step=0.5,
+                    label="Manual Start X (plane)",
+                    info="X coefficient in target-centric 2D plane (units: baseline distance).",
+                )
+                manual_start_y_slider = gr.Slider(
+                    minimum=-40.0,
+                    maximum=40.0,
+                    value=0.0,
+                    step=0.5,
+                    label="Manual Start Y (plane)",
+                    info="Y coefficient in target-centric 2D plane (units: baseline distance).",
+                )
+                project_start_norm_checkbox = gr.Checkbox(
+                    value=False,
+                    label="Project Start To Target Norm",
+                    info="If enabled, start is normalized to target norm after far/manual placement.",
+                )
+
+            with gr.Row():
                 sota_eval_batch_size_slider = gr.Slider(
                     minimum=8,
                     maximum=256,
@@ -2755,6 +3032,11 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
+            start_mode_dropdown,
+            far_start_scale_slider,
+            manual_start_x_slider,
+            manual_start_y_slider,
+            project_start_norm_checkbox,
         ],
         outputs=[inference_output, landscape_plot, trajectory_plot, checkpoint_summary],
     )
@@ -2872,10 +3154,3 @@ if __name__ == "__main__":
         show_error=True,
         theme=gr.themes.Soft(),
     )
-
-
-
-
-
-
-

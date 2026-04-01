@@ -1,5 +1,96 @@
 # Lessons
 
+## 2026-03-31 - Standard MALA makes well-trapping WORSE, not better
+
+### Pattern
+Researched MALA (Metropolis-Adjusted Langevin) as inference improvement. Standard MALA rejects uphill moves (energy increases). But our failure mode is the OPPOSITE: particles fall into spurious low-energy wells. Standard MALA would ALWAYS accept steps into wells (energy decreases, α=1) and REJECT escape attempts (energy increases, α≈0).
+
+### Solution
+Trust-Region Metropolis (TRM): two-sided acceptance filter.
+- Standard MH part: reject discretization errors going uphill.
+- Trust region part: reject suspiciously large downhill jumps (well entry detection).
+- Combined: band-pass filter on per-step energy changes.
+
+### Rule
+- Before implementing any sampling algorithm, verify its assumptions match your failure mode.
+- For EBMs with spurious wells, standard MALA is counterproductive.
+- The trust-region bound (max descent per step) is the key ingredient for well prevention.
+
+## 2026-03-31 - Hybrid dual-critic v1 diagnosis: 6 bugs causing dir plateau and E=147
+
+### Symptoms
+- dir metric plateaus at ~0.313 (Phase 2i achieved 0.77)
+- rank_success plateaus at ~0.805 (Phase 2i achieved 0.895)
+- E_start=147 at inference (should be O(1))
+- ereg spikes to 0.405
+
+### Root Causes & Fixes
+1. **No output layer zero-init**: Default Kaiming init on angular (4106-d input) produces large E at OOD points. Fix: `nn.init.zeros_` on output layer weight/bias.
+2. **CD routed to radial only**: Angular head had NO well suppression. Angular wells (weight 0.45-0.75 in combined E) dominate inference. Fix: `route_cd_to_radial_only=false`.
+3. **lambda_direction_angular=0.1**: 3x weaker than proven Phase 2i (0.3). Directly explains dir plateau. Fix: increase to 0.3.
+4. **energy_reg_universal=false**: Only E(clean) penalized, inference starting points uncontrolled. Fix: enable universal.
+5. **No energy_output_clamp**: E=147 causes gradient explosion in Langevin. Fix: add clamp=50.0.
+6. **critic_steps_per_actor=2**: Each head gets only 1 update/actor step. Fix: increase to 4 (2 per head).
+
+### Rule
+- When splitting losses across multiple heads, VERIFY each head individually gets sufficient gradient signal.
+- Well suppression (CD/floor) must apply to ALL heads that contribute to inference energy.
+- Always zero-init output layer of energy networks — SOTA practice from score matching literature.
+- After implementing multi-head architecture, re-derive the effective per-head lambda vs single-critic baseline.
+
+## 2026-03-31 - "Twin critic" must not be mislabeled as radial+angular without explicit specialization
+
+### Pattern
+User requested a true radial+angular twin-critic architecture. Current Stage1.5 had two homogeneous critics (`SimpleEnergy` + same features/losses), which is an ensemble, not geometric decomposition.
+
+### Rule
+1. Never call architecture "radial+angular" unless critics are explicitly specialized by design.
+2. Radial critic must consume radius/displacement features (or equivalent) and be supervised by radial objectives.
+3. Angular critic must consume normalized/geodesic features and be supervised by angular objectives.
+4. Trainer/eval must report per-head metrics (radial vs angular), not only aggregated twin score.
+
+### Verification checklist before claiming radial+angular
+1. Distinct critic modules/classes or distinct head pathways exist in code.
+2. Distinct loss terms are active and mapped to respective heads.
+3. Aggregator mixes the two heads in inference and training consistently.
+4. Ablations can independently disable radial or angular head.
+
+## 2026-03-29 - CRITICAL: Never change multiple variables at once (Phase 2f post-mortem)
+
+### Pattern
+Phase 2f changed 5 things simultaneously from Phase 2b: norm_mode (none→orthonorm), activation (silu→groupsort), critic_lr (0.001→0.0003), direction_loss (removed), energy_reg_universal (false→true). Result: total failure (rank_success=0.001, spread=-0.001). Impossible to diagnose which change caused the collapse.
+
+### Evidence
+- Phase 2b (norm_mode=none, silu, lr=0.001): spread=0.56, rank_success=88%, E range [-0.03, 0.53]
+- Phase 2f (orthonorm, groupsort, lr=0.0003): spread=0.002, rank_success=0.1%, E range [0.23, 0.36]
+- 1-Lipschitz (orthonorm+groupsort) crushed energy capacity to 0.13 range (4× less than Phase 2b)
+- energy_reg_universal=true was ALREADY known to kill ranking (Phase 2e lesson!)
+
+### Rule
+1. **ONE change per experiment**. If Phase 2b is the baseline, the next experiment changes ONLY lambda_mdsm
+2. NEVER reuse a parameter combination that already failed (energy_reg_universal=true)
+3. If an experiment fails, identify which single variable caused it before trying the next
+4. Architecture changes (norm_mode, activation) are the MOST impactful — never combine with loss changes
+
+## 2026-03-29 - Phase 2b training success ≠ inference success
+
+### Pattern
+Phase 2b achieved 88% rank_success, 0.56 spread, dir=0.643 in training. But strict inference evaluation: mean_cos_success=19%, cos_improvement at noise=0.05: -0.107 (NEGATIVE). Training metrics can look excellent while the actual Langevin navigation fails completely.
+
+### Why
+- Ranking trains energy VALUES at discrete training points
+- Direction loss trains gradient DIRECTION at sampled noisy points
+- Neither guarantees smooth gradient field BETWEEN training points
+- Unconstrained MLP (norm_mode=none) creates wild gradients in unexplored regions
+- At fine noise (0.05), Langevin is purely gradient-driven → navigates the untrained wild field
+- At coarse noise (0.3), random walk component dominates → partially compensates bad gradients
+
+### Rule
+1. **Never trust training rank_success for inference quality** — always check strict Langevin eval
+2. The gap between training and inference = gradient field smoothness problem
+3. Solutions: (a) smooth the field (soft Lipschitz), (b) supervise the field (MDSM), (c) bypass the field (flow matching, score distillation)
+4. Test at noise_scale=0.05 to expose gradient field quality (removes random walk compensation)
+
 ## 2026-03-29 - CRITICAL: Always enable gradient field supervision (MDSM) for Langevin dynamics
 
 ### Pattern
@@ -918,3 +1009,231 @@ Result: spread=0.000, rank_success=0.000, model cannot learn ANY energy ordering
 2. Lipschitz constraint spectrum: spectral_norm (too hard) → gradient_penalty (soft, tunable) → none (too free)
 3. For Lipschitz control, prefer gradient penalty: penalizes ||∇E||² without hard-bounding capacity
 4. If spread=0 after epoch 1, the constraint is too tight — don't wait for more epochs
+
+---
+
+## Lesson: Random probing is useless in 1024D (Phase 2h, 2026-03-30)
+
+### Summary
+Sampling 64-512 random points on the 1024D sphere NEVER finds structured energy wells.
+efloor=0.000 for all 50 epochs despite deep wells (E=-31) in the landscape.
+
+### Pattern
+In high-dimensional spaces (D=1024), the probability of a random point landing near
+a structured energy well is essentially zero. Wells occupy negligible volume relative
+to the sphere surface. Random probing is a low-dimensional intuition that fails at D>100.
+
+### Evidence
+- Phase 2h: energy_floor with 64 random sphere points → efloor=0.000 every epoch
+- Energy landscape has wells at E=-31 (from Phase 2h analysis)
+- Increasing to 512 random points still gives efloor=0.000
+
+### Rule
+1. **Never use random probing to find wells in high dimensions** — use adversarial probing (gradient descent) or Contrastive Divergence
+2. CD (Langevin in critic loop) is the principled EBM approach: model's own dynamics find wells
+3. Adversarial probing (gradient descent from random starts) works because it FOLLOWS gradients into wells
+
+---
+
+## Lesson: Contrastive Divergence works for well suppression (Phase 2i, 2026-03-30)
+
+### Summary
+CD (run Langevin in critic loop, push up energy at endpoints) successfully suppresses
+spurious wells without hurting ranking. Combined with adversarial probing and underdamped
+inference, achieves 100% cosine success at noise=0.15.
+
+### Evidence
+- Phase 2i: cd≈0.003, efloor≈0.005 at end of training (both active and >0)
+- rank_success=89.5%, spread=0.674 (no regression from Phase 2g)
+- noise=0.15: 100% cosine success (+0.332 improvement)
+- Wells shallower than Phase 2h (E=-31 → much less)
+
+### Rule
+1. CD is safe to combine with ranking + MDSM + direction_loss
+2. Use softplus penalty with threshold (E < -5 only), NOT penalizing all E<0
+3. CD threshold must be well below training energy range (E[c]≈-0.03) to avoid conflicting with ranking
+
+---
+
+## Lesson: Training σ range must cover inference σ (Phase 2i→2j, 2026-03-30)
+
+### Summary
+If training uses σ∈[0.01, 0.3] but inference runs at σ=0.0002, the critic
+has never learned scores at that noise scale. MDSM teaches ∇E only for
+trained σ range. At untrained σ, gradients are extrapolation noise.
+
+### Evidence
+- Phase 2i: noise=0.15 (within training range) → 100% success
+- Phase 2i: noise=0.0002 (50x below training min) → 64% success
+- Energy goes to -1.456 at low noise — critic creates untrained wells at fine scale
+- σ-conditioned critic passes σ to all energy evaluations — at unseen σ, output is undefined
+
+### Rule
+1. **sigma_curriculum_start must be ≤ inference noise_scale** (or close to it)
+2. Sigma annealing at inference (NCSN-style) should stay within trained σ range
+3. If extending σ range, check numerical stability: sigma_eff_sq clamped at 1e-6 prevents overflow
+4. loguniform sampling naturally allocates density across scales — extending range costs minimal compute
+
+---
+
+## Lesson: GroupSort, NCE, CQL, inbatch_negatives — all disabled in successful phases (2026-03-30)
+
+### Summary
+Phase 2g (best baseline) and Phase 2i (best overall) both run with ALL of these disabled.
+Enabling any of them violates single-variable discipline and risks known failure modes.
+
+### Evidence
+- **GroupSort**: Phase 2f collapse (rank_success=0.001). With orthonorm, creates 1-Lipschitz = spread≈0.
+  Phase 2c (spectral_norm+groupsort): spread=0.000. Both successful phases use SiLU.
+- **NCE**: "VALUE-based loss — cannot teach gradient field" (root cause analysis).
+  Phase 2g/2i: lambda_nce=0.0, use_nce=false.
+- **CQL**: Phase 2 regression (74%→40%). Flattens landscape like energy_reg.
+  CD is strictly superior for the same purpose (finds real wells, not random OOD).
+- **inbatch_negatives**: Value-based contrastive. Phase 2g/2i: lambda_inbatch_nce=0.0.
+
+### Rule
+1. **Do NOT enable groupsort** — kills energy range on unconstrained MLP
+2. **Do NOT enable NCE/CQL** — value-based losses conflict with MDSM gradient supervision
+3. **Do NOT enable inbatch_negatives** — same category as NCE
+4. If ranking needs improvement, tune lambda_rank or margins, not add auxiliary contrastive losses
+
+## Lesson: Extended σ curriculum is a dead-end due to sigma_eff_sq clamp (Phase 2j, 2026-03-31)
+
+### Summary
+Phase 2j extended training σ from [0.01, 0.3] to [0.001, 0.3]. Result: no improvement at low noise (65% vs 64%), slight regression at high noise. The sigma_eff_sq clamp at 1e-6 makes training at σ<0.005 mathematically impossible.
+
+### Root Cause
+```python
+sigma_eff_sq = ((sigma * nrm) ** 2).clamp(min=1e-6)  # train_stage1_5.py:243
+```
+At σ=0.001, nrm≈0.2051: `(0.001 × 0.2051)² = 4.2e-8` → clamped to `1e-6` (24× inflation).
+- MDSM target `tgt = displacement / sigma_eff_sq` is 24× smaller than correct value
+- sigma2 weight `w = sigma_eff_sq = 1e-6` → near-zero contribution to loss
+- Double suppression: wrong target AND near-zero weight = critic learns NOTHING at σ<0.005
+- Additionally, loguniform over [0.001, 0.3] = 2.5 decades → less density per decade at important σ=[0.01, 0.3]
+
+### Evidence
+- Phase 2i (σ=[0.01, 0.3]): noise=0.0002 success 64%, noise=0.15 success 100%
+- Phase 2j (σ=[0.001, 0.3]): noise=0.0002 success 65%, noise=0.15 regressed (cosine -0.115 less improvement)
+
+### Rule
+1. **Never extend σ below 0.005** with current sigma_eff_sq clamp — the samples are dead weight
+2. If low-σ training is needed, fix the clamp first (adaptive floor or log-space MDSM formulation)
+3. Wider σ range with loguniform = diluted training density — always check samples-per-decade
+4. Extending training range is wrong lever when inference σ-conditioning doesn't match actual noise
+
+## Lesson: Stronger CD improves well suppression but competes with direction learning (Option A, 2026-03-31)
+
+### Summary
+Option A (cd_num_samples=64, cd_num_steps=40, lambda_cd=0.3) improved low-noise success 64%→75% but direction loss regressed significantly (dir 0.77→0.62). CD and direction loss have conflicting gradient objectives at overlapping spatial regions.
+
+### Root Cause
+CD pushes energy UP at Langevin endpoints (wells). Direction loss teaches gradient DIRECTION at noisy points (σ-perturbed training data). When CD particles land near training points, CD wants to flatten the landscape there while direction loss wants specific gradient orientations. Stronger CD = more particles competing for the same gradient space = worse direction learning.
+
+### Evidence
+- Phase 2i (CD: 32 samples, 10 steps, λ=0.1): dir=0.77, noise=0.0002 success 64%
+- Option A (CD: 64 samples, 40 steps, λ=0.3): dir=0.624, noise=0.0002 success 75.39%
+- Energy success still only 3.91% — wells near clean target persist despite stronger CD
+
+### Rule
+1. CD has diminishing returns — going from λ=0.1→0.3 gives +11% cosine success but -0.15 direction quality
+2. CD and direction/MDSM losses compete for the energy landscape shape near training points
+3. If CD is increased, expect direction loss regression — monitor both metrics together
+4. Energy success ~3% means clean target is NOT the energy minimum — CD alone cannot fix landscape topology
+
+## Lesson: More Langevin steps = deeper well trapping, not better convergence (Option B, 2026-03-31)
+
+### Summary
+Option B (500 Langevin steps instead of 100) produced WORSE results: 60.55% vs 65% cosine success at noise=0.0002. More steps gives more time to fall into and get trapped in structural local minima.
+
+### Evidence
+- 100 steps: noise=0.0002 success ~65%
+- 500 steps: noise=0.0002 success 60.55%, energy -1.121 (deeper than 100-step endpoint)
+- Energy success 2.73% — still overwhelmingly falling into wrong wells
+
+### Root Cause
+The energy landscape has structural local minima near clean targets (E_well < E_clean in 97% of cases). With noise_scale=0.0002, Langevin is deterministic gradient descent. More steps = deeper descent into the nearest well. The wells are structural features of the unconstrained MLP, not noise artifacts.
+
+### Rule
+1. **Do NOT increase Langevin steps** as a fix for low-noise inference — it makes things worse
+2. At noise_scale=0.0002, dynamics is purely gradient-driven → more steps = deeper well trapping
+3. If 100 steps don't converge, the problem is landscape topology, not insufficient iteration
+4. The only way more steps could help is with noise annealing (high→low) so early steps escape wells
+
+## CRITICAL Lesson: σ-conditioning is semantically broken at inference (2026-03-31)
+
+### Summary
+During training, σ truthfully describes the sample's noise level: `noisy = pos + noise * σ * norm`. During inference, σ is a schedule value (geometric anneal from σ_max→σ_min) that has NO relation to the sample's actual distance from clean. The critic learned `score(q, x, σ=actual_noise_level)` but inference asks for `score(q, x, σ=schedule_value)`.
+
+### Evidence
+- Training: σ sampled from [0.01, 0.3], `noisy` is literally at distance σ×norm from clean
+- Inference: σ_anneal=true anneals σ from 0.3→0.01, but Langevin noise_scale FIXED at 0.0002
+- The sample's actual distance from clean is unknown and constantly changing
+- At noise=0.15 (high Langevin noise): mismatch tolerable because random walk dominates
+- At noise=0.0002 (deterministic): mismatch fatal because gradients depend entirely on σ-conditioning
+
+### Root Cause
+This is the NCSN/diffusion inference paradigm done incorrectly:
+- NCSN anneals BOTH the σ-conditioning AND the sampling noise together
+- Our system anneals σ-conditioning but keeps sampling noise fixed at 0.0002
+- Result: critic receives σ=0.3 (early steps) but sample may be at distance 0.05 from clean → wrong gradients
+
+### Rule
+1. **σ-conditioning must match actual sample state** — either:
+   a) Anneal Langevin noise_scale in sync with σ-conditioning (true NCSN sampling)
+   b) Use distance-adaptive σ (sigma_schedule.py's "adaptive" mode) so σ reflects reality
+2. Fixed noise_scale + annealed σ-conditioning = semantic lie → critic gives wrong gradients
+3. High-noise success (100% at noise=0.15) is stochastic search DESPITE bad gradients, not gradient-guided
+4. The most promising fix: anneal noise FROM 0.15 TO 0.0002 synced with σ, leveraging the 100% success regime
+
+## Lesson: Energy success ~3% proves clean target is not energy-minimal (2026-03-31)
+
+### Summary
+Across ALL configurations (Phase 2i/2j/Option A/Option B), energy success rate at noise=0.0002 is 2.7-3.9%. This means the Langevin endpoint has HIGHER energy than the clean target in 96-97% of cases. The clean target is structurally not the energy minimum in its local neighborhood.
+
+### Evidence
+| Config | Energy Success | E_final |
+|--------|---------------|---------|
+| Phase 2i | low | -1.456 |
+| Phase 2j | 2.73% | -1.606 |
+| Option A | 3.91% | -1.104 |
+| Option B | 2.73% | -1.121 |
+
+### Root Cause
+An MLP with [2048, 1024, 512] hidden dims and SiLU activation creates exponentially many local minima in 1024D. clean_min_penalty only sees actor outputs during training, not the full neighborhood. CD explores a vanishing fraction of 1024D per step. Wells that neither actor nor CD finds during training persist at inference.
+
+### Rule
+1. 3% energy success = the energy landscape is fundamentally wrong near clean targets
+2. No amount of CD/efloor can exhaustively suppress wells in 1024D — it's a whack-a-mole problem
+3. This points to an architectural limitation of unconstrained MLP for EBM in high dimensions
+4. Potential fixes require architectural change: dual-critic decomposition, score distillation, or flow matching
+
+## Process Lesson: Capture user diagnosis into TODO before deeper work (2026-03-31)
+
+### Summary
+When the user provides a concrete root-cause diagnosis and asks to continue, first convert that diagnosis into explicit checkboxes in `tasks/todo.md`, then proceed to analysis/implementation.
+
+### Rule
+1. User diagnosis/corrections are actionable requirements, not just discussion.
+2. Immediately write a dedicated TODO block with traceable items and priorities.
+3. Only after TODO capture continue with deeper technical analysis.
+
+## Process Lesson: Validate active run/log source before diagnostics (2026-03-31)
+
+### Summary
+If the user states that the active logs are those pasted in chat, do not infer root-cause from a different local run artifact even if it exists in `logs/`.
+
+### Rule
+1. Before drawing conclusions, confirm the exact log source for this diagnosis: in-chat stream vs local file path.
+2. If sources diverge, prioritize the user-provided active run and label local artifacts as potentially stale/different-run.
+3. Reflect the active-run conclusions in `tasks/todo.md` before continuing implementation.
+
+## Process Lesson: Keep legacy trainer intact when user requests modular add-ons (2026-04-01)
+
+### Summary
+If the user asks for modular/standalone pipelines and explicitly says not to split an existing trainer, keep the current trainer file unchanged and add new scripts/configs around it.
+
+### Rule
+1. Treat "do not split existing trainer" as a hard compatibility requirement.
+2. Implement new standalone entrypoints (`train_*`) instead of refactoring the existing monolithic script.
+3. Preserve checkpoint key compatibility (`surprise_predictor`, `context_encoder`, `ipp`) across old and new scripts.
