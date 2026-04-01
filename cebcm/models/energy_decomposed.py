@@ -139,6 +139,9 @@ class _SigmaConditionedCritic(nn.Module):
     ) -> Tensor:
         if sigma is None:
             sigma = self._estimate_sigma(v_query, v_candidate)
+        # Broadcast sigma to batch size (GUI may pass [1,1] for batch of N)
+        if sigma.shape[0] == 1 and v_query.shape[0] > 1:
+            sigma = sigma.expand(v_query.shape[0], -1)
         x = self._feature_build(v_query=v_query, v_candidate=v_candidate, sigma=sigma)
         scale = torch.exp(self.log_energy_scale.clamp(min=-8.0, max=8.0))
         e = scale * self.net(x).squeeze(-1)

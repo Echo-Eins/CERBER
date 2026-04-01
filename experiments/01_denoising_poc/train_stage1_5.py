@@ -836,6 +836,7 @@ def eval_model(
             if cfg.critic_eval_langevin_steps > 0:
                 # Keep eval math sample-independent when batched: fixed-step rollout,
                 # no batch-coupled early stop by mean energy.
+                _cos_es = getattr(cfg.langevin, 'cosine_early_stop', False)
                 res = run_langevin(
                     method=cfg.langevin.method,
                     energy_fn=sigma_bound_ef,
@@ -849,8 +850,11 @@ def eval_model(
                     plateau_patience=max(cfg.critic_eval_langevin_steps + 1, cfg.langevin.plateau_patience),
                     plateau_delta=cfg.langevin.plateau_delta,
                     tangent_noise=cfg.langevin_tangent_noise,
-                    v_target=None,
+                    v_target=pos if _cos_es else None,
                     tamed=getattr(cfg.langevin, 'tamed', False),
+                    cosine_early_stop=_cos_es,
+                    cosine_patience=int(getattr(cfg.langevin, 'cosine_patience', 20)),
+                    cosine_delta=float(getattr(cfg.langevin, 'cosine_delta', 0.001)),
                     **kw,
                 )
                 final = res.v_last if res.v_last is not None else res.v_final

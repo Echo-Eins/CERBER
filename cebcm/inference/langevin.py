@@ -86,6 +86,41 @@ def _check_early_stop(
     return False, best_energy, plateau_counter, improved
 
 
+def _check_cosine_early_stop(
+    cos_mean: float,
+    best_cosine: float,
+    cos_plateau_counter: int,
+    cosine_patience: int,
+    cosine_delta: float,
+) -> tuple[bool, float, int, bool]:
+    """
+    Check cosine-similarity-based early stopping.
+
+    Triggers when cosine similarity to target hasn't improved by at least
+    `cosine_delta` for `cosine_patience` consecutive steps.
+    This catches degradation that energy-based stopping misses on flat plateaus.
+
+    Returns (should_stop, new_best_cosine, new_counter, improved).
+    """
+    improved = cos_mean > best_cosine
+    if improved:
+        best_cosine = cos_mean
+
+    if cos_mean > best_cosine - cosine_delta:
+        # Still within delta of best — but only reset if actually improved
+        if cos_mean > best_cosine - cosine_delta and improved:
+            cos_plateau_counter = 0
+        else:
+            cos_plateau_counter += 1
+    else:
+        cos_plateau_counter += 1
+
+    if cos_plateau_counter >= cosine_patience:
+        return True, best_cosine, cos_plateau_counter, improved
+
+    return False, best_cosine, cos_plateau_counter, improved
+
+
 def _safe_unit(v: Tensor, eps: float = 1e-8) -> Tensor:
     """Numerically stable normalization with deterministic fallback direction."""
     norm = v.norm(dim=-1, keepdim=True)
@@ -243,6 +278,10 @@ def langevin_dynamics(
     mala_enabled: bool = False,
     mala_temperature_floor: float = 0.01,
     mala_trust_radius: float = 10.0,
+    # Cosine-based early stopping (requires v_target)
+    cosine_early_stop: bool = False,
+    cosine_patience: int = 20,
+    cosine_delta: float = 0.001,
 ) -> LangevinResult:
     """
     Classic overdamped Langevin dynamics.
@@ -277,8 +316,11 @@ def langevin_dynamics(
     cos_trajectory: list[float] = []
     v_trajectory: list[Tensor] = []
     best_energy = float("inf")
+    best_cosine = float("-inf")
     v_best = v_current.clone()
+    v_best_cos = v_current.clone()
     plateau_counter = 0
+    cos_plateau_counter = 0
     mala_accepts = 0
     mala_total = 0
     if track_vectors:
@@ -300,7 +342,25 @@ def langevin_dynamics(
             cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
             cos_trajectory.append(cos)
 
-        # Early stopping
+            # Cosine-based early stopping
+            if cosine_early_stop:
+                cos_stop, best_cosine, cos_plateau_counter, cos_improved = _check_cosine_early_stop(
+                    cos, best_cosine, cos_plateau_counter, cosine_patience, cosine_delta,
+                )
+                if cos_improved:
+                    v_best_cos = v_current.clone()
+                if cos_stop:
+                    return LangevinResult(
+                        v_final=v_best_cos,
+                        v_last=v_current.clone(),
+                        trajectory=trajectory,
+                        cos_trajectory=cos_trajectory,
+                        v_trajectory=v_trajectory,
+                        num_steps=step, stopped_early=True,
+                        mala_accept_rate=mala_accepts / max(mala_total, 1),
+                    )
+
+        # Early stopping (energy-based)
         should_stop, best_energy, plateau_counter, improved = _check_early_stop(
             e_mean, best_energy, plateau_counter,
             energy_threshold, plateau_patience, plateau_delta,
@@ -404,6 +464,10 @@ def pid_langevin_dynamics(
     mala_enabled: bool = False,
     mala_temperature_floor: float = 0.01,
     mala_trust_radius: float = 10.0,
+    # Cosine-based early stopping (requires v_target)
+    cosine_early_stop: bool = False,
+    cosine_patience: int = 20,
+    cosine_delta: float = 0.001,
 ) -> LangevinResult:
     """
     PID-Controlled Langevin Dynamics (PIDLD).
@@ -456,8 +520,11 @@ def pid_langevin_dynamics(
     cos_trajectory: list[float] = []
     v_trajectory: list[Tensor] = []
     best_energy = float("inf")
+    best_cosine = float("-inf")
     v_best = v_current.clone()
+    v_best_cos = v_current.clone()
     plateau_counter = 0
+    cos_plateau_counter = 0
     mala_accepts = 0
     mala_total = 0
     if track_vectors:
@@ -479,7 +546,25 @@ def pid_langevin_dynamics(
             cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
             cos_trajectory.append(cos)
 
-        # Early stopping
+            # Cosine-based early stopping
+            if cosine_early_stop:
+                cos_stop, best_cosine, cos_plateau_counter, cos_improved = _check_cosine_early_stop(
+                    cos, best_cosine, cos_plateau_counter, cosine_patience, cosine_delta,
+                )
+                if cos_improved:
+                    v_best_cos = v_current.clone()
+                if cos_stop:
+                    return LangevinResult(
+                        v_final=v_best_cos,
+                        v_last=v_current.clone(),
+                        trajectory=trajectory,
+                        cos_trajectory=cos_trajectory,
+                        v_trajectory=v_trajectory,
+                        num_steps=step, stopped_early=True,
+                        mala_accept_rate=mala_accepts / max(mala_total, 1),
+                    )
+
+        # Early stopping (energy-based)
         should_stop, best_energy, plateau_counter, improved = _check_early_stop(
             e_mean, best_energy, plateau_counter,
             energy_threshold, plateau_patience, plateau_delta,
@@ -592,6 +677,10 @@ def underdamped_langevin_dynamics(
     mala_enabled: bool = False,
     mala_temperature_floor: float = 0.01,
     mala_trust_radius: float = 10.0,
+    # Cosine-based early stopping (requires v_target)
+    cosine_early_stop: bool = False,
+    cosine_patience: int = 20,
+    cosine_delta: float = 0.001,
 ) -> LangevinResult:
     """
     Underdamped (second-order) Langevin Dynamics.
@@ -649,8 +738,11 @@ def underdamped_langevin_dynamics(
     cos_trajectory: list[float] = []
     v_trajectory: list[Tensor] = []
     best_energy = float("inf")
+    best_cosine = float("-inf")
     v_best = v_current.clone()
+    v_best_cos = v_current.clone()
     plateau_counter = 0
+    cos_plateau_counter = 0
     mala_accepts = 0
     mala_total = 0
     if track_vectors:
@@ -672,7 +764,25 @@ def underdamped_langevin_dynamics(
             cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
             cos_trajectory.append(cos)
 
-        # Early stopping
+            # Cosine-based early stopping
+            if cosine_early_stop:
+                cos_stop, best_cosine, cos_plateau_counter, cos_improved = _check_cosine_early_stop(
+                    cos, best_cosine, cos_plateau_counter, cosine_patience, cosine_delta,
+                )
+                if cos_improved:
+                    v_best_cos = v_current.clone()
+                if cos_stop:
+                    return LangevinResult(
+                        v_final=v_best_cos,
+                        v_last=v_current.clone(),
+                        trajectory=trajectory,
+                        cos_trajectory=cos_trajectory,
+                        v_trajectory=v_trajectory,
+                        num_steps=step, stopped_early=True,
+                        mala_accept_rate=mala_accepts / max(mala_total, 1),
+                    )
+
+        # Early stopping (energy-based)
         should_stop, best_energy, plateau_counter, improved = _check_early_stop(
             e_mean, best_energy, plateau_counter,
             energy_threshold, plateau_patience, plateau_delta,
@@ -780,6 +890,10 @@ def run_langevin(
     v_target: Tensor | None = None,
     track_vectors: bool = False,
     tamed: bool = False,
+    # Cosine-based early stopping
+    cosine_early_stop: bool = False,
+    cosine_patience: int = 20,
+    cosine_delta: float = 0.001,
     **method_kwargs,
 ) -> LangevinResult:
     """
@@ -805,6 +919,9 @@ def run_langevin(
         tamed=tamed,
         v_target=v_target,
         track_vectors=track_vectors,
+        cosine_early_stop=cosine_early_stop,
+        cosine_patience=cosine_patience,
+        cosine_delta=cosine_delta,
     )
 
     if method == LangevinMethod.OVERDAMPED:

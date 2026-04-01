@@ -87,6 +87,12 @@ class LangevinConfig:
     mala_enabled: bool = False
     mala_temperature_floor: float = 0.01  # prevent division by ~0 at low noise
     mala_trust_radius: float = 10.0       # max descent per step in units of T
+    # Cosine-based early stopping: triggers rollback to best-cosine point
+    # when cos(v_current, v_target) hasn't improved for cosine_patience steps.
+    # Only active when v_target is provided (eval mode).
+    cosine_early_stop: bool = False
+    cosine_patience: int = 20     # steps without cosine improvement before stopping
+    cosine_delta: float = 0.001   # minimum improvement to reset patience counter
 
 
 @dataclass
