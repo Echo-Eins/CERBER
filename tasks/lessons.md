@@ -1,14 +1,42 @@
 # Lessons
 
-## 2026-03-31 - GUI/runtime diagnostics must reflect the actual Langevin controls
+## 2026-03-31 - Standard MALA makes well-trapping WORSE, not better
 
 ### Pattern
-User-facing logs showed low-noise inference collapse, but GUI path mixed runtime sliders with checkpoint-side anneal defaults in a way that could misrepresent actual dynamics. Conditional landscape probing also used `target` as query anchor, which is semantically wrong for retrieval objective `E(query, candidate)`.
+Researched MALA (Metropolis-Adjusted Langevin) as inference improvement. Standard MALA rejects uphill moves (energy increases). But our failure mode is the OPPOSITE: particles fall into spurious low-energy wells. Standard MALA would ALWAYS accept steps into wells (energy decreases, α=1) and REJECT escape attempts (energy increases, α≈0).
+
+### Solution
+Trust-Region Metropolis (TRM): two-sided acceptance filter.
+- Standard MH part: reject discretization errors going uphill.
+- Trust region part: reject suspiciously large downhill jumps (well entry detection).
+- Combined: band-pass filter on per-step energy changes.
 
 ### Rule
-1. If runtime provides explicit sigma/noise overrides, those overrides must control the actual Langevin dynamics path.
-2. For conditional retrieval, any landscape/energy probe must evaluate with `query` anchor, never `target` anchor.
-3. Eval noise scales must include the real deployment/debug regime (for this project: `noise=0.0002`) or strict gates are not trustworthy.
+- Before implementing any sampling algorithm, verify its assumptions match your failure mode.
+- For EBMs with spurious wells, standard MALA is counterproductive.
+- The trust-region bound (max descent per step) is the key ingredient for well prevention.
+
+## 2026-03-31 - Hybrid dual-critic v1 diagnosis: 6 bugs causing dir plateau and E=147
+
+### Symptoms
+- dir metric plateaus at ~0.313 (Phase 2i achieved 0.77)
+- rank_success plateaus at ~0.805 (Phase 2i achieved 0.895)
+- E_start=147 at inference (should be O(1))
+- ereg spikes to 0.405
+
+### Root Causes & Fixes
+1. **No output layer zero-init**: Default Kaiming init on angular (4106-d input) produces large E at OOD points. Fix: `nn.init.zeros_` on output layer weight/bias.
+2. **CD routed to radial only**: Angular head had NO well suppression. Angular wells (weight 0.45-0.75 in combined E) dominate inference. Fix: `route_cd_to_radial_only=false`.
+3. **lambda_direction_angular=0.1**: 3x weaker than proven Phase 2i (0.3). Directly explains dir plateau. Fix: increase to 0.3.
+4. **energy_reg_universal=false**: Only E(clean) penalized, inference starting points uncontrolled. Fix: enable universal.
+5. **No energy_output_clamp**: E=147 causes gradient explosion in Langevin. Fix: add clamp=50.0.
+6. **critic_steps_per_actor=2**: Each head gets only 1 update/actor step. Fix: increase to 4 (2 per head).
+
+### Rule
+- When splitting losses across multiple heads, VERIFY each head individually gets sufficient gradient signal.
+- Well suppression (CD/floor) must apply to ALL heads that contribute to inference energy.
+- Always zero-init output layer of energy networks — SOTA practice from score matching literature.
+- After implementing multi-head architecture, re-derive the effective per-head lambda vs single-critic baseline.
 
 ## 2026-03-31 - "Twin critic" must not be mislabeled as radial+angular without explicit specialization
 

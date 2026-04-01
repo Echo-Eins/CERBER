@@ -98,6 +98,15 @@ class _SigmaConditionedCritic(nn.Module):
         layers.append(_make_linear(prev, 1, norm_mode))
         self.net = nn.Sequential(*layers)
 
+        # Zero-init output layer: start with E≈0 everywhere, learn landscape gradually.
+        # Prevents OOD energy explosions (E=147+) before training shapes the landscape.
+        with torch.no_grad():
+            out_layer = self.net[-1]
+            if hasattr(out_layer, 'weight'):
+                nn.init.zeros_(out_layer.weight)
+            if hasattr(out_layer, 'bias') and out_layer.bias is not None:
+                nn.init.zeros_(out_layer.bias)
+
         # Global energy scale: fixed by default; optionally trainable.
         init = torch.tensor(float(energy_scale_init_log))
         if trainable_energy_scale:

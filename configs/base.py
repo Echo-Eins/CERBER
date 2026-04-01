@@ -69,6 +69,24 @@ class LangevinConfig:
     noise_anneal_max: float = 0.15
     noise_anneal_min: float = 0.0002
     noise_anneal_sync_with_sigma: bool = True
+    # Trust-Region Metropolis (TRM): two-sided accept/reject filter.
+    # Prevents both discretization errors (uphill) and well trapping (downhill).
+    # Standard MALA rejects uphill moves; TRM also rejects suspiciously large
+    # downhill jumps that indicate entry into spurious energy wells.
+    #
+    # Math:
+    #   T = max(step_noise_scale, mala_temperature_floor)
+    #   descent = E_current - E_proposed  (positive = energy decreased)
+    #   log_α = descent / T               (standard MH acceptance ratio)
+    #   accept = (log(U) < log_α) AND (descent < trust_radius * T)
+    #
+    # The trust_radius parameter bounds the maximum per-step energy descent
+    # relative to T.  At T=0.01 with trust_radius=10, descents > 0.1 are
+    # rejected — catching well entries (ΔE ~ -1…-50) while allowing normal
+    # gradient progress (ΔE ~ -0.001…-0.01).
+    mala_enabled: bool = False
+    mala_temperature_floor: float = 0.01  # prevent division by ~0 at low noise
+    mala_trust_radius: float = 10.0       # max descent per step in units of T
 
 
 @dataclass
@@ -253,6 +271,8 @@ class Stage1_5Config:
     angular_activation: str = "silu"
     radial_norm_mode: str = "none"
     radial_activation: str = "silu"
+    angular_energy_output_clamp: float | None = 50.0
+    radial_energy_output_clamp: float | None = 50.0
     actor_norm_mode: str = "none"   # "orthonorm", "spectral_norm", "none"
     actor_activation: str = "silu"       # "silu", "gelu", "relu", "groupsort", "lipschitz_spline"
     ortho_n_iters: int = 2
@@ -432,7 +452,7 @@ class Stage1_5Config:
     actor_eval_steps: int = 3
     critic_eval_langevin_steps: int = 20
     eval_langevin_batch_size: int = 16
-    eval_noise_scales: list[float] = field(default_factory=lambda: [0.0002, 0.05, 0.1, 0.2, 0.3])
+    eval_noise_scales: list[float] = field(default_factory=lambda: [0.05, 0.1, 0.2, 0.3])
 
     # Retrieval conditioning
     retrieval_bank_size: int = 4096

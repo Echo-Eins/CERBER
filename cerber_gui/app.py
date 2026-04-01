@@ -1039,15 +1039,9 @@ def run_langevin_denoise(
     v_target_override: torch.Tensor | None = None,
     tangent_noise_override: bool | None = None,
     sigma_override: torch.Tensor | None = None,
-    noise_scale_override: float | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor], object]:
     """
     Run Langevin denoising with Stage1-consistent math and trajectory capture.
-
-    Notes:
-    - If `sigma_override` is provided, fixed-sigma inference is used for semantic parity
-      with GUI/runtime sliders.
-    - Sigma annealing is only used when `sigma_override` is None.
     """
     method = stage1_cfg.langevin.method
     method_kwargs = {}
@@ -1067,11 +1061,6 @@ def run_langevin_denoise(
         method_kwargs = dict(momentum_beta=stage1_cfg.langevin.momentum_beta)
 
     lr = float(lr_override) if lr_override is not None else float(stage1_cfg.langevin.lr)
-    inference_noise_scale = (
-        float(noise_scale_override)
-        if noise_scale_override is not None
-        else float(stage1_cfg.langevin.noise_scale)
-    )
     max_steps = int(max_steps)
     energy_threshold = None if force_full_steps else stage1_cfg.langevin.energy_threshold
     plateau_patience = (max_steps + 1) if force_full_steps else stage1_cfg.langevin.plateau_patience
@@ -1088,11 +1077,7 @@ def run_langevin_denoise(
         # Check if adaptive sigma is enabled in the config
         _langevin_cfg = getattr(stage1_cfg, 'langevin', None)
         _sigma_anneal = getattr(_langevin_cfg, 'sigma_anneal', False) if _langevin_cfg else False
-        # Runtime sigma override must take priority; otherwise GUI "noise/sigma" sliders
-        # do not control the actual Langevin dynamics.
-        if sigma_override is not None:
-            energy_fn = _SigmaBoundPairEnergyAdapter(model, sigma=sigma_override)
-        elif _sigma_anneal:
+        if _sigma_anneal and sigma_override is not None:
             _sched = SigmaScheduleConfig(
                 enabled=True,
                 mode=getattr(_langevin_cfg, 'sigma_anneal_mode', 'hybrid'),
@@ -1102,10 +1087,12 @@ def run_langevin_denoise(
                 noise_anneal=getattr(_langevin_cfg, 'noise_anneal', True),
                 noise_mode=getattr(_langevin_cfg, 'noise_anneal_mode', 'hybrid'),
                 noise_max=getattr(_langevin_cfg, 'noise_anneal_max', 0.15),
-                noise_min=getattr(_langevin_cfg, 'noise_anneal_min', inference_noise_scale),
+                noise_min=getattr(_langevin_cfg, 'noise_anneal_min', stage1_cfg.langevin.noise_scale),
                 noise_sync_with_sigma=getattr(_langevin_cfg, 'noise_anneal_sync_with_sigma', True),
             )
             energy_fn = AdaptiveSigmaEnergyWrapper(model, _sched, max_steps=max_steps)
+        elif sigma_override is not None:
+            energy_fn = _SigmaBoundPairEnergyAdapter(model, sigma=sigma_override)
         else:
             energy_fn = model
         v_query = v_query_override if v_query_override is not None else v_clean
@@ -1116,7 +1103,7 @@ def run_langevin_denoise(
         v_query=v_query,
         v_init=v_noisy,
         lr=lr,
-        noise_scale=inference_noise_scale,
+        noise_scale=stage1_cfg.langevin.noise_scale,
         max_steps=max_steps,
         target_norm=stage1_cfg.langevin.target_norm,
         tangent_noise=tangent_noise,
@@ -1554,7 +1541,6 @@ def _compute_sota_eval_metrics(
             v_target_override=v_target_batch,
             tangent_noise_override=tangent_noise,
             sigma_override=sigma_eval,
-            noise_scale_override=float(noise_scale),
         )
         eval_query_batch = q_batch
     else:
@@ -1586,7 +1572,6 @@ def _compute_sota_eval_metrics(
             force_full_steps=True,
             track_vectors=False,
             sigma_override=sigma_eval,
-            noise_scale_override=float(noise_scale),
         )
         eval_query_batch = v_clean_batch
 
@@ -2024,20 +2009,14 @@ def run_inference_fn(
         v_target_override=v_target,
         tangent_noise_override=tangent_noise,
         sigma_override=sigma_infer,
-        noise_scale_override=float(noise_scale),
     )
 
     grid, rf, abs_range = _resolve_scan_params(grid_size, range_factor, absolute_half_range)
 
-    landscape_energy_fn = model
-    if model_type == "simple" and sigma_infer is not None:
-        landscape_energy_fn = _SigmaBoundPairEnergyAdapter(model, sigma=sigma_infer)
-
     landscape_data = scan_energy_landscape_3d(
-        energy_fn=landscape_energy_fn,
+        energy_fn=model,
         v_clean=v_target,
         v_noisy=v_noisy,
-        v_query=v_query,
         grid_size=grid,
         range_factor=rf,
         absolute_half_range=abs_range,
@@ -2201,18 +2180,12 @@ def generate_landscape_for_checkpoint(
         v_target_override=v_target,
         tangent_noise_override=tangent_noise,
         sigma_override=sigma_preview,
-        noise_scale_override=float(preview_noise),
     )
 
-    landscape_energy_fn = model
-    if model_type == "simple" and sigma_preview is not None:
-        landscape_energy_fn = _SigmaBoundPairEnergyAdapter(model, sigma=sigma_preview)
-
     landscape_data = scan_energy_landscape_3d(
-        energy_fn=landscape_energy_fn,
+        energy_fn=model,
         v_clean=v_target,
         v_noisy=v_noisy,
-        v_query=v_query,
         grid_size=grid,
         range_factor=rf,
         absolute_half_range=abs_range,

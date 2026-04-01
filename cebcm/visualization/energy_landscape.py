@@ -111,7 +111,6 @@ def scan_energy_landscape(
     energy_fn: torch.nn.Module,
     v_clean: Tensor,
     v_noisy: Tensor,
-    v_query: Tensor | None = None,
     grid_size: int = 80,
     grid_range: float | None = None,
     v_denoised: Tensor | None = None,
@@ -125,9 +124,7 @@ def scan_energy_landscape(
 
     Args:
         energy_fn:   E(v_query, v_candidate) → scalar
-        v_clean:     [1, D] target/reference embedding for plane center and diagnostics
-        v_query:     [1, D] optional query anchor for conditional energy E(query, candidate).
-                     If None, defaults to v_clean (legacy behavior).
+        v_clean:     [1, D] clean embedding (query / anchor)
         v_noisy:     [1, D] noisy embedding
         grid_size:   Number of points per axis (total = grid_size²)
         grid_range:  Half-width of grid in each direction.
@@ -142,7 +139,6 @@ def scan_energy_landscape(
     """
     device = v_clean.device
     v_clean_flat = v_clean.squeeze(0)  # [D]
-    v_query_eval = (v_query if v_query is not None else v_clean).to(device=device, dtype=v_clean.dtype)
     v_noisy_flat = v_noisy.squeeze(0)  # [D]
 
     if basis is not None:
@@ -206,7 +202,7 @@ def scan_energy_landscape(
         params = [p for p in sig.parameters.values() if p.name != 'self']
         if len(params) >= 2:
             # Pairwise model (SimpleEnergy)
-            v_q = v_query_eval.expand(batch.shape[0], -1)
+            v_q = v_clean.expand(batch.shape[0], -1)
             e = energy_fn(v_q, batch)  # [B]
         else:
             # Unconditional model (UnconditionalEnergy)

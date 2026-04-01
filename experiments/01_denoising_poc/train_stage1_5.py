@@ -757,6 +757,11 @@ def eval_model(
         kw = dict(friction=cfg.langevin.underdamped_friction, mass=cfg.langevin.underdamped_mass)
     else:
         kw = dict(momentum_beta=cfg.langevin.momentum_beta)
+    # Trust-Region Metropolis (TRM) acceptance filter
+    if getattr(cfg.langevin, 'mala_enabled', False):
+        kw['mala_enabled'] = True
+        kw['mala_temperature_floor'] = float(getattr(cfg.langevin, 'mala_temperature_floor', 0.01))
+        kw['mala_trust_radius'] = float(getattr(cfg.langevin, 'mala_trust_radius', 10.0))
     out = {}
     eval_batch = max(1, int(cfg.eval_langevin_batch_size))
     for ns in cfg.eval_noise_scales:
@@ -1331,7 +1336,7 @@ def main() -> None:
             hidden_dims=cfg.angular_hidden_dims,
             norm_mode=cfg.angular_norm_mode,
             activation=cfg.angular_activation,
-            energy_output_clamp=None,
+            energy_output_clamp=getattr(cfg, 'angular_energy_output_clamp', None),
             trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
             energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)
@@ -1341,7 +1346,7 @@ def main() -> None:
             norm_mode=cfg.radial_norm_mode,
             activation=cfg.radial_activation,
             target_norm=cfg.langevin.target_norm,
-            energy_output_clamp=None,
+            energy_output_clamp=getattr(cfg, 'radial_energy_output_clamp', None),
             trainable_energy_scale=bool(getattr(cfg, "energy_scale_trainable", False)),
             energy_scale_init_log=float(getattr(cfg, "energy_scale_init_log", 0.0)),
         ).to(device)

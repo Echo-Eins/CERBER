@@ -53,6 +53,7 @@ class LangevinResult:
     v_trajectory: list[Tensor] = field(default_factory=list)  # optional vector trajectory
     num_steps: int = 0       # actual steps taken
     stopped_early: bool = False  # whether early stopping triggered
+    mala_accept_rate: float = 1.0  # mean acceptance rate (1.0 = all accepted / MALA disabled)
 
 
 def _check_early_stop(
@@ -147,6 +148,77 @@ def _resolve_step_noise_scale(
     return max(0.0, noise)
 
 
+def _trust_region_metropolis(
+    energy_fn,
+    v_query: Tensor,
+    v_current: Tensor,
+    v_proposed: Tensor,
+    e_current: Tensor,
+    step_noise_scale: float,
+    temperature_floor: float = 0.01,
+    trust_radius: float = 10.0,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Trust-Region Metropolis (TRM) acceptance filter.
+
+    Combines standard Metropolis-Hastings (rejects uphill discretization errors)
+    with a trust-region bound (rejects suspiciously large downhill jumps into
+    spurious energy wells).
+
+    Math (per sample):
+        T = max(step_noise_scale, temperature_floor)
+        descent_i = E_current_i - E_proposed_i   (positive = energy decreased)
+
+        # Standard MH: accept energy-decreasing moves; probabilistically reject increases
+        log_α_i = descent_i / T
+        accept_mh_i = log(U_i) < log_α_i
+
+        # Trust region: reject if descent exceeds trust_radius * T
+        trust_ok_i = descent_i < trust_radius * T
+
+        accept_i = accept_mh_i AND trust_ok_i
+
+    Args:
+        energy_fn:         E(v_query, v_candidate) → [B] energy (no grad needed).
+        v_query:           [B, D] anchor vectors.
+        v_current:         [B, D] current positions.
+        v_proposed:        [B, D] proposed positions (after Langevin step + projection).
+        e_current:         [B] energy at v_current (from energy_and_grad, avoids recomputation).
+        step_noise_scale:  Current step's Langevin noise scale.
+        temperature_floor: Minimum temperature to prevent near-zero division.
+        trust_radius:      Max allowed descent per step in units of T.
+
+    Returns:
+        v_next:     [B, D] accepted positions (mix of proposed and current).
+        e_next:     [B] energy at v_next.
+        accept:     [B] boolean mask of accepted proposals.
+    """
+    with torch.no_grad():
+        e_proposed = energy_fn(v_query, v_proposed)
+
+    T = max(step_noise_scale, temperature_floor)
+    descent = e_current - e_proposed  # [B]; positive = energy decreased
+
+    # Standard MH acceptance (without proposal correction — suitable for
+    # PID/underdamped where exact proposal density is intractable).
+    log_alpha = descent / T
+    log_u = torch.log(torch.rand_like(log_alpha).clamp(min=1e-30))
+    accept_mh = log_u < log_alpha
+
+    # Trust-region: reject suspiciously large energy drops (well entry).
+    max_descent = trust_radius * T
+    trust_ok = descent < max_descent
+
+    accept = accept_mh & trust_ok  # [B] bool
+
+    # Per-sample select: keep proposed where accepted, else revert.
+    accept_expand = accept.unsqueeze(-1)  # [B, 1] for broadcasting over D
+    v_next = torch.where(accept_expand, v_proposed, v_current)
+    e_next = torch.where(accept, e_proposed, e_current)
+
+    return v_next, e_next, accept
+
+
 # ============================================================
 # Method 1: Classic Overdamped Langevin
 # ============================================================
@@ -167,6 +239,10 @@ def langevin_dynamics(
     v_target: Tensor | None = None,
     track_vectors: bool = False,
     tamed: bool = False,
+    # Trust-Region Metropolis (TRM)
+    mala_enabled: bool = False,
+    mala_temperature_floor: float = 0.01,
+    mala_trust_radius: float = 10.0,
 ) -> LangevinResult:
     """
     Classic overdamped Langevin dynamics.
@@ -203,6 +279,8 @@ def langevin_dynamics(
     best_energy = float("inf")
     v_best = v_current.clone()
     plateau_counter = 0
+    mala_accepts = 0
+    mala_total = 0
     if track_vectors:
         v_trajectory.append(v_current.detach().cpu().clone())
 
@@ -237,6 +315,7 @@ def langevin_dynamics(
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
                 num_steps=step, stopped_early=True,
+                mala_accept_rate=mala_accepts / max(mala_total, 1),
             )
 
         # Update with optional momentum
@@ -255,11 +334,29 @@ def langevin_dynamics(
         langevin_noise = torch.randn_like(v_current) * (2 * lr * step_noise_scale) ** 0.5
         if tangent_noise and target_norm is not None:
             langevin_noise = _tangent_projection(langevin_noise, v_current)
-        v_current = v_current - lr * update + langevin_noise
+        v_proposed = v_current - lr * update + langevin_noise
 
         # OOD projection
         if target_norm is not None:
-            v_current = _project_to_sphere(v_current, target_norm)
+            v_proposed = _project_to_sphere(v_proposed, target_norm)
+
+        # Trust-Region Metropolis acceptance filter
+        if mala_enabled:
+            v_current, _e_next, accept_mask = _trust_region_metropolis(
+                energy_fn=energy_fn,
+                v_query=v_query,
+                v_current=v_current,
+                v_proposed=v_proposed,
+                e_current=energy,
+                step_noise_scale=step_noise_scale,
+                temperature_floor=mala_temperature_floor,
+                trust_radius=mala_trust_radius,
+            )
+            mala_accepts += int(accept_mask.sum().item())
+            mala_total += accept_mask.numel()
+        else:
+            v_current = v_proposed
+
         if track_vectors:
             v_trajectory.append(v_current.detach().cpu().clone())
 
@@ -275,6 +372,7 @@ def langevin_dynamics(
         cos_trajectory=cos_trajectory,
         v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
+        mala_accept_rate=mala_accepts / max(mala_total, 1),
     )
 
 
@@ -302,6 +400,10 @@ def pid_langevin_dynamics(
     integral_decay: float = 0.95,
     track_vectors: bool = False,
     tamed: bool = False,
+    # Trust-Region Metropolis (TRM)
+    mala_enabled: bool = False,
+    mala_temperature_floor: float = 0.01,
+    mala_trust_radius: float = 10.0,
 ) -> LangevinResult:
     """
     PID-Controlled Langevin Dynamics (PIDLD).
@@ -356,6 +458,8 @@ def pid_langevin_dynamics(
     best_energy = float("inf")
     v_best = v_current.clone()
     plateau_counter = 0
+    mala_accepts = 0
+    mala_total = 0
     if track_vectors:
         v_trajectory.append(v_current.detach().cpu().clone())
 
@@ -390,6 +494,7 @@ def pid_langevin_dynamics(
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
                 num_steps=step, stopped_early=True,
+                mala_accept_rate=mala_accepts / max(mala_total, 1),
             )
 
         # PID components
@@ -419,11 +524,29 @@ def pid_langevin_dynamics(
         langevin_noise = torch.randn_like(v_current) * (2 * lr * step_noise_scale) ** 0.5
         if tangent_noise and target_norm is not None:
             langevin_noise = _tangent_projection(langevin_noise, v_current)
-        v_current = v_current - lr * update + langevin_noise
+        v_proposed = v_current - lr * update + langevin_noise
 
         # OOD projection
         if target_norm is not None:
-            v_current = _project_to_sphere(v_current, target_norm)
+            v_proposed = _project_to_sphere(v_proposed, target_norm)
+
+        # Trust-Region Metropolis acceptance filter
+        if mala_enabled:
+            v_current, _e_next, accept_mask = _trust_region_metropolis(
+                energy_fn=energy_fn,
+                v_query=v_query,
+                v_current=v_current,
+                v_proposed=v_proposed,
+                e_current=energy,
+                step_noise_scale=step_noise_scale,
+                temperature_floor=mala_temperature_floor,
+                trust_radius=mala_trust_radius,
+            )
+            mala_accepts += int(accept_mask.sum().item())
+            mala_total += accept_mask.numel()
+        else:
+            v_current = v_proposed
+
         if track_vectors:
             v_trajectory.append(v_current.detach().cpu().clone())
 
@@ -439,6 +562,7 @@ def pid_langevin_dynamics(
         cos_trajectory=cos_trajectory,
         v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
+        mala_accept_rate=mala_accepts / max(mala_total, 1),
     )
 
 
@@ -464,6 +588,10 @@ def underdamped_langevin_dynamics(
     mass: float = 1.0,
     track_vectors: bool = False,
     tamed: bool = False,
+    # Trust-Region Metropolis (TRM)
+    mala_enabled: bool = False,
+    mala_temperature_floor: float = 0.01,
+    mala_trust_radius: float = 10.0,
 ) -> LangevinResult:
     """
     Underdamped (second-order) Langevin Dynamics.
@@ -523,6 +651,8 @@ def underdamped_langevin_dynamics(
     best_energy = float("inf")
     v_best = v_current.clone()
     plateau_counter = 0
+    mala_accepts = 0
+    mala_total = 0
     if track_vectors:
         v_trajectory.append(v_current.detach().cpu().clone())
 
@@ -557,6 +687,7 @@ def underdamped_langevin_dynamics(
                 cos_trajectory=cos_trajectory,
                 v_trajectory=v_trajectory,
                 num_steps=step, stopped_early=True,
+                mala_accept_rate=mala_accepts / max(mala_total, 1),
             )
 
         # Underdamped update:
@@ -570,19 +701,42 @@ def underdamped_langevin_dynamics(
         momentum = (1.0 - friction) * momentum - lr * grad + thermal_noise
 
         # Position update: V_{t+1} = V_t + p_{t+1}/m
-        # Momentum already includes lr-scaled gradient/noise terms.
         position_update = momentum / mass
 
         # Tangent projection (apply to position update, not momentum directly)
         if target_norm is not None:
             position_update = _tangent_projection(position_update, v_current)
 
-        v_current = v_current + position_update
+        v_proposed = v_current + position_update
 
         # OOD projection
         if target_norm is not None:
-            v_current = _project_to_sphere(v_current, target_norm)
-            # Also project momentum to tangent space to prevent norm-fighting
+            v_proposed = _project_to_sphere(v_proposed, target_norm)
+
+        # Trust-Region Metropolis acceptance filter
+        if mala_enabled:
+            v_next, _e_next, accept_mask = _trust_region_metropolis(
+                energy_fn=energy_fn,
+                v_query=v_query,
+                v_current=v_current,
+                v_proposed=v_proposed,
+                e_current=energy,
+                step_noise_scale=step_noise_scale,
+                temperature_floor=mala_temperature_floor,
+                trust_radius=mala_trust_radius,
+            )
+            mala_accepts += int(accept_mask.sum().item())
+            mala_total += accept_mask.numel()
+            # On rejection: damp momentum for that sample to prevent
+            # carrying rejected direction into next step.
+            reject_mask = (~accept_mask).unsqueeze(-1)  # [B, 1]
+            momentum = torch.where(reject_mask, momentum * 0.5, momentum)
+            v_current = v_next
+        else:
+            v_current = v_proposed
+
+        # Project momentum to tangent space to prevent norm-fighting
+        if target_norm is not None:
             momentum = momentum - (
                 (momentum * F.normalize(v_current, dim=-1)).sum(dim=-1, keepdim=True)
                 * F.normalize(v_current, dim=-1)
@@ -602,6 +756,7 @@ def underdamped_langevin_dynamics(
         cos_trajectory=cos_trajectory,
         v_trajectory=v_trajectory,
         num_steps=max_steps, stopped_early=False,
+        mala_accept_rate=mala_accepts / max(mala_total, 1),
     )
 
 
