@@ -3,6 +3,8 @@ CEBCM Base Configuration.
 All hyperparameters in one place as dataclasses.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 
@@ -514,3 +516,101 @@ class Stage1_5Config:
     output_dir: str = "experiments/03_Stage_1.5"
     checkpoint_dir: str = "experiments/03_Stage_1.5/checkpoints"
     logs_dir: str = "experiments/03_Stage_1.5/logs"
+
+
+@dataclass
+class Stage2Config:
+    """Stage 2: Autoregressor — ContextEncoder + IPP + SurprisePredictor.
+
+    Trains three parallel components:
+      1. SurprisePredictor (self-supervised, frozen after pretrain)
+      2. ContextEncoder (SSM + Global Token attention)
+      3. IPP (Conditional Flow Matching or MLP baseline)
+
+    The ContextEncoder and IPP are trained jointly: ContextEncoder produces
+    V_context, which conditions the IPP to generate V_init proposals.
+    """
+    sonar: SONARConfig = field(default_factory=SONARConfig)
+
+    # --- Context Encoder ---
+    ce_d_model: int = 1024
+    ce_ssm_d_state: int = 64
+    ce_ssm_d_conv: int = 4
+    ce_ssm_expand: int = 2
+    ce_ssm_n_layers: int = 2
+    ce_ssm_dropout: float = 0.05
+    ce_n_global_heads: int = 8
+    ce_global_attn_dropout: float = 0.1
+    ce_surprise_top_k_pct: float = 0.05
+    ce_n_types: int = 3  # query=0, answer=1, compact=2
+    ce_output_dim: int = 1024
+    ce_use_alibi: bool = True
+
+    # --- IPP ---
+    ipp_mode: str = "flow"  # "flow" or "mlp"
+    ipp_d_model: int = 1024
+    ipp_d_context: int = 1024
+    ipp_hidden_dims: list[int] = field(default_factory=lambda: [2048, 2048, 1024])
+    ipp_n_integration_steps: int = 10
+    ipp_d_time: int = 256
+    ipp_sigma_init: float = 0.5
+    ipp_solver: str = "midpoint"  # "euler" or "midpoint"
+    ipp_mlp_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024])
+
+    # --- Surprise Predictor ---
+    sp_d_model: int = 1024
+    sp_ssm_d_state: int = 64
+    sp_ssm_d_conv: int = 4
+    sp_ssm_expand: int = 2
+    sp_ssm_n_layers: int = 2
+    sp_ssm_dropout: float = 0.0
+    sp_pred_hidden: int = 1024
+    sp_cos_loss_weight: float = 0.5
+    sp_threshold_mode: str = "percentile"
+    sp_threshold_percentile: float = 95.0
+    sp_threshold_fixed: float = 0.3
+
+    # --- Training ---
+    surprise_lr: float = 3e-4
+    context_encoder_lr: float = 1e-4
+    ipp_lr: float = 1e-4
+    weight_decay: float = 0.01
+    clip_grad_norm: float = 1.0
+    batch_size: int = 32
+    num_epochs: int = 50
+    warmup_epochs: int = 3
+    lr_min_factor: float = 0.01
+
+    # Surprise pretrain: train SP alone first, then freeze
+    surprise_pretrain_epochs: int = 10
+    freeze_surprise_after_pretrain: bool = True
+
+    # SONAR space
+    target_norm: float = 0.2051
+
+    # Eval & checkpointing
+    eval_every_epochs: int = 2
+    checkpoint_every_epochs: int = 5
+    log_every: int = 50
+
+    # --- Data ---
+    train_data_path: str = "data/squad_sequences.pt"
+    val_data_path: str = ""
+    train_val_split: float = 0.9
+    max_seq_len: int = 64
+    min_seq_len: int = 3
+    num_workers: int = 4
+
+    # --- AMP ---
+    amp_enabled: bool = True
+    amp_dtype: str = "bf16"
+
+    # --- Paths ---
+    output_dir: str = "experiments/08_autoregressor"
+    checkpoint_dir: str = "experiments/08_autoregressor/checkpoints"
+    logs_dir: str = "experiments/08_autoregressor/logs"
+
+    # --- Stability ---
+    seed: int = 42
+    skip_non_finite_batches: bool = True
+    max_consecutive_non_finite_batches: int = 10
