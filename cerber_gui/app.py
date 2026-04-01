@@ -1156,6 +1156,79 @@ def _sample_clean_noisy_pair(
     return v_clean, v_noisy, reference_source
 
 
+def _build_target_plane_basis(
+    v_query: torch.Tensor,
+    v_target: torch.Tensor,
+    v_noisy_default: torch.Tensor,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    target = v_target.squeeze(0)
+    primary = v_noisy_default.squeeze(0) - target
+    if float(primary.norm().item()) < 1e-8:
+        primary = v_query.squeeze(0) - target
+    if float(primary.norm().item()) < 1e-8:
+        gen = torch.Generator(device=target.device)
+        gen.manual_seed(int(seed) + 17)
+        primary = torch.randn(target.shape, generator=gen, device=target.device, dtype=target.dtype)
+
+    u1 = F.normalize(primary.unsqueeze(0), dim=-1).squeeze(0)
+
+    secondary = v_query.squeeze(0) - target
+    secondary = secondary - (secondary * u1).sum() * u1
+    if float(secondary.norm().item()) < 1e-8:
+        gen = torch.Generator(device=target.device)
+        gen.manual_seed(int(seed) + 29)
+        secondary = torch.randn(target.shape, generator=gen, device=target.device, dtype=target.dtype)
+        secondary = secondary - (secondary * u1).sum() * u1
+    if float(secondary.norm().item()) < 1e-8:
+        # Last-resort deterministic orthogonal direction.
+        secondary = torch.roll(u1, shifts=1)
+        secondary = secondary - (secondary * u1).sum() * u1
+
+    u2 = F.normalize(secondary.unsqueeze(0), dim=-1).squeeze(0)
+    base_dist = max(float((v_noisy_default.squeeze(0) - target).norm().item()), 1e-6)
+    return u1, u2, base_dist
+
+
+def _apply_noisy_start_strategy(
+    v_query: torch.Tensor,
+    v_target: torch.Tensor,
+    v_noisy_default: torch.Tensor,
+    stage1_cfg: Stage1Config,
+    start_mode: str,
+    far_scale: float,
+    manual_x: float,
+    manual_y: float,
+    project_to_target_norm: bool,
+    seed: int,
+) -> tuple[torch.Tensor, str]:
+    mode = str(start_mode or "objective_seed").strip().lower()
+    if mode not in {"objective_seed", "far_auto", "manual_plane_xy"}:
+        mode = "objective_seed"
+
+    if mode == "objective_seed":
+        return v_noisy_default, mode
+
+    u1, u2, base_dist = _build_target_plane_basis(
+        v_query=v_query,
+        v_target=v_target,
+        v_noisy_default=v_noisy_default,
+        seed=seed,
+    )
+    target = v_target.squeeze(0)
+
+    if mode == "far_auto":
+        scale = max(1.0, float(far_scale))
+        delta = scale * base_dist * u1
+    else:  # manual_plane_xy
+        delta = (float(manual_x) * base_dist) * u1 + (float(manual_y) * base_dist) * u2
+
+    v_noisy = (target + delta).unsqueeze(0).to(device=v_target.device, dtype=v_target.dtype)
+    if bool(project_to_target_norm) and stage1_cfg.langevin.target_norm is not None:
+        v_noisy = F.normalize(v_noisy, dim=-1) * float(stage1_cfg.langevin.target_norm)
+    return v_noisy, mode
+
+
 def _is_stage15_conditional_checkpoint(checkpoint_payload: dict, model_type: str) -> bool:
     if model_type != "simple" or not isinstance(checkpoint_payload, dict):
         return False
@@ -1174,7 +1247,12 @@ def _sample_inference_triplet(
     noise_scale: float,
     seed: int,
     retrieval_bank_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str, str]:
+    start_mode: str = "objective_seed",
+    far_start_scale: float = 8.0,
+    manual_start_x: float = 8.0,
+    manual_start_y: float = 0.0,
+    project_start_to_target_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str, str, str]:
     """
     Unified sampler for single-run inference:
     returns (v_query, v_target, v_noisy, reference_source, target_label, objective).
@@ -1195,16 +1273,40 @@ def _sample_inference_triplet(
             seed_mix = float(rt["actor_seed_mix_query"])
             seed_scale = float(rt["actor_seed_noise_scale"])
             seed_vec = seed_mix * q + (1.0 - seed_mix) * hard
-            noisy = _add_relative_noise(seed_vec, float(noise_scale) * seed_scale, seed=seed + 1)
-            return q, pos, noisy, src, "retrieved_pos", "conditional_retrieval"
+            noisy_default = _add_relative_noise(seed_vec, float(noise_scale) * seed_scale, seed=seed + 1)
+            noisy, mode_used = _apply_noisy_start_strategy(
+                v_query=q,
+                v_target=pos,
+                v_noisy_default=noisy_default,
+                stage1_cfg=stage1_cfg,
+                start_mode=start_mode,
+                far_scale=far_start_scale,
+                manual_x=manual_start_x,
+                manual_y=manual_start_y,
+                project_to_target_norm=project_start_to_target_norm,
+                seed=seed,
+            )
+            return q, pos, noisy, src, "retrieved_pos", "conditional_retrieval", mode_used
 
-    v_clean, v_noisy, src = _sample_clean_noisy_pair(
+    v_clean, v_noisy_default, src = _sample_clean_noisy_pair(
         stage1_cfg=stage1_cfg,
         device=device,
         noise_scale=float(noise_scale),
         seed=int(seed),
     )
-    return v_clean, v_clean, v_noisy, src, "clean", "self_denoise"
+    v_noisy, mode_used = _apply_noisy_start_strategy(
+        v_query=v_clean,
+        v_target=v_clean,
+        v_noisy_default=v_noisy_default,
+        stage1_cfg=stage1_cfg,
+        start_mode=start_mode,
+        far_scale=far_start_scale,
+        manual_x=manual_start_x,
+        manual_y=manual_start_y,
+        project_to_target_norm=project_start_to_target_norm,
+        seed=seed,
+    )
+    return v_clean, v_clean, v_noisy, src, "clean", "self_denoise", mode_used
 
 
 @torch.no_grad()
@@ -1728,6 +1830,8 @@ def _format_inference_info(
     target_label: str = "clean",
     eval_objective: str = "self_denoise",
     query_target_cos: float | None = None,
+    start_mode: str | None = None,
+    start_distance_to_target: float | None = None,
 ) -> str:
     energy_min = float(landscape_data.get("energy_min", np.nan))
     energy_max = float(landscape_data.get("energy_max", np.nan))
@@ -1744,6 +1848,12 @@ def _format_inference_info(
         f"- Forced full steps (GUI debug mode): `{force_full_steps}`",
         f"- Reference source: `{reference_source}`",
         f"- Eval objective: `{eval_objective}` (target=`{target_label}`)",
+        f"- Noisy start mode: `{start_mode or 'objective_seed'}`",
+        (
+            f"- Initial distance ||x0-target||: `{float(start_distance_to_target):.6f}`"
+            if start_distance_to_target is not None
+            else "- Initial distance ||x0-target||: `N/A`"
+        ),
         f"- Energy range on scanned plane: `[{energy_min:.4f}, {energy_max:.4f}]`",
         f"- Energy(target ref): `{energies['clean']:.6f}`",
         f"- Energy(noisy start): `{energies['noisy']:.6f}`",
@@ -1864,6 +1974,11 @@ def run_inference_fn(
     absolute_half_range,
     sota_eval_batch_size,
     sota_eval_bank_size,
+    start_mode,
+    far_start_scale,
+    manual_start_x,
+    manual_start_y,
+    project_start_to_target_norm,
 ):
     """Run denoising/refinement inference and refresh both surface + trajectory plots."""
     if not checkpoint_path or checkpoint_path not in session_state["checkpoints"]:
@@ -1875,7 +1990,7 @@ def run_inference_fn(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, model_type = _load_energy_model_from_checkpoint(checkpoint, device)
-    v_query, v_target, v_noisy, reference_source, target_label, eval_objective = _sample_inference_triplet(
+    v_query, v_target, v_noisy, reference_source, target_label, eval_objective, start_mode_used = _sample_inference_triplet(
         checkpoint_payload=checkpoint,
         model_type=model_type,
         stage1_cfg=stage1_cfg,
@@ -1883,6 +1998,11 @@ def run_inference_fn(
         noise_scale=float(noise_scale),
         seed=42,
         retrieval_bank_size=int(sota_eval_bank_size),
+        start_mode=str(start_mode),
+        far_start_scale=float(far_start_scale),
+        manual_start_x=float(manual_start_x),
+        manual_start_y=float(manual_start_y),
+        project_start_to_target_norm=bool(project_start_to_target_norm),
     )
     sigma_infer = (
         torch.full((v_noisy.shape[0], 1), float(noise_scale), device=device, dtype=v_noisy.dtype)
@@ -1959,6 +2079,8 @@ def run_inference_fn(
             v_denoised=v_denoised,
         )
     )
+    runtime_metrics["start_mode"] = str(start_mode_used)
+    runtime_metrics["start_distance_to_target"] = float((v_target - v_noisy).norm().item())
     runtime_metrics["sota"] = _compute_sota_eval_metrics(
         checkpoint_path=checkpoint_path,
         model=model,
@@ -2007,6 +2129,8 @@ def run_inference_fn(
         query_target_cos=float(runtime_metrics.get("query_target_cos"))
         if runtime_metrics.get("query_target_cos") is not None
         else None,
+        start_mode=str(runtime_metrics.get("start_mode", start_mode_used)),
+        start_distance_to_target=float(runtime_metrics.get("start_distance_to_target", float("nan"))),
     )
 
     summary = _build_checkpoint_summary(checkpoint_path, checkpoint)
@@ -2048,7 +2172,7 @@ def generate_landscape_for_checkpoint(
     stage1_cfg = build_stage1_config(checkpoint)
     stage15_rt = _extract_stage15_runtime_options(checkpoint)
 
-    v_query, v_target, v_noisy, reference_source, target_label, eval_objective = _sample_inference_triplet(
+    v_query, v_target, v_noisy, reference_source, target_label, eval_objective, _ = _sample_inference_triplet(
         checkpoint_payload=checkpoint,
         model_type=model_type,
         stage1_cfg=stage1_cfg,
@@ -2604,6 +2728,47 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 run_inference_btn = gr.Button("Run Inference", variant="primary")
 
             with gr.Row():
+                start_mode_dropdown = gr.Dropdown(
+                    choices=[
+                        ("Objective Seed (Default)", "objective_seed"),
+                        ("Far Auto From Target", "far_auto"),
+                        ("Manual XY (Target Plane)", "manual_plane_xy"),
+                    ],
+                    value="objective_seed",
+                    label="Noisy Start Mode",
+                    info="Use far/manual start to stress-test long-range navigation to target.",
+                )
+                far_start_scale_slider = gr.Slider(
+                    minimum=1.0,
+                    maximum=40.0,
+                    value=8.0,
+                    step=0.5,
+                    label="Far Start Scale",
+                    info="Multiplier for baseline ||seed-target|| distance in `far_auto` mode.",
+                )
+                manual_start_x_slider = gr.Slider(
+                    minimum=-40.0,
+                    maximum=40.0,
+                    value=8.0,
+                    step=0.5,
+                    label="Manual Start X (plane)",
+                    info="X coefficient in target-centric 2D plane (units: baseline distance).",
+                )
+                manual_start_y_slider = gr.Slider(
+                    minimum=-40.0,
+                    maximum=40.0,
+                    value=0.0,
+                    step=0.5,
+                    label="Manual Start Y (plane)",
+                    info="Y coefficient in target-centric 2D plane (units: baseline distance).",
+                )
+                project_start_norm_checkbox = gr.Checkbox(
+                    value=False,
+                    label="Project Start To Target Norm",
+                    info="If enabled, start is normalized to target norm after far/manual placement.",
+                )
+
+            with gr.Row():
                 sota_eval_batch_size_slider = gr.Slider(
                     minimum=8,
                     maximum=256,
@@ -2894,6 +3059,11 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             landscape_abs_range_slider,
             sota_eval_batch_size_slider,
             sota_eval_bank_size_slider,
+            start_mode_dropdown,
+            far_start_scale_slider,
+            manual_start_x_slider,
+            manual_start_y_slider,
+            project_start_norm_checkbox,
         ],
         outputs=[inference_output, landscape_plot, trajectory_plot, checkpoint_summary],
     )

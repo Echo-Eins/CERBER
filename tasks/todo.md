@@ -1543,3 +1543,36 @@ Close the remaining mismatch between reported metrics/plots and actual dynamics 
   - `cebcm/visualization/energy_landscape.py`
   - `configs/stage1_5_config.json`
   - `configs/base.py`
+
+# Stage1.5 Far-Start Inference Stress Test (2026-03-31, Pass 51)
+
+## Goal
+Test true long-range navigation by starting `noisy` far from `target` instead of near-target default seeds.
+
+## Checklist
+- [x] Add noisy start modes for single-run inference:
+  - [x] `objective_seed` (current default)
+  - [x] `far_auto` (auto far start from target)
+  - [x] `manual_plane_xy` (manual XY start in target-centric 2D plane)
+- [x] Wire new parameters through `_sample_inference_triplet(...)` and `run_inference_fn(...)`
+- [x] Add GUI controls in Inference Settings
+- [x] Report selected start mode in Inference Results
+- [x] Preserve backward compatibility for preview/live paths (defaults unchanged)
+- [x] Validate syntax with `py_compile`
+
+## Review
+- Implemented in `cerber_gui/app.py`:
+  - new helper logic for target-plane basis and controlled start override:
+    - `_build_target_plane_basis(...)`
+    - `_apply_noisy_start_strategy(...)`
+  - extended `_sample_inference_triplet(...)` to support `start_mode`, `far_start_scale`, `manual_start_x`, `manual_start_y`, `project_start_to_target_norm`.
+  - extended `run_inference_fn(...)` to consume these controls and persist `start_mode` + initial distance metric.
+  - extended `_format_inference_info(...)` to print start mode and initial `||x0-target||`.
+  - added UI controls:
+    - `Noisy Start Mode`
+    - `Far Start Scale`
+    - `Manual Start X (plane)`
+    - `Manual Start Y (plane)`
+    - `Project Start To Target Norm`
+- Validation:
+  - `python -m py_compile cerber_gui/app.py`
