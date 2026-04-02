@@ -137,28 +137,30 @@ def get_cosine_schedule_with_warmup(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def build_type_ids_for_squad(lengths: Tensor, max_len: int) -> Tensor:
+def build_type_ids(lengths: Tensor, max_len: int, dataset_source: str) -> Tensor:
     """
-    Build type_ids for SQuAD-style sequences.
+    Build type_ids for the current dataset.
 
-    Convention: last 2 elements of each sequence are [question, answer].
-    Everything before is context (type=1 for answer-like context sentences).
-    We use: context=1 (answer), question=0 (query), answer=1 (answer).
+    SQuAD convention:
+      last 2 elements are [question, answer].
+      context -> type=1, question -> type=0, answer -> type=1.
 
-    For general sequences without QA structure, all types = 0 (query).
+    Non-SQuAD corpora (WikiText/CNN):
+      no explicit QA markup in each sequence -> keep all type_ids=0.
     """
     B = lengths.shape[0]
     type_ids = torch.zeros(B, max_len, dtype=torch.long)
 
-    for i in range(B):
-        L = int(lengths[i].item())
-        if L >= 3:
-            # Context sentences: type=1 (answer)
-            type_ids[i, : L - 2] = 1
-            # Question: type=0 (query)
-            type_ids[i, L - 2] = 0
-            # Answer: type=1 (answer)
-            type_ids[i, L - 1] = 1
+    if dataset_source.lower().startswith("squad"):
+        for i in range(B):
+            L = int(lengths[i].item())
+            if L >= 3:
+                # Context sentences: type=1 (answer-like context facts)
+                type_ids[i, : L - 2] = 1
+                # Question: type=0 (query)
+                type_ids[i, L - 2] = 0
+                # Answer: type=1 (answer)
+                type_ids[i, L - 1] = 1
 
     return type_ids
 
@@ -194,6 +196,7 @@ def train_surprise_epoch(
         scheduler: torch.optim.lr_scheduler.LambdaLR,
         scaler: torch.amp.GradScaler,
         device: torch.device,
+        amp_enabled: bool,
         amp_dtype: torch.dtype,
         clip_grad: float,
         log_every: int,
@@ -208,13 +211,19 @@ def train_surprise_epoch(
         vectors = batch["vectors"].to(device)  # [B, L, D]
         lengths = batch["lengths"].to(device)  # [B]
 
-        # Mask to only train on valid positions
-        B, L, D = vectors.shape
+        # Keep only sequences with at least 3 vectors (2 prediction steps).
+        valid_rows = lengths >= 3
+        if not valid_rows.any():
+            continue
+        vectors = vectors[valid_rows]
+        lengths = lengths[valid_rows]
+        _, L, _ = vectors.shape
+
         if L < 3:
             continue
 
-        with torch.amp.autocast("cuda", dtype=amp_dtype):
-            loss, metrics = model.compute_loss(vectors)
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            loss, metrics = model.compute_loss(vectors, lengths=lengths)
 
         if not torch.isfinite(loss):
             continue
@@ -250,6 +259,7 @@ def eval_surprise(
         model: SurprisePredictor,
         loader: DataLoader,
         device: torch.device,
+        amp_enabled: bool,
         amp_dtype: torch.dtype,
 ) -> dict[str, float]:
     """Evaluate SurprisePredictor on validation set."""
@@ -258,11 +268,19 @@ def eval_surprise(
 
     for batch in loader:
         vectors = batch["vectors"].to(device)
+        lengths = batch["lengths"].to(device)
+
+        valid_rows = lengths >= 3
+        if not valid_rows.any():
+            continue
+        vectors = vectors[valid_rows]
+        lengths = lengths[valid_rows]
+
         if vectors.shape[1] < 3:
             continue
 
-        with torch.amp.autocast("cuda", dtype=amp_dtype):
-            _, metrics = model.compute_loss(vectors)
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            _, metrics = model.compute_loss(vectors, lengths=lengths)
 
         tracker.update(metrics)
 
@@ -282,11 +300,13 @@ def train_joint_epoch(
         scheduler: torch.optim.lr_scheduler.LambdaLR,
         scaler: torch.amp.GradScaler,
         device: torch.device,
+        amp_enabled: bool,
         amp_dtype: torch.dtype,
         clip_grad: float,
         target_norm: float,
         log_every: int,
         epoch: int,
+        dataset_source: str,
 ) -> dict[str, float]:
     """Train ContextEncoder + IPP jointly for one epoch."""
     context_encoder.train()
@@ -299,6 +319,11 @@ def train_joint_epoch(
     for batch in loader:
         vectors = batch["vectors"].to(device)  # [B, L, D]
         lengths = batch["lengths"].to(device)  # [B]
+        valid_rows = lengths >= 4
+        if not valid_rows.any():
+            continue
+        vectors = vectors[valid_rows]
+        lengths = lengths[valid_rows]
         B, L, D = vectors.shape
 
         if L < 4:  # Need at least context + question + answer
@@ -307,16 +332,17 @@ def train_joint_epoch(
         # For SQuAD-style: context is vectors[:, :-1], target is vectors[:, -1]
         # Context = everything except the last vector (the answer)
         context_vecs = vectors[:, :-1]  # [B, L-1, D]
-        target_vecs = vectors[:, -1]  # [B, D] — the answer to predict
+        target_idx = (lengths - 1).long()
+        target_vecs = vectors[torch.arange(B, device=device), target_idx]  # [B, D]
         context_lengths = lengths - 1  # [B]
 
         # Type IDs for the context portion
-        type_ids = build_type_ids_for_squad(lengths, L)[:, :-1].to(device)  # [B, L-1]
+        type_ids = build_type_ids(lengths, L, dataset_source=dataset_source)[:, :-1].to(device)  # [B, L-1]
 
-        with torch.amp.autocast("cuda", dtype=amp_dtype):
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             # Step 1: Get surprise scores (frozen SP)
             with torch.no_grad():
-                surprise_scores = surprise_predictor.compute_surprise(context_vecs)
+                surprise_scores = surprise_predictor.compute_surprise(context_vecs, lengths=context_lengths)
                 # Pad surprise to match context length (first position has no surprise)
                 surprise_padded = torch.zeros(B, L - 1, device=device)
                 if surprise_scores.shape[1] > 0:
@@ -373,8 +399,10 @@ def eval_joint(
         surprise_predictor: SurprisePredictor,
         loader: DataLoader,
         device: torch.device,
+        amp_enabled: bool,
         amp_dtype: torch.dtype,
         target_norm: float,
+        dataset_source: str,
 ) -> dict[str, float]:
     """Evaluate ContextEncoder + IPP on validation set."""
     context_encoder.eval()
@@ -388,19 +416,25 @@ def eval_joint(
     for batch in loader:
         vectors = batch["vectors"].to(device)
         lengths = batch["lengths"].to(device)
+        valid_rows = lengths >= 4
+        if not valid_rows.any():
+            continue
+        vectors = vectors[valid_rows]
+        lengths = lengths[valid_rows]
         B, L, D = vectors.shape
         if L < 4:
             continue
 
         context_vecs = vectors[:, :-1]
-        target_vecs = vectors[:, -1]
+        target_idx = (lengths - 1).long()
+        target_vecs = vectors[torch.arange(B, device=device), target_idx]  # [B, D]
         context_lengths = lengths - 1
 
-        type_ids = build_type_ids_for_squad(lengths, L)[:, :-1].to(device)
+        type_ids = build_type_ids(lengths, L, dataset_source=dataset_source)[:, :-1].to(device)  # [B, L-1]
 
-        with torch.amp.autocast("cuda", dtype=amp_dtype):
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             # Surprise scores
-            surprise_scores = surprise_predictor.compute_surprise(context_vecs)
+            surprise_scores = surprise_predictor.compute_surprise(context_vecs, lengths=context_lengths)
             surprise_padded = torch.zeros(B, L - 1, device=device)
             if surprise_scores.shape[1] > 0:
                 surprise_padded[:, 1:1 + surprise_scores.shape[1]] = surprise_scores
@@ -428,6 +462,14 @@ def eval_joint(
         tracker.update(metrics)
 
     avg = tracker.get()
+    if not all_cos_sims:
+        avg.setdefault("eval_cos_mean", 0.0)
+        avg.setdefault("eval_cos_std", 0.0)
+        avg.setdefault("eval_cos_gt05", 0.0)
+        avg.setdefault("eval_cos_gt07", 0.0)
+        avg.setdefault("eval_l2_mean", 0.0)
+        return avg
+
     cos_tensor = torch.tensor(all_cos_sims)
     l2_tensor = torch.tensor(all_l2_dists)
 
@@ -549,6 +591,8 @@ def main():
           f"mean_len={stats['mean_length']:.1f}, mean_norm={stats['mean_norm']:.4f}")
     val_stats = val_dataset.get_statistics()
     print(f"  Val:   {val_stats['num_sequences']} sequences")
+    train_source = str(getattr(train_dataset, "source", "unknown"))
+    val_source = str(getattr(val_dataset, "source", train_source))
 
     num_workers = data_cfg.get("num_workers", 4)
     train_loader = DataLoader(
@@ -675,6 +719,7 @@ def main():
                 scheduler=sp_scheduler,
                 scaler=scaler,
                 device=device,
+                amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 clip_grad=clip_grad,
                 log_every=log_every,
@@ -688,7 +733,7 @@ def main():
             # Eval
             if (epoch + 1) % eval_every == 0 or epoch == surprise_pretrain_epochs - 1:
                 val_metrics = eval_surprise(
-                    surprise_predictor, val_loader, device, amp_dtype
+                    surprise_predictor, val_loader, device, amp_enabled, amp_dtype
                 )
                 print(
                     f"  [SP VAL] "
@@ -742,11 +787,13 @@ def main():
             scheduler=joint_scheduler,
             scaler=scaler,
             device=device,
+            amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             clip_grad=clip_grad,
             target_norm=target_norm,
             log_every=log_every,
             epoch=epoch,
+            dataset_source=train_source,
         )
         elapsed = time.time() - t0
 
@@ -757,7 +804,7 @@ def main():
         if (epoch + 1) % eval_every == 0 or epoch == num_epochs - 1:
             val_metrics = eval_joint(
                 context_encoder, ipp, surprise_predictor,
-                val_loader, device, amp_dtype, target_norm,
+                val_loader, device, amp_enabled, amp_dtype, target_norm, val_source,
             )
             loss_key = "flow_loss" if "flow_loss" in val_metrics else "ipp_loss"
             cos_key = "flow_cos" if "flow_cos" in val_metrics else "ipp_cos"
@@ -810,3 +857,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

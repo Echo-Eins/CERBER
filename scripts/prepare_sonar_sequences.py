@@ -44,12 +44,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import sys
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
+
+# Ensure project root is importable when running as:
+#   python scripts/prepare_sonar_sequences.py
+# (otherwise sys.path[0] points to scripts/, and `import cebcm` can fail).
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 # ============================================================
@@ -124,7 +132,8 @@ def load_squad_sequences(
             continue
 
         # Deduplicate by context to avoid near-identical sequences
-        ctx_hash = hash(context[:200])
+        # Use a deterministic hash (Python built-in `hash()` is process-randomized).
+        ctx_hash = hashlib.blake2b(context[:200].encode("utf-8"), digest_size=8).hexdigest()
         if ctx_hash in seen_contexts:
             continue
         seen_contexts.add(ctx_hash)

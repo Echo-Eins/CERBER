@@ -106,7 +106,11 @@ class SurprisePredictor(nn.Module):
         hidden = self.ssm(sequence)  # [B, L, D]
         return self.pred_head(hidden)  # [B, L, D]
 
-    def compute_surprise(self, sequence: Tensor) -> Tensor:
+    def compute_surprise(
+            self,
+            sequence: Tensor,
+            lengths: Tensor | None = None,
+    ) -> Tensor:
         """
         Compute surprise scores for each position (except first).
 
@@ -121,10 +125,20 @@ class SurprisePredictor(nn.Module):
 
         cos_sim = F.cosine_similarity(predictions, actual, dim=-1)  # [B, L-1]
         surprise = (1.0 - cos_sim) / 2.0  # Normalize to [0, 1]
+
+        if lengths is not None:
+            max_pred_len = predictions.shape[1]
+            valid_pred_len = (lengths - 1).clamp(min=0, max=max_pred_len)
+            pos = torch.arange(max_pred_len, device=sequence.device).unsqueeze(0)
+            mask = pos < valid_pred_len.unsqueeze(1)
+            surprise = surprise * mask.float()
+
         return surprise
 
     def compute_loss(
-            self, sequence: Tensor
+            self,
+            sequence: Tensor,
+            lengths: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """
         Self-supervised training loss: predict next vector.
@@ -139,19 +153,50 @@ class SurprisePredictor(nn.Module):
         predictions = self.predict_next(sequence[:, :-1])  # [B, L-1, D]
         targets = sequence[:, 1:]  # [B, L-1, D]
 
-        loss_mse = F.mse_loss(predictions, targets)
-        loss_cos = (1.0 - F.cosine_similarity(predictions, targets, dim=-1)).mean()
+        # Per-token losses for padding-aware masking.
+        mse_per_tok = (predictions - targets).pow(2).mean(dim=-1)  # [B, L-1]
+        cos_per_tok = 1.0 - F.cosine_similarity(predictions, targets, dim=-1)  # [B, L-1]
+
+        if lengths is not None:
+            max_pred_len = predictions.shape[1]
+            valid_pred_len = (lengths - 1).clamp(min=0, max=max_pred_len)
+            pos = torch.arange(max_pred_len, device=sequence.device).unsqueeze(0)
+            mask = pos < valid_pred_len.unsqueeze(1)  # [B, L-1]
+            mask_f = mask.float()
+            denom = mask_f.sum().clamp(min=1.0)
+
+            loss_mse = (mse_per_tok * mask_f).sum() / denom
+            loss_cos = (cos_per_tok * mask_f).sum() / denom
+
+            with torch.no_grad():
+                surprise = 0.5 * cos_per_tok * mask_f
+                surprise_mean = surprise.sum() / denom
+                centered = (surprise - surprise_mean) * mask_f
+                surprise_var = (centered.pow(2).sum() / denom).clamp(min=0.0)
+                surprise_std = surprise_var.sqrt()
+                surprise_max = surprise.masked_fill(~mask, float("-inf")).max()
+                if not torch.isfinite(surprise_max):
+                    surprise_max = torch.tensor(0.0, device=surprise.device)
+        else:
+            loss_mse = mse_per_tok.mean()
+            loss_cos = cos_per_tok.mean()
+
+            with torch.no_grad():
+                surprise = (1.0 - F.cosine_similarity(predictions, targets, dim=-1)) / 2.0
+                surprise_mean = surprise.mean()
+                surprise_std = surprise.std()
+                surprise_max = surprise.max()
+
         loss = loss_mse + self.cfg.cos_loss_weight * loss_cos
 
         with torch.no_grad():
-            surprise = (1.0 - F.cosine_similarity(predictions, targets, dim=-1)) / 2.0
             metrics = {
                 "surprise_loss": loss.item(),
                 "surprise_mse": loss_mse.item(),
                 "surprise_cos": loss_cos.item(),
-                "surprise_mean": surprise.mean().item(),
-                "surprise_std": surprise.std().item(),
-                "surprise_max": surprise.max().item(),
+                "surprise_mean": surprise_mean.item(),
+                "surprise_std": surprise_std.item(),
+                "surprise_max": surprise_max.item(),
             }
 
         return loss, metrics

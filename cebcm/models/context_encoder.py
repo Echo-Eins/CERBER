@@ -197,6 +197,7 @@ class ContextEncoder(nn.Module):
         # Incremental inference state
         self._ssm_states: list[tuple[Tensor, Tensor]] | None = None
         self._global_tokens: list[Tensor] = []
+        self._surprise_history: list[float] = []
 
     def forward(
             self,
@@ -289,33 +290,73 @@ class ContextEncoder(nn.Module):
         """Cross-attention from query to high-surprise (global) tokens."""
         B, L, D = ssm_hidden.shape
 
-        # Select global tokens: top-k% by surprise
-        k = max(1, int(L * self.cfg.surprise_top_k_pct))
+        if pad_mask is None:
+            pad_mask = torch.ones(B, L, dtype=torch.bool, device=ssm_hidden.device)
 
-        # Mask padding from surprise scores
-        if pad_mask is not None:
-            masked_surprise = surprise_scores.masked_fill(~pad_mask, -1.0)
-        else:
-            masked_surprise = surprise_scores
+        pct = float(self.cfg.surprise_top_k_pct)
+        pct = min(max(pct, 1e-6), 1.0)
+        global_tokens_per_batch: list[Tensor] = []
+        max_k = 1
 
-        # Get top-k indices per batch
-        _, topk_idx = masked_surprise.topk(min(k, L), dim=-1)  # [B, k]
+        # Per-sample selection avoids pulling padded positions into top-k.
+        for b in range(B):
+            valid_idx = pad_mask[b].nonzero(as_tuple=False).squeeze(-1)
+            if valid_idx.numel() == 0:
+                global_tokens_per_batch.append(ssm_hidden[b:b + 1, :1, :].squeeze(0))
+                max_k = max(max_k, 1)
+                continue
 
-        # Gather global token vectors from SSM hidden states
-        topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, D)  # [B, k, D]
-        global_tokens = torch.gather(ssm_hidden, 1, topk_idx_exp)  # [B, k, D]
+            scores = surprise_scores[b, valid_idx]
+            k_b = max(1, int(valid_idx.numel() * pct))
+            k_b = min(k_b, int(valid_idx.numel()))
+
+            top_local = scores.topk(k_b, dim=0).indices
+            selected_idx = valid_idx[top_local]
+            tokens_b = ssm_hidden[b, selected_idx, :]  # [k_b, D]
+            global_tokens_per_batch.append(tokens_b)
+            max_k = max(max_k, k_b)
+
+        global_tokens = torch.zeros(B, max_k, D, device=ssm_hidden.device, dtype=ssm_hidden.dtype)
+        global_mask = torch.zeros(B, max_k, dtype=torch.bool, device=ssm_hidden.device)
+        for b, tokens_b in enumerate(global_tokens_per_batch):
+            k_b = tokens_b.shape[0]
+            global_tokens[b, :k_b] = tokens_b
+            global_mask[b, :k_b] = True
 
         # Cross-attention: query → global tokens
         q = self.global_norm_q(query.unsqueeze(1))  # [B, 1, D]
         kv = self.global_norm_kv(global_tokens)  # [B, k, D]
+        attn_mask = global_mask.unsqueeze(1)  # [B, 1, k]
 
-        attn_out = self.global_attn(query=q, key=kv, value=kv)  # [B, 1, D]
+        attn_out = self.global_attn(query=q, key=kv, value=kv, attn_mask=attn_mask)  # [B, 1, D]
         return attn_out.squeeze(1)  # [B, D]
 
     def reset_state(self) -> None:
         """Reset incremental inference state."""
         self._ssm_states = None
         self._global_tokens = []
+        self._surprise_history = []
+
+    def _is_global_surprise(self, surprise: float) -> bool:
+        """
+        Running-percentile global-token flag for incremental inference.
+
+        Uses `surprise_top_k_pct` as a tail fraction (e.g. 0.05 → top-5%).
+        """
+        pct = float(self.cfg.surprise_top_k_pct)
+        if pct <= 0.0:
+            return False
+        if pct >= 1.0:
+            return True
+
+        self._surprise_history.append(float(surprise))
+        if len(self._surprise_history) > 4096:
+            self._surprise_history = self._surprise_history[-4096:]
+
+        hist = torch.tensor(self._surprise_history, dtype=torch.float32)
+        q = max(0.0, min(1.0, 1.0 - pct))
+        threshold = torch.quantile(hist, q).item()
+        return float(surprise) >= threshold
 
     def step(
             self,
@@ -343,8 +384,8 @@ class ContextEncoder(nn.Module):
         # SSM step
         ssm_out, self._ssm_states = self.ssm.step(x, self._ssm_states)
 
-        # Track global tokens
-        if surprise > self.cfg.surprise_top_k_pct:  # approximate threshold
+        # Track global tokens using running percentile (top-k% tail), not fixed scalar.
+        if self._is_global_surprise(surprise):
             self._global_tokens.append(ssm_out.detach())
 
         # Cross-attend to accumulated global tokens
