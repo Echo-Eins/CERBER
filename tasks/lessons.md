@@ -1227,3 +1227,13 @@ If the user states that the active logs are those pasted in chat, do not infer r
 1. Before drawing conclusions, confirm the exact log source for this diagnosis: in-chat stream vs local file path.
 2. If sources diverge, prioritize the user-provided active run and label local artifacts as potentially stale/different-run.
 3. Reflect the active-run conclusions in `tasks/todo.md` before continuing implementation.
+
+## Process Lesson: Keep legacy trainer intact when user requests modular add-ons (2026-04-01)
+
+### Summary
+If the user asks for modular/standalone pipelines and explicitly says not to split an existing trainer, keep the current trainer file unchanged and add new scripts/configs around it.
+
+### Rule
+1. Treat "do not split existing trainer" as a hard compatibility requirement.
+2. Implement new standalone entrypoints (`train_*`) instead of refactoring the existing monolithic script.
+3. Preserve checkpoint key compatibility (`surprise_predictor`, `context_encoder`, `ipp`) across old and new scripts.

@@ -1,0 +1,50 @@
+{
+    "description": "Stage 2A: SurprisePredictor standalone pretraining",
+
+    "surprise": {
+        "d_model": 1024,
+        "ssm_d_state": 64,
+        "ssm_d_conv": 4,
+        "ssm_expand": 2,
+        "ssm_n_layers": 2,
+        "ssm_dropout": 0.0,
+        "pred_hidden": 1024,
+        "cos_loss_weight": 0.5,
+        "threshold_mode": "percentile",
+        "threshold_percentile": 95.0
+    },
+
+    "training": {
+        "lr": 3e-4,
+        "weight_decay": 0.01,
+        "clip_grad_norm": 1.0,
+        "batch_size": 32,
+        "num_epochs": 10,
+        "warmup_epochs": 3,
+        "lr_min_factor": 0.01,
+        "eval_every_epochs": 2,
+        "checkpoint_every_epochs": 2,
+        "log_every": 50
+    },
+
+    "data": {
+        "train_data_path": "data/squad_sequences.pt",
+        "val_data_path": "",
+        "train_val_split": 0.9,
+        "max_seq_len": 64,
+        "min_seq_len": 3,
+        "num_workers": 4
+    },
+
+    "amp": {
+        "enabled": true,
+        "dtype": "bf16"
+    },
+
+    "output": {
+        "checkpoint_dir": "experiments/08_autoregressor/sp/checkpoints",
+        "logs_dir": "experiments/08_autoregressor/sp/logs"
+    },
+
+    "seed": 42
+}

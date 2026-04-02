@@ -1576,3 +1576,49 @@ Test true long-range navigation by starting `noisy` far from `target` instead of
     - `Project Start To Target Norm`
 - Validation:
   - `python -m py_compile cerber_gui/app.py`
+
+# Stage2 Modular Training Pipelines (2026-04-01)
+
+## Goal
+Replace monolithic Stage2 training usage with separate production-ready pipelines per module/stage:
+- `SurprisePredictor` pretrain,
+- `ContextEncoder` pretrain,
+- `IPP` pretrain on frozen `ContextEncoder`,
+- joint `ContextEncoder + IPP` fine-tune on frozen `SurprisePredictor`.
+
+## Checklist
+- [x] Add shared Stage2 training utilities module (builders, data loading, type IDs, schedulers, checkpoints).
+- [x] Add standalone `train_stage2_sp.py` (SP-only self-supervised training + eval + checkpoints).
+- [x] Add standalone `train_stage2_ce.py` (CE-only with contextual next-target objective + optional frozen SP surprise features).
+- [x] Add standalone `train_stage2_ipp.py` (IPP-only with frozen CE and optional frozen SP).
+- [x] Add standalone `train_stage2_ce_ipp_joint.py` (joint fine-tune with frozen SP).
+- [x] Add stage-specific JSON configs for each pipeline.
+- [x] Validate syntax (`py_compile`) for all added files.
+- [x] Document exact run order and commands in review notes.
+
+## Review
+- Added new shared utility module:
+  - `cebcm/training/stage2_utils.py`
+  - contains shared builders/config loading/device+AMP setup/data loading/type-ids/scheduler/ckpt helpers.
+- Added separate training scripts (existing monolithic `experiments/08_autoregressor/train_stage2.py` untouched):
+  - `experiments/08_autoregressor/train_stage2_sp.py`
+  - `experiments/08_autoregressor/train_stage2_ce.py`
+  - `experiments/08_autoregressor/train_stage2_ipp.py`
+  - `experiments/08_autoregressor/train_stage2_ce_ipp_joint.py`
+- Added dedicated configs:
+  - `configs/stage2_sp_config.json`
+  - `configs/stage2_ce_config.json`
+  - `configs/stage2_ipp_config.json`
+  - `configs/stage2_ce_ipp_joint_config.json`
+- Validation:
+  - `py -3 -m py_compile cebcm/training/stage2_utils.py experiments/08_autoregressor/train_stage2_sp.py experiments/08_autoregressor/train_stage2_ce.py experiments/08_autoregressor/train_stage2_ipp.py experiments/08_autoregressor/train_stage2_ce_ipp_joint.py`
+  - Note: `python -m py_compile ...` is not available in this Windows shell alias setup, `py -3` works.
+- Stage2 modular run order:
+  1. `py -3 experiments/08_autoregressor/train_stage2_sp.py --config configs/stage2_sp_config.json`
+  2. `py -3 experiments/08_autoregressor/train_stage2_ce.py --config configs/stage2_ce_config.json`
+  3. `py -3 experiments/08_autoregressor/train_stage2_ipp.py --config configs/stage2_ipp_config.json`
+  4. `py -3 experiments/08_autoregressor/train_stage2_ce_ipp_joint.py --config configs/stage2_ce_ipp_joint_config.json`
+- Optional overrides:
+  - CE script: `--sp-checkpoint <path>`
+  - IPP script: `--ce-checkpoint <path> --sp-checkpoint <path>`
+  - Joint script: `--sp-checkpoint <path> --ce-checkpoint <path> --ipp-checkpoint <path>`

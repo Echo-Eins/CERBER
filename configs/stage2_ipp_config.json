@@ -1,0 +1,84 @@
+{
+    "description": "Stage 2B-2: IPP standalone pretraining on frozen CE",
+
+    "context_encoder": {
+        "d_model": 1024,
+        "ssm_d_state": 64,
+        "ssm_d_conv": 4,
+        "ssm_expand": 2,
+        "ssm_n_layers": 2,
+        "ssm_dropout": 0.05,
+        "n_global_heads": 8,
+        "global_attn_dropout": 0.1,
+        "surprise_top_k_pct": 0.05,
+        "n_types": 3,
+        "output_dim": 1024,
+        "use_alibi": true
+    },
+
+    "ipp": {
+        "mode": "flow",
+        "d_model": 1024,
+        "d_context": 1024,
+        "hidden_dims": [2048, 2048, 1024],
+        "n_integration_steps": 10,
+        "d_time": 256,
+        "sigma_init": 0.5,
+        "solver": "midpoint",
+        "mlp_hidden_dims": [2048, 1024]
+    },
+
+    "surprise": {
+        "d_model": 1024,
+        "ssm_d_state": 64,
+        "ssm_d_conv": 4,
+        "ssm_expand": 2,
+        "ssm_n_layers": 2,
+        "ssm_dropout": 0.0,
+        "pred_hidden": 1024,
+        "cos_loss_weight": 0.5,
+        "threshold_mode": "percentile",
+        "threshold_percentile": 95.0
+    },
+
+    "training": {
+        "lr": 1e-4,
+        "weight_decay": 0.01,
+        "clip_grad_norm": 1.0,
+        "batch_size": 32,
+        "num_epochs": 20,
+        "warmup_epochs": 3,
+        "lr_min_factor": 0.01,
+        "use_surprise_features": true,
+        "target_norm": 0.2051,
+        "eval_every_epochs": 2,
+        "checkpoint_every_epochs": 2,
+        "log_every": 50
+    },
+
+    "data": {
+        "train_data_path": "data/squad_sequences.pt",
+        "val_data_path": "",
+        "train_val_split": 0.9,
+        "max_seq_len": 64,
+        "min_seq_len": 4,
+        "num_workers": 4
+    },
+
+    "init": {
+        "sp_checkpoint": "experiments/08_autoregressor/sp/checkpoints/best.pt",
+        "ce_checkpoint": "experiments/08_autoregressor/ce/checkpoints/best.pt"
+    },
+
+    "amp": {
+        "enabled": true,
+        "dtype": "bf16"
+    },
+
+    "output": {
+        "checkpoint_dir": "experiments/08_autoregressor/ipp/checkpoints",
+        "logs_dir": "experiments/08_autoregressor/ipp/logs"
+    },
+
+    "seed": 42
+}
