@@ -49,12 +49,12 @@ class IPPConfig:
     d_context: int = 1024  # Context vector dimension (from ContextEncoder)
     # Flow Matching architecture
     hidden_dims: list[int] | None = None  # MLP hidden dims for velocity net
-    n_integration_steps: int = 10  # ODE steps at inference
+    n_integration_steps: int = 50  # ODE steps at inference
     # Time embedding
     d_time: int = 256  # Time embedding dimension
     time_embed_type: str = "sinusoidal"  # "sinusoidal" or "learned"
     # Noise schedule
-    sigma_init: float = 0.5  # Noise scale for V_0 (starting distribution)
+    sigma_init: float = 0.05  # Noise scale for V_0 (SONAR norm ~0.2051, keep same order)
     # ODE solver
     solver: str = "euler"  # "euler" or "midpoint"
     # MLP baseline

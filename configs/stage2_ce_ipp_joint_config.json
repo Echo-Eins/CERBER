@@ -21,9 +21,9 @@
         "d_model": 1024,
         "d_context": 1024,
         "hidden_dims": [2048, 2048, 1024],
-        "n_integration_steps": 10,
+        "n_integration_steps": 50,
         "d_time": 256,
-        "sigma_init": 0.5,
+        "sigma_init": 0.05,
         "solver": "midpoint",
         "mlp_hidden_dims": [2048, 1024]
     },

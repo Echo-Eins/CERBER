@@ -7,7 +7,7 @@
         "ssm_d_conv": 4,
         "ssm_expand": 2,
         "ssm_n_layers": 2,
-        "ssm_dropout": 0.0,
+        "ssm_dropout": 0.1,
         "pred_hidden": 1024,
         "cos_loss_weight": 0.5,
         "threshold_mode": "percentile",

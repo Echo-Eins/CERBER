@@ -1,5 +1,46 @@
 # Lessons
 
+## 2026-04-02 - FlowIPP sigma_init must match SONAR embedding scale
+
+### Pattern
+FlowIPP with sigma_init=0.5 and 10 integration steps: train velocity cos=0.89 but eval sample cos=0.011 (100x gap). Velocity prediction was excellent but ODE integration from noise→target was completely broken.
+
+### Root Causes
+1. **sigma_init=0.5 vs target_norm=0.2051**: Starting noise V_0 ~ N(0, 0.25·I) has norm ≈ √1024·0.5 ≈ 16.0, while target lives on sphere of radius 0.2051. Signal-to-noise ratio = 80:1. 10 Euler steps cannot traverse this distance.
+2. **10 integration steps**: Far too few for the long noise→target path. Discretization error accumulates.
+3. **No target_norm projection at eval**: Results not projected to SONAR sphere after generation.
+4. **No direct sample-quality loss**: Training only supervises velocity at random interpolation points V_t, never the final sample V_1. Errors at boundary (t→0, t→1) accumulate during integration.
+
+### Fix
+- sigma_init: 0.5 → 0.05 (same order as SONAR norms)
+- n_integration_steps: 10 → 50
+- Always call sample(target_norm=0.2051)
+- Consider midpoint solver instead of Euler
+
+### Rule
+**For any flow matching model, sigma_init MUST be calibrated to the data scale.** If targets have norm ~0.2, starting noise should have norm ~0.05-0.1, not ~16.0. The train-eval gap in flow matching = ODE integration quality gap.
+
+## 2026-04-02 - SurprisePredictor overfits without dropout/early-stopping
+
+### Pattern
+SP standalone 30 epochs: train loss 0.30→0.15, val loss improving until epoch 4 (0.3075) then steadily increasing (→0.3522). No dropout, no early stopping. SSM with d_state=64 memorizes sequences.
+
+### Fix
+- Add dropout=0.1 to SSM and prediction head
+- Early stopping with patience=5 on val loss
+- SP is frozen forever (per spec) — val loss quality at freeze point = permanent quality
+
+### Rule
+SP should train for ~5-8 epochs max (early stopping by val loss). Overfitting is permanent since SP is never unfrozen.
+
+## 2026-04-02 - CE pretrain cos=0.60 is an MSE mode-averaging ceiling, not a bug
+
+### Pattern
+ContextEncoder pretrain with MSE head plateaus at cos=0.60 within 2-3 epochs. L2 keeps improving (1.93→0.84) but cosine doesn't. This is EXPECTED: MSE averages multiple valid continuations in WikiText, the geometric average of modes has cos≈0.60.
+
+### Rule
+CE pretrain cos=0.60 is the architectural ceiling for MSE-based pretrain. The real test is whether FlowIPP can EXCEED this ceiling by generating specific modes rather than averages. If FlowIPP (with fixed sigma/steps) gives cos>0.60, flow matching is working.
+
 ## 2026-03-31 - Standard MALA makes well-trapping WORSE, not better
 
 ### Pattern

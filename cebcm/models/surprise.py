@@ -85,6 +85,7 @@ class SurprisePredictor(nn.Module):
         self.pred_head = nn.Sequential(
             nn.Linear(cfg.d_model, cfg.pred_hidden),
             nn.GELU(),
+            nn.Dropout(cfg.ssm_dropout),
             nn.Linear(cfg.pred_hidden, cfg.d_model),
         )
 

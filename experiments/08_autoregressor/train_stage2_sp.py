@@ -212,6 +212,8 @@ def main() -> None:
     log_every = int(train_cfg.get("log_every", 50))
     eval_every = int(train_cfg.get("eval_every_epochs", 1))
     ckpt_every = int(train_cfg.get("checkpoint_every_epochs", 1))
+    early_stop_patience = int(train_cfg.get("early_stop_patience", 5))
+    no_improve_count = 0
 
     log_path = logs_dir / "sp_training_log.jsonl"
     log_file = open(log_path, "a", encoding="utf-8")
@@ -259,6 +261,7 @@ def main() -> None:
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                no_improve_count = 0
                 save_checkpoint(
                     checkpoint_dir / "best.pt",
                     {
@@ -272,6 +275,11 @@ def main() -> None:
                     },
                 )
                 print(f"  ** New best: val_loss={best_val_loss:.6f}")
+            else:
+                no_improve_count += 1
+                if no_improve_count >= early_stop_patience:
+                    print(f"  Early stopping: no improvement for {early_stop_patience} evals")
+                    break
 
         if ((epoch + 1) % ckpt_every == 0) or (epoch == num_epochs - 1):
             payload = {
