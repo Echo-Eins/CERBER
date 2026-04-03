@@ -115,12 +115,13 @@ def build_chain_datasets(
     cfg = ChainDataConfig(
         min_chain_len=chain_data_cfg.get("min_chain_len", 5),
         max_chain_len=chain_data_cfg.get("max_chain_len", 15),
-        num_negatives=chain_data_cfg.get("num_negatives", 7),
-        neg_ratio_shuffled=chain_data_cfg.get("neg_ratio_shuffled", 0.25),
-        neg_ratio_truncated=chain_data_cfg.get("neg_ratio_truncated", 0.25),
+        num_negatives=chain_data_cfg.get("num_negatives", 15),
+        neg_ratio_adj_swap=chain_data_cfg.get("neg_ratio_adj_swap", 0.25),
+        neg_ratio_truncated=chain_data_cfg.get("neg_ratio_truncated", 0.20),
         neg_ratio_corrupted=chain_data_cfg.get("neg_ratio_corrupted", 0.25),
-        neg_ratio_wrong_conclusion=chain_data_cfg.get("neg_ratio_wrong_conclusion", 0.25),
-        noise_std=chain_data_cfg.get("noise_std", 0.2),
+        neg_ratio_wrong_conclusion=chain_data_cfg.get("neg_ratio_wrong_conclusion", 0.30),
+        corruption_alpha_min=chain_data_cfg.get("corruption_alpha_min", 0.3),
+        corruption_alpha_max=chain_data_cfg.get("corruption_alpha_max", 0.7),
         target_norm=chain_data_cfg.get("target_norm", 0.2051),
     )
 
@@ -153,6 +154,7 @@ def train_epoch(
         pos_lengths = batch["pos_lengths"].to(device)
         negatives = batch["negatives"].to(device)
         neg_lengths = batch["neg_lengths"].to(device)
+        neg_types = batch.get("neg_types")  # [B][N] str labels
 
         optimizer.zero_grad()
 
@@ -161,6 +163,7 @@ def train_epoch(
                 positives, negatives,
                 pos_lengths=pos_lengths,
                 neg_lengths=neg_lengths,
+                neg_types=neg_types,
             )
 
         scaler.scale(loss).backward()
@@ -204,12 +207,14 @@ def eval_epoch(
         pos_lengths = batch["pos_lengths"].to(device)
         negatives = batch["negatives"].to(device)
         neg_lengths = batch["neg_lengths"].to(device)
+        neg_types = batch.get("neg_types")
 
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
             _, metrics = model.compute_infonce_loss(
                 positives, negatives,
                 pos_lengths=pos_lengths,
                 neg_lengths=neg_lengths,
+                neg_types=neg_types,
             )
 
         tracker.update(metrics)
@@ -347,11 +352,16 @@ def main():
                     print(f"  Early stopping: no improvement for {patience} evals")
                     break
 
-            # Check if target achieved
-            if rank_acc >= target_acc:
-                print(f"\n  TARGET ACHIEVED: rank_acc={rank_acc:.4f} >= {target_acc}")
+            # Check if target achieved (need BOTH rank_acc AND energy_gap)
+            e_gap = val_metrics.get("chain_energy_gap", 0.0)
+            min_energy_gap = phase_cfg.get("target_energy_gap", 1.0)
+            if rank_acc >= target_acc and e_gap >= min_energy_gap:
+                print(f"\n  TARGET ACHIEVED: rank_acc={rank_acc:.4f} >= {target_acc}, "
+                      f"energy_gap={e_gap:.4f} >= {min_energy_gap}")
                 print("  Phase A complete. Ready for Phase B.")
                 break
+            elif rank_acc >= target_acc:
+                print(f"  rank_acc={rank_acc:.4f} OK but energy_gap={e_gap:.4f} < {min_energy_gap} — keep training")
 
         # Periodic checkpoint
         if (epoch + 1) % phase_cfg.get("checkpoint_every_epochs", 5) == 0:

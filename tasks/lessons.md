@@ -1,5 +1,25 @@
 # Lessons
 
+## 2026-04-03 - Chain Head rank_acc 0.93 in 4 epochs = shortcuts, not reasoning
+
+### Pattern
+Chain Head achieved rank_acc=0.928 by epoch 4 with original negatives. All 4 negative types were trivially detectable by cosine-distance heuristics, not chain coherence reasoning:
+- Shuffled (full permutation): cos between neighbors drops from ~0.8 to ~0.4
+- Corrupted (random vector on sphere): cos~0.0 with everything — trivial outlier
+- Wrong conclusion (cross-document): cos to chain prefix ~0.3 instead of ~0.8
+- Truncated: chain is shorter, visible in attention mask
+
+### Fix
+Hard negatives that defeat cosine shortcuts:
+1. **Adjacent-swap** (not full shuffle): swap 1-2 neighboring pairs only
+2. **Interpolated corruption** (not random noise): blend α=0.3-0.7 toward pool vector, stays on-manifold
+3. **Same-document wrong conclusion**: replace last vector with another from SAME sequence (cos to prefix stays ~0.7-0.9)
+4. **Increased negatives**: 7→15 per positive
+5. **Dual gate**: rank_acc > 0.85 AND energy_gap > 1.0
+
+### Rule
+**Never use negatives that can be detected by simple feature statistics (mean cosine, norm outliers).** Always verify: "can a linear probe on [mean neighbor cos, min cos, norm variance] achieve similar accuracy?" If yes, negatives are trivial.
+
 ## 2026-04-03 - ALiBi not RoPE for attention over SONAR vectors
 
 ### Pattern

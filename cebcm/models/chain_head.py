@@ -375,6 +375,7 @@ class EBTChainHead(nn.Module):
         negative_chains: Tensor,       # [B, N, L, D]
         pos_lengths: Tensor | None = None,   # [B]
         neg_lengths: Tensor | None = None,   # [B, N]
+        neg_types: list[list[str]] | None = None,  # [B][N] per-neg type labels
     ) -> tuple[Tensor, dict[str, float]]:
         """
         Focal-InfoNCE loss over positive vs negative chains.
@@ -455,7 +456,9 @@ class EBTChainHead(nn.Module):
 
         # Metrics
         with torch.no_grad():
-            correct = (E_pos.unsqueeze(1) < E_neg).float().mean()
+            # Per-pair correctness: [B, N] bool
+            pair_correct = (E_pos.unsqueeze(1) < E_neg).float()
+            correct = pair_correct.mean()
             energy_gap = (E_neg.mean(dim=1) - E_pos).mean()
             metrics = {
                 "chain_loss": loss.item(),
@@ -467,6 +470,19 @@ class EBTChainHead(nn.Module):
                 "chain_E_neg_mean": E_neg.mean().item(),
                 "chain_energy_gap": energy_gap.item(),
             }
+
+            # Per-type accuracy (diagnostic: which negatives are too easy?)
+            if neg_types is not None:
+                type_correct: dict[str, list[float]] = {}
+                for b in range(B):
+                    for n_idx in range(N):
+                        if n_idx < len(neg_types[b]):
+                            ntype = neg_types[b][n_idx]
+                            if ntype not in type_correct:
+                                type_correct[ntype] = []
+                            type_correct[ntype].append(pair_correct[b, n_idx].item())
+                for ntype, vals in type_correct.items():
+                    metrics[f"chain_acc_{ntype}"] = sum(vals) / len(vals)
 
         return loss, metrics
 
