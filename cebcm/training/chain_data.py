@@ -19,6 +19,7 @@ import random
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -38,6 +39,53 @@ class ChainDataConfig:
     # Corruption parameters
     noise_std: float = 0.2       # Std for random vector replacement (~SONAR norm)
     target_norm: float = 0.2051  # SONAR embedding norm
+    # Curriculum: adjust ratios based on epoch progress (0.0=start, 1.0=end)
+    # Start: mostly shuffled (easy). End: mostly wrong_conclusion (hard).
+    curriculum_enabled: bool = True
+
+
+def apply_curriculum(cfg: ChainDataConfig, progress: float) -> ChainDataConfig:
+    """
+    Adjust negative ratios based on training progress.
+
+    Curriculum: easy → medium → hard (from spec §5.5)
+      - progress 0.0-0.2: 50% shuffled, 20% truncated, 20% corrupted, 10% wrong
+      - progress 0.2-0.5: 25% each (balanced)
+      - progress 0.5-1.0: 10% shuffled, 20% truncated, 25% corrupted, 45% wrong
+
+    Args:
+        cfg: Base config
+        progress: Training progress in [0.0, 1.0]
+
+    Returns:
+        New config with adjusted ratios
+    """
+    if not cfg.curriculum_enabled:
+        return cfg
+
+    import copy
+    new_cfg = copy.copy(cfg)
+
+    if progress < 0.2:
+        # Easy: mostly shuffled (obvious order violation)
+        new_cfg.neg_ratio_shuffled = 0.50
+        new_cfg.neg_ratio_truncated = 0.20
+        new_cfg.neg_ratio_corrupted = 0.20
+        new_cfg.neg_ratio_wrong_conclusion = 0.10
+    elif progress < 0.5:
+        # Medium: balanced
+        new_cfg.neg_ratio_shuffled = 0.25
+        new_cfg.neg_ratio_truncated = 0.25
+        new_cfg.neg_ratio_corrupted = 0.25
+        new_cfg.neg_ratio_wrong_conclusion = 0.25
+    else:
+        # Hard: mostly wrong conclusion (requires deep reasoning)
+        new_cfg.neg_ratio_shuffled = 0.10
+        new_cfg.neg_ratio_truncated = 0.20
+        new_cfg.neg_ratio_corrupted = 0.25
+        new_cfg.neg_ratio_wrong_conclusion = 0.45
+
+    return new_cfg
 
 
 def generate_negative_chains(
@@ -157,10 +205,6 @@ def generate_negative_chains(
     return padded, lengths_tensor, neg_types
 
 
-# Avoid circular import — F is used in generate_negative_chains
-import torch.nn.functional as F
-
-
 class ChainDataset(Dataset):
     """
     Dataset that generates positive/negative chain pairs from SONAR sequences.
@@ -214,6 +258,10 @@ class ChainDataset(Dataset):
             # Fallback: random vectors on SONAR sphere
             self.vector_pool = torch.randn(1000, vectors.shape[-1])
             self.vector_pool = F.normalize(self.vector_pool, dim=-1) * cfg.target_norm
+
+    def set_curriculum_progress(self, progress: float) -> None:
+        """Update negative ratios based on training progress [0.0, 1.0]."""
+        self.cfg = apply_curriculum(self.cfg, progress)
 
     def __len__(self) -> int:
         return len(self.chains)

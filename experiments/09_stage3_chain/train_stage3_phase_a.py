@@ -30,6 +30,7 @@ from cebcm.models.chain_head import ChainHeadConfig, EBTChainHead
 from cebcm.training.chain_data import (
     ChainDataConfig,
     ChainDataset,
+    apply_curriculum,
     chain_collate_fn,
 )
 from cebcm.training.stage2_utils import (
@@ -276,6 +277,10 @@ def main():
 
     for epoch in range(start_epoch, phase_cfg["num_epochs"]):
         t0 = time.time()
+
+        # Curriculum: adjust negative ratios based on training progress
+        progress = epoch / max(1, phase_cfg["num_epochs"] - 1)
+        train_ds.set_curriculum_progress(progress)
 
         train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, scaler,

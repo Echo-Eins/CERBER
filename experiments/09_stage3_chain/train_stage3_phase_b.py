@@ -165,16 +165,21 @@ def train_epoch_phase_b(
             # positive chain vectors lower than negative chain vectors
             # Use first + last vector of positive chain as query/target pair
             B = positives.shape[0]
-            # Query = first vector in chain, target = last vector
+            batch_idx = torch.arange(B, device=positives.device)
+            # Query = first vector in chain, target = last valid vector
             v_queries = positives[:, 0, :]  # [B, D]
-            v_targets = positives[torch.arange(B), (pos_lengths - 1).clamp(min=0), :]  # [B, D]
-            # Negative targets from negative chains
-            v_neg = negatives[:, 0, -1, :]  # [B, D] last vector of first negative
+            v_targets = positives[batch_idx, (pos_lengths - 1).clamp(min=0), :]  # [B, D]
+            # Negative targets: last VALID vector of first negative (not padding!)
+            neg_last_idx = (neg_lengths[:, 0] - 1).clamp(min=0)  # [B]
+            v_neg = negatives[batch_idx, 0, neg_last_idx, :]  # [B, D]
 
             E_pos_pair = pairwise(v_queries, v_targets)
             E_neg_pair = pairwise(v_queries, v_neg)
-            # Margin ranking loss for pairwise
-            pairwise_loss = F.relu(E_pos_pair - E_neg_pair + 1.0).mean()
+            # Margin ranking loss for pairwise (adaptive margin based on energy scale)
+            with torch.no_grad():
+                energy_scale = (E_pos_pair.abs().mean() + E_neg_pair.abs().mean()).clamp(min=0.1)
+                margin = energy_scale * 0.5  # 50% of typical energy magnitude
+            pairwise_loss = F.relu(E_pos_pair - E_neg_pair + margin).mean()
 
             # Mode-dependent weighting
             if mode == "system1":
@@ -251,9 +256,11 @@ def eval_epoch_phase_b(
 
             # Pairwise eval
             B = positives.shape[0]
+            batch_idx = torch.arange(B, device=positives.device)
             v_queries = positives[:, 0, :]
-            v_targets = positives[torch.arange(B), (pos_lengths - 1).clamp(min=0), :]
-            v_neg = negatives[:, 0, -1, :]
+            v_targets = positives[batch_idx, (pos_lengths - 1).clamp(min=0), :]
+            neg_last_idx = (neg_lengths[:, 0] - 1).clamp(min=0)
+            v_neg = negatives[batch_idx, 0, neg_last_idx, :]
 
             E_pos_pair = pairwise(v_queries, v_targets)
             E_neg_pair = pairwise(v_queries, v_neg)
@@ -305,8 +312,6 @@ def main():
     print(f"  Total trainable params: {total_params:,}")
 
     # Build data
-    from experiments.train_stage3_phase_a import build_chain_datasets
-    # Import is relative — use direct construction instead
     data_path = config["data"]["train_data_path"]
     print(f"  Loading data from {data_path}")
     raw = torch.load(data_path, map_location="cpu", weights_only=True)

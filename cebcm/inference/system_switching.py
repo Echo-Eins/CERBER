@@ -169,6 +169,7 @@ def run_system2(
     cos_trajectory: list[float] = []
     backtrack_count = 0
     steps_since_improve = 0
+    just_backtracked = False  # Prevent duplicate chain entry after backtrack
 
     for step in range(max_steps):
         # Langevin step using pairwise energy
@@ -194,8 +195,10 @@ def run_system2(
 
         # Chain validation every N steps
         if (step + 1) % cfg.chain_eval_every == 0:
-            # Add current point to chain
-            chain_buffer.append(v_current.detach().clone())
+            # Add current point to chain (skip if just backtracked — already added)
+            if not just_backtracked:
+                chain_buffer.append(v_current.detach().clone())
+            just_backtracked = False
 
             # Keep chain within max length (sliding window)
             if len(chain_buffer) > cfg.max_chain_len:
@@ -220,7 +223,8 @@ def run_system2(
                     v_current = v_best.clone()
                     backtrack_count += 1
                     steps_since_improve = 0
-                    # Trim chain to remove degraded portion
+                    just_backtracked = True
+                    # Trim chain to remove degraded portion, append revert point
                     chain_buffer = chain_buffer[:max(3, len(chain_buffer) // 2)]
                     chain_buffer.append(v_best.detach().clone())
 

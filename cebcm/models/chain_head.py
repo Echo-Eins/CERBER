@@ -55,6 +55,10 @@ class ChainHeadConfig:
     # Training
     temperature: float = 0.07  # InfoNCE temperature
     focal_gamma: float = 2.0   # Focal-InfoNCE exponent (0 = standard)
+    # Regularization (spec §5.4: smooth landscape for Langevin)
+    lambda_grad: float = 0.05  # Gradient penalty weight
+    lambda_energy_norm: float = 0.01  # Energy magnitude regularization
+    energy_norm_margin: float = 5.0   # Max allowed |E| before penalty
 
 
 # ─── ALiBi for Chain Head Self-Attention ──────────────────────────────
@@ -421,7 +425,32 @@ class EBTChainHead(nn.Module):
             logits = torch.cat([pos_logits, neg_logits], dim=1)  # [B, 1+N]
 
         labels = torch.zeros(B, dtype=torch.long, device=logits.device)
-        loss = F.cross_entropy(logits, labels)
+        nce_loss = F.cross_entropy(logits, labels)
+
+        # Gradient penalty: ||∇_chain E||² (smooth landscape for Langevin)
+        # Compute on positive chains (they represent valid data region)
+        grad_penalty = torch.tensor(0.0, device=positive_chains.device)
+        if self.cfg.lambda_grad > 0:
+            pos_for_grad = positive_chains.detach().requires_grad_(True)
+            E_for_grad = self.forward(pos_for_grad, chain_lengths=pos_lengths)
+            grads = torch.autograd.grad(
+                E_for_grad.sum(), pos_for_grad, create_graph=True,
+            )[0]
+            grad_penalty = grads.pow(2).sum(dim=-1).mean()
+
+        # Energy norm regularization: penalize |E| > margin
+        energy_norm_reg = torch.tensor(0.0, device=positive_chains.device)
+        if self.cfg.lambda_energy_norm > 0:
+            all_E = torch.cat([E_pos, E_neg.reshape(-1)])
+            energy_norm_reg = F.relu(
+                all_E.abs() - self.cfg.energy_norm_margin
+            ).pow(2).mean()
+
+        loss = (
+            nce_loss
+            + self.cfg.lambda_grad * grad_penalty
+            + self.cfg.lambda_energy_norm * energy_norm_reg
+        )
 
         # Metrics
         with torch.no_grad():
@@ -429,6 +458,9 @@ class EBTChainHead(nn.Module):
             energy_gap = (E_neg.mean(dim=1) - E_pos).mean()
             metrics = {
                 "chain_loss": loss.item(),
+                "chain_nce_loss": nce_loss.item(),
+                "chain_grad_penalty": grad_penalty.item(),
+                "chain_energy_norm_reg": energy_norm_reg.item(),
                 "chain_rank_acc": correct.item(),
                 "chain_E_pos_mean": E_pos.mean().item(),
                 "chain_E_neg_mean": E_neg.mean().item(),
