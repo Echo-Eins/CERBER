@@ -1,0 +1,126 @@
+{
+    "description": "Stage 3: Chain of Thought + System 2 (Deep Thinking)",
+
+    "chain_head": {
+        "d_model": 1024,
+        "n_heads": 8,
+        "n_layers": 2,
+        "dim_feedforward": 2048,
+        "max_chain_len": 20,
+        "dropout": 0.1,
+        "activation": "gelu",
+        "energy_hidden": 512,
+        "temperature": 0.07,
+        "focal_gamma": 2.0
+    },
+
+    "chain_data": {
+        "min_chain_len": 5,
+        "max_chain_len": 15,
+        "num_negatives": 7,
+        "neg_ratio_shuffled": 0.25,
+        "neg_ratio_truncated": 0.25,
+        "neg_ratio_corrupted": 0.25,
+        "neg_ratio_wrong_conclusion": 0.25,
+        "noise_std": 0.2,
+        "target_norm": 0.2051
+    },
+
+    "pairwise": {
+        "checkpoint": "experiments/03_Stage_1.5/checkpoints/best_critic.pt",
+        "dim": 1024,
+        "hidden_dims": [2048, 1024, 512],
+        "norm_mode": "orthonorm",
+        "activation": "groupsort"
+    },
+
+    "langevin": {
+        "lr": 0.01,
+        "noise_scale": 0.005,
+        "max_steps": 100,
+        "target_norm": 0.2051,
+        "method": "pid",
+        "pid_kp": 1.0,
+        "pid_ki": 0.3,
+        "pid_kd": 0.1,
+        "pid_integral_decay": 0.95,
+        "sigma_anneal": true,
+        "sigma_anneal_mode": "hybrid",
+        "sigma_anneal_max": 0.3,
+        "sigma_anneal_min": 0.01,
+        "noise_anneal": true,
+        "noise_anneal_max": 0.15,
+        "noise_anneal_min": 0.0002,
+        "cosine_early_stop": true,
+        "cosine_patience": 30,
+        "cosine_delta": 0.001
+    },
+
+    "phase_a": {
+        "_comment": "Phase A: Chain Head only (Pairwise frozen)",
+        "lr": 1e-4,
+        "weight_decay": 0.01,
+        "clip_grad_norm": 1.0,
+        "batch_size": 32,
+        "num_epochs": 30,
+        "warmup_epochs": 3,
+        "lr_min_factor": 0.01,
+        "eval_every_epochs": 1,
+        "checkpoint_every_epochs": 5,
+        "log_every": 50,
+        "early_stop_patience": 7,
+        "target_rank_acc": 0.85,
+        "_chain_ranking_target": "> 0.85 accuracy means Phase A success"
+    },
+
+    "phase_b": {
+        "_comment": "Phase B: Joint fine-tune + System 1/2 switching",
+        "chain_head_lr": 5e-5,
+        "pairwise_lr": 1e-5,
+        "weight_decay": 0.01,
+        "clip_grad_norm": 1.0,
+        "batch_size": 16,
+        "num_epochs": 20,
+        "warmup_epochs": 2,
+        "lr_min_factor": 0.01,
+        "eval_every_epochs": 1,
+        "checkpoint_every_epochs": 5,
+        "log_every": 50,
+        "early_stop_patience": 5,
+
+        "system1_weight": 0.3,
+        "system2_weight": 0.7,
+
+        "system1_steps": [10, 20, 50],
+        "system1_cruise_ratios": [0.5, 0.7],
+
+        "system2_steps": [100, 200],
+        "system2_cruise_ratios": [0.0, 0.1, 0.3],
+
+        "chain_eval_every_steps": 5,
+
+        "_cruise_ratio_training": "Expose model to ALL cruise_ratio values during training (lesson)"
+    },
+
+    "data": {
+        "train_data_path": "data/squad_sequences.pt",
+        "val_data_path": "",
+        "train_val_split": 0.9,
+        "max_seq_len": 64,
+        "min_seq_len": 3,
+        "num_workers": 4
+    },
+
+    "amp": {
+        "enabled": true,
+        "dtype": "bf16"
+    },
+
+    "output": {
+        "output_dir": "experiments/09_stage3_chain",
+        "checkpoint_dir": "experiments/09_stage3_chain/checkpoints",
+        "logs_dir": "experiments/09_stage3_chain/logs"
+    },
+
+    "seed": 42
+}

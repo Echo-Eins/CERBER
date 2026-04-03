@@ -1,5 +1,16 @@
 # Lessons
 
+## 2026-04-03 - ALiBi not RoPE for attention over SONAR vectors
+
+### Pattern
+Chain Head initially implemented with RoPE (Rotary Position Embeddings). RoPE rotates Q and K vectors, which breaks SONAR semantic geometry — cosine distances between SONAR embeddings are no longer preserved after rotation.
+
+### Fix
+Use ALiBi (Attention with Linear Biases) instead. ALiBi adds additive bias -m|i-j| to attention scores without modifying Q, K, or V vectors. SONAR distances are fully preserved. ALiBi slopes provide sufficient order sensitivity for short chains (5-20 elements).
+
+### Rule
+**Never use RoPE on SONAR embeddings.** Any positional encoding that modifies the embedding vectors (RoPE, learned position embeddings added to input) corrupts SONAR geometry. Use ALiBi or other score-level biases that leave vectors untouched.
+
 ## 2026-04-02 - FlowIPP sigma_init must match SONAR embedding scale
 
 ### Pattern
