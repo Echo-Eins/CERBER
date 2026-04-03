@@ -222,8 +222,7 @@ class ChainDataset(Dataset):
 
     def __init__(
         self,
-        vectors: Tensor,        # [num_sequences, max_seq_len, D] or list of [L, D]
-        lengths: Tensor,         # [num_sequences] actual lengths
+        sequences: list[Tensor],   # list of [L_i, D] variable-length SONAR sequences
         cfg: ChainDataConfig,
     ):
         super().__init__()
@@ -233,11 +232,12 @@ class ChainDataset(Dataset):
         self.all_vectors: list[Tensor] = []
         self.chains: list[Tensor] = []
 
-        for i in range(len(lengths)):
-            seq_len = int(lengths[i].item())
+        for seq in sequences:
+            if not isinstance(seq, Tensor) or seq.dim() != 2:
+                continue
+            seq_len = seq.shape[0]
             if seq_len < cfg.min_chain_len:
                 continue
-            seq = vectors[i, :seq_len]  # [seq_len, D]
 
             # Extract all valid chains from this sequence
             max_cl = min(cfg.max_chain_len, seq_len)
@@ -256,7 +256,8 @@ class ChainDataset(Dataset):
             self.vector_pool = torch.cat(self.all_vectors, dim=0)
         else:
             # Fallback: random vectors on SONAR sphere
-            self.vector_pool = torch.randn(1000, vectors.shape[-1])
+            d = sequences[0].shape[-1] if sequences else 1024
+            self.vector_pool = torch.randn(1000, d)
             self.vector_pool = F.normalize(self.vector_pool, dim=-1) * cfg.target_norm
 
     def set_curriculum_progress(self, progress: float) -> None:

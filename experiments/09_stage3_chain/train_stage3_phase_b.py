@@ -311,21 +311,31 @@ def main():
     total_params = sum(p.numel() for p in pairwise.parameters()) + chain_head.num_params
     print(f"  Total trainable params: {total_params:,}")
 
-    # Build data
+    # Build data — load sequences (supports both formats)
     data_path = config["data"]["train_data_path"]
     print(f"  Loading data from {data_path}")
-    raw = torch.load(data_path, map_location="cpu", weights_only=True)
+    raw = torch.load(data_path, map_location="cpu", weights_only=False)
+
     if isinstance(raw, dict):
-        vectors = raw["vectors"]
-        lengths = raw["lengths"]
+        if "sequences" in raw:
+            sequences = raw["sequences"]
+        elif "vectors" in raw:
+            vectors = raw["vectors"]
+            lengths = raw["lengths"]
+            sequences = [vectors[i, :int(lengths[i].item())] for i in range(len(lengths))]
+        else:
+            raise KeyError(f"Unknown data format. Keys: {list(raw.keys())}")
+    elif isinstance(raw, list):
+        sequences = raw
     else:
-        vectors = raw
-        lengths = torch.tensor([v.shape[0] for v in vectors])
+        raise TypeError(f"Unknown data type: {type(raw)}")
+
+    n = len(sequences)
+    print(f"  Loaded {n} sequences")
 
     split = config["data"].get("train_val_split", 0.9)
-    n = len(lengths)
     gen = torch.Generator().manual_seed(config.get("seed", 42))
-    perm = torch.randperm(n, generator=gen)
+    perm = torch.randperm(n, generator=gen).tolist()
     n_train = int(n * split)
 
     chain_data_cfg = ChainDataConfig(
@@ -335,8 +345,8 @@ def main():
         target_norm=config["chain_data"].get("target_norm", 0.2051),
     )
 
-    train_ds = ChainDataset(vectors[perm[:n_train]], lengths[perm[:n_train]], chain_data_cfg)
-    val_ds = ChainDataset(vectors[perm[n_train:]], lengths[perm[n_train:]], chain_data_cfg)
+    train_ds = ChainDataset([sequences[i] for i in perm[:n_train]], chain_data_cfg)
+    val_ds = ChainDataset([sequences[i] for i in perm[n_train:]], chain_data_cfg)
     print(f"  Train chains: {len(train_ds)}, Val chains: {len(val_ds)}")
 
     phase_cfg = config["phase_b"]

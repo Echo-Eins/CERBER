@@ -63,32 +63,54 @@ def build_chain_head(cfg: dict, device: torch.device) -> EBTChainHead:
     return model
 
 
+def _load_sequences(data_cfg: dict) -> list[torch.Tensor]:
+    """
+    Load SONAR sequences from .pt file.
+
+    Supports two formats:
+      1. {"sequences": list[Tensor[L_i, D]], ...}  — SONARSequenceDataset format
+      2. {"vectors": Tensor[N, L, D], "lengths": Tensor[N]}  — padded format
+    """
+    data_path = data_cfg["train_data_path"]
+    print(f"  Loading data from {data_path}")
+    raw = torch.load(data_path, map_location="cpu", weights_only=False)
+
+    if isinstance(raw, dict):
+        if "sequences" in raw:
+            # SONARSequenceDataset format: list of variable-length tensors
+            return raw["sequences"]
+        elif "vectors" in raw:
+            # Padded format: [N, L, D] + lengths
+            vectors = raw["vectors"]
+            lengths = raw["lengths"]
+            return [vectors[i, :int(lengths[i].item())] for i in range(len(lengths))]
+        else:
+            raise KeyError(f"Unknown data format. Keys: {list(raw.keys())}. "
+                           f"Expected 'sequences' or 'vectors'.")
+    elif isinstance(raw, list):
+        return raw
+    else:
+        raise TypeError(f"Unknown data type: {type(raw)}")
+
+
 def build_chain_datasets(
     data_cfg: dict,
     chain_data_cfg: dict,
     seed: int,
 ) -> tuple[ChainDataset, ChainDataset]:
     """Load SONAR sequences and create chain train/val datasets."""
-    data_path = data_cfg["train_data_path"]
-    print(f"  Loading data from {data_path}")
-    raw = torch.load(data_path, map_location="cpu", weights_only=True)
-
-    if isinstance(raw, dict):
-        vectors = raw["vectors"]
-        lengths = raw["lengths"]
-    else:
-        vectors = raw
-        lengths = torch.tensor([v.shape[0] for v in vectors])
+    sequences = _load_sequences(data_cfg)
+    n = len(sequences)
+    print(f"  Loaded {n} sequences")
 
     # Train/val split
     split = data_cfg.get("train_val_split", 0.9)
-    n = len(lengths)
     gen = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(n, generator=gen)
+    perm = torch.randperm(n, generator=gen).tolist()
     n_train = int(n * split)
 
-    train_idx = perm[:n_train]
-    val_idx = perm[n_train:]
+    train_seqs = [sequences[i] for i in perm[:n_train]]
+    val_seqs = [sequences[i] for i in perm[n_train:]]
 
     cfg = ChainDataConfig(
         min_chain_len=chain_data_cfg.get("min_chain_len", 5),
@@ -102,8 +124,8 @@ def build_chain_datasets(
         target_norm=chain_data_cfg.get("target_norm", 0.2051),
     )
 
-    train_ds = ChainDataset(vectors[train_idx], lengths[train_idx], cfg)
-    val_ds = ChainDataset(vectors[val_idx], lengths[val_idx], cfg)
+    train_ds = ChainDataset(train_seqs, cfg)
+    val_ds = ChainDataset(val_seqs, cfg)
 
     print(f"  Train chains: {len(train_ds)}, Val chains: {len(val_ds)}")
     return train_ds, val_ds
