@@ -15,7 +15,7 @@
         "lambda_grad": 0.05,
         "lambda_energy_norm": 0.05,
         "energy_norm_margin": 1.0,
-        "_energy_norm_comment": "margin=5.0 caused energy explosion (0.04→4.8 in 8 epochs), adj_swap anti-learning. Tight margin=1.0 + stronger lambda=0.05 keeps energy bounded."
+        "_energy_norm_comment": "margin=5.0 caused energy explosion (0.04->4.8 in 8 epochs), adj_swap anti-learning. Tight margin=1.0 + stronger lambda=0.05 keeps energy bounded."
     },
 
     "chain_data": {
