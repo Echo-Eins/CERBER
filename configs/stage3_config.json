@@ -1,6 +1,5 @@
 {
     "description": "Stage 3: Chain of Thought + System 2 (Deep Thinking)",
-
     "chain_head": {
         "d_model": 1024,
         "n_heads": 8,
@@ -17,32 +16,37 @@
         "energy_norm_margin": 1.0,
         "_energy_norm_comment": "margin=5.0 caused energy explosion (0.04->4.8 in 8 epochs), adj_swap anti-learning. Tight margin=1.0 + stronger lambda=0.05 keeps energy bounded."
     },
-
     "chain_data": {
         "min_chain_len": 5,
         "max_chain_len": 15,
         "num_negatives": 15,
         "neg_ratio_adj_swap": 0.25,
-        "neg_ratio_truncated": 0.20,
+        "neg_ratio_truncated": 0.2,
         "neg_ratio_corrupted": 0.25,
-        "neg_ratio_wrong_conclusion": 0.30,
+        "neg_ratio_wrong_conclusion": 0.3,
         "corruption_alpha_min": 0.3,
         "corruption_alpha_max": 0.7,
         "target_norm": 0.2051
     },
-
     "pairwise": {
         "_comment": "Stage 1.5 uses radial_angular architecture (AngularEnergyCritic + RadialEnergyCritic), NOT SimpleEnergy. Checkpoint keys: critic1_state (angular), critic2_state (radial). norm_mode=none, activation=silu. See tasks/lessons.md.",
         "checkpoint": "experiments/03_Stage_1.5/checkpoints/best.pt",
         "architecture": "radial_angular",
         "dim": 1024,
-        "angular_hidden_dims": [2048, 1024, 512],
-        "radial_hidden_dims": [512, 256, 128],
+        "angular_hidden_dims": [
+            2048,
+            1024,
+            512
+        ],
+        "radial_hidden_dims": [
+            512,
+            256,
+            128
+        ],
         "norm_mode": "none",
         "activation": "silu",
         "energy_output_clamp": 50.0
     },
-
     "langevin": {
         "lr": 0.01,
         "noise_scale": 0.005,
@@ -64,10 +68,9 @@
         "cosine_patience": 30,
         "cosine_delta": 0.001
     },
-
     "phase_a": {
         "_comment": "Phase A: Chain Head only (Pairwise frozen)",
-        "lr": 1e-4,
+        "lr": 0.0001,
         "weight_decay": 0.01,
         "clip_grad_norm": 1.0,
         "batch_size": 32,
@@ -82,11 +85,10 @@
         "target_energy_gap": 1.0,
         "_chain_ranking_target": "> 0.85 rank_acc AND > 1.0 energy_gap means Phase A success"
     },
-
     "phase_b": {
         "_comment": "Phase B: Joint fine-tune + System 1/2 switching",
-        "chain_head_lr": 5e-5,
-        "pairwise_lr": 1e-5,
+        "chain_head_lr": 5e-05,
+        "pairwise_lr": 1e-05,
         "weight_decay": 0.01,
         "clip_grad_norm": 1.0,
         "batch_size": 16,
@@ -97,21 +99,29 @@
         "checkpoint_every_epochs": 5,
         "log_every": 50,
         "early_stop_patience": 5,
-
         "system1_weight": 0.3,
         "system2_weight": 0.7,
-
-        "system1_steps": [10, 20, 50],
-        "system1_cruise_ratios": [0.5, 0.7],
-
-        "system2_steps": [100, 200],
-        "system2_cruise_ratios": [0.0, 0.1, 0.3],
-
+        "system1_steps": [
+            10,
+            20,
+            50
+        ],
+        "system1_cruise_ratios": [
+            0.5,
+            0.7
+        ],
+        "system2_steps": [
+            100,
+            200
+        ],
+        "system2_cruise_ratios": [
+            0.0,
+            0.1,
+            0.3
+        ],
         "chain_eval_every_steps": 5,
-
         "_cruise_ratio_training": "Expose model to ALL cruise_ratio values during training (lesson)"
     },
-
     "data": {
         "train_data_path": "data/squad_sequences.pt",
         "val_data_path": "",
@@ -120,17 +130,14 @@
         "min_seq_len": 3,
         "num_workers": 4
     },
-
     "amp": {
         "enabled": true,
         "dtype": "bf16"
     },
-
     "output": {
         "output_dir": "experiments/09_stage3_chain",
         "checkpoint_dir": "experiments/09_stage3_chain/checkpoints",
         "logs_dir": "experiments/09_stage3_chain/logs"
     },
-
     "seed": 42
 }
