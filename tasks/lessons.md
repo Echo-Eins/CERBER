@@ -1365,3 +1365,27 @@ If the user asks for modular/standalone pipelines and explicitly says not to spl
 1. Treat "do not split existing trainer" as a hard compatibility requirement.
 2. Implement new standalone entrypoints (`train_*`) instead of refactoring the existing monolithic script.
 3. Preserve checkpoint key compatibility (`surprise_predictor`, `context_encoder`, `ipp`) across old and new scripts.
+
+## 2026-04-04 - CRITICAL: Chain Head used ALiBi instead of RoPE — spec mismatch causing adj_swap failure
+
+### Pattern
+Chain Head implementation used ALiBi (content-agnostic distance bias) instead of RoPE (position-content binding) as specified in Appendix C line 2232. This caused:
+- adj_swap accuracy: 0.6165 (barely above random 0.5) — model CANNOT detect adjacent swaps
+- energy_gap: 0.024 (target 1.0) — model cannot separate positive from negative chains
+- Val rank_acc peaked at epoch 1 then degraded — overfitting without learning position
+
+### Root Cause
+ALiBi adds `-m|i-j|` bias — content-agnostic, only biases attention by distance. When adjacent elements swap, the distance matrix barely changes → ALiBi cannot detect swaps. RoPE rotates Q/K vectors by position → same content at different positions produces different dot products → position-content binding enables swap detection.
+
+### Spec Decision (Appendix C)
+- **Chain Head (5-20 elements):** RoPE — order is CRITICAL, short chains minimize geometry distortion
+- **Context Aggregation (50K+ vectors):** ALiBi — preserves SONAR geometry, distance bias sufficient
+
+### Fix
+Replaced ALiBiSelfAttention with RoPESelfAttention + PyTorch SDPA (Flash Attention).
+
+### Rule
+1. ALWAYS check the spec's Appendix C (Architecture Decisions) before implementing attention mechanisms
+2. For order-critical tasks: use position-content binding (RoPE, learnable embeddings) — NOT content-agnostic bias (ALiBi)
+3. ALiBi is ONLY for Context Aggregation where preserving SONAR vector geometry matters more than ordering
+4. Use PyTorch SDPA (`F.scaled_dot_product_attention`) for automatic Flash Attention — never manual matmul+softmax

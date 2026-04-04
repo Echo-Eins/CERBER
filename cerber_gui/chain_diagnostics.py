@@ -41,14 +41,18 @@ def extract_attention_weights(
     def make_hook(storage):
         def hook_fn(module, input, output):
             # Re-run the attention computation to capture weights
+            # Works with RoPE: apply rotary to Q/K before computing scores
+            from cebcm.models.chain_head import _apply_rope
             x = input[0]  # [B, L, D]
             B, L, _ = x.shape
             q = module.q_proj(x).view(B, L, module.n_heads, module.head_dim).transpose(1, 2)
             k = module.k_proj(x).view(B, L, module.n_heads, module.head_dim).transpose(1, 2)
+            # Apply RoPE rotation to Q and K
+            rope = module._get_rope(L, x.device)
+            q = _apply_rope(q, rope)
+            k = _apply_rope(k, rope)
             scale = module.head_dim ** -0.5
             attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            alibi = module._get_alibi_bias(L, x.device)
-            attn = attn + alibi.unsqueeze(0)
             attn = F.softmax(attn, dim=-1)
             storage.append(attn[0].detach().cpu())  # [H, L, L]
         return hook_fn

@@ -6,17 +6,29 @@ self-attention to detect global inconsistencies (e.g., step 5
 contradicts step 2).
 
 Architecture:
-  [CLS] + [V₁, V₂, ..., Vₙ] + ALiBi positional bias
+  [CLS] + [V₁, V₂, ..., Vₙ] + RoPE positional encoding
     → TransformerEncoder (2 layers, 8 heads, 2048 FFN, Pre-Norm)
     → CLS pooling
     → Energy head: Linear(1024, 512) + GELU + Linear(512, 1) → scalar E
 
-Why ALiBi (not RoPE):
-  RoPE rotates Q/K vectors, breaking SONAR semantic geometry.
-  ALiBi only adds additive bias -m|i-j| to attention scores —
-  Q, K, V vectors stay untouched, preserving SONAR distances.
-  For short chains (5-20 elements), ALiBi slopes provide sufficient
-  order signal without modifying the embedding space.
+Why RoPE (not ALiBi) for Chain Head (spec Appendix C, line 2232):
+  Chain Head evaluates ORDER of reasoning steps (5-20 elements).
+  Order detection requires position-content binding: the model must
+  distinguish "concept A at position 3" from "concept A at position 4".
+
+  - RoPE rotates Q/K vectors by position → same content at different
+    positions produces different attention patterns → enables swap detection
+  - ALiBi adds content-agnostic bias -m|i-j| → biases attention distance
+    but does NOT bind position to content → cannot detect adjacent swaps
+
+  ALiBi is reserved for Context Aggregation (§9.9) where preserving
+  SONAR geometry across 50K+ vectors matters more than order.
+
+  For short chains (5-20), RoPE distortion of SONAR geometry is minimal,
+  and the position-content binding is critical for the ordering task.
+
+Uses PyTorch SDPA (scaled_dot_product_attention) for automatic Flash
+Attention support on compatible hardware (spec Appendix C, line 2231).
 
 Energy semantics: lower E = more coherent chain.
 
@@ -26,7 +38,7 @@ Negatives: shuffled order, truncated, corrupted, wrong conclusion.
 At inference: called every 5-10 Langevin steps during Deep Thinking
 (System 2) mode to validate the reasoning chain being constructed.
 
-Spec reference: §5.2 Mode B, §8.2 (Deep Thinking), §9.9 (ALiBi)
+Spec reference: §5.2 Mode B, §8.2 (Deep Thinking), Appendix C
 """
 
 from __future__ import annotations
@@ -61,62 +73,62 @@ class ChainHeadConfig:
     energy_norm_margin: float = 5.0   # Max allowed |E| before penalty
 
 
-# ─── ALiBi for Chain Head Self-Attention ──────────────────────────────
-# ALiBi adds -m|i-j| bias to attention scores (Press et al., ICLR 2022).
-# Does NOT modify Q/K/V — preserves SONAR geometry fully.
-# Slopes m follow a geometric sequence per head.
+# ─── RoPE for Chain Head Self-Attention ──────────────────────────────
+# RoPE (Rotary Position Embedding, Su et al. 2021) rotates Q/K by
+# position-dependent angles, creating position-content binding.
+# Critical for chain ordering: same content at pos 3 vs pos 4 produces
+# different Q·K products → model can detect adjacent swaps.
+#
+# For short chains (5-20), RoPE distortion of SONAR geometry is minimal.
+# ALiBi is reserved for Context Aggregation (long sequences, 50K+).
 
 
-def _get_alibi_slopes(n_heads: int) -> Tensor:
+def _build_rope_cache(seq_len: int, head_dim: int, device: torch.device) -> Tensor:
     """
-    Compute ALiBi slopes as geometric sequence.
+    Build RoPE frequency cache.
 
-    For n_heads=8: slopes = [1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128, 1/256]
-    Closest heads focus on local order, farthest on global structure.
+    Returns: [seq_len, head_dim] complex rotation factors
     """
-    def _power_of_2_slopes(n: int) -> list[float]:
-        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-        ratio = start
-        return [start * ratio ** i for i in range(n)]
-
-    if math.log2(n_heads).is_integer():
-        slopes = _power_of_2_slopes(n_heads)
-    else:
-        closest_pow2 = 2 ** math.floor(math.log2(n_heads))
-        slopes = _power_of_2_slopes(closest_pow2)
-        extra = _power_of_2_slopes(2 * closest_pow2)
-        slopes = slopes + extra[0::2][: n_heads - closest_pow2]
-    return torch.tensor(slopes, dtype=torch.float32)
+    theta = 10000.0
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    positions = torch.arange(seq_len, device=device).float()
+    angles = torch.outer(positions, freqs)  # [L, head_dim//2]
+    return torch.polar(torch.ones_like(angles), angles)  # [L, head_dim//2] complex
 
 
-def _build_alibi_bias(seq_len: int, n_heads: int, device: torch.device) -> Tensor:
+def _apply_rope(x: Tensor, rope_cache: Tensor) -> Tensor:
     """
-    Build ALiBi attention bias matrix.
+    Apply RoPE to input tensor.
 
-    Returns: [n_heads, seq_len, seq_len] additive bias
+    Args:
+        x: [B, H, L, D_head] real tensor
+        rope_cache: [L, D_head//2] complex rotation factors
+    Returns:
+        [B, H, L, D_head] rotated tensor
     """
-    slopes = _get_alibi_slopes(n_heads).to(device)
-    positions = torch.arange(seq_len, device=device)
-    # |i - j| distance matrix
-    dist = (positions.unsqueeze(1) - positions.unsqueeze(0)).abs().float()  # [L, L]
-    # Per-head bias: -slope * |i-j|
-    bias = -slopes[:, None, None] * dist.unsqueeze(0)  # [H, L, L]
-    return bias
+    # View as complex pairs: [B, H, L, D_head//2] complex
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    # Rotate: broadcast rope_cache [L, D_head//2] over B, H
+    rope = rope_cache[:x.shape[2]]  # trim to actual seq_len
+    rotated = x_complex * rope.unsqueeze(0).unsqueeze(0)  # [B, H, L, D_head//2]
+    # Back to real: [B, H, L, D_head]
+    return torch.view_as_real(rotated).flatten(-2).to(x.dtype)
 
 
-class ALiBiSelfAttention(nn.Module):
+class RoPESelfAttention(nn.Module):
     """
-    Multi-head self-attention with ALiBi positional bias.
+    Multi-head self-attention with Rotary Position Embedding (RoPE).
 
-    ALiBi adds additive bias -m|i-j| to attention scores without
-    modifying Q/K/V vectors. This preserves SONAR embedding geometry
-    while encoding positional information for chain ordering.
+    RoPE rotates Q/K vectors by position-dependent angles, creating
+    position-content binding that is critical for chain ordering tasks.
+
+    Uses PyTorch SDPA for automatic Flash Attention on compatible hardware.
 
     Properties:
-      - Q, K, V vectors unchanged → SONAR cosine distances preserved
-      - Larger slopes (head 0) = strong local bias (order-sensitive)
-      - Smaller slopes (head 7) = weak global bias (content-sensitive)
-      - No learnable position parameters — zero extra params
+      - Q/K rotated by position → enables adjacent swap detection
+      - V vectors unchanged → output preserves content information
+      - No learnable position parameters — deterministic rotations
+      - Compatible with Flash Attention via torch SDPA
     """
 
     def __init__(
@@ -131,30 +143,27 @@ class ALiBiSelfAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         assert d_model % n_heads == 0
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.attn_dropout = nn.Dropout(dropout)
+        self.dropout_p = dropout
 
-        # Pre-compute ALiBi slopes (constant, no grad)
-        slopes = _get_alibi_slopes(n_heads)
-        self.register_buffer("alibi_slopes", slopes, persistent=False)
-        # Pre-compute bias for max length
-        bias = _build_alibi_bias(max_seq_len, n_heads, torch.device("cpu"))
-        self.register_buffer("_alibi_bias_cache", bias, persistent=False)
+        # Pre-compute RoPE cache
+        rope_cache = _build_rope_cache(max_seq_len, self.head_dim, torch.device("cpu"))
+        self.register_buffer("_rope_cache", rope_cache, persistent=False)
         self._cached_seq_len = max_seq_len
 
-    def _get_alibi_bias(self, seq_len: int, device: torch.device) -> Tensor:
-        """Get ALiBi bias for given sequence length, rebuilding cache if needed."""
+    def _get_rope(self, seq_len: int, device: torch.device) -> Tensor:
+        """Get RoPE cache, rebuilding if sequence exceeds cached length."""
         if seq_len <= self._cached_seq_len:
-            return self._alibi_bias_cache[:, :seq_len, :seq_len].to(device)
-        # Rebuild for longer sequence
-        bias = _build_alibi_bias(seq_len, self.n_heads, device)
-        self._alibi_bias_cache = bias
+            return self._rope_cache[:seq_len].to(device)
+        rope = _build_rope_cache(seq_len, self.head_dim, device)
+        self._rope_cache = rope
         self._cached_seq_len = seq_len
-        return bias
+        return rope
 
     def forward(
         self,
@@ -168,30 +177,35 @@ class ALiBiSelfAttention(nn.Module):
         v = self.v_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         # q, k, v: [B, H, L, D_head]
 
-        # Scaled dot-product + ALiBi bias
-        scale = self.head_dim ** -0.5
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, L, L]
+        # Apply RoPE to Q and K (NOT V — preserves content)
+        rope = self._get_rope(L, x.device)
+        q = _apply_rope(q, rope)
+        k = _apply_rope(k, rope)
 
-        # Add ALiBi positional bias (does NOT touch Q/K vectors)
-        alibi = self._get_alibi_bias(L, x.device)  # [H, L, L]
-        attn_weights = attn_weights + alibi.unsqueeze(0)  # broadcast over batch
-
-        # Apply padding mask
+        # Build SDPA-compatible attention mask (additive: 0 for valid, -inf for masked)
+        sdpa_mask = None
         if attn_mask is not None:
-            mask_kv = attn_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]
-            attn_weights = attn_weights.masked_fill(~mask_kv, float("-inf"))
+            # [B, L] bool → [B, 1, L, L] key mask (broadcast over heads)
+            key_mask = attn_mask[:, None, None, :]  # [B, 1, 1, L]
+            sdpa_mask = torch.where(key_mask, 0.0, float("-inf"))
+            sdpa_mask = sdpa_mask.expand(B, 1, L, L)
 
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
+        # Use PyTorch SDPA — auto-selects Flash Attention when available
+        dropout_p = self.dropout_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=sdpa_mask,
+            dropout_p=dropout_p,
+            scale=self.head_dim ** -0.5,
+        )  # [B, H, L, D_head]
 
-        out = torch.matmul(attn_weights, v)  # [B, H, L, D_head]
         out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)
         return self.out_proj(out)
 
 
 class ChainTransformerLayer(nn.Module):
     """
-    Single Transformer encoder layer with ALiBi attention + FFN.
+    Single Transformer encoder layer with RoPE attention + FFN.
 
     Pre-norm architecture (LayerNorm before attention/FFN) for stable
     training with contrastive losses. Residual connections throughout.
@@ -208,7 +222,7 @@ class ChainTransformerLayer(nn.Module):
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = ALiBiSelfAttention(
+        self.attn = RoPESelfAttention(
             d_model=d_model,
             n_heads=n_heads,
             dropout=dropout,
@@ -240,14 +254,14 @@ class EBTChainHead(nn.Module):
 
     Architecture:
       - Learnable [CLS] token (1024d)
-      - ALiBi-biased Transformer encoder (2 layers, 8 heads, Pre-Norm)
+      - RoPE Transformer encoder (2 layers, 8 heads, Pre-Norm, SDPA)
       - CLS vector extraction after encoding
       - Energy head: Linear(1024, 512) + GELU + Linear(512, 1)
 
     The [CLS] token acts as a global aggregator — self-attention allows it
     to attend to all chain positions simultaneously, detecting contradictions
-    between arbitrary steps. ALiBi provides order sensitivity without
-    modifying the SONAR vectors.
+    between arbitrary steps. RoPE provides position-content binding critical
+    for detecting ordering violations (adj_swap, truncation).
 
     ~17M parameters at default settings.
     """
