@@ -121,11 +121,15 @@ def generate_negative_chains(
     neg_lengths = []
     neg_types = []
 
-    # ─── 1. Adjacent-swap: swap 1-2 neighboring pairs ─────────────────
-    # Much harder than full shuffle. Model must detect subtle order violations.
+    # ─── 1. Adjacent-swap: swap neighboring pairs ─────────────────────
+    # Scale swap count with chain length: 1 swap in 5-vec chain is 20%,
+    # but 1 swap in 15-vec chain is only 7% — too subtle for SONAR.
+    # Use floor(L/4) as minimum to keep relative disruption ~25%.
     for _ in range(n_swap):
         swapped = positive.clone()
-        n_swaps = random.randint(1, min(2, L - 1))
+        min_swaps = max(1, L // 4)
+        max_swaps = min(min_swaps + 1, L - 1)
+        n_swaps = random.randint(min_swaps, max_swaps)
         swap_positions = random.sample(range(L - 1), n_swaps)
         for pos in swap_positions:
             swapped[pos], swapped[pos + 1] = swapped[pos + 1].clone(), swapped[pos].clone()
@@ -250,31 +254,16 @@ class ChainDataset(Dataset):
 
         # Store source sequences for same-document negative generation
         self.source_sequences: list[Tensor] = []
-        self.chains: list[Tensor] = []
-        self.chain_source_idx: list[int] = []  # Which sequence each chain came from
         self.all_vectors: list[Tensor] = []
 
-        seq_idx = 0
         for seq in sequences:
             if not isinstance(seq, Tensor) or seq.dim() != 2:
                 continue
             seq_len = seq.shape[0]
             if seq_len < cfg.min_chain_len:
                 continue
-
             self.source_sequences.append(seq)
-
-            # Extract all valid chains from this sequence
-            max_cl = min(cfg.max_chain_len, seq_len)
-            min_cl = min(cfg.min_chain_len, seq_len)
-            for start in range(seq_len - min_cl + 1):
-                cl = random.randint(min_cl, min(max_cl, seq_len - start))
-                chain = seq[start:start + cl]
-                self.chains.append(chain)
-                self.chain_source_idx.append(seq_idx)
-
             self.all_vectors.append(seq)
-            seq_idx += 1
 
         # Build global vector pool (for fallback)
         if self.all_vectors:
@@ -289,18 +278,28 @@ class ChainDataset(Dataset):
         self.cfg = apply_curriculum(self.cfg, progress)
 
     def __len__(self) -> int:
-        return len(self.chains)
+        # Each source sequence yields one chain per epoch access.
+        # With shuffle=True in DataLoader, each epoch sees different
+        # random chains from each sequence — much more diversity than
+        # pre-extracted overlapping sliding windows.
+        return len(self.source_sequences)
 
     def __getitem__(self, idx: int) -> dict:
-        positive = self.chains[idx]
+        # Extract a RANDOM chain from the source sequence each time.
+        # This gives different chains each epoch, preventing overfitting
+        # on fixed pre-extracted overlapping chains.
+        seq = self.source_sequences[idx]
+        seq_len = seq.shape[0]
+
+        max_cl = min(self.cfg.max_chain_len, seq_len)
+        min_cl = min(self.cfg.min_chain_len, seq_len)
+        cl = random.randint(min_cl, max_cl)
+        start = random.randint(0, seq_len - cl)
+        positive = seq[start:start + cl]
         L = positive.shape[0]
 
-        # Get source sequence for same-document negatives
-        src_idx = self.chain_source_idx[idx]
-        same_doc = self.source_sequences[src_idx]
-
         negatives, neg_lengths, neg_types = generate_negative_chains(
-            positive, same_doc, self.global_pool, self.cfg
+            positive, seq, self.global_pool, self.cfg
         )
 
         return {

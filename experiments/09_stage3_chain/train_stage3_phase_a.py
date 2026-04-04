@@ -131,7 +131,7 @@ def build_chain_datasets(
     train_ds = ChainDataset(train_seqs, cfg)
     val_ds = ChainDataset(val_seqs, cfg)
 
-    print(f"  Train chains: {len(train_ds)}, Val chains: {len(val_ds)}")
+    print(f"  Train sequences: {len(train_ds)}, Val sequences: {len(val_ds)} (random chains generated on-the-fly)")
     return train_ds, val_ds
 
 

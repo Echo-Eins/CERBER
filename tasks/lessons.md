@@ -1389,3 +1389,27 @@ Replaced ALiBiSelfAttention with RoPESelfAttention + PyTorch SDPA (Flash Attenti
 2. For order-critical tasks: use position-content binding (RoPE, learnable embeddings) — NOT content-agnostic bias (ALiBi)
 3. ALiBi is ONLY for Context Aggregation where preserving SONAR vector geometry matters more than ordering
 4. Use PyTorch SDPA (`F.scaled_dot_product_attention`) for automatic Flash Attention — never manual matmul+softmax
+
+## 2026-04-04 - Chain Head Phase A overfitting: gradient penalty fighting discrimination + data overlap
+
+### Pattern
+After RoPE fix, Phase A showed: train adj_swap 0.60->0.72, val adj_swap 0.68->0.61 (overfitting). Gradient penalty grew 0.3->2.3 over training, adding up to 0.115 to loss — nearly canceling NCE improvement of 0.1. target_energy_gap=1.0 was unreachable (requires logit gap 14 with tau=0.07).
+
+### Root Causes
+1. **lambda_grad=0.05 too strong** — gradient penalty penalizes sharp energy landscapes, but discrimination between positive and near-identical adj_swap chains REQUIRES sharp gradients
+2. **Pre-extracted overlapping chains** — 28964 chains from 10000 seqs via sliding window → heavy vector overlap → memorization
+3. **adj_swap too subtle** — 1 swap in 15-vec chain = 7% disruption. SONAR adjacent sentences cos~0.8-0.9, single swap nearly undetectable
+4. **target_energy_gap=1.0 unrealistic** — with tau=0.07, E_gap ~0.19 gives 85% accuracy. 1.0 would be logit gap 14
+
+### Fix
+- lambda_grad: 0.05 -> 0.01 (allow sharper discrimination in Phase A)
+- dropout: 0.1 -> 0.2 (regularize overfitting)
+- target_energy_gap: 1.0 -> 0.2 (realistic for tau=0.07)
+- adj_swap: scale swap count with chain length (min=L//4, ~25% disruption)
+- On-the-fly chain extraction: random chain per sequence per access (not pre-extracted overlapping windows)
+
+### Rule
+1. Gradient penalty must be WEAK during contrastive learning phase — smooth landscape is a Phase B concern (Langevin dynamics)
+2. target_energy_gap should be ~3*tau for realistic convergence
+3. Negative difficulty must scale with chain length — fixed count of perturbations dilutes as L grows
+4. Random data augmentation per access beats pre-extracted fixed samples for small datasets

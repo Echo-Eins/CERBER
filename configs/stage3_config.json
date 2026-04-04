@@ -6,15 +6,15 @@
         "n_layers": 2,
         "dim_feedforward": 2048,
         "max_chain_len": 20,
-        "dropout": 0.1,
+        "dropout": 0.2,
         "activation": "gelu",
         "energy_hidden": 512,
         "temperature": 0.07,
         "focal_gamma": 2.0,
-        "lambda_grad": 0.05,
+        "lambda_grad": 0.01,
         "lambda_energy_norm": 0.05,
         "energy_norm_margin": 1.0,
-        "_energy_norm_comment": "margin=5.0 caused energy explosion (0.04->4.8 in 8 epochs), adj_swap anti-learning. Tight margin=1.0 + stronger lambda=0.05 keeps energy bounded."
+        "_energy_norm_comment": "margin=5.0 caused energy explosion. lambda_grad reduced 0.05->0.01: penalty was fighting discrimination (0.3->2.3 over training, adding 0.115 to loss). Dropout 0.1->0.2 to fight overfitting on 28K chains."
     },
     "chain_data": {
         "min_chain_len": 5,
@@ -82,8 +82,8 @@
         "log_every": 50,
         "early_stop_patience": 7,
         "target_rank_acc": 0.85,
-        "target_energy_gap": 1.0,
-        "_chain_ranking_target": "> 0.85 rank_acc AND > 1.0 energy_gap means Phase A success"
+        "target_energy_gap": 0.2,
+        "_chain_ranking_target": "> 0.85 rank_acc AND > 0.2 energy_gap (logit gap ~3 with tau=0.07). 1.0 was unrealistic — required logit gap 14."
     },
     "phase_b": {
         "_comment": "Phase B: Joint fine-tune + System 1/2 switching",
