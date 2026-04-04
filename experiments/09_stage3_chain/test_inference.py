@@ -72,23 +72,59 @@ def load_chain_head(ckpt_path: str, device: torch.device) -> EBTChainHead:
 
 
 def load_pairwise(ckpt_path: str, device: torch.device) -> torch.nn.Module:
-    """Load trained pairwise energy critic."""
+    """
+    Load trained pairwise energy critic.
+
+    Handles two checkpoint formats:
+      1. Stage 1.5 radial_angular: keys critic1_state (Angular), critic2_state (Radial)
+      2. SimpleEnergy: key model or model_state_dict
+    """
     from cebcm.models.energy import SimpleEnergy
+    from cebcm.models.energy_decomposed import AngularEnergyCritic
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ckpt.get("config", ckpt.get("model_config", {}))
-    model = SimpleEnergy(
-        dim=cfg.get("dim", 1024),
-        hidden_dims=cfg.get("hidden_dims", [2048, 1024, 512]),
-        norm_mode=cfg.get("norm_mode", "orthonorm"),
-        activation=cfg.get("activation", "groupsort"),
+    cfg = ckpt.get("config", {})
+
+    # Stage 1.5 radial_angular format
+    if "critic1_state" in ckpt:
+        norm_mode = cfg.get("angular_norm_mode", cfg.get("norm_mode", "none"))
+        activation = cfg.get("angular_activation", cfg.get("activation", "silu"))
+        dim = cfg.get("energy_dim", 1024)
+        hidden = cfg.get("angular_hidden_dims", [2048, 1024, 512])
+        clamp = cfg.get("angular_energy_output_clamp", None)
+        model = AngularEnergyCritic(
+            dim=dim,
+            hidden_dims=hidden,
+            norm_mode=norm_mode,
+            activation=activation,
+            energy_output_clamp=clamp,
+        )
+        model.load_state_dict(ckpt["critic1_state"])
+        model = model.to(device)
+        model.eval()
+        print(f"  Pairwise (AngularEnergyCritic) loaded from {ckpt_path}")
+        return model
+
+    # SimpleEnergy format
+    if "model" in ckpt or "model_state_dict" in ckpt:
+        model = SimpleEnergy(
+            dim=cfg.get("dim", cfg.get("energy_dim", 1024)),
+            hidden_dims=cfg.get("hidden_dims", cfg.get("energy_hidden_dims", [2048, 1024, 512])),
+            norm_mode=cfg.get("norm_mode", "none"),
+            activation=cfg.get("activation", "silu"),
+        )
+        state_key = "model" if "model" in ckpt else "model_state_dict"
+        model.load_state_dict(ckpt[state_key])
+        model = model.to(device)
+        model.eval()
+        print(f"  Pairwise (SimpleEnergy) loaded from {ckpt_path}")
+        return model
+
+    available = list(ckpt.keys())
+    raise KeyError(
+        f"Cannot find pairwise state in checkpoint. "
+        f"Expected 'critic1_state' or 'model'. Available keys: {available}"
     )
-    state_key = "model" if "model" in ckpt else "model_state_dict"
-    model.load_state_dict(ckpt[state_key])
-    model = model.to(device)
-    model.eval()
-    print(f"  Pairwise critic loaded from {ckpt_path}")
-    return model
 
 
 def make_synthetic_pairwise(device: torch.device) -> torch.nn.Module:

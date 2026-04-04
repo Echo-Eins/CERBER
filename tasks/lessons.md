@@ -1,5 +1,61 @@
 # Lessons
 
+## 2026-04-04 - CRITICAL: Chain Head energy_norm_margin=5.0 causes energy explosion and learning collapse
+
+### Pattern
+Phase A training with hard negatives showed:
+- E_pos: 0.04 → 0.16 → 0.51 → 0.90 → 1.63 → 3.18 → 4.23 → 4.59 (8 epochs)
+- Loss stuck at ~2.7 (ln(16)=2.77 = random for 1+15 classes). **Barely above random!**
+- adj_swap accuracy: 0.63 → 0.55 → 0.46 → 0.40 (anti-learning, below random)
+- energy_gap: 0.005 → 0.16 (negligible relative to E=4.8)
+
+### Root Cause
+`energy_norm_margin=5.0` allows energy to grow far before regularization kicks in.
+With τ=0.07 InfoNCE: logits = -E/τ. When E=4.8, logit = -69. All logits are huge negative with tiny gap → softmax outputs near-uniform → zero learning signal for subtle differences (adj_swap).
+
+### Fix
+- `energy_norm_margin`: 5.0 → **1.0** (energy stays in workable range for τ=0.07)
+- `lambda_energy_norm`: 0.01 → **0.05** (stronger scale anchor)
+- With E ∈ [-1, 1] and τ=0.07: logits ∈ [-14, 14] — normal softmax operating range
+
+### Rule
+1. For InfoNCE with temperature τ, energy magnitude must stay << 1/τ to avoid softmax saturation
+2. energy_norm_margin should be ~1/τ × 0.1 = **1.0** for τ=0.07
+3. Monitor: if E_pos and E_neg grow together with tiny gap, scale is uncontrolled
+4. Loss near ln(1+N) = constant means the model is at random → check energy scale first
+
+## 2026-04-04 - CRITICAL: Checkpoint architecture mismatch — Stage 1.5 uses radial_angular, not SimpleEnergy
+
+### Pattern
+Stage 3 Phase B `build_pairwise()` created `SimpleEnergy`, but Stage 1.5 trained `AngularEnergyCritic` + `RadialEnergyCritic` (radial_angular architecture). Checkpoint keys: `critic1_state`, `critic2_state` — not `model` or `model_state_dict`.
+
+Additional errors:
+1. Checkpoint filename: `best.pt` (actual) vs `best_critic.pt` (in config)
+2. `load_pairwise` in test_inference.py crashed with KeyError because format didn't match
+
+### Rule
+1. Before referencing ANY checkpoint, verify: (a) filename, (b) state dict keys, (c) model architecture class
+2. Stage 1.5 = `radial_angular` → use `AngularEnergyCritic` with `critic1_state` key
+3. Never default to a different model class than what produced the checkpoint
+
+## 2026-04-03 - CRITICAL: Stage 3 config must match actually trained models, not aspirational architecture
+
+### Pattern
+`stage3_config.json` specified `norm_mode: "orthonorm"` and `activation: "groupsort"` for the pairwise critic, but:
+1. The actually trained Stage 1.5 critic used `norm_mode: "none"`, `activation: "silu"`, architecture: `radial_angular`
+2. Phase 2f proved orthonorm+groupsort **crushes energy capacity** to 0.13 range (E∈[0.23, 0.36]), rank_success=0.1%
+3. Phase 2b (norm_mode=none, silu) achieved spread=0.56, rank_success=88%
+4. Config mismatch would cause checkpoint loading failure or silent architecture incompatibility
+
+### Root Cause
+Config was written based on theoretical spec (v1.4 recommends orthonorm) rather than experimental results. Spec and practice diverged after Phase 2f failure.
+
+### Rule
+1. **Config MUST match the architecture of the actually trained checkpoint** — not the theoretical ideal
+2. Before writing any model config, CHECK the training config of the referenced checkpoint
+3. Phase 2f post-mortem is definitive: orthonorm+groupsort kills energy range in practice for this problem
+4. Cross-reference `tasks/lessons.md` for known failures before choosing architecture settings
+
 ## 2026-04-03 - Chain Head rank_acc 0.93 in 4 epochs = shortcuts, not reasoning
 
 ### Pattern

@@ -57,6 +57,9 @@ def build_chain_head(cfg: dict, device: torch.device) -> EBTChainHead:
         energy_hidden=cfg.get("energy_hidden", 512),
         temperature=cfg.get("temperature", 0.07),
         focal_gamma=cfg.get("focal_gamma", 2.0),
+        lambda_grad=cfg.get("lambda_grad", 0.05),
+        lambda_energy_norm=cfg.get("lambda_energy_norm", 0.05),
+        energy_norm_margin=cfg.get("energy_norm_margin", 1.0),
     )
     model = EBTChainHead(chain_cfg).to(device)
     print(f"  Chain Head: {model.num_params:,} parameters")

@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from cebcm.models.chain_head import ChainHeadConfig, EBTChainHead
 from cebcm.models.energy import SimpleEnergy
+from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
 from cebcm.inference.system_switching import (
     System1Config,
     System2Config,
@@ -60,27 +61,57 @@ from cebcm.training.stage2_utils import (
 )
 
 
-def build_pairwise(cfg: dict, device: torch.device) -> SimpleEnergy:
-    """Build pairwise critic from config and load checkpoint."""
-    model = SimpleEnergy(
-        dim=cfg.get("dim", 1024),
-        hidden_dims=cfg.get("hidden_dims", [2048, 1024, 512]),
-        norm_mode=cfg.get("norm_mode", "orthonorm"),
-        activation=cfg.get("activation", "groupsort"),
-    ).to(device)
+def build_pairwise(cfg: dict, device: torch.device) -> nn.Module:
+    """
+    Build pairwise critic from config and load checkpoint.
+
+    Stage 1.5 uses radial_angular architecture:
+      - critic1 = AngularEnergyCritic (semantic/tangential)
+      - critic2 = RadialEnergyCritic (norm/shell/OOD)
+    Checkpoint keys: critic1_state, critic2_state.
+
+    For Phase B we use AngularEnergyCritic as the primary pairwise function
+    (it handles semantic direction, which is what chain reasoning cares about).
+    """
+    arch = cfg.get("architecture", "simple")
+    norm_mode = cfg.get("norm_mode", "none")
+    activation = cfg.get("activation", "silu")
+    dim = cfg.get("dim", 1024)
+    clamp = cfg.get("energy_output_clamp", None)
+
+    if arch == "radial_angular":
+        model = AngularEnergyCritic(
+            dim=dim,
+            hidden_dims=cfg.get("angular_hidden_dims", [2048, 1024, 512]),
+            norm_mode=norm_mode,
+            activation=activation,
+            energy_output_clamp=clamp,
+        ).to(device)
+        ckpt_key = "critic1_state"
+    else:
+        model = SimpleEnergy(
+            dim=dim,
+            hidden_dims=cfg.get("hidden_dims", [2048, 1024, 512]),
+            norm_mode=norm_mode,
+            activation=activation,
+        ).to(device)
+        ckpt_key = "model"
 
     ckpt_path = cfg.get("checkpoint")
     if ckpt_path and Path(ckpt_path).exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        # Handle different checkpoint formats
-        state = ckpt.get("model", ckpt.get("critic", ckpt))
-        if isinstance(state, dict) and any(k.startswith("net.") for k in state):
-            model.load_state_dict(state)
-        print(f"  Pairwise loaded from {ckpt_path}")
+        if ckpt_key in ckpt:
+            model.load_state_dict(ckpt[ckpt_key])
+            print(f"  Pairwise ({arch}) loaded from {ckpt_path} [key={ckpt_key}]")
+        else:
+            available = [k for k in ckpt if k.endswith("_state") or k == "model"]
+            print(f"  WARNING: Key '{ckpt_key}' not in checkpoint. Available: {available}")
+            print(f"  Using random init.")
     else:
         print(f"  WARNING: Pairwise checkpoint not found at {ckpt_path}, using random init")
 
-    print(f"  Pairwise: {sum(p.numel() for p in model.parameters()):,} parameters")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Pairwise ({arch}): {n_params:,} parameters")
     return model
 
 
@@ -97,6 +128,9 @@ def build_chain_head(cfg: dict, device: torch.device, checkpoint: str | None = N
         energy_hidden=cfg.get("energy_hidden", 512),
         temperature=cfg.get("temperature", 0.07),
         focal_gamma=cfg.get("focal_gamma", 2.0),
+        lambda_grad=cfg.get("lambda_grad", 0.05),
+        lambda_energy_norm=cfg.get("lambda_energy_norm", 0.05),
+        energy_norm_margin=cfg.get("energy_norm_margin", 1.0),
     )
     model = EBTChainHead(chain_cfg).to(device)
 
