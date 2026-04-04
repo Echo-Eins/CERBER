@@ -530,6 +530,8 @@ def load_chain_head_from_checkpoint(
     """Load Chain Head model and return (model, checkpoint_info)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg_dict = ckpt.get("config", {})
+    if "chain_head" in cfg_dict:
+        cfg_dict = cfg_dict["chain_head"]
 
     cfg = ChainHeadConfig(
         d_model=cfg_dict.get("d_model", 1024),
@@ -541,7 +543,12 @@ def load_chain_head_from_checkpoint(
         energy_hidden=cfg_dict.get("energy_hidden", 512),
     )
     model = EBTChainHead(cfg)
-    model.load_state_dict(ckpt["model"])
+    if "model" in ckpt:
+        model.load_state_dict(ckpt["model"])
+    elif "chain_head" in ckpt:
+        model.load_state_dict(ckpt["chain_head"])
+    else:
+        raise KeyError(f"No chain head state found. Keys: {list(ckpt.keys())}")
     model = model.to(device)
     model.eval()
 
