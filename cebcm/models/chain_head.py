@@ -445,10 +445,13 @@ class EBTChainHead(nn.Module):
         # Gradient penalty: ||∇_chain E||² (smooth landscape for Langevin)
         # Compute on positive chains (they represent valid data region)
         # Skip when grad is disabled (eval mode with torch.no_grad())
+        # NOTE: Must use math SDPA backend — flash/efficient kernels don't
+        # support double backward (create_graph=True)
         grad_penalty = torch.tensor(0.0, device=positive_chains.device)
         if self.cfg.lambda_grad > 0 and torch.is_grad_enabled():
             pos_for_grad = positive_chains.detach().requires_grad_(True)
-            E_for_grad = self.forward(pos_for_grad, chain_lengths=pos_lengths)
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                E_for_grad = self.forward(pos_for_grad, chain_lengths=pos_lengths)
             grads = torch.autograd.grad(
                 E_for_grad.sum(), pos_for_grad, create_graph=True,
             )[0]
