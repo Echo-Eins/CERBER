@@ -56,6 +56,22 @@ from cerber_gui.sota_eval import (
     compute_distribution_suite,
     compute_manifold_knn_metrics,
 )
+from cerber_gui.chain_diagnostics import (
+    load_chain_head_from_checkpoint,
+    make_sample_chain,
+    extract_attention_weights,
+    create_attention_heatmap,
+    create_all_heads_heatmap,
+    compute_swap_sensitivity,
+    create_swap_sensitivity_plot,
+    compute_chain_growth_energy,
+    create_chain_growth_plot,
+    compute_pos_neg_comparison,
+    create_pos_neg_violin,
+    parse_training_log,
+    create_overfitting_plot,
+    create_energy_scale_plot,
+)
 from configs.base import Stage1Config
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.inference.langevin import run_langevin
@@ -2909,6 +2925,68 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
 
             # Auto-refresh every 5 seconds
             live_timer = gr.Timer(value=5, active=True)
+
+        # === Tab 5: Chain Head Diagnostics ===
+        with gr.TabItem("Chain Head Diagnostics"):
+            gr.Markdown(
+                """
+            ### Chain Head Analysis
+
+            Diagnose Chain Head behavior: attention patterns, energy sensitivity,
+            positive vs negative discrimination, and overfitting detection.
+            """
+            )
+
+            with gr.Row():
+                chain_ckpt_input = gr.Textbox(
+                    label="Chain Head Checkpoint",
+                    value="experiments/09_stage3_chain/checkpoints/best_chain_head.pt",
+                )
+                chain_data_input = gr.Textbox(
+                    label="SONAR Data Path",
+                    value="data/squad_sequences.pt",
+                )
+
+            with gr.Row():
+                chain_seq_idx = gr.Slider(
+                    minimum=0, maximum=999, value=0, step=1,
+                    label="Sequence Index",
+                )
+                chain_length = gr.Slider(
+                    minimum=5, maximum=20, value=10, step=1,
+                    label="Chain Length",
+                )
+                chain_analyze_btn = gr.Button("Analyze Chain Head", variant="primary")
+
+            chain_info_md = gr.Markdown("Load a checkpoint to begin.")
+
+            gr.Markdown("#### Attention Patterns")
+            with gr.Row():
+                chain_layer_select = gr.Radio(
+                    choices=["0", "1"], value="0", label="Layer",
+                )
+            chain_attn_all_heads = gr.Plot(label="All Heads Attention")
+            chain_attn_single = gr.Plot(label="Average Attention")
+
+            gr.Markdown("#### Energy Sensitivity")
+            with gr.Row():
+                chain_swap_plot = gr.Plot(label="Adjacent Swap Sensitivity")
+                chain_growth_plot = gr.Plot(label="Energy vs Chain Length")
+
+            gr.Markdown("#### Positive vs Negative Discrimination")
+            chain_violin_plot = gr.Plot(label="Energy Distributions by Perturbation Type")
+
+            gr.Markdown("#### Training Log Analysis")
+            chain_log_input = gr.Textbox(
+                label="Paste training log here (or path to log file)",
+                lines=5,
+                placeholder="Paste Phase A training output...",
+            )
+            chain_log_btn = gr.Button("Analyze Training Log")
+            with gr.Row():
+                chain_overfit_plot = gr.Plot(label="Train vs Val (Overfitting Detection)")
+                chain_energy_scale_plot = gr.Plot(label="Energy Scale Monitoring")
+
     # === Event Handlers ===
 
     # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²
@@ -3109,6 +3187,87 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             live_sota_eval_bank_size,
         ],
         outputs=[live_landscape_status, live_landscape_plot, live_landscape_traj_plot],
+    )
+
+    # === Chain Head Diagnostics Handlers ===
+
+    def analyze_chain_head_fn(ckpt_path, data_path, seq_idx, chain_len, layer_str):
+        """Main analysis function for Chain Head diagnostics tab."""
+        try:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            if not Path(ckpt_path).exists():
+                return (f"Checkpoint not found: {ckpt_path}",
+                        None, None, None, None, None)
+
+            model, info = load_chain_head_from_checkpoint(ckpt_path, device)
+            chain = make_sample_chain(data_path, int(chain_len), int(seq_idx), device)
+
+            info_text = (
+                f"**Chain Head loaded**: {info['params']:,} params, "
+                f"epoch {info['epoch']}, best rank_acc={info['best_rank_acc']}\n\n"
+                f"**Sample chain**: seq #{int(seq_idx)}, length {chain.shape[1]}\n\n"
+                f"**Val metrics**: {json.dumps({k: round(v, 4) for k, v in info['val_metrics'].items()}, indent=2) if info['val_metrics'] else 'N/A'}"
+            )
+
+            # Attention
+            layer_idx = int(layer_str)
+            attn_maps = extract_attention_weights(model, chain)
+            all_heads_fig = create_all_heads_heatmap(attn_maps, layer_idx)
+            avg_fig = create_attention_heatmap(attn_maps, layer_idx, head_idx=None)
+
+            # Swap sensitivity
+            swap_data = compute_swap_sensitivity(model, chain, torch.device(device))
+            swap_fig = create_swap_sensitivity_plot(swap_data)
+
+            # Chain growth
+            growth_data = compute_chain_growth_energy(model, chain, torch.device(device))
+            growth_fig = create_chain_growth_plot(growth_data)
+
+            # Pos vs neg
+            comparison = compute_pos_neg_comparison(model, chain, torch.device(device))
+            violin_fig = create_pos_neg_violin(comparison)
+
+            return info_text, all_heads_fig, avg_fig, swap_fig, growth_fig, violin_fig
+        except Exception as e:
+            import traceback
+            err = f"Error: {e}\n\n```\n{traceback.format_exc()}\n```"
+            return err, None, None, None, None, None
+
+    def analyze_training_log_fn(log_text):
+        """Parse and visualize training log."""
+        try:
+            # Check if it's a file path
+            if log_text.strip() and Path(log_text.strip()).exists():
+                log_text = Path(log_text.strip()).read_text()
+
+            parsed = parse_training_log(log_text)
+            n_train = len(parsed.get("train", []))
+            n_val = len(parsed.get("val", []))
+            if n_train == 0 and n_val == 0:
+                empty = go.Figure()
+                empty.update_layout(title="No epoch data found in log")
+                return empty, empty
+
+            overfit_fig = create_overfitting_plot(parsed)
+            energy_fig = create_energy_scale_plot(parsed)
+            return overfit_fig, energy_fig
+        except Exception as e:
+            err_fig = go.Figure()
+            err_fig.update_layout(title=f"Error: {e}")
+            return err_fig, err_fig
+
+    chain_analyze_btn.click(
+        analyze_chain_head_fn,
+        inputs=[chain_ckpt_input, chain_data_input, chain_seq_idx, chain_length, chain_layer_select],
+        outputs=[chain_info_md, chain_attn_all_heads, chain_attn_single,
+                 chain_swap_plot, chain_growth_plot, chain_violin_plot],
+    )
+
+    chain_log_btn.click(
+        analyze_training_log_fn,
+        inputs=[chain_log_input],
+        outputs=[chain_overfit_plot, chain_energy_scale_plot],
     )
 
     demo.load(
