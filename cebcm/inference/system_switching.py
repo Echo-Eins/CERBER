@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -54,6 +55,9 @@ class ThinkingResult:
     chain_energies: list[float] = field(default_factory=list)  # Chain Head energies (System 2)
     backtrack_count: int = 0      # Number of backtracks performed
     cos_trajectory: list[float] = field(default_factory=list)  # Optional cos to target
+    v_trajectory: list[Tensor] = field(default_factory=list)  # Per-step vectors (if tracked)
+    grad_norms: list[float] = field(default_factory=list)  # Gradient norms per step
+    attention_snapshots: list[tuple[int, list[Tensor]]] = field(default_factory=list)  # (step, attn_maps)
 
 
 def select_thinking_mode(
@@ -78,6 +82,7 @@ def run_system1(
     cfg: System1Config,
     langevin_kwargs: dict | None = None,
     v_target: Tensor | None = None,
+    track_vectors: bool = False,
 ) -> ThinkingResult:
     """
     System 1 (Fast Shot): pairwise energy + short Langevin.
@@ -89,13 +94,12 @@ def run_system1(
         cfg: System 1 configuration
         langevin_kwargs: Additional Langevin parameters
         v_target: [B, D] optional ground truth for eval metrics
+        track_vectors: Store per-step vectors for trajectory visualization
 
     Returns:
         ThinkingResult
     """
     max_steps = random.choice(cfg.max_steps_choices)
-    # cruise_ratio not directly used in Langevin (it's for inertial navigation)
-    # but we vary max_steps as proxy for fast vs slower
 
     kwargs = dict(
         method="pid",
@@ -104,6 +108,7 @@ def run_system1(
         v_init=v_init,
         max_steps=max_steps,
         v_target=v_target,
+        track_vectors=track_vectors,
     )
     if langevin_kwargs:
         kwargs.update(langevin_kwargs)
@@ -116,6 +121,7 @@ def run_system1(
         num_steps=result.num_steps,
         energy_trajectory=result.trajectory,
         cos_trajectory=result.cos_trajectory,
+        v_trajectory=result.v_trajectory if track_vectors else [],
     )
 
 
@@ -127,6 +133,8 @@ def run_system2(
     cfg: System2Config,
     langevin_kwargs: dict | None = None,
     v_target: Tensor | None = None,
+    track_vectors: bool = False,
+    attention_callback: Callable[[int, Tensor], list[Tensor]] | None = None,
 ) -> ThinkingResult:
     """
     System 2 (Deep Thinking): chain-validated Langevin with backtracking.
@@ -143,9 +151,12 @@ def run_system2(
         cfg: System 2 configuration
         langevin_kwargs: Additional Langevin parameters (lr, noise, target_norm, etc.)
         v_target: [B, D] optional ground truth for eval metrics
+        track_vectors: Store per-step vectors for trajectory visualization
+        attention_callback: If provided, called at each chain eval with (step, chain_tensor).
+            Should return list of attention maps [H, L, L] per layer.
 
     Returns:
-        ThinkingResult with chain energies and backtrack info
+        ThinkingResult with chain energies, backtrack info, and optional diagnostics
     """
     max_steps = random.choice(cfg.max_steps_choices)
     device = v_init.device
@@ -167,15 +178,20 @@ def run_system2(
     energy_trajectory: list[float] = []
     chain_energies: list[float] = []
     cos_trajectory: list[float] = []
+    grad_norms: list[float] = []
+    v_trajectory: list[Tensor] = []
+    attention_snapshots: list[tuple[int, list[Tensor]]] = []
     backtrack_count = 0
     steps_since_improve = 0
-    just_backtracked = False  # Prevent duplicate chain entry after backtrack
+    just_backtracked = False
 
     for step in range(max_steps):
         # Langevin step using pairwise energy
         v_current = v_current.detach().requires_grad_(True)
         E_pair = pairwise_fn(v_query, v_current)
         grad = torch.autograd.grad(E_pair.sum(), v_current)[0]
+
+        grad_norms.append(grad.norm().item())
 
         with torch.no_grad():
             noise = noise_scale * torch.randn_like(v_current)
@@ -186,6 +202,9 @@ def run_system2(
                 v_current = F.normalize(v_current, dim=-1) * target_norm
 
         energy_trajectory.append(E_pair.mean().item())
+
+        if track_vectors:
+            v_trajectory.append(v_current.detach().cpu().clone())
 
         # Track cosine to target if available
         if v_target is not None:
@@ -211,6 +230,14 @@ def run_system2(
                     E_chain = chain_head(chain_tensor).mean().item()
                 chain_energies.append(E_chain)
 
+                # Capture attention maps at this chain evaluation
+                if attention_callback is not None:
+                    try:
+                        attn_maps = attention_callback(step, chain_tensor)
+                        attention_snapshots.append((step, attn_maps))
+                    except Exception:
+                        pass  # Don't break inference for diagnostics
+
                 if E_chain < best_chain_energy:
                     best_chain_energy = E_chain
                     v_best = v_current.detach().clone()
@@ -224,7 +251,6 @@ def run_system2(
                     backtrack_count += 1
                     steps_since_improve = 0
                     just_backtracked = True
-                    # Trim chain to remove degraded portion, append revert point
                     chain_buffer = chain_buffer[:max(3, len(chain_buffer) // 2)]
                     chain_buffer.append(v_best.detach().clone())
 
@@ -236,6 +262,9 @@ def run_system2(
         chain_energies=chain_energies,
         backtrack_count=backtrack_count,
         cos_trajectory=cos_trajectory,
+        v_trajectory=v_trajectory,
+        grad_norms=grad_norms,
+        attention_snapshots=attention_snapshots,
     )
 
 
@@ -249,6 +278,8 @@ def run_thinking(
     sys2_cfg: System2Config | None = None,
     langevin_kwargs: dict | None = None,
     v_target: Tensor | None = None,
+    track_vectors: bool = False,
+    attention_callback: Callable[[int, Tensor], list[Tensor]] | None = None,
 ) -> ThinkingResult:
     """
     Unified entry point for System 1/2 thinking.
@@ -263,6 +294,8 @@ def run_thinking(
         sys2_cfg: System 2 config
         langevin_kwargs: Shared Langevin parameters
         v_target: Optional ground truth
+        track_vectors: Store per-step vectors for trajectory visualization
+        attention_callback: Called at each System 2 chain eval for attention capture
 
     Returns:
         ThinkingResult
@@ -275,6 +308,7 @@ def run_thinking(
             cfg=sys1_cfg or System1Config(),
             langevin_kwargs=langevin_kwargs,
             v_target=v_target,
+            track_vectors=track_vectors,
         )
     elif mode == "system2":
         assert chain_head is not None, "Chain Head required for System 2"
@@ -286,6 +320,8 @@ def run_thinking(
             cfg=sys2_cfg or System2Config(),
             langevin_kwargs=langevin_kwargs,
             v_target=v_target,
+            track_vectors=track_vectors,
+            attention_callback=attention_callback,
         )
     else:
         raise ValueError(f"Unknown thinking mode: {mode}")

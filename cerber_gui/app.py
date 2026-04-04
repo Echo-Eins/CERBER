@@ -72,6 +72,26 @@ from cerber_gui.chain_diagnostics import (
     create_overfitting_plot,
     create_energy_scale_plot,
 )
+from cerber_gui.inference_diagnostics import (
+    PRESET_QUESTIONS,
+    DiagnosticsState,
+    InferenceResult,
+    load_pairwise_model as diag_load_pairwise,
+    load_chain_head_model as diag_load_chain,
+    load_sonar as diag_load_sonar,
+    run_inference as diag_run_inference,
+    run_text_inference as diag_run_text_inference,
+    create_energy_trajectory_plot,
+    create_cosine_trajectory_plot,
+    create_attention_animation,
+    create_attention_grid,
+    create_landscape_with_trajectory,
+    create_contour_with_trajectory,
+    format_metrics_markdown,
+    export_metrics_json,
+    export_metrics_csv,
+    get_state as get_diag_state,
+)
 from configs.base import Stage1Config
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.inference.langevin import run_langevin
@@ -2987,9 +3007,139 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 chain_overfit_plot = gr.Plot(label="Train vs Val (Overfitting Detection)")
                 chain_energy_scale_plot = gr.Plot(label="Energy Scale Monitoring")
 
+        # === Tab 6: Inference Diagnostics ===
+        with gr.TabItem("Inference Diagnostics"):
+            gr.Markdown(
+                """
+            ### Comprehensive Inference Diagnostics
+
+            Load pairwise + chain head checkpoints, run System 1/2 inference with full visibility:
+            attention heatmaps, energy landscape, trajectory tracking, and numerical metrics.
+            """
+            )
+
+            # --- Model Loading ---
+            gr.Markdown("#### Load Models")
+            with gr.Row():
+                diag_pairwise_path = gr.Textbox(
+                    label="Pairwise Checkpoint",
+                    value="experiments/05_stage15_twin/checkpoints/best_model.pt",
+                )
+                diag_pairwise_load_btn = gr.Button("Load Pairwise", variant="secondary")
+                diag_pairwise_status = gr.Textbox(label="Pairwise Status", lines=3, interactive=False)
+
+            with gr.Row():
+                diag_chain_path = gr.Textbox(
+                    label="Chain Head Checkpoint",
+                    value="experiments/09_stage3_chain/checkpoints/best_phase_b.pt",
+                )
+                diag_chain_load_btn = gr.Button("Load Chain Head", variant="secondary")
+                diag_chain_status = gr.Textbox(label="Chain Head Status", lines=3, interactive=False)
+
+            with gr.Row():
+                diag_sonar_btn = gr.Button("Load SONAR (for text)", variant="secondary")
+                diag_sonar_status = gr.Textbox(label="SONAR Status", lines=1, interactive=False)
+
+            # --- Inference Parameters ---
+            gr.Markdown("#### Inference Parameters")
+            with gr.Row():
+                diag_mode = gr.Radio(
+                    choices=["system1", "system2", "both"], value="system2",
+                    label="Mode",
+                )
+                diag_max_steps = gr.Slider(
+                    minimum=10, maximum=500, value=200, step=10,
+                    label="Max Steps",
+                )
+                diag_lr = gr.Number(value=0.01, label="Learning Rate")
+                diag_noise_scale = gr.Number(value=0.005, label="Noise Scale")
+
+            with gr.Row():
+                diag_target_norm = gr.Number(value=0.2051, label="Target Norm")
+                diag_chain_eval_every = gr.Slider(
+                    minimum=1, maximum=20, value=5, step=1,
+                    label="Chain Eval Every (S2)",
+                )
+                diag_backtrack_patience = gr.Slider(
+                    minimum=5, maximum=100, value=30, step=5,
+                    label="Backtrack Patience (S2)",
+                )
+                diag_max_chain_len = gr.Slider(
+                    minimum=3, maximum=30, value=20, step=1,
+                    label="Max Chain Len (S2)",
+                )
+
+            # --- Data Source ---
+            gr.Markdown("#### Data Source")
+            with gr.Row():
+                diag_data_path = gr.Textbox(
+                    label="SONAR Data Path",
+                    value="data/squad_sequences.pt",
+                )
+                diag_seq_idx = gr.Slider(
+                    minimum=0, maximum=999, value=0, step=1,
+                    label="Sequence Index",
+                )
+                diag_noise_pct = gr.Slider(
+                    minimum=0.1, maximum=20.0, value=5.0, step=0.1,
+                    label="Noise %",
+                )
+                diag_run_data_btn = gr.Button("Run Inference (Data)", variant="primary")
+
+            # --- Text Input ---
+            gr.Markdown("#### Text Input (requires SONAR)")
+            with gr.Row():
+                diag_text_input = gr.Textbox(
+                    label="Input Text",
+                    lines=2,
+                    placeholder="Enter text to encode with SONAR...",
+                )
+                diag_preset_dropdown = gr.Dropdown(
+                    choices=[q["label"] for q in PRESET_QUESTIONS],
+                    label="Preset Questions",
+                    interactive=True,
+                )
+            diag_run_text_btn = gr.Button("Run Inference (Text)", variant="primary")
+
+            # --- Results ---
+            gr.Markdown("#### Results")
+            diag_metrics_md = gr.Markdown("Run inference to see results.")
+
+            with gr.Tabs():
+                with gr.TabItem("Energy Trajectory"):
+                    diag_energy_plot = gr.Plot(label="Energy over Steps")
+                with gr.TabItem("Cosine Trajectory"):
+                    diag_cos_plot = gr.Plot(label="Cosine Similarity to Target")
+                with gr.TabItem("Attention Animation"):
+                    with gr.Row():
+                        diag_attn_layer = gr.Radio(
+                            choices=["0", "1"], value="0", label="Layer",
+                        )
+                    diag_attn_anim = gr.Plot(label="Attention Evolution")
+                with gr.TabItem("Attention Grid"):
+                    with gr.Row():
+                        diag_attn_grid_step = gr.Slider(
+                            minimum=0, maximum=50, value=0, step=1,
+                            label="Snapshot Index (0 = last)",
+                        )
+                        diag_attn_grid_layer = gr.Radio(
+                            choices=["0", "1"], value="0", label="Layer",
+                        )
+                    diag_attn_grid = gr.Plot(label="All Heads at Snapshot")
+                with gr.TabItem("3D Landscape"):
+                    diag_landscape_3d = gr.Plot(label="Energy Surface + Trajectory")
+                with gr.TabItem("2D Contour"):
+                    diag_contour = gr.Plot(label="Contour + Trajectory")
+
+            gr.Markdown("#### Export Metrics")
+            with gr.Row():
+                diag_export_btn = gr.Button("Export JSON")
+                diag_export_csv_btn = gr.Button("Export CSV (per-step)")
+                diag_export_output = gr.Textbox(label="Exported Metrics", lines=10, interactive=False)
+
     # === Event Handlers ===
 
-    # ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²
+    #ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²
     load_btn.click(
         load_checkpoints_fn,
         inputs=[file_upload],
@@ -3268,6 +3418,203 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
         analyze_training_log_fn,
         inputs=[chain_log_input],
         outputs=[chain_overfit_plot, chain_energy_scale_plot],
+    )
+
+    # === Inference Diagnostics Handlers ===
+
+    # Store last inference result in session state
+    session_state["diag_result"] = None
+
+    def diag_load_pairwise_fn(path):
+        try:
+            return diag_load_pairwise(path)
+        except Exception as e:
+            import traceback
+            return f"Error: {e}\n{traceback.format_exc()}"
+
+    def diag_load_chain_fn(path):
+        try:
+            return diag_load_chain(path)
+        except Exception as e:
+            import traceback
+            return f"Error: {e}\n{traceback.format_exc()}"
+
+    def diag_load_sonar_fn():
+        try:
+            return diag_load_sonar()
+        except Exception as e:
+            return f"Error: {e}"
+
+    def diag_preset_selected(label):
+        for q in PRESET_QUESTIONS:
+            if q["label"] == label:
+                return q["text"]
+        return ""
+
+    def diag_run_data_fn(
+        data_path, seq_idx, noise_pct, mode, max_steps, lr, noise_scale,
+        target_norm, chain_eval_every, backtrack_patience, max_chain_len,
+        attn_layer_str,
+    ):
+        try:
+            result = diag_run_inference(
+                mode=mode, data_path=data_path, seq_idx=int(seq_idx),
+                noise_pct=noise_pct, max_steps=int(max_steps), lr=lr,
+                noise_scale=noise_scale, target_norm=target_norm,
+                chain_eval_every=int(chain_eval_every),
+                backtrack_patience=int(backtrack_patience),
+                max_chain_len=int(max_chain_len),
+            )
+            session_state["diag_result"] = result
+            return _diag_build_outputs(result, int(attn_layer_str))
+        except Exception as e:
+            import traceback
+            err = f"Error: {e}\n```\n{traceback.format_exc()}\n```"
+            empty = go.Figure()
+            return err, empty, empty, empty, empty, empty, empty
+
+    def diag_run_text_fn(
+        text, mode, max_steps, lr, noise_scale, target_norm, noise_pct,
+        chain_eval_every, backtrack_patience, max_chain_len,
+        attn_layer_str,
+    ):
+        try:
+            result = diag_run_text_inference(
+                text=text, mode=mode, noise_pct=noise_pct,
+                max_steps=int(max_steps), lr=lr,
+                noise_scale=noise_scale, target_norm=target_norm,
+                chain_eval_every=int(chain_eval_every),
+                backtrack_patience=int(backtrack_patience),
+                max_chain_len=int(max_chain_len),
+            )
+            session_state["diag_result"] = result
+            return _diag_build_outputs(result, int(attn_layer_str))
+        except Exception as e:
+            import traceback
+            err = f"Error: {e}\n```\n{traceback.format_exc()}\n```"
+            empty = go.Figure()
+            return err, empty, empty, empty, empty, empty, empty
+
+    def _diag_build_outputs(result, attn_layer):
+        md = format_metrics_markdown(result)
+        energy_fig = create_energy_trajectory_plot(result)
+        cos_fig = create_cosine_trajectory_plot(result)
+        attn_anim = create_attention_animation(result, layer_idx=attn_layer)
+
+        # Attention grid: use last snapshot
+        attn_grid = create_attention_grid(result, snapshot_idx=-1, layer_idx=attn_layer)
+
+        # Landscape plots (can be slow)
+        try:
+            landscape = create_landscape_with_trajectory(result)
+        except Exception:
+            landscape = go.Figure()
+            landscape.update_layout(title="Landscape unavailable")
+
+        try:
+            contour = create_contour_with_trajectory(result)
+        except Exception:
+            contour = go.Figure()
+            contour.update_layout(title="Contour unavailable")
+
+        return md, energy_fig, cos_fig, attn_anim, attn_grid, landscape, contour
+
+    def diag_update_attn_anim(layer_str):
+        result = session_state.get("diag_result")
+        if result is None:
+            return go.Figure()
+        return create_attention_animation(result, layer_idx=int(layer_str))
+
+    def diag_update_attn_grid(step_idx, layer_str):
+        result = session_state.get("diag_result")
+        if result is None:
+            return go.Figure()
+        idx = int(step_idx) if int(step_idx) > 0 else -1
+        return create_attention_grid(result, snapshot_idx=idx, layer_idx=int(layer_str))
+
+    def diag_export_fn():
+        result = session_state.get("diag_result")
+        if result is None:
+            return "No inference result to export."
+        return export_metrics_json(result)
+
+    def diag_export_csv_fn():
+        result = session_state.get("diag_result")
+        if result is None:
+            return "No inference result to export."
+        return export_metrics_csv(result)
+
+    # Wire up event handlers
+    diag_pairwise_load_btn.click(
+        diag_load_pairwise_fn,
+        inputs=[diag_pairwise_path],
+        outputs=[diag_pairwise_status],
+    )
+    diag_chain_load_btn.click(
+        diag_load_chain_fn,
+        inputs=[diag_chain_path],
+        outputs=[diag_chain_status],
+    )
+    diag_sonar_btn.click(
+        diag_load_sonar_fn,
+        outputs=[diag_sonar_status],
+    )
+    diag_preset_dropdown.change(
+        diag_preset_selected,
+        inputs=[diag_preset_dropdown],
+        outputs=[diag_text_input],
+    )
+
+    diag_run_data_btn.click(
+        diag_run_data_fn,
+        inputs=[
+            diag_data_path, diag_seq_idx, diag_noise_pct, diag_mode,
+            diag_max_steps, diag_lr, diag_noise_scale, diag_target_norm,
+            diag_chain_eval_every, diag_backtrack_patience, diag_max_chain_len,
+            diag_attn_layer,
+        ],
+        outputs=[
+            diag_metrics_md, diag_energy_plot, diag_cos_plot,
+            diag_attn_anim, diag_attn_grid, diag_landscape_3d, diag_contour,
+        ],
+    )
+
+    diag_run_text_btn.click(
+        diag_run_text_fn,
+        inputs=[
+            diag_text_input, diag_mode, diag_max_steps, diag_lr,
+            diag_noise_scale, diag_target_norm, diag_noise_pct,
+            diag_chain_eval_every, diag_backtrack_patience, diag_max_chain_len,
+            diag_attn_layer,
+        ],
+        outputs=[
+            diag_metrics_md, diag_energy_plot, diag_cos_plot,
+            diag_attn_anim, diag_attn_grid, diag_landscape_3d, diag_contour,
+        ],
+    )
+
+    diag_attn_layer.change(
+        diag_update_attn_anim,
+        inputs=[diag_attn_layer],
+        outputs=[diag_attn_anim],
+    )
+    diag_attn_grid_step.change(
+        diag_update_attn_grid,
+        inputs=[diag_attn_grid_step, diag_attn_grid_layer],
+        outputs=[diag_attn_grid],
+    )
+    diag_attn_grid_layer.change(
+        diag_update_attn_grid,
+        inputs=[diag_attn_grid_step, diag_attn_grid_layer],
+        outputs=[diag_attn_grid],
+    )
+    diag_export_btn.click(
+        diag_export_fn,
+        outputs=[diag_export_output],
+    )
+    diag_export_csv_btn.click(
+        diag_export_csv_fn,
+        outputs=[diag_export_output],
     )
 
     demo.load(
