@@ -60,7 +60,7 @@ class ChainHeadConfig:
     n_layers: int = 2          # Transformer encoder layers
     dim_feedforward: int = 2048  # FFN hidden dim (2× d_model)
     max_chain_len: int = 20    # Max reasoning chain length
-    dropout: float = 0.1       # Attention + FFN dropout
+    dropout: float = 0.2       # Attention + FFN dropout
     activation: str = "gelu"   # FFN activation
     # Energy head
     energy_hidden: int = 512   # Hidden dim of energy projection
@@ -68,9 +68,9 @@ class ChainHeadConfig:
     temperature: float = 0.07  # InfoNCE temperature
     focal_gamma: float = 2.0   # Focal-InfoNCE exponent (0 = standard)
     # Regularization (spec §5.4: smooth landscape for Langevin)
-    lambda_grad: float = 0.05  # Gradient penalty weight
-    lambda_energy_norm: float = 0.01  # Energy magnitude regularization
-    energy_norm_margin: float = 5.0   # Max allowed |E| before penalty
+    lambda_grad: float = 0.01  # Gradient penalty weight (weak in Phase A, smooth landscape is Phase B concern)
+    lambda_energy_norm: float = 0.05  # Energy magnitude regularization
+    energy_norm_margin: float = 1.0   # Max allowed |E| before penalty
 
 
 # ─── RoPE for Chain Head Self-Attention ──────────────────────────────
@@ -273,7 +273,7 @@ class EBTChainHead(nn.Module):
         # Learnable [CLS] token
         self.cls_token = nn.Parameter(torch.randn(1, 1, cfg.d_model) * 0.02)
 
-        # Transformer encoder layers with ALiBi
+        # Transformer encoder layers with RoPE
         max_seq = cfg.max_chain_len + 1  # +1 for CLS
         self.layers = nn.ModuleList([
             ChainTransformerLayer(
@@ -348,7 +348,7 @@ class EBTChainHead(nn.Module):
             valid_len = chain_lengths.unsqueeze(1) + 1  # +1 for CLS
             attn_mask = positions < valid_len  # [B, L+1] bool
 
-        # Transformer encoder with ALiBi
+        # Transformer encoder with RoPE
         for layer in self.layers:
             x = layer(x, attn_mask=attn_mask)
 

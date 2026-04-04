@@ -49,9 +49,21 @@ from cebcm.inference.system_switching import (
 # ─── Model Loading ────────────────────────────────────────────────────
 
 def load_chain_head(ckpt_path: str, device: torch.device) -> EBTChainHead:
-    """Load trained Chain Head from checkpoint."""
+    """
+    Load trained Chain Head from checkpoint.
+
+    Handles both checkpoint formats:
+      - Phase A: state under "model", config flat or under "config"
+      - Phase B: state under "chain_head", config nested under "config" -> "chain_head"
+    """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    # Resolve config dict (may be flat or nested)
     cfg_dict = ckpt.get("config", {})
+    if "chain_head" in cfg_dict:
+        # Phase B saves full config — chain head params are nested
+        cfg_dict = cfg_dict["chain_head"]
+
     cfg = ChainHeadConfig(
         d_model=cfg_dict.get("d_model", 1024),
         n_heads=cfg_dict.get("n_heads", 8),
@@ -63,7 +75,16 @@ def load_chain_head(ckpt_path: str, device: torch.device) -> EBTChainHead:
         temperature=cfg_dict.get("temperature", 0.07),
     )
     model = EBTChainHead(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
+
+    # Resolve state dict key (Phase A: "model", Phase B: "chain_head")
+    if "model" in ckpt:
+        model.load_state_dict(ckpt["model"])
+    elif "chain_head" in ckpt:
+        model.load_state_dict(ckpt["chain_head"])
+    else:
+        available = [k for k in ckpt.keys() if not k.startswith("_")]
+        raise KeyError(f"No chain head state found. Available keys: {available}")
+
     model.eval()
     print(f"  Chain Head loaded: {model.num_params:,} params from {ckpt_path}")
     if "val_metrics" in ckpt:

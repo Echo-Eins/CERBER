@@ -123,12 +123,12 @@ def build_chain_head(cfg: dict, device: torch.device, checkpoint: str | None = N
         n_layers=cfg.get("n_layers", 2),
         dim_feedforward=cfg.get("dim_feedforward", 2048),
         max_chain_len=cfg.get("max_chain_len", 20),
-        dropout=cfg.get("dropout", 0.1),
+        dropout=cfg.get("dropout", 0.2),
         activation=cfg.get("activation", "gelu"),
         energy_hidden=cfg.get("energy_hidden", 512),
         temperature=cfg.get("temperature", 0.07),
         focal_gamma=cfg.get("focal_gamma", 2.0),
-        lambda_grad=cfg.get("lambda_grad", 0.05),
+        lambda_grad=cfg.get("lambda_grad", 0.01),
         lambda_energy_norm=cfg.get("lambda_energy_norm", 0.05),
         energy_norm_margin=cfg.get("energy_norm_margin", 1.0),
     )
@@ -146,7 +146,7 @@ def build_chain_head(cfg: dict, device: torch.device, checkpoint: str | None = N
 
 
 def train_epoch_phase_b(
-    pairwise: SimpleEnergy,
+    pairwise: nn.Module,
     chain_head: EBTChainHead,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -181,6 +181,7 @@ def train_epoch_phase_b(
         pos_lengths = batch["pos_lengths"].to(device)
         negatives = batch["negatives"].to(device)
         neg_lengths = batch["neg_lengths"].to(device)
+        neg_types = batch.get("neg_types")
 
         # Select thinking mode
         mode = select_thinking_mode(sys1_weight, sys2_weight)
@@ -193,6 +194,7 @@ def train_epoch_phase_b(
                 positives, negatives,
                 pos_lengths=pos_lengths,
                 neg_lengths=neg_lengths,
+                neg_types=neg_types,
             )
 
             # Pairwise consistency loss: pairwise energy should rank
@@ -263,7 +265,7 @@ def train_epoch_phase_b(
 
 @torch.no_grad()
 def eval_epoch_phase_b(
-    pairwise: SimpleEnergy,
+    pairwise: nn.Module,
     chain_head: EBTChainHead,
     loader: DataLoader,
     device: torch.device,
@@ -280,12 +282,14 @@ def eval_epoch_phase_b(
         pos_lengths = batch["pos_lengths"].to(device)
         negatives = batch["negatives"].to(device)
         neg_lengths = batch["neg_lengths"].to(device)
+        neg_types = batch.get("neg_types")
 
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
             _, chain_metrics = chain_head.compute_infonce_loss(
                 positives, negatives,
                 pos_lengths=pos_lengths,
                 neg_lengths=neg_lengths,
+                neg_types=neg_types,
             )
 
             # Pairwise eval
