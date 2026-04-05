@@ -104,11 +104,17 @@ def build_ipp(cfg: dict) -> FlowIPP | MLPIPP:
         d_model=ipp_cfg.get("d_model", 1024),
         d_context=ipp_cfg.get("d_context", 1024),
         hidden_dims=ipp_cfg.get("hidden_dims", [2048, 2048, 1024]),
-        n_integration_steps=ipp_cfg.get("n_integration_steps", 10),
+        n_integration_steps=ipp_cfg.get("n_integration_steps", 50),
         d_time=ipp_cfg.get("d_time", 256),
-        sigma_init=ipp_cfg.get("sigma_init", 0.5),
+        sigma_init=ipp_cfg.get("sigma_init", 0.05),
         solver=ipp_cfg.get("solver", "midpoint"),
+        endpoint_loss_weight=ipp_cfg.get("endpoint_loss_weight", 0.0),
+        endpoint_cos_weight=ipp_cfg.get("endpoint_cos_weight", 0.5),
+        endpoint_steps=ipp_cfg.get("endpoint_steps", 20),
+        endpoint_target_norm=ipp_cfg.get("endpoint_target_norm", 0.2051),
         mlp_hidden_dims=ipp_cfg.get("mlp_hidden_dims", [2048, 1024]),
+        mlp_contrastive_weight=ipp_cfg.get("mlp_contrastive_weight", 0.0),
+        mlp_temperature=ipp_cfg.get("mlp_temperature", 0.07),
     )
     mode = ipp_cfg.get("mode", "flow")
     if mode == "flow":
@@ -619,10 +625,11 @@ def main():
     surprise_predictor = build_surprise_predictor(cfg).to(device)
     context_encoder = build_context_encoder(cfg).to(device)
     ipp = build_ipp(cfg).to(device)
+    ipp_mode = str(cfg.get("ipp", {}).get("mode", "flow")).lower()
 
     print(f"  SurprisePredictor: {surprise_predictor.num_params:,} params")
     print(f"  ContextEncoder:    {context_encoder.num_params:,} params")
-    print(f"  IPP:               {ipp.num_params:,} params")
+    print(f"  IPP:               {ipp.num_params:,} params ({ipp_mode}, {ipp.__class__.__name__})")
     total = surprise_predictor.num_params + context_encoder.num_params + ipp.num_params
     print(f"  Total:             {total:,} params ({total / 1e6:.1f}M)")
 

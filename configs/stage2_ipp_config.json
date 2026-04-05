@@ -17,7 +17,7 @@
     },
 
     "ipp": {
-        "mode": "flow",
+        "mode": "mlp",
         "d_model": 1024,
         "d_context": 1024,
         "hidden_dims": [2048, 2048, 1024],
@@ -25,7 +25,9 @@
         "d_time": 256,
         "sigma_init": 0.05,
         "solver": "midpoint",
-        "mlp_hidden_dims": [2048, 1024]
+        "mlp_hidden_dims": [2048, 1024],
+        "mlp_contrastive_weight": 0.2,
+        "mlp_temperature": 0.07
     },
 
     "surprise": {
@@ -51,6 +53,7 @@
         "lr_min_factor": 0.01,
         "use_surprise_features": true,
         "target_norm": 0.2051,
+        "eval_num_samples": 4,
         "eval_every_epochs": 2,
         "checkpoint_every_epochs": 2,
         "log_every": 50

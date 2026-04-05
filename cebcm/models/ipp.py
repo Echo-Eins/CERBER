@@ -57,8 +57,15 @@ class IPPConfig:
     sigma_init: float = 0.05  # Noise scale for V_0 (SONAR norm ~0.2051, keep same order)
     # ODE solver
     solver: str = "euler"  # "euler" or "midpoint"
+    # Optional endpoint supervision (improves sample quality, not just velocity fit)
+    endpoint_loss_weight: float = 0.0
+    endpoint_cos_weight: float = 0.5
+    endpoint_steps: int = 20
+    endpoint_target_norm: float | None = 0.2051
     # MLP baseline
     mlp_hidden_dims: list[int] | None = None
+    mlp_contrastive_weight: float = 0.0
+    mlp_temperature: float = 0.07
 
     def __post_init__(self):
         if self.hidden_dims is None:
@@ -176,6 +183,35 @@ class FlowIPP(nn.Module):
         self.cfg = cfg
         self.velocity_net = VelocityNet(cfg)
 
+    def _integrate(
+            self,
+            v_start: Tensor,
+            v_context: Tensor,
+            n_steps: int,
+    ) -> Tensor:
+        """
+        Integrate dV/dt = v_theta(V, t, context) from t=0 to t=1.
+        """
+        B = v_start.shape[0]
+        device = v_start.device
+        steps = max(1, int(n_steps))
+        dt = 1.0 / steps
+        v = v_start
+
+        if self.cfg.solver == "midpoint":
+            for i in range(steps):
+                t = torch.full((B,), i * dt, device=device)
+                t_mid = torch.full((B,), (i + 0.5) * dt, device=device)
+                v_mid = v + 0.5 * dt * self.velocity_net(v, t, v_context)
+                v = v + dt * self.velocity_net(v_mid, t_mid, v_context)
+        else:  # Euler
+            for i in range(steps):
+                t = torch.full((B,), i * dt, device=device)
+                velocity = self.velocity_net(v, t, v_context)
+                v = v + dt * velocity
+
+        return v
+
     def compute_loss(
             self,
             v_context: Tensor,  # [B, D_ctx] from ContextEncoder
@@ -214,15 +250,43 @@ class FlowIPP(nn.Module):
         # Predict velocity
         v_pred = self.velocity_net(v_t, t, v_context)
 
-        # MSE loss on velocity
-        loss = F.mse_loss(v_pred, u_target)
+        # Flow matching loss on velocity
+        loss_flow = F.mse_loss(v_pred, u_target)
+        loss = loss_flow
+
+        endpoint_mse = None
+        endpoint_cos = None
+        if self.cfg.endpoint_loss_weight > 0.0:
+            # Explicitly supervise final integrated sample quality.
+            v_end = self._integrate(
+                v_start=v_noise,
+                v_context=v_context,
+                n_steps=self.cfg.endpoint_steps,
+            )
+            if self.cfg.endpoint_target_norm is not None:
+                v_end = F.normalize(v_end, dim=-1) * float(self.cfg.endpoint_target_norm)
+            endpoint_mse_t = F.mse_loss(v_end, v_target)
+            endpoint_cos_t = (1 - F.cosine_similarity(v_end, v_target, dim=-1)).mean()
+            endpoint_loss = endpoint_mse_t + float(self.cfg.endpoint_cos_weight) * endpoint_cos_t
+            loss = loss + float(self.cfg.endpoint_loss_weight) * endpoint_loss
+            endpoint_mse = endpoint_mse_t.item()
+            endpoint_cos = 1.0 - endpoint_cos_t.item()
 
         # Diagnostics
         with torch.no_grad():
-            cos = F.cosine_similarity(v_pred, u_target, dim=-1).mean().item()
+            flow_cos = F.cosine_similarity(v_pred, u_target, dim=-1).mean().item()
             vel_norm = v_pred.norm(dim=-1).mean().item()
 
-        return loss, {"flow_loss": loss.item(), "flow_cos": cos, "vel_norm": vel_norm}
+        metrics = {
+            "flow_loss": loss.item(),
+            "flow_vel_mse": loss_flow.item(),
+            "flow_cos": flow_cos,
+            "vel_norm": vel_norm,
+        }
+        if endpoint_mse is not None and endpoint_cos is not None:
+            metrics["flow_endpoint_mse"] = endpoint_mse
+            metrics["flow_endpoint_cos"] = endpoint_cos
+        return loss, metrics
 
     @torch.no_grad()
     def sample(
@@ -248,7 +312,6 @@ class FlowIPP(nn.Module):
         D = self.cfg.d_model
         device = v_context.device
         steps = n_steps or self.cfg.n_integration_steps
-        dt = 1.0 / steps
 
         # Start from noise (or provided init)
         if v_init is not None:
@@ -256,20 +319,7 @@ class FlowIPP(nn.Module):
         else:
             v = torch.randn(B, D, device=device) * self.cfg.sigma_init
 
-        # Euler or midpoint integration
-        if self.cfg.solver == "midpoint":
-            for i in range(steps):
-                t = torch.full((B,), i * dt, device=device)
-                t_mid = torch.full((B,), (i + 0.5) * dt, device=device)
-                # Half step
-                v_mid = v + 0.5 * dt * self.velocity_net(v, t, v_context)
-                # Full step using midpoint velocity
-                v = v + dt * self.velocity_net(v_mid, t_mid, v_context)
-        else:  # Euler
-            for i in range(steps):
-                t = torch.full((B,), i * dt, device=device)
-                velocity = self.velocity_net(v, t, v_context)
-                v = v + dt * velocity
+        v = self._integrate(v_start=v, v_context=v_context, n_steps=steps)
 
         # Project to SONAR sphere if target_norm specified
         if target_norm is not None:
@@ -328,10 +378,25 @@ class MLPIPP(nn.Module):
         loss_cos = (1 - F.cosine_similarity(v_pred, v_target, dim=-1)).mean()
         loss = loss_mse + 0.5 * loss_cos
 
+        loss_nce = torch.tensor(0.0, device=v_pred.device)
+        if self.cfg.mlp_contrastive_weight > 0.0 and v_pred.shape[0] > 1:
+            z_pred = F.normalize(v_pred, dim=-1)
+            z_tgt = F.normalize(v_target, dim=-1)
+            logits = z_pred @ z_tgt.t()
+            logits = logits / max(1e-6, float(self.cfg.mlp_temperature))
+            labels = torch.arange(v_pred.shape[0], device=v_pred.device)
+            loss_nce = F.cross_entropy(logits, labels)
+            loss = loss + float(self.cfg.mlp_contrastive_weight) * loss_nce
+
         with torch.no_grad():
             cos = F.cosine_similarity(v_pred, v_target, dim=-1).mean().item()
 
-        return loss, {"ipp_loss": loss.item(), "ipp_mse": loss_mse.item(), "ipp_cos": cos}
+        return loss, {
+            "ipp_loss": loss.item(),
+            "ipp_mse": loss_mse.item(),
+            "ipp_cos": cos,
+            "ipp_nce": loss_nce.item(),
+        }
 
     @torch.no_grad()
     def sample(

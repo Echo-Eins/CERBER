@@ -179,6 +179,7 @@ def eval_epoch(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     target_norm: float,
+    eval_num_samples: int,
     dataset_source: str,
 ) -> dict[str, float]:
     context_encoder.eval()
@@ -189,6 +190,8 @@ def eval_epoch(
     tracker = MetricTracker()
     all_cos: list[float] = []
     all_l2: list[float] = []
+    all_cos_best: list[float] = []
+    all_l2_best: list[float] = []
 
     for batch in loader:
         vectors = batch["vectors"].to(device)
@@ -223,6 +226,20 @@ def eval_epoch(
         l2 = (v_init - target_vecs).norm(dim=-1)
         all_cos.extend(cos.cpu().tolist())
         all_l2.extend(l2.cpu().tolist())
+
+        if eval_num_samples > 1:
+            cos_samples = [cos]
+            l2_samples = [l2]
+            for _ in range(eval_num_samples - 1):
+                with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    v_s = ipp.sample(v_context, target_norm=target_norm)
+                cos_samples.append(F.cosine_similarity(v_s, target_vecs, dim=-1))
+                l2_samples.append((v_s - target_vecs).norm(dim=-1))
+            cos_stack = torch.stack(cos_samples, dim=0)  # [K, B]
+            l2_stack = torch.stack(l2_samples, dim=0)  # [K, B]
+            all_cos_best.extend(cos_stack.max(dim=0).values.cpu().tolist())
+            all_l2_best.extend(l2_stack.min(dim=0).values.cpu().tolist())
+
         tracker.update(metrics)
 
     avg = tracker.get()
@@ -234,12 +251,23 @@ def eval_epoch(
         avg["eval_cos_gt05"] = (cos_t > 0.5).float().mean().item()
         avg["eval_cos_gt07"] = (cos_t > 0.7).float().mean().item()
         avg["eval_l2_mean"] = l2_t.mean().item()
+        if all_cos_best:
+            cos_best_t = torch.tensor(all_cos_best)
+            l2_best_t = torch.tensor(all_l2_best)
+            avg["eval_cos_bestk_mean"] = cos_best_t.mean().item()
+            avg["eval_cos_bestk_gt05"] = (cos_best_t > 0.5).float().mean().item()
+            avg["eval_cos_bestk_gt07"] = (cos_best_t > 0.7).float().mean().item()
+            avg["eval_l2_bestk_mean"] = l2_best_t.mean().item()
     else:
         avg.setdefault("eval_cos_mean", 0.0)
         avg.setdefault("eval_cos_std", 0.0)
         avg.setdefault("eval_cos_gt05", 0.0)
         avg.setdefault("eval_cos_gt07", 0.0)
         avg.setdefault("eval_l2_mean", 0.0)
+        avg.setdefault("eval_cos_bestk_mean", 0.0)
+        avg.setdefault("eval_cos_bestk_gt05", 0.0)
+        avg.setdefault("eval_cos_bestk_gt07", 0.0)
+        avg.setdefault("eval_l2_bestk_mean", 0.0)
     return avg
 
 
@@ -288,7 +316,9 @@ def main() -> None:
     print("Building models...")
     context_encoder = build_context_encoder(cfg).to(device)
     ipp = build_ipp(cfg).to(device)
+    ipp_mode = str(cfg.get("ipp", {}).get("mode", "flow")).lower()
     print(f"  ContextEncoder params: {context_encoder.num_params:,}")
+    print(f"  IPP mode:              {ipp_mode} ({ipp.__class__.__name__})")
     print(f"  IPP params:            {ipp.num_params:,}")
 
     # By default force both modules to remain trainable in joint stage.
@@ -380,6 +410,7 @@ def main() -> None:
     eval_every = int(train_cfg.get("eval_every_epochs", 1))
     ckpt_every = int(train_cfg.get("checkpoint_every_epochs", 1))
     target_norm = float(train_cfg.get("target_norm", 0.2051))
+    eval_num_samples = max(1, int(train_cfg.get("eval_num_samples", 1)))
 
     log_path = logs_dir / "ce_ipp_joint_training_log.jsonl"
     log_file = open(log_path, "a", encoding="utf-8")
@@ -427,6 +458,7 @@ def main() -> None:
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 target_norm=target_norm,
+                eval_num_samples=eval_num_samples,
                 dataset_source=val_source,
             )
             loss_key = "flow_loss" if "flow_loss" in val_metrics else "ipp_loss"
@@ -439,6 +471,13 @@ def main() -> None:
                 f"eval_cos>0.7={val_metrics.get('eval_cos_gt07', 0.0):.1%} "
                 f"eval_l2={val_metrics.get('eval_l2_mean', 0.0):.4f}"
             )
+            if eval_num_samples > 1:
+                print(
+                    f"        eval_cos_best@{eval_num_samples}="
+                    f"{val_metrics.get('eval_cos_bestk_mean', 0.0):.4f} "
+                    f"eval_cos_best>0.7={val_metrics.get('eval_cos_bestk_gt07', 0.0):.1%} "
+                    f"eval_l2_best={val_metrics.get('eval_l2_bestk_mean', 0.0):.4f}"
+                )
             write_log(epoch, "val", val_metrics, 0.0)
 
             cos_mean = float(val_metrics.get("eval_cos_mean", 0.0))

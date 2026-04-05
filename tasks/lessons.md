@@ -1,5 +1,34 @@
 # Lessons
 
+## 2026-04-04 - Respect requested IPP regime (MLP vs Flow) and lock mode explicitly
+
+### Pattern
+User asked for MLP-focused analysis, but changes were made in FlowIPP path first, causing mismatch with requested experiment track.
+
+### Fix
+- Set `ipp.mode` explicitly in active stage2 configs for the intended run.
+- Print effective IPP mode/class at training start in all stage2 trainers.
+- Treat Flow and MLP as separate experiment branches; do not silently mix.
+
+### Rule
+Before changing IPP math, verify the active regime (`mlp`/`flow`) in config and logs. If user requests one regime, all proposed code/config changes must target that regime first.
+
+## 2026-04-04 - FlowIPP needs endpoint supervision, not only velocity supervision
+
+### Pattern
+`FlowIPP` could optimize velocity-field loss (`flow_cos`) while `eval_cos_mean` stayed near the ~0.60 ceiling.
+
+### Root Cause
+Pure CFM objective supervises local velocity at random `(V_t, t)` points, but does not directly penalize final integration error of `V_init` after finite-step ODE rollout.
+
+### Fix
+- Add endpoint loss during training: integrate from sampled `V_noise` to `t=1`, then supervise `(V_end, V_target)` with MSE+cosine.
+- Keep CFM loss as base objective; endpoint term is auxiliary and config-controlled.
+- Add best-of-k eval diagnostics to distinguish "single-sample quality" from "mode coverage".
+
+### Rule
+For flow-based IPP, always monitor and, when needed, optimize endpoint sample quality explicitly; velocity fit alone is insufficient for retrieval-level cosine targets.
+
 ## 2026-04-04 - Joint CE+IPP: never assume freeze state, log it explicitly
 
 ### Pattern

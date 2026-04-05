@@ -1,5 +1,29 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-04 - MLP-only IPP track alignment
+- [x] Align stage2 configs to `ipp.mode = mlp` for active runs
+- [x] Add explicit IPP mode/class print in stage2 trainers
+- [x] Add MLP contrastive term (in-batch NCE) to reduce mode-averaging
+- [x] Keep flow-path changes isolated and non-blocking for MLP mode
+- [x] Validate compile + JSON parse after mode switch
+
+### Review
+- User target is MLP branch; training must be auditable as MLP from first log lines.
+- MLP now receives extra discrimination pressure (`ipp_nce`) beyond MSE+cosine.
+
+## 2026-04-04 - IPP ceiling mitigation (0.60 plateau)
+- [x] Re-audit FlowIPP objective vs eval metric mismatch
+- [x] Add endpoint supervision to FlowIPP (MSE+cosine on integrated endpoint)
+- [x] Keep objective backward-compatible via config gates
+- [x] Add best-of-k eval diagnostics to IPP and CE+IPP joint trainers
+- [x] Update stage2 configs to enable endpoint-loss and multi-sample eval
+- [x] Validate Python compile + JSON parse
+
+### Review
+- Plateau source is not only freeze state; velocity-field fit can improve without endpoint sample improving.
+- Added direct endpoint optimization to align training objective with `eval_cos_mean`.
+- Added `best@k` eval to detect whether model has good modes but weak single-sample selection.
+
 ## 2026-04-04 - Joint CE+IPP trainability diagnostics
 - [x] Verify whether IPP is frozen in `train_stage2_ce_ipp_joint.py`
 - [x] Add explicit forced-unfreeze toggles (default on) for CE and IPP

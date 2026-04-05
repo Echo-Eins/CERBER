@@ -155,7 +155,13 @@ def build_ipp(cfg: dict) -> FlowIPP | MLPIPP:
         d_time=ipp_cfg.get("d_time", 256),
         sigma_init=ipp_cfg.get("sigma_init", 0.05),
         solver=ipp_cfg.get("solver", "midpoint"),
+        endpoint_loss_weight=ipp_cfg.get("endpoint_loss_weight", 0.0),
+        endpoint_cos_weight=ipp_cfg.get("endpoint_cos_weight", 0.5),
+        endpoint_steps=ipp_cfg.get("endpoint_steps", 20),
+        endpoint_target_norm=ipp_cfg.get("endpoint_target_norm", 0.2051),
         mlp_hidden_dims=ipp_cfg.get("mlp_hidden_dims", [2048, 1024]),
+        mlp_contrastive_weight=ipp_cfg.get("mlp_contrastive_weight", 0.0),
+        mlp_temperature=ipp_cfg.get("mlp_temperature", 0.07),
     )
     mode = ipp_cfg.get("mode", "flow")
     if mode == "flow":
