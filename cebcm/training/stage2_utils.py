@@ -140,7 +140,7 @@ def build_context_encoder(cfg: dict) -> ContextEncoder:
         surprise_top_k_pct=ce_cfg.get("surprise_top_k_pct", 0.05),
         n_types=ce_cfg.get("n_types", 3),
         output_dim=ce_cfg.get("output_dim", 1024),
-        use_alibi=ce_cfg.get("use_alibi", True),
+        use_alibi=ce_cfg.get("use_alibi", False),
     ))
 
 

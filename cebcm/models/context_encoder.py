@@ -49,7 +49,33 @@ class ContextEncoderConfig:
     n_types: int = 3  # 0=query, 1=answer, 2=compact
     # Output
     output_dim: int = 1024  # Output context vector dimension
-    use_alibi: bool = True  # ALiBi positional bias (preserves SONAR geometry)
+    use_alibi: bool = False  # ALiBi is optional; absolute positional signal is always injected.
+
+
+def _sinusoidal_position_embedding(
+    positions: Tensor,  # [B, L] or [L]
+    d_model: int,
+    dtype: torch.dtype,
+) -> Tensor:
+    """
+    Build absolute sinusoidal position embeddings.
+
+    Provides explicit position-content binding for global-token attention.
+    """
+    if positions.dim() == 1:
+        positions = positions.unsqueeze(0)
+    positions = positions.float()  # [B, L]
+    device = positions.device
+
+    half = d_model // 2
+    freq = torch.exp(
+        -math.log(10000.0) * torch.arange(half, device=device, dtype=torch.float32) / max(1, half)
+    )  # [half]
+    angles = positions.unsqueeze(-1) * freq.unsqueeze(0).unsqueeze(0)  # [B, L, half]
+    emb = torch.cat([angles.sin(), angles.cos()], dim=-1)  # [B, L, 2*half]
+    if emb.shape[-1] < d_model:
+        emb = F.pad(emb, (0, d_model - emb.shape[-1]))
+    return emb.to(dtype=dtype)
 
 
 class ALiBiAttention(nn.Module):
@@ -63,12 +89,13 @@ class ALiBiAttention(nn.Module):
     Reference: Press et al., "Train Short, Test Long" (ICLR 2022)
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, use_alibi: bool = True):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         assert d_model % n_heads == 0
+        self.use_alibi = bool(use_alibi)
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -77,8 +104,11 @@ class ALiBiAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # ALiBi slopes: geometric sequence from 2^(-8/n_heads) to 2^(-8)
-        slopes = self._get_alibi_slopes(n_heads)
-        self.register_buffer("alibi_slopes", slopes)
+        if self.use_alibi:
+            slopes = self._get_alibi_slopes(n_heads)
+            self.register_buffer("alibi_slopes", slopes)
+        else:
+            self.register_buffer("alibi_slopes", torch.empty(0))
 
     @staticmethod
     def _get_alibi_slopes(n_heads: int) -> Tensor:
@@ -114,6 +144,8 @@ class ALiBiAttention(nn.Module):
             key: Tensor,  # [B, K, D]
             value: Tensor,  # [B, K, D]
             attn_mask: Tensor | None = None,  # [B, Q, K] or [B, 1, Q, K]
+            query_positions: Tensor | None = None,  # [B, Q]
+            key_positions: Tensor | None = None,  # [B, K]
     ) -> Tensor:
         B, Q, _ = query.shape
         K = key.shape[1]
@@ -127,9 +159,18 @@ class ALiBiAttention(nn.Module):
         scale = self.head_dim ** -0.5
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, Q, K]
 
-        # Add ALiBi bias
-        alibi = self._get_alibi_bias(Q, K, query.device)  # [H, Q, K]
-        attn_weights = attn_weights + alibi.unsqueeze(0)
+        # Add ALiBi bias (optional)
+        if self.use_alibi:
+            if query_positions is not None and key_positions is not None:
+                q_pos = query_positions.float().unsqueeze(-1)  # [B, Q, 1]
+                k_pos = key_positions.float().unsqueeze(-2)    # [B, 1, K]
+                dist = (q_pos - k_pos).abs()                   # [B, Q, K]
+                slopes = self.alibi_slopes.to(query.device).view(1, self.n_heads, 1, 1)
+                alibi = -slopes * dist.unsqueeze(1)            # [B, H, Q, K]
+                attn_weights = attn_weights + alibi
+            else:
+                alibi = self._get_alibi_bias(Q, K, query.device)  # [H, Q, K]
+                attn_weights = attn_weights + alibi.unsqueeze(0)
 
         # Apply mask (e.g., for padding)
         if attn_mask is not None:
@@ -182,6 +223,7 @@ class ContextEncoder(nn.Module):
             d_model=cfg.d_model,
             n_heads=cfg.n_global_heads,
             dropout=cfg.global_attn_dropout,
+            use_alibi=cfg.use_alibi,
         )
         self.global_norm_q = RMSNorm(cfg.d_model)
         self.global_norm_kv = RMSNorm(cfg.d_model)
@@ -197,7 +239,9 @@ class ContextEncoder(nn.Module):
         # Incremental inference state
         self._ssm_states: list[tuple[Tensor, Tensor]] | None = None
         self._global_tokens: list[Tensor] = []
+        self._global_positions: list[int] = []
         self._surprise_history: list[float] = []
+        self._position_counter: int = 0
 
     def forward(
             self,
@@ -244,9 +288,11 @@ class ContextEncoder(nn.Module):
 
         # Build padding mask if lengths provided
         pad_mask = None
+        query_positions = torch.full((B,), L - 1, dtype=torch.long, device=x.device)
         if lengths is not None:
             positions = torch.arange(L, device=x.device).unsqueeze(0)
             pad_mask = positions < lengths.unsqueeze(1)  # [B, L] bool
+            query_positions = (lengths - 1).clamp(min=0).long()
 
         # Stage 1: SSM processes full sequence
         ssm_out = self.ssm(x)  # [B, L, D]
@@ -268,6 +314,7 @@ class ContextEncoder(nn.Module):
                 ssm_hidden=ssm_out,
                 surprise_scores=surprise_scores,
                 pad_mask=pad_mask,
+                query_positions=query_positions,
             )
         else:
             # No surprise info → just use SSM summary doubled
@@ -286,6 +333,7 @@ class ContextEncoder(nn.Module):
             ssm_hidden: Tensor,  # [B, L, D]
             surprise_scores: Tensor,  # [B, L]
             pad_mask: Tensor | None,  # [B, L]
+            query_positions: Tensor,  # [B]
     ) -> Tensor:
         """Cross-attention from query to high-surprise (global) tokens."""
         B, L, D = ssm_hidden.shape
@@ -296,6 +344,7 @@ class ContextEncoder(nn.Module):
         pct = float(self.cfg.surprise_top_k_pct)
         pct = min(max(pct, 1e-6), 1.0)
         global_tokens_per_batch: list[Tensor] = []
+        global_pos_per_batch: list[Tensor] = []
         max_k = 1
 
         # Per-sample selection avoids pulling padded positions into top-k.
@@ -303,6 +352,7 @@ class ContextEncoder(nn.Module):
             valid_idx = pad_mask[b].nonzero(as_tuple=False).squeeze(-1)
             if valid_idx.numel() == 0:
                 global_tokens_per_batch.append(ssm_hidden[b:b + 1, :1, :].squeeze(0))
+                global_pos_per_batch.append(torch.zeros(1, dtype=torch.long, device=ssm_hidden.device))
                 max_k = max(max_k, 1)
                 continue
 
@@ -314,28 +364,43 @@ class ContextEncoder(nn.Module):
             selected_idx = valid_idx[top_local]
             tokens_b = ssm_hidden[b, selected_idx, :]  # [k_b, D]
             global_tokens_per_batch.append(tokens_b)
+            global_pos_per_batch.append(selected_idx.long())
             max_k = max(max_k, k_b)
 
         global_tokens = torch.zeros(B, max_k, D, device=ssm_hidden.device, dtype=ssm_hidden.dtype)
         global_mask = torch.zeros(B, max_k, dtype=torch.bool, device=ssm_hidden.device)
+        global_pos = torch.zeros(B, max_k, dtype=torch.long, device=ssm_hidden.device)
         for b, tokens_b in enumerate(global_tokens_per_batch):
             k_b = tokens_b.shape[0]
             global_tokens[b, :k_b] = tokens_b
             global_mask[b, :k_b] = True
+            global_pos[b, :k_b] = global_pos_per_batch[b]
 
         # Cross-attention: query → global tokens
-        q = self.global_norm_q(query.unsqueeze(1))  # [B, 1, D]
-        kv = self.global_norm_kv(global_tokens)  # [B, k, D]
+        q_pos = query_positions.unsqueeze(1)  # [B, 1]
+        q_pos_emb = _sinusoidal_position_embedding(q_pos, D, query.dtype)
+        kv_pos_emb = _sinusoidal_position_embedding(global_pos, D, global_tokens.dtype)
+        q = self.global_norm_q(query.unsqueeze(1) + q_pos_emb)  # [B, 1, D]
+        kv = self.global_norm_kv(global_tokens + kv_pos_emb)  # [B, k, D]
         attn_mask = global_mask.unsqueeze(1)  # [B, 1, k]
 
-        attn_out = self.global_attn(query=q, key=kv, value=kv, attn_mask=attn_mask)  # [B, 1, D]
+        attn_out = self.global_attn(
+            query=q,
+            key=kv,
+            value=kv,
+            attn_mask=attn_mask,
+            query_positions=q_pos,
+            key_positions=global_pos,
+        )  # [B, 1, D]
         return attn_out.squeeze(1)  # [B, D]
 
     def reset_state(self) -> None:
         """Reset incremental inference state."""
         self._ssm_states = None
         self._global_tokens = []
+        self._global_positions = []
         self._surprise_history = []
+        self._position_counter = 0
 
     def _is_global_surprise(self, surprise: float) -> bool:
         """
@@ -383,17 +448,32 @@ class ContextEncoder(nn.Module):
 
         # SSM step
         ssm_out, self._ssm_states = self.ssm.step(x, self._ssm_states)
+        current_pos = self._position_counter
+        self._position_counter += 1
 
         # Track global tokens using running percentile (top-k% tail), not fixed scalar.
         if self._is_global_surprise(surprise):
             self._global_tokens.append(ssm_out.detach())
+            self._global_positions.append(current_pos)
 
         # Cross-attend to accumulated global tokens
         if len(self._global_tokens) > 0:
             globals_t = torch.stack(self._global_tokens, dim=1)  # [B, G, D]
-            q = self.global_norm_q(ssm_out.unsqueeze(1))
-            kv = self.global_norm_kv(globals_t)
-            global_out = self.global_attn(query=q, key=kv, value=kv).squeeze(1)
+            global_pos = torch.tensor(self._global_positions, dtype=torch.long, device=v_new.device)
+            global_pos = global_pos.unsqueeze(0).expand(B, -1)  # [B, G]
+            q_pos = torch.full((B, 1), current_pos, dtype=torch.long, device=v_new.device)  # [B, 1]
+
+            q_pos_emb = _sinusoidal_position_embedding(q_pos, D, ssm_out.dtype)
+            kv_pos_emb = _sinusoidal_position_embedding(global_pos, D, globals_t.dtype)
+            q = self.global_norm_q(ssm_out.unsqueeze(1) + q_pos_emb)
+            kv = self.global_norm_kv(globals_t + kv_pos_emb)
+            global_out = self.global_attn(
+                query=q,
+                key=kv,
+                value=kv,
+                query_positions=q_pos,
+                key_positions=global_pos,
+            ).squeeze(1)
         else:
             global_out = ssm_out
 

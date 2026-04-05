@@ -544,16 +544,16 @@ class Stage2Config:
     ce_surprise_top_k_pct: float = 0.05
     ce_n_types: int = 3  # query=0, answer=1, compact=2
     ce_output_dim: int = 1024
-    ce_use_alibi: bool = True
+    ce_use_alibi: bool = False
 
     # --- IPP ---
     ipp_mode: str = "flow"  # "flow" or "mlp"
     ipp_d_model: int = 1024
     ipp_d_context: int = 1024
     ipp_hidden_dims: list[int] = field(default_factory=lambda: [2048, 2048, 1024])
-    ipp_n_integration_steps: int = 10
+    ipp_n_integration_steps: int = 50
     ipp_d_time: int = 256
-    ipp_sigma_init: float = 0.5
+    ipp_sigma_init: float = 0.05
     ipp_solver: str = "midpoint"  # "euler" or "midpoint"
     ipp_mlp_hidden_dims: list[int] = field(default_factory=lambda: [2048, 1024])
 

@@ -13,7 +13,7 @@
         "surprise_top_k_pct": 0.05,
         "n_types": 3,
         "output_dim": 1024,
-        "use_alibi": true
+        "use_alibi": false
     },
 
     "surprise": {

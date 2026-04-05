@@ -1463,3 +1463,14 @@ when a config misses these fields.
 1. Builder defaults must match model dataclass defaults unless there is an explicit documented override.
 2. For SONAR-space IPP, keep fallback `sigma_init` in same norm scale (`~0.05`, not `0.5`).
 3. Integration step defaults should preserve expected solver behavior (`50` for Flow IPP baseline).
+
+## 2026-04-04 - Context Global Attention needs explicit position-content signal
+
+### Pattern
+Relying on ALiBi-only bias in global-token attention is insufficient for learning
+position-content binding. ALiBi is distance bias, not content-anchored positional encoding.
+
+### Rule
+1. For context global-token attention, inject explicit absolute positional encoding into Q/KV.
+2. Preserve true token positions for selected global tokens; do not lose chronology when top-k filtering.
+3. Keep ALiBi optional as extra bias, never as the only positional mechanism for this head.

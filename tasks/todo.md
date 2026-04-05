@@ -1678,3 +1678,30 @@ Implement strict training-time switching policy:
 - Validation:
   - `py -3 -m py_compile experiments/09_stage3_chain/train_stage3_phase_b.py`
   - `py -3 -c "import json; json.load(open('configs/stage3_config.json', encoding='utf-8')); print('ok')"`
+
+# ContextEncoder Positional Signal Fix (2026-04-04)
+
+## Goal
+Remove ALiBi-only positional dependency in CE global attention and enforce explicit
+position-content binding for global-token fusion.
+
+## Checklist
+- [x] Add absolute sinusoidal positional embedding for global attention Q/KV.
+- [x] Preserve selected global token absolute positions and pass them through attention.
+- [x] Keep ALiBi optional (as extra bias), not mandatory.
+- [x] Update Stage2 defaults/configs to disable ALiBi-only mode by default.
+- [x] Validate Python syntax and JSON configs.
+
+## Review
+- Updated:
+  - `cebcm/models/context_encoder.py`
+  - `cebcm/training/stage2_utils.py`
+  - `experiments/08_autoregressor/train_stage2.py`
+  - `configs/base.py`
+  - `configs/stage2_config.json`
+  - `configs/stage2_ce_config.json`
+  - `configs/stage2_ipp_config.json`
+  - `configs/stage2_ce_ipp_joint_config.json`
+- Validation:
+  - `py -3 -m py_compile cebcm/models/context_encoder.py cebcm/training/stage2_utils.py experiments/08_autoregressor/train_stage2.py`
+  - `py -3 -c "import json; [json.load(open(p, encoding='utf-8')) for p in ['configs/stage2_config.json','configs/stage2_ce_config.json','configs/stage2_ipp_config.json','configs/stage2_ce_ipp_joint_config.json']]; print('ok')"`
