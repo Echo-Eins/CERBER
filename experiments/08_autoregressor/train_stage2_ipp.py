@@ -156,10 +156,21 @@ def train_epoch(
             avg = tracker.get()
             loss_key = "flow_loss" if "flow_loss" in avg else "ipp_loss"
             cos_key = "flow_cos" if "flow_cos" in avg else "ipp_cos"
+            extras: list[str] = []
+            if "ipp_mse" in avg:
+                extras.append(f"mse={avg.get('ipp_mse', 0.0):.4f}")
+            if "ipp_nce" in avg:
+                extras.append(f"nce={avg.get('ipp_nce', 0.0):.4f}")
+            if "flow_vel_mse" in avg:
+                extras.append(f"vel_mse={avg.get('flow_vel_mse', 0.0):.4f}")
+            if "flow_endpoint_cos" in avg:
+                extras.append(f"end_cos={avg.get('flow_endpoint_cos', 0.0):.4f}")
+            extras_str = (" " + " ".join(extras)) if extras else ""
             print(
                 f"  [IPP] epoch={epoch} step={step} "
                 f"loss={avg.get(loss_key, 0.0):.4f} "
                 f"cos={avg.get(cos_key, 0.0):.4f} "
+                f"{extras_str}"
                 f"lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
@@ -330,13 +341,26 @@ def main() -> None:
     ipp_mode = str(cfg.get("ipp", {}).get("mode", "flow")).lower()
     print(f"  IPP mode:   {ipp_mode} ({ipp.__class__.__name__})")
     print(f"  IPP params: {ipp.num_params:,}")
+    if ipp_mode == "flow":
+        sigma_init = float(cfg.get("ipp", {}).get("sigma_init", 0.05))
+        if sigma_init > 0.1:
+            print(
+                f"  [WARN] sigma_init={sigma_init:.3f} is high vs SONAR norm (~0.2051). "
+                f"Flow may show high train cos but near-random eval samples."
+            )
 
     lr = float(train_cfg.get("lr", train_cfg.get("ipp_lr", 1e-4)))
+    weight_decay = float(train_cfg.get("weight_decay", 0.01))
     optimizer = torch.optim.AdamW(
         ipp.parameters(),
         lr=lr,
-        weight_decay=float(train_cfg.get("weight_decay", 0.01)),
+        weight_decay=weight_decay,
     )
+    if weight_decay > 0.1:
+        print(
+            f"  [WARN] weight_decay={weight_decay:.3f} is very high for AdamW; "
+            f"this can cap representation quality."
+        )
 
     num_epochs = int(train_cfg.get("num_epochs", train_cfg.get("ipp_num_epochs", 20)))
     warmup_epochs = int(train_cfg.get("warmup_epochs", 3))
@@ -433,6 +457,13 @@ def main() -> None:
                 f"eval_cos>0.5={val_metrics.get('eval_cos_gt05', 0.0):.1%} "
                 f"eval_l2={val_metrics.get('eval_l2_mean', 0.0):.4f}"
             )
+            if "ipp_mse" in val_metrics or "ipp_nce" in val_metrics or "flow_vel_mse" in val_metrics:
+                print(
+                    f"            components: "
+                    f"ipp_mse={val_metrics.get('ipp_mse', 0.0):.4f} "
+                    f"ipp_nce={val_metrics.get('ipp_nce', 0.0):.4f} "
+                    f"flow_vel_mse={val_metrics.get('flow_vel_mse', 0.0):.4f}"
+                )
             if eval_num_samples > 1:
                 print(
                     f"            eval_cos_best@{eval_num_samples}="

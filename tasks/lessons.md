@@ -1,5 +1,16 @@
 # Lessons
 
+## 2026-04-05 - High flow_cos can coexist with near-random eval_cos when sigma_init is mis-scaled
+
+### Pattern
+Flow IPP run reached `flow_cos ~0.93`, but `eval_cos_mean ~0.016` and `eval_l2 ~0.298` (near random on SONAR sphere).
+
+### Root Cause
+`sigma_init=0.5` is out-of-scale for SONAR norms (~0.2051). Velocity fitting improves on training interpolation, while finite-step sampling from oversized noise fails to land near targets.
+
+### Rule
+For SONAR-space Flow IPP, keep `sigma_init` in the same scale band (`~0.03..0.08`) and treat high `flow_cos` as insufficient without endpoint/sample metrics.
+
 ## 2026-04-04 - Respect requested IPP regime (MLP vs Flow) and lock mode explicitly
 
 ### Pattern

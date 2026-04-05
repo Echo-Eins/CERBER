@@ -49,6 +49,11 @@ class IPPConfig:
     d_context: int = 1024  # Context vector dimension (from ContextEncoder)
     # Flow Matching architecture
     hidden_dims: list[int] | None = None  # MLP hidden dims for velocity net
+    flow_activation: str = "silu"
+    flow_norm: str = "layernorm"
+    flow_dropout: float = 0.0
+    flow_zero_init_last: bool = True
+    flow_velocity_weight: float = 1.0
     n_integration_steps: int = 50  # ODE steps at inference
     # Time embedding
     d_time: int = 256  # Time embedding dimension
@@ -64,6 +69,11 @@ class IPPConfig:
     endpoint_target_norm: float | None = 0.2051
     # MLP baseline
     mlp_hidden_dims: list[int] | None = None
+    mlp_activation: str = "silu"
+    mlp_norm: str = "layernorm"
+    mlp_dropout: float = 0.0
+    mlp_mse_weight: float = 1.0
+    mlp_cos_weight: float = 0.5
     mlp_contrastive_weight: float = 0.0
     mlp_temperature: float = 0.07
 
@@ -99,6 +109,34 @@ class SinusoidalTimeEmbedding(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)  # [B, d_embed]
 
 
+def _make_activation(name: str) -> nn.Module:
+    key = name.lower()
+    if key == "silu":
+        return nn.SiLU()
+    if key == "gelu":
+        return nn.GELU()
+    if key == "relu":
+        return nn.ReLU()
+    if key == "tanh":
+        return nn.Tanh()
+    if key in {"identity", "none"}:
+        return nn.Identity()
+    raise ValueError(f"Unsupported activation: {name}")
+
+
+def _make_norm(name: str, dim: int) -> nn.Module:
+    key = name.lower()
+    if key == "layernorm":
+        return nn.LayerNorm(dim)
+    if key in {"identity", "none"}:
+        return nn.Identity()
+    if key == "rmsnorm":
+        if not hasattr(nn, "RMSNorm"):
+            raise ValueError("RMSNorm is not available in this torch version.")
+        return nn.RMSNorm(dim)
+    raise ValueError(f"Unsupported norm: {name}")
+
+
 class VelocityNet(nn.Module):
     """
     Velocity field network v_θ(V_t, t, V_context).
@@ -116,9 +154,11 @@ class VelocityNet(nn.Module):
 
         # Time embedding
         self.time_embed = SinusoidalTimeEmbedding(cfg.d_time)
+        time_act = _make_activation(cfg.flow_activation)
         self.time_proj = nn.Sequential(
             nn.Linear(cfg.d_time, cfg.d_time),
-            nn.SiLU(),
+            time_act,
+            nn.Dropout(cfg.flow_dropout) if cfg.flow_dropout > 0 else nn.Identity(),
             nn.Linear(cfg.d_time, cfg.d_time),
         )
 
@@ -129,17 +169,21 @@ class VelocityNet(nn.Module):
         layers: list[nn.Module] = []
         prev_dim = input_dim
         for h_dim in cfg.hidden_dims:
+            norm = _make_norm(cfg.flow_norm, h_dim)
+            act = _make_activation(cfg.flow_activation)
             layers.extend([
                 nn.Linear(prev_dim, h_dim),
-                nn.LayerNorm(h_dim),
-                nn.SiLU(),
+                norm,
+                act,
+                nn.Dropout(cfg.flow_dropout) if cfg.flow_dropout > 0 else nn.Identity(),
             ])
             prev_dim = h_dim
         layers.append(nn.Linear(prev_dim, cfg.d_model))
 
         # Zero-initialize last layer (start with zero velocity)
-        nn.init.zeros_(layers[-1].weight)
-        nn.init.zeros_(layers[-1].bias)
+        if cfg.flow_zero_init_last:
+            nn.init.zeros_(layers[-1].weight)
+            nn.init.zeros_(layers[-1].bias)
 
         self.net = nn.Sequential(*layers)
 
@@ -253,6 +297,8 @@ class FlowIPP(nn.Module):
         # Flow matching loss on velocity
         loss_flow = F.mse_loss(v_pred, u_target)
         loss = loss_flow
+        if self.cfg.flow_velocity_weight != 1.0:
+            loss = float(self.cfg.flow_velocity_weight) * loss
 
         endpoint_mse = None
         endpoint_cos = None
@@ -349,10 +395,13 @@ class MLPIPP(nn.Module):
         layers: list[nn.Module] = []
         prev_dim = cfg.d_context
         for h_dim in cfg.mlp_hidden_dims:
+            norm = _make_norm(cfg.mlp_norm, h_dim)
+            act = _make_activation(cfg.mlp_activation)
             layers.extend([
                 nn.Linear(prev_dim, h_dim),
-                nn.LayerNorm(h_dim),
-                nn.SiLU(),
+                norm,
+                act,
+                nn.Dropout(cfg.mlp_dropout) if cfg.mlp_dropout > 0 else nn.Identity(),
             ])
             prev_dim = h_dim
         layers.append(nn.Linear(prev_dim, cfg.d_model))
@@ -376,7 +425,7 @@ class MLPIPP(nn.Module):
         v_pred = self.net(v_context)
         loss_mse = F.mse_loss(v_pred, v_target)
         loss_cos = (1 - F.cosine_similarity(v_pred, v_target, dim=-1)).mean()
-        loss = loss_mse + 0.5 * loss_cos
+        loss = float(self.cfg.mlp_mse_weight) * loss_mse + float(self.cfg.mlp_cos_weight) * loss_cos
 
         loss_nce = torch.tensor(0.0, device=v_pred.device)
         if self.cfg.mlp_contrastive_weight > 0.0 and v_pred.shape[0] > 1:

@@ -1,5 +1,14 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-05 - IPP diagnostics hardening
+- [x] Add component-wise loss logging (`ipp_mse`, `ipp_nce`, `flow_vel_mse`) in IPP trainers
+- [x] Add config-risk warnings for `flow sigma_init` and extreme `weight_decay`
+- [x] Keep eval output with best@k for sample-quality sanity checks
+
+### Review
+- Prevents false confidence from single aggregate `loss/cos`.
+- Makes regularization/sampling pathologies visible during first epochs.
+
 ## 2026-04-04 - MLP-only IPP track alignment
 - [x] Align stage2 configs to `ipp.mode = mlp` for active runs
 - [x] Add explicit IPP mode/class print in stage2 trainers
