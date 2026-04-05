@@ -1,5 +1,18 @@
 # Lessons
 
+## 2026-04-04 - Joint CE+IPP: never assume freeze state, log it explicitly
+
+### Pattern
+Joint training plateaued around cosine ~0.60, and there was uncertainty whether IPP was actually frozen or updating.
+
+### Fix
+- In joint trainer, explicitly force `requires_grad=True` for CE/IPP by default after checkpoint load.
+- Print trainable parameter counts for both modules before training.
+- Log `ce_grad_norm` and `ipp_grad_norm` during training to verify updates are real.
+
+### Rule
+If a module should be trainable in a multi-module stage, always prove it in logs (trainable params + grad norm), not by assumption.
+
 ## 2026-04-04 - CRITICAL: Chain Head energy_norm_margin=5.0 causes energy explosion and learning collapse
 
 ### Pattern

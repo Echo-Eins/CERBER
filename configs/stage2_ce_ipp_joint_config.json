@@ -51,6 +51,8 @@
         "warmup_epochs": 3,
         "lr_min_factor": 0.01,
         "use_surprise_features": true,
+        "force_unfreeze_context_encoder": true,
+        "force_unfreeze_ipp": true,
         "target_norm": 0.2051,
         "eval_every_epochs": 2,
         "checkpoint_every_epochs": 2,

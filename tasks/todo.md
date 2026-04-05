@@ -1,5 +1,17 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-04 - Joint CE+IPP trainability diagnostics
+- [x] Verify whether IPP is frozen in `train_stage2_ce_ipp_joint.py`
+- [x] Add explicit forced-unfreeze toggles (default on) for CE and IPP
+- [x] Add trainable parameter count printouts for CE and IPP
+- [x] Add `ce_grad_norm` and `ipp_grad_norm` logging in train loop
+- [x] Validate script syntax and config JSON parsing
+
+### Review
+- Root issue was not hidden freeze by default; IPP was already in optimizer.
+- Added explicit diagnostics to remove ambiguity and confirm gradient flow every run.
+- Next tuning should target optimization/objective mismatch, not freeze state.
+
 ## Context
 Pure ranking ablation (norm_mode=none, SiLU, lr=1e-3) proved ranking CAN learn energy separation:
 - rank_success=0.569, spread=0.236, E[c/a/h]=-1.62/-1.47/-1.39

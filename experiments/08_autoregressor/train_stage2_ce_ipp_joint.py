@@ -43,6 +43,25 @@ from cebcm.training.stage2_utils import (
 )
 
 
+def _set_requires_grad(module: nn.Module, enabled: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad_(enabled)
+
+
+def _count_trainable_params(module: nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+def _grad_l2_norm(parameters: list[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for p in parameters:
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total += float(torch.sum(g * g).item())
+    return total ** 0.5
+
+
 def _build_surprise_padded(
     surprise_predictor: SurprisePredictor | None,
     context_vecs: Tensor,
@@ -116,6 +135,8 @@ def train_epoch(
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+        ce_grad_norm = _grad_l2_norm(list(context_encoder.parameters()))
+        ipp_grad_norm = _grad_l2_norm(list(ipp.parameters()))
         nn.utils.clip_grad_norm_(
             list(context_encoder.parameters()) + list(ipp.parameters()),
             clip_grad,
@@ -125,7 +146,11 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
 
-        tracker.update(metrics)
+        tracker.update({
+            **metrics,
+            "ce_grad_norm": ce_grad_norm,
+            "ipp_grad_norm": ipp_grad_norm,
+        })
         step += 1
 
         if step % log_every == 0:
@@ -136,6 +161,8 @@ def train_epoch(
                 f"  [CE+IPP] epoch={epoch} step={step} "
                 f"loss={avg.get(loss_key, 0.0):.4f} "
                 f"cos={avg.get(cos_key, 0.0):.4f} "
+                f"ce_gn={avg.get('ce_grad_norm', 0.0):.3e} "
+                f"ipp_gn={avg.get('ipp_grad_norm', 0.0):.3e} "
                 f"lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
@@ -264,6 +291,12 @@ def main() -> None:
     print(f"  ContextEncoder params: {context_encoder.num_params:,}")
     print(f"  IPP params:            {ipp.num_params:,}")
 
+    # By default force both modules to remain trainable in joint stage.
+    if bool(train_cfg.get("force_unfreeze_context_encoder", True)):
+        _set_requires_grad(context_encoder, True)
+    if bool(train_cfg.get("force_unfreeze_ipp", True)):
+        _set_requires_grad(ipp, True)
+
     use_surprise = bool(train_cfg.get("use_surprise_features", True))
     surprise_predictor: SurprisePredictor | None = None
     if use_surprise:
@@ -291,6 +324,17 @@ def main() -> None:
         print(f"Loading IPP init from {ipp_ckpt_path}")
         ipp_ckpt = load_checkpoint(ipp_ckpt_path, device=device)
         ipp.load_state_dict(ipp_ckpt["ipp"])
+
+    # Re-assert trainability after loading checkpoints.
+    if bool(train_cfg.get("force_unfreeze_context_encoder", True)):
+        _set_requires_grad(context_encoder, True)
+    if bool(train_cfg.get("force_unfreeze_ipp", True)):
+        _set_requires_grad(ipp, True)
+
+    ce_trainable = _count_trainable_params(context_encoder)
+    ipp_trainable = _count_trainable_params(ipp)
+    print(f"  Trainable CE params:   {ce_trainable:,}")
+    print(f"  Trainable IPP params:  {ipp_trainable:,}")
 
     optimizer = torch.optim.AdamW(
         [
