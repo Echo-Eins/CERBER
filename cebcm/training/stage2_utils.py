@@ -138,6 +138,8 @@ def build_context_encoder(cfg: dict) -> ContextEncoder:
         n_global_heads=ce_cfg.get("n_global_heads", 8),
         global_attn_dropout=ce_cfg.get("global_attn_dropout", 0.1),
         surprise_top_k_pct=ce_cfg.get("surprise_top_k_pct", 0.05),
+        surprise_top_k_min_tokens=ce_cfg.get("surprise_top_k_min_tokens", 1),
+        global_include_last_token=ce_cfg.get("global_include_last_token", True),
         n_types=ce_cfg.get("n_types", 3),
         output_dim=ce_cfg.get("output_dim", 1024),
         use_alibi=ce_cfg.get("use_alibi", False),

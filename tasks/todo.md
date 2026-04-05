@@ -1,5 +1,17 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-05 - ContextEncoder 0.60 ceiling investigation and fixes
+- [x] Audit CE training objective for potential regression-to-mean ceiling
+- [x] Add CE loss decomposition controls (`mse/cos/nce`) and diagnostics
+- [x] Add CE gradient-norm diagnostics to detect clipping/vanishing
+- [x] Add global-token minimum count + include-last-token controls in ContextEncoder
+- [x] Align Stage2 configs with new CE global-token controls
+- [x] Validate compile + JSON correctness
+
+### Review
+- Found concrete bottleneck: short SQuAD sequences + percent-only top-k frequently reduce to one global token.
+- Added objective controls to reduce representation averaging (NCE) and made CE optimization visible in logs.
+
 ## 2026-04-05 - IPP diagnostics hardening
 - [x] Add component-wise loss logging (`ipp_mse`, `ipp_nce`, `flow_vel_mse`) in IPP trainers
 - [x] Add config-risk warnings for `flow sigma_init` and extreme `weight_decay`

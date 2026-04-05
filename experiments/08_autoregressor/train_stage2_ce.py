@@ -60,6 +60,16 @@ class CEPretrainHead(nn.Module):
         return self.net(x)
 
 
+def _grad_l2_norm(parameters: list[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for p in parameters:
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total += float(torch.sum(g * g).item())
+    return total ** 0.5
+
+
 def _build_surprise_padded(
     surprise_predictor: SurprisePredictor | None,
     context_vecs: Tensor,
@@ -85,7 +95,10 @@ def _ce_batch(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     dataset_source: str,
+    mse_loss_weight: float,
     cos_loss_weight: float,
+    nce_loss_weight: float,
+    nce_temperature: float,
 ) -> tuple[Tensor | None, dict[str, float]]:
     vectors = batch["vectors"].to(device)
     lengths = batch["lengths"].to(device)
@@ -115,7 +128,16 @@ def _ce_batch(
         pred_vecs = pretrain_head(v_context)
         loss_mse = F.mse_loss(pred_vecs, target_vecs)
         loss_cos = (1.0 - F.cosine_similarity(pred_vecs, target_vecs, dim=-1)).mean()
-        loss = loss_mse + cos_loss_weight * loss_cos
+        loss = mse_loss_weight * loss_mse + cos_loss_weight * loss_cos
+        loss_nce = torch.tensor(0.0, device=pred_vecs.device, dtype=pred_vecs.dtype)
+        if nce_loss_weight > 0.0 and pred_vecs.shape[0] > 1:
+            z_pred = F.normalize(pred_vecs, dim=-1)
+            z_tgt = F.normalize(target_vecs, dim=-1)
+            logits = z_pred @ z_tgt.t()
+            logits = logits / max(1e-6, float(nce_temperature))
+            labels = torch.arange(pred_vecs.shape[0], device=pred_vecs.device)
+            loss_nce = F.cross_entropy(logits, labels)
+            loss = loss + nce_loss_weight * loss_nce
 
     with torch.no_grad():
         cos_mean = F.cosine_similarity(pred_vecs, target_vecs, dim=-1).mean().item()
@@ -125,6 +147,7 @@ def _ce_batch(
         "ce_loss": loss.item(),
         "ce_mse": loss_mse.item(),
         "ce_cos_loss": loss_cos.item(),
+        "ce_nce": loss_nce.item(),
         "ce_cos": cos_mean,
         "ce_pred_norm": pred_norm,
     }
@@ -146,7 +169,10 @@ def train_epoch(
     log_every: int,
     epoch: int,
     dataset_source: str,
+    mse_loss_weight: float,
     cos_loss_weight: float,
+    nce_loss_weight: float,
+    nce_temperature: float,
 ) -> dict[str, float]:
     context_encoder.train()
     pretrain_head.train()
@@ -166,13 +192,18 @@ def train_epoch(
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             dataset_source=dataset_source,
+            mse_loss_weight=mse_loss_weight,
             cos_loss_weight=cos_loss_weight,
+            nce_loss_weight=nce_loss_weight,
+            nce_temperature=nce_temperature,
         )
         if loss is None or not torch.isfinite(loss):
             continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+        ce_grad_norm = _grad_l2_norm(list(context_encoder.parameters()))
+        head_grad_norm = _grad_l2_norm(list(pretrain_head.parameters()))
         nn.utils.clip_grad_norm_(
             list(context_encoder.parameters()) + list(pretrain_head.parameters()),
             clip_grad,
@@ -182,7 +213,13 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
 
-        tracker.update(metrics)
+        tracker.update(
+            {
+                **metrics,
+                "ce_grad_norm": ce_grad_norm,
+                "ce_head_grad_norm": head_grad_norm,
+            }
+        )
         step += 1
 
         if step % log_every == 0:
@@ -191,6 +228,10 @@ def train_epoch(
                 f"  [CE] epoch={epoch} step={step} "
                 f"loss={avg.get('ce_loss', 0.0):.4f} "
                 f"cos={avg.get('ce_cos', 0.0):.4f} "
+                f"mse={avg.get('ce_mse', 0.0):.4f} "
+                f"nce={avg.get('ce_nce', 0.0):.4f} "
+                f"ce_gn={avg.get('ce_grad_norm', 0.0):.3e} "
+                f"head_gn={avg.get('ce_head_grad_norm', 0.0):.3e} "
                 f"lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
@@ -207,7 +248,10 @@ def eval_epoch(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     dataset_source: str,
+    mse_loss_weight: float,
     cos_loss_weight: float,
+    nce_loss_weight: float,
+    nce_temperature: float,
 ) -> dict[str, float]:
     context_encoder.eval()
     pretrain_head.eval()
@@ -247,7 +291,16 @@ def eval_epoch(
             pred_vecs = pretrain_head(v_context)
             loss_mse = F.mse_loss(pred_vecs, target_vecs)
             loss_cos = (1.0 - F.cosine_similarity(pred_vecs, target_vecs, dim=-1)).mean()
-            loss = loss_mse + cos_loss_weight * loss_cos
+            loss = mse_loss_weight * loss_mse + cos_loss_weight * loss_cos
+            loss_nce = torch.tensor(0.0, device=pred_vecs.device, dtype=pred_vecs.dtype)
+            if nce_loss_weight > 0.0 and pred_vecs.shape[0] > 1:
+                z_pred = F.normalize(pred_vecs, dim=-1)
+                z_tgt = F.normalize(target_vecs, dim=-1)
+                logits = z_pred @ z_tgt.t()
+                logits = logits / max(1e-6, float(nce_temperature))
+                labels = torch.arange(pred_vecs.shape[0], device=pred_vecs.device)
+                loss_nce = F.cross_entropy(logits, labels)
+                loss = loss + nce_loss_weight * loss_nce
 
         cos = F.cosine_similarity(pred_vecs, target_vecs, dim=-1)
         l2 = (pred_vecs - target_vecs).norm(dim=-1)
@@ -259,6 +312,7 @@ def eval_epoch(
                 "ce_loss": loss.item(),
                 "ce_mse": loss_mse.item(),
                 "ce_cos_loss": loss_cos.item(),
+                "ce_nce": loss_nce.item(),
                 "ce_cos": cos.mean().item(),
                 "ce_pred_norm": pred_vecs.norm(dim=-1).mean().item(),
             }
@@ -332,6 +386,17 @@ def main() -> None:
     ).to(device)
     print(f"  ContextEncoder params: {context_encoder.num_params:,}")
     print(f"  Pretrain head params:  {sum(p.numel() for p in pretrain_head.parameters()):,}")
+    approx_ctx_len = max(1.0, float(train_stats["mean_length"]) - 1.0)
+    approx_global_k = max(
+        int(context_encoder.cfg.surprise_top_k_min_tokens),
+        int(approx_ctx_len * float(context_encoder.cfg.surprise_top_k_pct)),
+    )
+    print(
+        f"  Global token policy: pct={context_encoder.cfg.surprise_top_k_pct:.3f}, "
+        f"min_tokens={context_encoder.cfg.surprise_top_k_min_tokens}, "
+        f"include_last={context_encoder.cfg.global_include_last_token} "
+        f"(approx k={approx_global_k} at mean ctx len {approx_ctx_len:.1f})"
+    )
 
     use_surprise = bool(train_cfg.get("use_surprise_features", True))
     surprise_predictor: SurprisePredictor | None = None
@@ -357,6 +422,11 @@ def main() -> None:
         ],
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
+    weight_decay = float(train_cfg.get("weight_decay", 0.01))
+    if weight_decay > 0.05:
+        print(
+            f"  [WARN] weight_decay={weight_decay:.3f} may over-regularize CE and cap cosine."
+        )
 
     num_epochs = int(train_cfg.get("num_epochs", train_cfg.get("ce_num_epochs", 20)))
     warmup_epochs = int(train_cfg.get("warmup_epochs", 3))
@@ -393,7 +463,14 @@ def main() -> None:
     log_every = int(train_cfg.get("log_every", 50))
     eval_every = int(train_cfg.get("eval_every_epochs", 1))
     ckpt_every = int(train_cfg.get("checkpoint_every_epochs", 1))
+    mse_loss_weight = float(train_cfg.get("mse_loss_weight", 1.0))
     cos_loss_weight = float(train_cfg.get("cos_loss_weight", 0.5))
+    nce_loss_weight = float(train_cfg.get("nce_loss_weight", 0.0))
+    nce_temperature = float(train_cfg.get("nce_temperature", 0.07))
+    print(
+        f"  CE losses: mse={mse_loss_weight:.3f}, cos={cos_loss_weight:.3f}, "
+        f"nce={nce_loss_weight:.3f}, nce_temp={nce_temperature:.3f}"
+    )
 
     log_path = logs_dir / "ce_training_log.jsonl"
     log_file = open(log_path, "a", encoding="utf-8")
@@ -424,7 +501,10 @@ def main() -> None:
             log_every=log_every,
             epoch=epoch,
             dataset_source=train_source,
+            mse_loss_weight=mse_loss_weight,
             cos_loss_weight=cos_loss_weight,
+            nce_loss_weight=nce_loss_weight,
+            nce_temperature=nce_temperature,
         )
         elapsed = time.time() - t0
         print(f"[CE] Epoch {epoch} done ({elapsed:.1f}s)")
@@ -442,7 +522,10 @@ def main() -> None:
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 dataset_source=val_source,
+                mse_loss_weight=mse_loss_weight,
                 cos_loss_weight=cos_loss_weight,
+                nce_loss_weight=nce_loss_weight,
+                nce_temperature=nce_temperature,
             )
             print(
                 f"  [CE VAL] loss={val_metrics.get('ce_loss', 0.0):.4f} "
@@ -450,6 +533,12 @@ def main() -> None:
                 f"eval_cos_mean={val_metrics.get('eval_cos_mean', 0.0):.4f} "
                 f"eval_cos>0.5={val_metrics.get('eval_cos_gt05', 0.0):.1%} "
                 f"eval_l2={val_metrics.get('eval_l2_mean', 0.0):.4f}"
+            )
+            print(
+                f"           components: mse={val_metrics.get('ce_mse', 0.0):.4f} "
+                f"cos_loss={val_metrics.get('ce_cos_loss', 0.0):.4f} "
+                f"nce={val_metrics.get('ce_nce', 0.0):.4f} "
+                f"pred_norm={val_metrics.get('ce_pred_norm', 0.0):.4f}"
             )
             write_log(epoch, "val", val_metrics, 0.0)
 

@@ -45,6 +45,8 @@ class ContextEncoderConfig:
     n_global_heads: int = 8  # Attention heads for global tokens
     global_attn_dropout: float = 0.1
     surprise_top_k_pct: float = 0.05  # Top 5% by surprise → global tokens
+    surprise_top_k_min_tokens: int = 1  # Minimum number of global tokens per sample.
+    global_include_last_token: bool = True  # Always include last valid token (question at CE pretrain).
     # Type embeddings
     n_types: int = 3  # 0=query, 1=answer, 2=compact
     # Output
@@ -343,6 +345,7 @@ class ContextEncoder(nn.Module):
 
         pct = float(self.cfg.surprise_top_k_pct)
         pct = min(max(pct, 1e-6), 1.0)
+        min_tokens = max(1, int(self.cfg.surprise_top_k_min_tokens))
         global_tokens_per_batch: list[Tensor] = []
         global_pos_per_batch: list[Tensor] = []
         max_k = 1
@@ -357,11 +360,15 @@ class ContextEncoder(nn.Module):
                 continue
 
             scores = surprise_scores[b, valid_idx]
-            k_b = max(1, int(valid_idx.numel() * pct))
+            k_b = max(min_tokens, int(valid_idx.numel() * pct))
             k_b = min(k_b, int(valid_idx.numel()))
 
             top_local = scores.topk(k_b, dim=0).indices
             selected_idx = valid_idx[top_local]
+            if self.cfg.global_include_last_token and valid_idx.numel() > 0:
+                last_idx = valid_idx[-1]
+                if not bool((selected_idx == last_idx).any()):
+                    selected_idx = torch.cat([selected_idx, last_idx.view(1)], dim=0)
             tokens_b = ssm_hidden[b, selected_idx, :]  # [k_b, D]
             global_tokens_per_batch.append(tokens_b)
             global_pos_per_batch.append(selected_idx.long())

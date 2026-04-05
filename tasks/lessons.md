@@ -1,5 +1,21 @@
 # Lessons
 
+## 2026-04-05 - CE global-token bottleneck on short sequences (top_k_pct alone can collapse to k=1)
+
+### Pattern
+With SQuAD mean sequence length around 7, `surprise_top_k_pct=0.05` yields `int(L*pct)=0` for most samples, so CE global branch falls back to `k=1` almost always.
+
+### Root Cause
+Percent-only top-k on short sequences discretizes to one token, reducing cross-token evidence and limiting context fusion capacity.
+
+### Fix
+- Add `surprise_top_k_min_tokens` and enforce `k >= min_tokens`.
+- Add `global_include_last_token` so the last valid token (question in CE pretrain) is always visible in global attention.
+- Log approximate effective `k` at train start.
+
+### Rule
+For short-sequence regimes, never rely on percent-only top-k selection. Always enforce a minimum token count.
+
 ## 2026-04-05 - High flow_cos can coexist with near-random eval_cos when sigma_init is mis-scaled
 
 ### Pattern

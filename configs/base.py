@@ -542,6 +542,8 @@ class Stage2Config:
     ce_n_global_heads: int = 8
     ce_global_attn_dropout: float = 0.1
     ce_surprise_top_k_pct: float = 0.05
+    ce_surprise_top_k_min_tokens: int = 1
+    ce_global_include_last_token: bool = True
     ce_n_types: int = 3  # query=0, answer=1, compact=2
     ce_output_dim: int = 1024
     ce_use_alibi: bool = False
