@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from cebcm.data.sequence_loading import load_sonar_sequences
 from cebcm.models.chain_head import ChainHeadConfig, EBTChainHead
 from cebcm.training.chain_data import (
     ChainDataConfig,
@@ -76,24 +77,15 @@ def _load_sequences(data_cfg: dict) -> list[torch.Tensor]:
     """
     data_path = data_cfg["train_data_path"]
     print(f"  Loading data from {data_path}")
-    raw = torch.load(data_path, map_location="cpu", weights_only=False)
-
-    if isinstance(raw, dict):
-        if "sequences" in raw:
-            # SONARSequenceDataset format: list of variable-length tensors
-            return raw["sequences"]
-        elif "vectors" in raw:
-            # Padded format: [N, L, D] + lengths
-            vectors = raw["vectors"]
-            lengths = raw["lengths"]
-            return [vectors[i, :int(lengths[i].item())] for i in range(len(lengths))]
-        else:
-            raise KeyError(f"Unknown data format. Keys: {list(raw.keys())}. "
-                           f"Expected 'sequences' or 'vectors'.")
-    elif isinstance(raw, list):
-        return raw
-    else:
-        raise TypeError(f"Unknown data type: {type(raw)}")
+    seqs, _, source, meta = load_sonar_sequences(
+        data_path,
+        max_seq_len=data_cfg.get("max_seq_len", None),
+        min_seq_len=data_cfg.get("min_seq_len", 1),
+        legacy_window_stride=data_cfg.get("legacy_window_stride", None),
+    )
+    fmt = meta.get("input_format", "unknown")
+    print(f"  Parsed {len(seqs)} sequences (source={source}, format={fmt})")
+    return seqs
 
 
 def build_chain_datasets(

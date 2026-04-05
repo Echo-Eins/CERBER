@@ -12,6 +12,10 @@ Dataset format (.pt file):
     "metadata": dict,            # encoding parameters, stats
 }
 
+Backward-compatible payloads are also accepted:
+- {"vectors": Tensor[N, L, D], "lengths": Tensor[N]}
+- {"embeddings": Tensor[N, D], "texts": list[str]}  (legacy flat format)
+
 Provides collated batches with padding, lengths, and optional type_ids.
 
 Usage:
@@ -27,6 +31,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from cebcm.data.sequence_loading import load_sonar_sequences
+
 
 class SONARSequenceDataset(Dataset):
     """
@@ -41,32 +47,23 @@ class SONARSequenceDataset(Dataset):
             path: str | Path,
             max_seq_len: int = 64,
             min_seq_len: int = 3,
+            legacy_window_stride: int | None = None,
     ):
         """
         Args:
             path: Path to .pt file with sequences
             max_seq_len: Truncate sequences longer than this
             min_seq_len: Skip sequences shorter than this
+            legacy_window_stride: Window stride when converting legacy
+                {"embeddings": [N, D]} payloads into sequences.
         """
-        data = torch.load(path, weights_only=False)
-
-        self.sequences: list[Tensor] = []
-        self.texts: list[list[str]] = []
         self.max_seq_len = max_seq_len
-
-        raw_seqs = data["sequences"]
-        raw_texts = data.get("texts", [None] * len(raw_seqs))
-
-        for seq, txt in zip(raw_seqs, raw_texts):
-            if isinstance(seq, Tensor) and seq.dim() == 2 and seq.shape[0] >= min_seq_len:
-                self.sequences.append(seq[:max_seq_len])
-                if txt is not None:
-                    self.texts.append(txt[:max_seq_len])
-                else:
-                    self.texts.append([])
-
-        self.source = data.get("source", "unknown")
-        self.metadata = data.get("metadata", {})
+        self.sequences, self.texts, self.source, self.metadata = load_sonar_sequences(
+            source=path,
+            max_seq_len=max_seq_len,
+            min_seq_len=min_seq_len,
+            legacy_window_stride=legacy_window_stride,
+        )
         self.d_model = self.sequences[0].shape[-1] if self.sequences else 1024
 
     def __len__(self) -> int:

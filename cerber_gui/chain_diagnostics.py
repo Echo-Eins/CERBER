@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from torch import Tensor
 
+from cebcm.data.sequence_loading import load_sonar_sequences
 from cebcm.models.chain_head import ChainHeadConfig, EBTChainHead
 
 
@@ -568,15 +569,13 @@ def make_sample_chain(
     device: str = "cpu",
 ) -> Tensor:
     """Load a sample chain from SONAR data for visualization."""
-    raw = torch.load(data_path, map_location="cpu", weights_only=False)
-    if isinstance(raw, dict) and "sequences" in raw:
-        sequences = raw["sequences"]
-    elif isinstance(raw, dict) and "vectors" in raw:
-        vectors = raw["vectors"]
-        lengths = raw["lengths"]
-        sequences = [vectors[i, :int(lengths[i].item())] for i in range(len(lengths))]
-    else:
-        raise ValueError(f"Unknown data format: {type(raw)}")
+    sequences, _, _, _ = load_sonar_sequences(
+        data_path,
+        max_seq_len=64,
+        min_seq_len=2,
+    )
+    if not sequences:
+        raise ValueError(f"No valid sequences found in dataset: {data_path}")
 
     seq = sequences[seq_idx % len(sequences)]
     chain_len = min(chain_len, seq.shape[0])

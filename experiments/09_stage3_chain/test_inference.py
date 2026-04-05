@@ -36,6 +36,7 @@ from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from cebcm.data.sequence_loading import load_sonar_sequences
 from cebcm.models.chain_head import ChainHeadConfig, EBTChainHead
 from cebcm.inference.system_switching import (
     System1Config,
@@ -184,16 +185,14 @@ def load_test_pairs(
       - target = last vector (ground truth answer)
       - init = noisy version of target (simulates IPP output)
     """
-    raw = torch.load(data_path, map_location="cpu", weights_only=False)
-
-    if isinstance(raw, dict) and "sequences" in raw:
-        sequences = raw["sequences"]
-    elif isinstance(raw, dict) and "vectors" in raw:
-        vectors = raw["vectors"]
-        lengths = raw["lengths"]
-        sequences = [vectors[i, :int(lengths[i].item())] for i in range(len(lengths))]
-    else:
-        raise ValueError(f"Unknown data format: {type(raw)}")
+    sequences, _, source, meta = load_sonar_sequences(
+        data_path,
+        min_seq_len=1,
+    )
+    print(
+        f"  Sequence payload: source={source}, "
+        f"format={meta.get('input_format', 'unknown')}"
+    )
 
     # Filter sequences long enough for meaningful pairs
     valid = [s for s in sequences if s.shape[0] >= 5]

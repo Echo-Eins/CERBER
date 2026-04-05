@@ -92,6 +92,10 @@ from cerber_gui.inference_diagnostics import (
     export_metrics_csv,
     get_state as get_diag_state,
 )
+from cerber_gui.context_encoder_diagnostics import (
+    load_ce_models as ce_diag_load_models,
+    run_ce_diagnostics as ce_diag_run,
+)
 from configs.base import Stage1Config
 from cebcm.data.dataset import SONARVectorDataset
 from cebcm.inference.langevin import run_langevin
@@ -3137,6 +3141,90 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 diag_export_csv_btn = gr.Button("Export CSV (per-step)")
                 diag_export_output = gr.Textbox(label="Exported Metrics", lines=10, interactive=False)
 
+        # === Tab 7: Context Encoder Diagnostics ===
+        with gr.TabItem("Context Encoder Diagnostics"):
+            gr.Markdown(
+                """
+            ### Context Encoder Stress Test
+
+            Evaluate pretrained `ContextEncoder` on real sequence data with:
+            - cosine / L2 / MSE / norm metrics
+            - robustness sweep across input noise levels
+            - length-bucket breakdown (short / medium / long contexts)
+            """
+            )
+
+            gr.Markdown("#### Load Models")
+            with gr.Row():
+                ce_diag_config_path = gr.Textbox(
+                    label="Stage2 Config Path",
+                    value="configs/stage2_ce_config.json",
+                )
+                ce_diag_ckpt_path = gr.Textbox(
+                    label="CE Checkpoint",
+                    value="experiments/08_autoregressor/ce/checkpoints/best.pt",
+                )
+            with gr.Row():
+                ce_diag_use_surprise = gr.Checkbox(
+                    value=True,
+                    label="Use Surprise Features (load SP)",
+                )
+                ce_diag_sp_ckpt_path = gr.Textbox(
+                    label="SP Checkpoint (optional if present in config.init.sp_checkpoint)",
+                    value="experiments/08_autoregressor/sp/checkpoints/best.pt",
+                )
+                ce_diag_load_btn = gr.Button("Load CE Bundle", variant="secondary")
+
+            ce_diag_load_status = gr.Markdown("Load CE bundle to start diagnostics.")
+
+            gr.Markdown("#### Evaluation Settings")
+            with gr.Row():
+                ce_diag_data_path = gr.Textbox(
+                    label="SONAR Sequence Dataset Path",
+                    value="data/squad_sequences.pt",
+                )
+                ce_diag_split_mode = gr.Radio(
+                    choices=["all", "train", "val"],
+                    value="val",
+                    label="Split",
+                )
+                ce_diag_split_ratio = gr.Slider(
+                    minimum=0.5,
+                    maximum=0.99,
+                    value=0.9,
+                    step=0.01,
+                    label="Train/Val Split Ratio",
+                )
+            with gr.Row():
+                ce_diag_batch_size = gr.Slider(
+                    minimum=4,
+                    maximum=128,
+                    value=32,
+                    step=4,
+                    label="Batch Size",
+                )
+                ce_diag_max_batches = gr.Slider(
+                    minimum=0,
+                    maximum=500,
+                    value=0,
+                    step=10,
+                    label="Max Batches (0 = full split)",
+                )
+                ce_diag_seed = gr.Number(value=42, label="Seed")
+                ce_diag_target_norm = gr.Number(value=0.2051, label="Target Norm (<=0 disables renorm)")
+            with gr.Row():
+                ce_diag_noise_levels = gr.Textbox(
+                    label="Noise Levels (%)",
+                    value="0,2,5,10,20",
+                    info="Comma-separated percentages for robustness sweep.",
+                )
+                ce_diag_run_btn = gr.Button("Run CE Diagnostics", variant="primary")
+
+            ce_diag_metrics_md = gr.Markdown("Run diagnostics to view metrics.")
+            with gr.Row():
+                ce_diag_noise_plot = gr.Plot(label="Noise Robustness")
+                ce_diag_bucket_plot = gr.Plot(label="Length Bucket Metrics")
+
     # === Event Handlers ===
 
     #ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬ÂÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â°ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã¢â‚¬ËœÃƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â·ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â° ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂµÃƒÆ’Ã‚ÂÃƒâ€šÃ‚ÂºÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¿ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â²
@@ -3615,6 +3703,69 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
     diag_export_csv_btn.click(
         diag_export_csv_fn,
         outputs=[diag_export_output],
+    )
+
+    # === Context Encoder Diagnostics Handlers ===
+
+    def ce_diag_load_fn(config_path, ce_ckpt, sp_ckpt, use_surprise):
+        try:
+            return ce_diag_load_models(
+                config_path=str(config_path),
+                ce_checkpoint_path=str(ce_ckpt),
+                sp_checkpoint_path=str(sp_ckpt),
+                use_surprise=bool(use_surprise),
+                device="auto",
+            )
+        except Exception as e:
+            import traceback
+            return f"Error: {e}\n\n```\n{traceback.format_exc()}\n```"
+
+    def ce_diag_run_fn(
+        data_path,
+        split_mode,
+        split_ratio,
+        batch_size,
+        max_batches,
+        noise_levels,
+        seed,
+        target_norm,
+    ):
+        try:
+            md, noise_fig, bucket_fig = ce_diag_run(
+                data_path=str(data_path),
+                split_mode=str(split_mode),
+                split_ratio=float(split_ratio),
+                batch_size=int(batch_size),
+                max_batches=int(max_batches),
+                noise_levels_csv=str(noise_levels),
+                seed=int(seed),
+                target_norm=float(target_norm),
+            )
+            return md, noise_fig, bucket_fig
+        except Exception as e:
+            import traceback
+            err = f"Error: {e}\n\n```\n{traceback.format_exc()}\n```"
+            return err, go.Figure(), go.Figure()
+
+    ce_diag_load_btn.click(
+        ce_diag_load_fn,
+        inputs=[ce_diag_config_path, ce_diag_ckpt_path, ce_diag_sp_ckpt_path, ce_diag_use_surprise],
+        outputs=[ce_diag_load_status],
+    )
+
+    ce_diag_run_btn.click(
+        ce_diag_run_fn,
+        inputs=[
+            ce_diag_data_path,
+            ce_diag_split_mode,
+            ce_diag_split_ratio,
+            ce_diag_batch_size,
+            ce_diag_max_batches,
+            ce_diag_noise_levels,
+            ce_diag_seed,
+            ce_diag_target_norm,
+        ],
+        outputs=[ce_diag_metrics_md, ce_diag_noise_plot, ce_diag_bucket_plot],
     )
 
     demo.load(

@@ -26,6 +26,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from torch import Tensor
 
+from cebcm.data.sequence_loading import load_sonar_sequences
 from cebcm.inference.system_switching import (
     System2Config,
     run_system2,
@@ -441,19 +442,17 @@ def run_inference(
     dev = torch.device(_state.device)
 
     # Load data
-    raw = torch.load(data_path, map_location="cpu", weights_only=False)
-    if isinstance(raw, dict) and "sequences" in raw:
-        seqs = raw["sequences"]
-        seq = seqs[seq_idx % len(seqs)]
-        # Use first vector as query, final vector as target (QA-style endpoint).
-        v_query = seq[0:1].to(dev)  # [1, D]
-        v_target = seq[-1:].to(dev) if seq.shape[0] > 1 else v_query.clone()
-    elif isinstance(raw, dict) and "vectors" in raw:
-        vectors = raw["vectors"]
-        v_query = vectors[seq_idx % len(vectors)].unsqueeze(0).to(dev)
-        v_target = vectors[(seq_idx + 1) % len(vectors)].unsqueeze(0).to(dev)
-    else:
-        raise ValueError(f"Unknown data format: {type(raw)}")
+    seqs, _, _, _ = load_sonar_sequences(
+        data_path,
+        max_seq_len=64,
+        min_seq_len=2,
+    )
+    if not seqs:
+        raise ValueError(f"No valid sequences found in dataset: {data_path}")
+    seq = seqs[seq_idx % len(seqs)]
+    # Use first vector as query, final vector as target (QA-style endpoint).
+    v_query = seq[0:1].to(dev)  # [1, D]
+    v_target = seq[-1:].to(dev) if seq.shape[0] > 1 else v_query.clone()
 
     # Add noise to create init
     noise_rel = noise_pct / 100.0

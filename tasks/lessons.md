@@ -1,5 +1,23 @@
 # Lessons
 
+## 2026-04-05 - Never assume one dataset schema across stages (legacy `embeddings` vs sequence payloads)
+
+### Pattern
+Old WikiText artifacts (`wikitext_sonar_10k.pt`) use flat payload
+`{"embeddings": Tensor[N, D], "texts": list[str]}`, while Stage2/Stage3 loaders expected sequence payloads (`"sequences"` or `"vectors"`), causing load/parse failures.
+
+### Root Cause
+Dataset schema evolved, but loaders were not backward-compatible and had duplicated parsing logic in several scripts.
+
+### Fix
+- Add unified loader `cebcm/data/sequence_loading.py`.
+- Support `sequences`, `vectors+lengths`, `embeddings` (legacy auto-windowing).
+- Route Stage2/Stage3/GUI loaders through this one parser.
+- Add clearer load-time diagnostics for corrupted/LFS-pointer files.
+
+### Rule
+When data format changes, keep one canonical parser and reuse it everywhere. Never duplicate format parsing across scripts.
+
 ## 2026-04-05 - CE global-token bottleneck on short sequences (top_k_pct alone can collapse to k=1)
 
 ### Pattern

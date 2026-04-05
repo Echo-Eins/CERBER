@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from cebcm.data.sequence_loading import load_sonar_sequences
 from cebcm.models.chain_head import ChainHeadConfig, EBTChainHead
 from cebcm.models.energy import SimpleEnergy
 from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
@@ -406,24 +407,18 @@ def main():
     # Build data — load sequences (supports both formats)
     data_path = config["data"]["train_data_path"]
     print(f"  Loading data from {data_path}")
-    raw = torch.load(data_path, map_location="cpu", weights_only=False)
-
-    if isinstance(raw, dict):
-        if "sequences" in raw:
-            sequences = raw["sequences"]
-        elif "vectors" in raw:
-            vectors = raw["vectors"]
-            lengths = raw["lengths"]
-            sequences = [vectors[i, :int(lengths[i].item())] for i in range(len(lengths))]
-        else:
-            raise KeyError(f"Unknown data format. Keys: {list(raw.keys())}")
-    elif isinstance(raw, list):
-        sequences = raw
-    else:
-        raise TypeError(f"Unknown data type: {type(raw)}")
+    sequences, _, seq_source, seq_meta = load_sonar_sequences(
+        data_path,
+        max_seq_len=config["data"].get("max_seq_len", None),
+        min_seq_len=config["data"].get("min_seq_len", 1),
+        legacy_window_stride=config["data"].get("legacy_window_stride", None),
+    )
 
     n = len(sequences)
-    print(f"  Loaded {n} sequences")
+    print(
+        f"  Loaded {n} sequences "
+        f"(source={seq_source}, format={seq_meta.get('input_format', 'unknown')})"
+    )
 
     split = config["data"].get("train_val_split", 0.9)
     gen = torch.Generator().manual_seed(config.get("seed", 42))

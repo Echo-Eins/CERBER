@@ -588,6 +588,7 @@ def main():
         path=data_cfg.get("train_data_path", "data/squad_sequences.pt"),
         max_seq_len=data_cfg.get("max_seq_len", 64),
         min_seq_len=data_cfg.get("min_seq_len", 3),
+        legacy_window_stride=data_cfg.get("legacy_window_stride", None),
     )
 
     val_path = data_cfg.get("val_data_path", "")
@@ -596,6 +597,7 @@ def main():
             path=val_path,
             max_seq_len=data_cfg.get("max_seq_len", 64),
             min_seq_len=data_cfg.get("min_seq_len", 3),
+            legacy_window_stride=data_cfg.get("legacy_window_stride", None),
         )
         train_dataset = dataset
     else:

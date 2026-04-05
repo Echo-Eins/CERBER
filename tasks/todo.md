@@ -1,5 +1,30 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-05 - Legacy dataset compatibility + sequence-splitting audit (wikitext parse failure)
+- [x] Reproduce/confirm Stage2 loader failure mode for old `wikitext_sonar_10k.pt` (`embeddings` format)
+- [x] Add backward-compatible conversion path in `SONARSequenceDataset` (`embeddings` -> contiguous sequences)
+- [x] Unify Stage3 loaders (`phase_a`, `phase_b`, `test_inference`) to accept legacy format too
+- [x] Add explicit error diagnostics for corrupted/non-PT payloads
+- [ ] Run smoke validation (load + split + collate) and document whether this can cap CE/IPP at ~0.60
+
+### Review
+- Root cause confirmed in code: Stage2 `SONARSequenceDataset` expected only `"sequences"` while old wiki artifacts are `"embeddings"`.
+- Added unified loader `cebcm/data/sequence_loading.py` and wired it into Stage2/Stage3/GUI loaders.
+- Runtime smoke test is blocked in this environment (no local `torch` runtime), but syntax checks pass.
+
+## 2026-04-05 - Web GUI tab for ContextEncoder real metrics
+- [x] Add dedicated `Context Encoder Diagnostics` backend module
+- [x] Implement CE bundle loading (CE checkpoint + optional SP checkpoint)
+- [x] Implement batch evaluation metrics (cos/L2/MSE/norm + thresholds)
+- [x] Add robustness sweep over input noise levels
+- [x] Add context-length bucket breakdown
+- [x] Wire a new tab in `cerber_gui/app.py` with controls and plots
+- [x] Validate syntax (`py_compile`) for GUI files
+
+### Review
+- New GUI tab provides actionable CE metrics under configurable conditions and noise stress.
+- Metrics are aligned with Stage2 CE pretraining semantics (target = final vector, context = sequence without final).
+
 ## 2026-04-05 - ContextEncoder 0.60 ceiling investigation and fixes
 - [x] Audit CE training objective for potential regression-to-mean ceiling
 - [x] Add CE loss decomposition controls (`mse/cos/nce`) and diagnostics
