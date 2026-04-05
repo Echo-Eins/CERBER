@@ -150,9 +150,10 @@ def build_ipp(cfg: dict) -> FlowIPP | MLPIPP:
         d_model=ipp_cfg.get("d_model", 1024),
         d_context=ipp_cfg.get("d_context", 1024),
         hidden_dims=ipp_cfg.get("hidden_dims", [2048, 2048, 1024]),
-        n_integration_steps=ipp_cfg.get("n_integration_steps", 10),
+        # Keep defaults aligned with IPPConfig/spec for stable Flow sampling.
+        n_integration_steps=ipp_cfg.get("n_integration_steps", 50),
         d_time=ipp_cfg.get("d_time", 256),
-        sigma_init=ipp_cfg.get("sigma_init", 0.5),
+        sigma_init=ipp_cfg.get("sigma_init", 0.05),
         solver=ipp_cfg.get("solver", "midpoint"),
         mlp_hidden_dims=ipp_cfg.get("mlp_hidden_dims", [2048, 1024]),
     )
@@ -224,4 +225,3 @@ def save_checkpoint(path: str | Path, payload: dict) -> None:
 
 def load_checkpoint(path: str | Path, device: torch.device) -> dict:
     return torch.load(Path(path), map_location=device, weights_only=False)
-

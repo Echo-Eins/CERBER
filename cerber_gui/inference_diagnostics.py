@@ -26,6 +26,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from torch import Tensor
 
+from cebcm.inference.system_switching import (
+    System2Config,
+    run_system2,
+)
+
 
 # ─── Preset test questions ──────────────────────────────────────────
 
@@ -56,6 +61,9 @@ class InferenceResult:
     input_text: str | None = None
     output_text: str | None = None
     target_text: str | None = None
+    # Metric semantics
+    target_objective: str = "qa"  # "qa" or "self_denoise"
+    target_note: str | None = None
     # Core metrics
     cos_init: float = 0.0
     cos_final: float = 0.0
@@ -248,7 +256,7 @@ def run_system1_diagnostics(
     v_query: Tensor,
     v_init: Tensor,
     v_target: Tensor | None = None,
-    max_steps: int = 50,
+    max_steps: int = 10,
     lr: float = 0.01,
     noise_scale: float = 0.005,
     target_norm: float = 0.2051,
@@ -267,12 +275,14 @@ def run_system1_diagnostics(
 
     t0 = time.time()
 
+    steps = min(int(max_steps), 10)
+
     result = run_langevin(
         method="pid",
         energy_fn=_state.pairwise_model,
         v_query=v_query,
         v_init=v_init,
-        max_steps=max_steps,
+        max_steps=steps,
         lr=lr,
         noise_scale=noise_scale,
         target_norm=target_norm,
@@ -301,6 +311,7 @@ def run_system1_diagnostics(
         cos_trajectory=result.cos_trajectory,
         v_trajectory=[v.cpu() for v in result.v_trajectory] if result.v_trajectory else [],
         elapsed_ms=elapsed,
+        target_objective="qa",
     )
     _state.last_result = ir
     return ir
@@ -310,7 +321,7 @@ def run_system2_diagnostics(
     v_query: Tensor,
     v_init: Tensor,
     v_target: Tensor | None = None,
-    max_steps: int = 200,
+    max_steps: int = 50,
     lr: float = 0.01,
     noise_scale: float = 0.005,
     target_norm: float = 0.2051,
@@ -318,13 +329,7 @@ def run_system2_diagnostics(
     backtrack_patience: int = 30,
     max_chain_len: int = 20,
 ) -> InferenceResult:
-    """
-    Run System 2 with attention capture at every chain evaluation.
-
-    Custom loop matching system_switching.run_system2() but with added diagnostics:
-    - Full v_trajectory tracking
-    - Attention snapshot at each chain eval step
-    """
+    """Run System 2 (PID + chain-guided gradients) with attention capture."""
     if _state.pairwise_model is None:
         raise RuntimeError("Pairwise model not loaded")
     if _state.chain_head is None:
@@ -341,107 +346,79 @@ def run_system2_diagnostics(
 
     t0 = time.time()
 
-    # State
-    v_current = v_init.clone()
-    v_best = v_current.clone()
-    best_chain_energy = float("inf")
+    steps = min(int(max_steps), 50)
+    chain_cap = min(int(max_chain_len), 20)
 
-    chain_buffer: list[Tensor] = [v_init.detach().clone()]
-    energy_trajectory: list[float] = []
-    chain_energies: list[float] = []
-    cos_trajectory: list[float] = []
-    v_trajectory: list[Tensor] = [v_init.detach().cpu().clone()]
-    attention_snapshots: list[dict] = []
-    backtrack_count = 0
-    steps_since_improve = 0
-    just_backtracked = False
+    def _attn_cb(step_id: int, chain_tensor: Tensor) -> list[Tensor]:
+        maps = _extract_attention(chain_head, chain_tensor)
+        return maps
 
-    for step in range(max_steps):
-        # Langevin step using pairwise energy
-        v_current = v_current.detach().requires_grad_(True)
-        E_pair = pairwise_fn(v_query, v_current)
-        grad = torch.autograd.grad(E_pair.sum(), v_current)[0]
-
-        with torch.no_grad():
-            noise = noise_scale * torch.randn_like(v_current)
-            v_current = v_current - lr * grad + noise
-            if target_norm is not None:
-                v_current = F.normalize(v_current, dim=-1) * target_norm
-
-        energy_trajectory.append(E_pair.mean().item())
-        v_trajectory.append(v_current.detach().cpu().clone())
-
-        if v_target is not None:
-            with torch.no_grad():
-                cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
-                cos_trajectory.append(cos)
-
-        # Chain validation every N steps
-        if (step + 1) % chain_eval_every == 0:
-            if not just_backtracked:
-                chain_buffer.append(v_current.detach().clone())
-            just_backtracked = False
-
-            if len(chain_buffer) > max_chain_len:
-                chain_buffer = chain_buffer[-max_chain_len:]
-
-            if len(chain_buffer) >= 3:
-                chain_tensor = torch.stack(chain_buffer, dim=1)  # [B, L, D]
-                with torch.no_grad():
-                    E_chain = chain_head(chain_tensor).mean().item()
-                chain_energies.append(E_chain)
-
-                # Extract attention at this evaluation point
-                try:
-                    attn_maps = _extract_attention(chain_head, chain_tensor)
-                    attention_snapshots.append({
-                        "step": step + 1,
-                        "maps": [m.cpu() for m in attn_maps],
-                        "chain_len": chain_tensor.shape[1],
-                        "chain_energy": E_chain,
-                    })
-                except Exception:
-                    pass  # Don't break inference for attention extraction failures
-
-                if E_chain < best_chain_energy:
-                    best_chain_energy = E_chain
-                    v_best = v_current.detach().clone()
-                    steps_since_improve = 0
-                else:
-                    steps_since_improve += chain_eval_every
-
-                if steps_since_improve >= backtrack_patience:
-                    v_current = v_best.clone()
-                    backtrack_count += 1
-                    steps_since_improve = 0
-                    just_backtracked = True
-                    chain_buffer = chain_buffer[:max(3, len(chain_buffer) // 2)]
-                    chain_buffer.append(v_best.detach().clone())
+    sys2 = run_system2(
+        pairwise_fn=pairwise_fn,
+        chain_head=chain_head,
+        v_query=v_query,
+        v_init=v_init,
+        cfg=System2Config(
+            max_steps_choices=[steps],
+            chain_eval_every=max(1, int(chain_eval_every)),
+            backtrack_patience=max(1, int(backtrack_patience)),
+            max_chain_len=chain_cap,
+        ),
+        langevin_kwargs={
+            "lr": float(lr),
+            "noise_scale": float(noise_scale),
+            "target_norm": float(target_norm) if target_norm is not None else None,
+            "kp": 1.0,
+            "ki": 0.3,
+            "kd": 0.1,
+            "integral_decay": 0.95,
+            "cosine_early_stop": v_target is not None,
+            "cosine_patience": 20,
+            "cosine_delta": 0.001,
+        },
+        v_target=v_target,
+        track_vectors=True,
+        attention_callback=_attn_cb,
+    )
 
     elapsed = (time.time() - t0) * 1000
-
     cos_init = F.cosine_similarity(v_init, v_target, dim=-1).mean().item() if v_target is not None else 0.0
-    cos_final = F.cosine_similarity(v_best, v_target, dim=-1).mean().item() if v_target is not None else 0.0
+    cos_final = F.cosine_similarity(sys2.v_final, v_target, dim=-1).mean().item() if v_target is not None else 0.0
+
+    attention_snapshots: list[dict[str, Any]] = []
+    for i, item in enumerate(sys2.attention_snapshots):
+        step_id, maps = item
+        chain_len = maps[0].shape[-1] if maps else 0
+        chain_energy = sys2.chain_energies[i] if i < len(sys2.chain_energies) else None
+        attention_snapshots.append(
+            {
+                "step": int(step_id),
+                "maps": [m.cpu() for m in maps],
+                "chain_len": int(chain_len),
+                "chain_energy": chain_energy,
+            }
+        )
 
     ir = InferenceResult(
         mode="system2",
         v_query=v_query.cpu(),
         v_init=v_init.cpu(),
-        v_final=v_best.cpu(),
+        v_final=sys2.v_final.cpu(),
         v_target=v_target.cpu() if v_target is not None else None,
         cos_init=cos_init,
         cos_final=cos_final,
         delta_cos=cos_final - cos_init,
-        energy_init=energy_trajectory[0] if energy_trajectory else 0.0,
-        energy_final=energy_trajectory[-1] if energy_trajectory else 0.0,
-        num_steps=max_steps,
-        energy_trajectory=energy_trajectory,
-        cos_trajectory=cos_trajectory,
-        v_trajectory=v_trajectory,
-        chain_energies=chain_energies,
-        backtrack_count=backtrack_count,
+        energy_init=sys2.energy_trajectory[0] if sys2.energy_trajectory else 0.0,
+        energy_final=sys2.energy_trajectory[-1] if sys2.energy_trajectory else 0.0,
+        num_steps=sys2.num_steps,
+        energy_trajectory=sys2.energy_trajectory,
+        cos_trajectory=sys2.cos_trajectory,
+        v_trajectory=sys2.v_trajectory,
+        chain_energies=sys2.chain_energies,
+        backtrack_count=sys2.backtrack_count,
         attention_snapshots=attention_snapshots,
         elapsed_ms=elapsed,
+        target_objective="qa",
     )
     _state.last_result = ir
     return ir
@@ -452,7 +429,7 @@ def run_inference(
     data_path: str = "data/squad_sequences.pt",
     seq_idx: int = 0,
     noise_pct: float = 5.0,
-    max_steps: int = 200,
+    max_steps: int = 50,
     lr: float = 0.01,
     noise_scale: float = 0.005,
     target_norm: float = 0.2051,
@@ -468,9 +445,9 @@ def run_inference(
     if isinstance(raw, dict) and "sequences" in raw:
         seqs = raw["sequences"]
         seq = seqs[seq_idx % len(seqs)]
-        # Use first vector as query, second as target
+        # Use first vector as query, final vector as target (QA-style endpoint).
         v_query = seq[0:1].to(dev)  # [1, D]
-        v_target = seq[1:2].to(dev) if seq.shape[0] > 1 else v_query.clone()
+        v_target = seq[-1:].to(dev) if seq.shape[0] > 1 else v_query.clone()
     elif isinstance(raw, dict) and "vectors" in raw:
         vectors = raw["vectors"]
         v_query = vectors[seq_idx % len(vectors)].unsqueeze(0).to(dev)
@@ -484,23 +461,27 @@ def run_inference(
     if target_norm:
         v_noisy = F.normalize(v_noisy, dim=-1) * target_norm
 
+    # Prevent stale overlays when not explicitly running "both".
+    if mode != "both":
+        _state.sys1_result = None
+
     if mode == "system1":
         return run_system1_diagnostics(
             v_query=v_query, v_init=v_noisy, v_target=v_target,
-            max_steps=max_steps, lr=lr, noise_scale=noise_scale,
+            max_steps=min(int(max_steps), 10), lr=lr, noise_scale=noise_scale,
             target_norm=target_norm,
         )
     elif mode == "both":
         # Run both systems, store sys1 result in _state for comparison
         sys1 = run_system1_diagnostics(
             v_query=v_query, v_init=v_noisy.clone(), v_target=v_target,
-            max_steps=min(max_steps, 50), lr=lr, noise_scale=noise_scale,
+            max_steps=min(int(max_steps), 10), lr=lr, noise_scale=noise_scale,
             target_norm=target_norm,
         )
         _state.sys1_result = sys1
         sys2 = run_system2_diagnostics(
             v_query=v_query, v_init=v_noisy.clone(), v_target=v_target,
-            max_steps=max_steps, lr=lr, noise_scale=noise_scale,
+            max_steps=min(int(max_steps), 50), lr=lr, noise_scale=noise_scale,
             target_norm=target_norm, chain_eval_every=chain_eval_every,
             backtrack_patience=backtrack_patience, max_chain_len=max_chain_len,
         )
@@ -508,7 +489,7 @@ def run_inference(
     else:
         return run_system2_diagnostics(
             v_query=v_query, v_init=v_noisy, v_target=v_target,
-            max_steps=max_steps, lr=lr, noise_scale=noise_scale,
+            max_steps=min(int(max_steps), 50), lr=lr, noise_scale=noise_scale,
             target_norm=target_norm, chain_eval_every=chain_eval_every,
             backtrack_patience=backtrack_patience, max_chain_len=max_chain_len,
         )
@@ -518,7 +499,7 @@ def run_text_inference(
     text: str,
     mode: str = "system2",
     noise_pct: float = 5.0,
-    max_steps: int = 200,
+    max_steps: int = 50,
     lr: float = 0.01,
     noise_scale: float = 0.005,
     target_norm: float = 0.2051,
@@ -535,7 +516,7 @@ def run_text_inference(
     # Encode
     v_clean = _state.sonar.encode([text]).to(dev)  # [1, D]
     v_query = v_clean.clone()
-    v_target = v_clean.clone()
+    v_target = v_clean.clone()  # self-denoise objective for text-mode diagnostics
 
     # Add noise
     noise_rel = noise_pct / 100.0
@@ -543,21 +524,42 @@ def run_text_inference(
     if target_norm:
         v_noisy = F.normalize(v_noisy, dim=-1) * target_norm
 
+    if mode != "both":
+        _state.sys1_result = None
+
     if mode == "system1":
         result = run_system1_diagnostics(
             v_query=v_query, v_init=v_noisy, v_target=v_target,
-            max_steps=max_steps, lr=lr, noise_scale=noise_scale,
+            max_steps=min(int(max_steps), 10), lr=lr, noise_scale=noise_scale,
             target_norm=target_norm,
+        )
+    elif mode == "both":
+        sys1 = run_system1_diagnostics(
+            v_query=v_query, v_init=v_noisy.clone(), v_target=v_target,
+            max_steps=min(int(max_steps), 10), lr=lr, noise_scale=noise_scale,
+            target_norm=target_norm,
+        )
+        _state.sys1_result = sys1
+        result = run_system2_diagnostics(
+            v_query=v_query, v_init=v_noisy.clone(), v_target=v_target,
+            max_steps=min(int(max_steps), 50), lr=lr, noise_scale=noise_scale,
+            target_norm=target_norm, chain_eval_every=chain_eval_every,
+            backtrack_patience=backtrack_patience, max_chain_len=max_chain_len,
         )
     else:
         result = run_system2_diagnostics(
             v_query=v_query, v_init=v_noisy, v_target=v_target,
-            max_steps=max_steps, lr=lr, noise_scale=noise_scale,
+            max_steps=min(int(max_steps), 50), lr=lr, noise_scale=noise_scale,
             target_norm=target_norm, chain_eval_every=chain_eval_every,
             backtrack_patience=backtrack_patience, max_chain_len=max_chain_len,
         )
 
     result.input_text = text
+    result.target_objective = "self_denoise"
+    result.target_note = (
+        "Text diagnostics optimize self-denoise (recover original embedding), "
+        "not QA semantic correctness."
+    )
 
     # Decode output
     try:
@@ -633,12 +635,17 @@ def create_energy_trajectory_plot(result: InferenceResult) -> go.Figure:
 def create_cosine_trajectory_plot(result: InferenceResult) -> go.Figure:
     """Cosine similarity to target over steps."""
     fig = go.Figure()
+    cosine_label = (
+        "cos(v_current, v_target[self-denoise])"
+        if result.target_objective == "self_denoise"
+        else "cos(v_current, v_target[qa])"
+    )
 
     if result.cos_trajectory:
         steps = list(range(len(result.cos_trajectory)))
         fig.add_trace(go.Scatter(
             x=steps, y=result.cos_trajectory,
-            mode="lines", name="cos(v_current, v_target)",
+            mode="lines", name=cosine_label,
             line=dict(color="#4CAF50", width=2),
         ))
 
@@ -877,6 +884,7 @@ def create_metrics_summary(result: InferenceResult) -> dict:
     """Flat dict of all numerical metrics for JSON export."""
     metrics = {
         "mode": result.mode,
+        "target_objective": result.target_objective,
         "cos_init": round(result.cos_init, 6),
         "cos_final": round(result.cos_final, 6),
         "delta_cos": round(result.delta_cos, 6),
@@ -921,6 +929,8 @@ def create_metrics_summary(result: InferenceResult) -> dict:
         metrics["input_text"] = result.input_text
     if result.output_text:
         metrics["output_text"] = result.output_text
+    if result.target_note:
+        metrics["target_note"] = result.target_note
 
     return metrics
 
@@ -935,6 +945,7 @@ def format_metrics_markdown(result: InferenceResult) -> str:
         "| Metric | Value |",
         "|--------|-------|",
         f"| Mode | {m['mode']} |",
+        f"| Objective | {m.get('target_objective', 'qa')} |",
         f"| Steps | {m['num_steps']} |",
         f"| Time | {m['elapsed_ms']:.1f} ms |",
         f"| cos(init, target) | {m['cos_init']:.6f} |",
@@ -961,6 +972,11 @@ def format_metrics_markdown(result: InferenceResult) -> str:
             f"**Input**: {result.input_text}",
             f"**Output**: {result.output_text}",
         ])
+        if result.target_objective == "self_denoise":
+            lines.append(
+                "**Note**: `target` in cosine metric is original input embedding "
+                "(self-denoise diagnostic), not QA ground-truth answer."
+            )
 
     # Show System 1 comparison if available (from "both" mode)
     if _state.sys1_result is not None and result.mode == "system2":

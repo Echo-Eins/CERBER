@@ -3048,8 +3048,8 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     label="Mode",
                 )
                 diag_max_steps = gr.Slider(
-                    minimum=10, maximum=500, value=200, step=10,
-                    label="Max Steps",
+                    minimum=10, maximum=50, value=50, step=1,
+                    label="Max Steps (S1<=10, S2<=50)",
                 )
                 diag_lr = gr.Number(value=0.01, label="Learning Rate")
                 diag_noise_scale = gr.Number(value=0.005, label="Noise Scale")
@@ -3065,7 +3065,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     label="Backtrack Patience (S2)",
                 )
                 diag_max_chain_len = gr.Slider(
-                    minimum=3, maximum=30, value=20, step=1,
+                    minimum=3, maximum=20, value=20, step=1,
                     label="Max Chain Len (S2)",
                 )
 

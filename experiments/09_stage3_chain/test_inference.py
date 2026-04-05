@@ -264,11 +264,11 @@ def run_test(
     Returns dict with per-sample and aggregate results.
     """
     sys1_cfg = System1Config(
-        max_steps_choices=[50],  # Fixed for reproducible comparison
+        max_steps_choices=[10],  # Fixed for reproducible comparison
         cruise_ratio_choices=[0.5],
     )
     sys2_cfg = System2Config(
-        max_steps_choices=[200],  # Fixed for comparison
+        max_steps_choices=[50],  # Fixed for comparison
         cruise_ratio_choices=[0.0],
         chain_eval_every=5,
         backtrack_patience=30,

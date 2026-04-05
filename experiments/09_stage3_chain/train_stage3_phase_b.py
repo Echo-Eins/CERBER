@@ -3,11 +3,14 @@
 Stage 3 Phase B: Joint fine-tune + System 1/2 switching.
 
 Both Pairwise and Chain Head are UNFROZEN and trained jointly.
-Each batch is processed in a random mode (System 1 or System 2, 30/70 bias).
+Mode policy is strict:
+  - Until simple-task accuracy reaches threshold (default 95%), only System 1 is allowed.
+  - After unlock, batches are sampled in 30/70 ratio (System 1/System 2).
+  - System 2 quality is continuously monitored after unlock.
 
 Key training mechanisms:
-  - System 1 (30%): Pairwise energy + short Langevin (10-50 steps)
-  - System 2 (70%): Chain Head energy + extended Langevin (100-200 steps)
+  - System 1 (30%): Pairwise energy + short Langevin (10 steps)
+  - System 2 (70%): Chain Head energy + extended Langevin (up to 50 steps)
   - Cruise ratio sampling: expose model to [0.0, 0.3, 0.5, 0.7]
   - Combined loss: pairwise ranking + chain ranking + cosine reconstruction
 
@@ -26,6 +29,7 @@ import json
 import random
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -39,10 +43,7 @@ from cebcm.models.chain_head import ChainHeadConfig, EBTChainHead
 from cebcm.models.energy import SimpleEnergy
 from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
 from cebcm.inference.system_switching import (
-    System1Config,
-    System2Config,
     select_thinking_mode,
-    run_thinking,
 )
 from cebcm.training.chain_data import (
     ChainDataConfig,
@@ -59,6 +60,37 @@ from cebcm.training.stage2_utils import (
     setup_amp,
     setup_seed,
 )
+
+
+@dataclass
+class ModeSwitchState:
+    """Runtime state for strict System1->System2 gating."""
+    system2_unlocked: bool = False
+    unlock_epoch: int = -1
+    unlock_metric_value: float = 0.0
+    unlock_hits: int = 0
+    system2_monitor_fail_streak: int = 0
+
+
+def build_mode_schedule(num_batches: int, sys1_weight: float, sys2_weight: float) -> list[str]:
+    """
+    Build an exact per-epoch mode schedule with target sys1/sys2 ratio.
+
+    Random weighted sampling gives ratio only in expectation. For strict
+    30/70 policy we pre-build counts and shuffle.
+    """
+    if num_batches <= 0:
+        return []
+
+    total = max(1e-8, float(sys1_weight) + float(sys2_weight))
+    sys1_share = float(sys1_weight) / total
+    n_sys1 = int(round(num_batches * sys1_share))
+    n_sys1 = max(0, min(num_batches, n_sys1))
+    n_sys2 = num_batches - n_sys1
+
+    schedule = (["system1"] * n_sys1) + (["system2"] * n_sys2)
+    random.shuffle(schedule)
+    return schedule
 
 
 def build_pairwise(cfg: dict, device: torch.device) -> nn.Module:
@@ -157,6 +189,7 @@ def train_epoch_phase_b(
     amp_dtype: torch.dtype,
     phase_cfg: dict,
     epoch: int,
+    mode_state: ModeSwitchState,
 ) -> dict[str, float]:
     """
     Phase B training epoch with System 1/2 switching.
@@ -171,20 +204,31 @@ def train_epoch_phase_b(
     tracker = MetricTracker()
     step = 0
 
-    sys1_weight = phase_cfg.get("system1_weight", 0.3)
-    sys2_weight = phase_cfg.get("system2_weight", 0.7)
+    sys1_weight = float(phase_cfg.get("system1_weight", 0.3))
+    sys2_weight = float(phase_cfg.get("system2_weight", 0.7))
     clip_grad = phase_cfg.get("clip_grad_norm", 1.0)
     log_every = phase_cfg.get("log_every", 50)
+    mode_schedule: list[str] = []
+    if mode_state.system2_unlocked:
+        mode_schedule = build_mode_schedule(len(loader), sys1_weight, sys2_weight)
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         positives = batch["positives"].to(device)
         pos_lengths = batch["pos_lengths"].to(device)
         negatives = batch["negatives"].to(device)
         neg_lengths = batch["neg_lengths"].to(device)
         neg_types = batch.get("neg_types")
 
-        # Select thinking mode
-        mode = select_thinking_mode(sys1_weight, sys2_weight)
+        # Strict gating: until unlock, force System 1 only.
+        if mode_state.system2_unlocked:
+            if batch_idx < len(mode_schedule):
+                mode = mode_schedule[batch_idx]
+            else:
+                mode = select_thinking_mode(sys1_weight, sys2_weight)
+            forced_system1 = 0.0
+        else:
+            mode = "system1"
+            forced_system1 = 1.0
 
         optimizer.zero_grad()
 
@@ -211,6 +255,7 @@ def train_epoch_phase_b(
 
             E_pos_pair = pairwise(v_queries, v_targets)
             E_neg_pair = pairwise(v_queries, v_neg)
+            pair_rank_acc = (E_pos_pair < E_neg_pair).float().mean()
             # Margin ranking loss for pairwise (adaptive margin based on energy scale)
             with torch.no_grad():
                 energy_scale = (E_pos_pair.abs().mean() + E_neg_pair.abs().mean()).clamp(min=0.1)
@@ -240,9 +285,16 @@ def train_epoch_phase_b(
         metrics = {
             **chain_metrics,
             "pairwise_loss": pairwise_loss.item(),
+            "pairwise_rank_acc": pair_rank_acc.item(),
             "total_loss": total_loss.item(),
             f"mode_{mode}": 1.0,
+            "mode_forced_system1": forced_system1,
+            "system2_unlocked": 1.0 if mode_state.system2_unlocked else 0.0,
         }
+        if mode == "system1":
+            metrics["simple_acc_system1"] = pair_rank_acc.item()
+        else:
+            metrics["simple_acc_system2"] = pair_rank_acc.item()
         tracker.update(metrics)
         step += 1
 
@@ -255,8 +307,10 @@ def train_epoch_phase_b(
                 f"total={avg.get('total_loss', 0):.4f} "
                 f"chain={avg.get('chain_loss', 0):.4f} "
                 f"pair={avg.get('pairwise_loss', 0):.4f} "
-                f"rank_acc={avg.get('chain_rank_acc', 0):.4f} "
+                f"simple_acc={avg.get('pairwise_rank_acc', 0):.4f} "
+                f"chain_rank={avg.get('chain_rank_acc', 0):.4f} "
                 f"sys1%={sys1_pct:.2f} "
+                f"sys2_unlocked={int(mode_state.system2_unlocked)} "
                 f"lr={lr:.2e}"
             )
 
@@ -424,6 +478,19 @@ def main():
     # Resume
     start_epoch = 0
     best_metric = 0.0
+    gate_cfg = phase_cfg.get("mode_switch_gate", {})
+    lock_until_simple = bool(gate_cfg.get("lock_system2_until_simple_acc", True))
+    unlock_metric_name = str(gate_cfg.get("unlock_metric", "pairwise_rank_acc"))
+    unlock_threshold = float(gate_cfg.get("simple_acc_threshold", 0.95))
+    unlock_consecutive_evals = int(gate_cfg.get("unlock_consecutive_evals", 1))
+    system2_monitor_source = str(gate_cfg.get("system2_monitor_source", "val")).strip().lower()
+    if system2_monitor_source not in {"train", "val"}:
+        system2_monitor_source = "val"
+    system2_monitor_metric = str(gate_cfg.get("system2_monitor_metric", "chain_rank_acc"))
+    system2_monitor_min = float(gate_cfg.get("system2_monitor_min", 0.85))
+    system2_monitor_patience = int(gate_cfg.get("system2_monitor_patience", 3))
+    mode_state = ModeSwitchState(system2_unlocked=not lock_until_simple)
+
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         pairwise.load_state_dict(ckpt["pairwise"])
@@ -431,24 +498,55 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt.get("epoch", 0)
         best_metric = ckpt.get("best_metric", 0.0)
+        mode_switch = ckpt.get("mode_switch", {})
+        if mode_switch:
+            mode_state.system2_unlocked = bool(mode_switch.get("system2_unlocked", mode_state.system2_unlocked))
+            mode_state.unlock_epoch = int(mode_switch.get("unlock_epoch", mode_state.unlock_epoch))
+            mode_state.unlock_metric_value = float(mode_switch.get("unlock_metric_value", mode_state.unlock_metric_value))
+            mode_state.unlock_hits = int(mode_switch.get("unlock_hits", mode_state.unlock_hits))
+            mode_state.system2_monitor_fail_streak = int(
+                mode_switch.get("system2_monitor_fail_streak", mode_state.system2_monitor_fail_streak)
+            )
         print(f"  Resumed from epoch {start_epoch}")
+        print(
+            "  Resume mode-switch: "
+            f"system2_unlocked={mode_state.system2_unlocked}, "
+            f"unlock_epoch={mode_state.unlock_epoch}, "
+            f"unlock_metric={mode_state.unlock_metric_value:.4f}"
+        )
 
     # Training loop
     no_improve_count = 0
     patience = phase_cfg.get("early_stop_patience", 5)
+    print(
+        "Mode-switch policy: "
+        f"lock_until_simple={lock_until_simple}, "
+        f"unlock_metric={unlock_metric_name}, "
+        f"threshold={unlock_threshold:.3f}, "
+        f"unlock_consecutive_evals={unlock_consecutive_evals}, "
+        f"ratio_after_unlock={phase_cfg.get('system1_weight', 0.3):.2f}/"
+        f"{phase_cfg.get('system2_weight', 0.7):.2f}"
+    )
+    print(
+        "System2 monitor: "
+        f"source={system2_monitor_source}, "
+        f"metric={system2_monitor_metric}, min={system2_monitor_min:.3f}, "
+        f"patience={system2_monitor_patience}"
+    )
 
     for epoch in range(start_epoch, phase_cfg["num_epochs"]):
         t0 = time.time()
 
         train_metrics = train_epoch_phase_b(
             pairwise, chain_head, train_loader, optimizer, scheduler, scaler,
-            device, amp_enabled, amp_dtype, phase_cfg, epoch,
+            device, amp_enabled, amp_dtype, phase_cfg, epoch, mode_state,
         )
 
         elapsed = time.time() - t0
         print(f"\n  Epoch {epoch} train ({elapsed:.1f}s):")
         for k, v in sorted(train_metrics.items()):
             print(f"    {k}: {v:.4f}")
+        print(f"    system2_unlocked: {int(mode_state.system2_unlocked)}")
 
         # Eval
         if (epoch + 1) % phase_cfg.get("eval_every_epochs", 1) == 0:
@@ -459,6 +557,57 @@ def main():
             print(f"  Epoch {epoch} val:")
             for k, v in sorted(val_metrics.items()):
                 print(f"    {k}: {v:.4f}")
+
+            # Strict unlock condition: System2 remains disabled until simple-task
+            # accuracy reaches threshold on validation.
+            simple_acc_val = float(val_metrics.get(unlock_metric_name, 0.0))
+            if lock_until_simple and not mode_state.system2_unlocked:
+                if simple_acc_val >= unlock_threshold:
+                    mode_state.unlock_hits += 1
+                else:
+                    mode_state.unlock_hits = 0
+
+                print(
+                    "  [ModeGate] "
+                    f"{unlock_metric_name}={simple_acc_val:.4f} "
+                    f"(threshold={unlock_threshold:.4f}, hits={mode_state.unlock_hits}/"
+                    f"{unlock_consecutive_evals})"
+                )
+
+                if mode_state.unlock_hits >= unlock_consecutive_evals:
+                    mode_state.system2_unlocked = True
+                    mode_state.unlock_epoch = epoch
+                    mode_state.unlock_metric_value = simple_acc_val
+                    mode_state.system2_monitor_fail_streak = 0
+                    print(
+                        "  [ModeGate] System2 UNLOCKED: "
+                        f"{unlock_metric_name}={simple_acc_val:.4f} >= {unlock_threshold:.4f}"
+                    )
+            elif mode_state.system2_unlocked:
+                # Post-unlock strict monitoring.
+                if system2_monitor_source == "train":
+                    monitor_metrics = train_metrics
+                else:
+                    monitor_metrics = val_metrics
+                sys2_metric_val = float(monitor_metrics.get(system2_monitor_metric, 0.0))
+                if sys2_metric_val < system2_monitor_min:
+                    mode_state.system2_monitor_fail_streak += 1
+                else:
+                    mode_state.system2_monitor_fail_streak = 0
+
+                print(
+                    "  [System2 Monitor] "
+                    f"source={system2_monitor_source}, "
+                    f"{system2_monitor_metric}={sys2_metric_val:.4f}, "
+                    f"min={system2_monitor_min:.4f}, "
+                    f"fail_streak={mode_state.system2_monitor_fail_streak}/"
+                    f"{system2_monitor_patience}"
+                )
+                if mode_state.system2_monitor_fail_streak >= system2_monitor_patience:
+                    print(
+                        "  [System2 Monitor][WARNING] "
+                        "System2 quality below configured floor for consecutive evals."
+                    )
 
             # Combined metric: chain_rank_acc * pairwise_rank_acc
             chain_acc = val_metrics.get("chain_rank_acc", 0)
@@ -477,6 +626,13 @@ def main():
                         "epoch": epoch,
                         "best_metric": best_metric,
                         "val_metrics": val_metrics,
+                        "mode_switch": {
+                            "system2_unlocked": mode_state.system2_unlocked,
+                            "unlock_epoch": mode_state.unlock_epoch,
+                            "unlock_metric_value": mode_state.unlock_metric_value,
+                            "unlock_hits": mode_state.unlock_hits,
+                            "system2_monitor_fail_streak": mode_state.system2_monitor_fail_streak,
+                        },
                         "config": config,
                     },
                 )
@@ -497,6 +653,13 @@ def main():
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                     "best_metric": best_metric,
+                    "mode_switch": {
+                        "system2_unlocked": mode_state.system2_unlocked,
+                        "unlock_epoch": mode_state.unlock_epoch,
+                        "unlock_metric_value": mode_state.unlock_metric_value,
+                        "unlock_hits": mode_state.unlock_hits,
+                        "system2_monitor_fail_streak": mode_state.system2_monitor_fail_streak,
+                    },
                 },
             )
 

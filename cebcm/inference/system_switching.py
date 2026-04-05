@@ -3,14 +3,15 @@ System 1/2 switching for inference and training.
 
 System 1 (Fast Shot):
   - Pairwise energy scoring only
-  - 10-50 Langevin steps with aggressive momentum (cruise_ratio 0.5-0.7)
+  - 10 Langevin steps (PID) for fast convergence
   - For simple queries, fast response
 
 System 2 (Deep Thinking):
   - Chain Head energy scoring
-  - 100-200+ Langevin steps with low momentum (cruise_ratio 0.0-0.3)
+  - <=50 Langevin steps (PID) with chain-guided gradients
   - Chain validation every chain_eval_every steps
   - Backtracking: revert to best point if no improvement for N steps
+  - Chain energy contributes to update direction (not only monitoring)
 
 Spec reference: §8.2 (Deep Thinking), IMPLEMENTATION_PLAN.md §6.1 Phase B
 """
@@ -31,18 +32,20 @@ from cebcm.inference.langevin import LangevinResult, run_langevin
 @dataclass
 class System1Config:
     """Fast Shot configuration."""
-    max_steps_choices: list[int] = field(default_factory=lambda: [10, 20, 50])
+    max_steps_choices: list[int] = field(default_factory=lambda: [10])
     cruise_ratio_choices: list[float] = field(default_factory=lambda: [0.5, 0.7])
 
 
 @dataclass
 class System2Config:
     """Deep Thinking configuration."""
-    max_steps_choices: list[int] = field(default_factory=lambda: [100, 200])
+    max_steps_choices: list[int] = field(default_factory=lambda: [50])
     cruise_ratio_choices: list[float] = field(default_factory=lambda: [0.0, 0.1, 0.3])
     chain_eval_every: int = 5       # Evaluate chain every N Langevin steps
     backtrack_patience: int = 30    # Steps without improvement before reverting
     max_chain_len: int = 20         # Max vectors in reasoning chain
+    chain_guidance_weight: float = 0.35  # Weight of chain gradient in total update
+    min_chain_guidance_len: int = 5      # Avoid OOD chain lengths for chain-head guidance
 
 
 @dataclass
@@ -137,11 +140,13 @@ def run_system2(
     attention_callback: Callable[[int, Tensor], list[Tensor]] | None = None,
 ) -> ThinkingResult:
     """
-    System 2 (Deep Thinking): chain-validated Langevin with backtracking.
+    System 2 (Deep Thinking): chain-guided PID Langevin with backtracking.
 
-    Runs extended Langevin dynamics using pairwise energy for gradient steps,
-    but validates the accumulated reasoning chain every chain_eval_every steps
-    using the Chain Head. If chain energy degrades, backtracks to best point.
+    Runs PID Langevin updates where the gradient is:
+      grad_total = grad_pairwise + w_chain * grad_chain
+    and grad_chain is computed from Chain Head energy over recent trajectory.
+    Chain quality is additionally validated every chain_eval_every steps,
+    with backtracking to the best chain state on stagnation.
 
     Args:
         pairwise_fn: Pairwise energy function for Langevin gradients
@@ -158,23 +163,49 @@ def run_system2(
     Returns:
         ThinkingResult with chain energies, backtrack info, and optional diagnostics
     """
-    max_steps = random.choice(cfg.max_steps_choices)
-    device = v_init.device
-    B, D = v_init.shape
+    max_steps = min(random.choice(cfg.max_steps_choices), 50)
 
-    # Default Langevin params
     lk = langevin_kwargs or {}
-    lr = lk.get("lr", 0.01)
-    noise_scale = lk.get("noise_scale", 0.005)
+    lr = float(lk.get("lr", 0.01))
+    noise_scale = float(lk.get("noise_scale", 0.005))
     target_norm = lk.get("target_norm", 0.2051)
+    if target_norm is not None:
+        target_norm = float(target_norm)
+    chain_eval_every = max(1, int(cfg.chain_eval_every))
+    max_chain_len = min(int(cfg.max_chain_len), 20)
+    backtrack_patience = max(chain_eval_every, int(cfg.backtrack_patience))
+    chain_guidance_weight = float(getattr(cfg, "chain_guidance_weight", 0.35))
+    min_chain_guidance_len = max(3, int(getattr(cfg, "min_chain_guidance_len", 5)))
 
-    # State
-    v_current = v_init.clone().requires_grad_(False)
-    v_best = v_current.clone()
+    # PID + early-stop parameters (align with run_langevin defaults)
+    kp = float(lk.get("kp", 1.0))
+    ki = float(lk.get("ki", 0.3))
+    kd = float(lk.get("kd", 0.1))
+    integral_decay = float(lk.get("integral_decay", 0.95))
+    plateau_patience = int(lk.get("plateau_patience", 10))
+    plateau_delta = float(lk.get("plateau_delta", 1e-4))
+    energy_threshold = lk.get("energy_threshold", None)
+    cosine_early_stop = bool(lk.get("cosine_early_stop", False)) and (v_target is not None)
+    cosine_patience = int(lk.get("cosine_patience", 20))
+    cosine_delta = float(lk.get("cosine_delta", 0.001))
+    tamed = bool(lk.get("tamed", False))
+
+    v_current = v_init.clone().detach()
+    v_best_chain = v_current.clone()
+    v_best_energy = v_current.clone()
+    v_best_cos = v_current.clone()
     best_chain_energy = float("inf")
+    best_pairwise_energy = float("inf")
+    best_cosine = float("-inf")
+    plateau_counter = 0
+    cosine_plateau_counter = 0
 
-    # Reasoning chain: accumulate intermediate points
-    chain_buffer: list[Tensor] = [v_init.detach().clone()]
+    # PID state
+    integral = torch.zeros_like(v_current)
+    prev_grad: Tensor | None = None
+
+    # chain_history stores accepted states and is used both for guidance and eval
+    chain_history: list[Tensor] = [v_init.detach().clone()]
     energy_trajectory: list[float] = []
     chain_energies: list[float] = []
     cos_trajectory: list[float] = []
@@ -183,81 +214,156 @@ def run_system2(
     attention_snapshots: list[tuple[int, list[Tensor]]] = []
     backtrack_count = 0
     steps_since_improve = 0
-    just_backtracked = False
+
+    if track_vectors:
+        v_trajectory.append(v_current.detach().cpu().clone())
 
     for step in range(max_steps):
-        # Langevin step using pairwise energy
-        v_current = v_current.detach().requires_grad_(True)
-        E_pair = pairwise_fn(v_query, v_current)
-        grad = torch.autograd.grad(E_pair.sum(), v_current)[0]
+        if hasattr(pairwise_fn, "set_step"):
+            pairwise_fn.set_step(step)
 
-        grad_norms.append(grad.norm().item())
+        v_current_req = v_current.detach().requires_grad_(True)
+        e_pair = pairwise_fn(v_query, v_current_req)
+        pairwise_mean = e_pair.mean().item()
 
-        with torch.no_grad():
-            noise = noise_scale * torch.randn_like(v_current)
-            v_current = v_current - lr * grad + noise
+        # Chain-guided gradient: include chain_head energy on recent trajectory + current candidate.
+        use_chain_guidance = len(chain_history) >= (min_chain_guidance_len - 1)
+        total_objective = e_pair.sum()
+        if use_chain_guidance and chain_guidance_weight > 0:
+            history = chain_history[-max(1, max_chain_len - 1):]
+            chain_tensor = torch.stack([*history, v_current_req], dim=1)  # [B, L, D]
+            e_chain_guidance = chain_head(chain_tensor)
+            total_objective = total_objective + chain_guidance_weight * e_chain_guidance.sum()
 
-            # Project to SONAR sphere (OOD protection)
-            if target_norm is not None:
-                v_current = F.normalize(v_current, dim=-1) * target_norm
+        total_grad = torch.autograd.grad(total_objective, v_current_req)[0]
 
-        energy_trajectory.append(E_pair.mean().item())
+        if tamed:
+            g_norm = total_grad.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            total_grad = total_grad / (1.0 + lr * g_norm)
 
-        if track_vectors:
-            v_trajectory.append(v_current.detach().cpu().clone())
+        grad_norms.append(total_grad.norm().item())
+        energy_trajectory.append(pairwise_mean)
 
-        # Track cosine to target if available
+        prev_best_pairwise = best_pairwise_energy
+        # Track best pairwise-energy point
+        if pairwise_mean < best_pairwise_energy:
+            best_pairwise_energy = pairwise_mean
+            v_best_energy = v_current.detach().clone()
+
+        # Energy-based early stop (pairwise objective)
+        if pairwise_mean < (prev_best_pairwise - plateau_delta):
+            plateau_counter = 0
+        else:
+            plateau_counter += 1
+
+        if energy_threshold is not None and pairwise_mean < float(energy_threshold):
+            break
+        if plateau_counter >= plateau_patience:
+            break
+
+        # Optional cosine tracking / stopping
         if v_target is not None:
             with torch.no_grad():
                 cos = F.cosine_similarity(v_current, v_target, dim=-1).mean().item()
                 cos_trajectory.append(cos)
-
-        # Chain validation every N steps
-        if (step + 1) % cfg.chain_eval_every == 0:
-            # Add current point to chain (skip if just backtracked — already added)
-            if not just_backtracked:
-                chain_buffer.append(v_current.detach().clone())
-            just_backtracked = False
-
-            # Keep chain within max length (sliding window)
-            if len(chain_buffer) > cfg.max_chain_len:
-                chain_buffer = chain_buffer[-cfg.max_chain_len:]
-
-            # Evaluate chain quality
-            if len(chain_buffer) >= 3:
-                chain_tensor = torch.stack(chain_buffer, dim=1)  # [B, chain_len, D]
-                with torch.no_grad():
-                    E_chain = chain_head(chain_tensor).mean().item()
-                chain_energies.append(E_chain)
-
-                # Capture attention maps at this chain evaluation
-                if attention_callback is not None:
-                    try:
-                        attn_maps = attention_callback(step, chain_tensor)
-                        attention_snapshots.append((step, attn_maps))
-                    except Exception:
-                        pass  # Don't break inference for diagnostics
-
-                if E_chain < best_chain_energy:
-                    best_chain_energy = E_chain
-                    v_best = v_current.detach().clone()
-                    steps_since_improve = 0
+                if cos > best_cosine:
+                    best_cosine = cos
+                    v_best_cos = v_current.detach().clone()
+                    cosine_plateau_counter = 0
+                elif cos > best_cosine - cosine_delta:
+                    cosine_plateau_counter += 1
                 else:
-                    steps_since_improve += cfg.chain_eval_every
+                    cosine_plateau_counter += 1
 
-                # Backtracking: revert if no improvement for too long
-                if steps_since_improve >= cfg.backtrack_patience:
-                    v_current = v_best.clone()
-                    backtrack_count += 1
-                    steps_since_improve = 0
-                    just_backtracked = True
-                    chain_buffer = chain_buffer[:max(3, len(chain_buffer) // 2)]
-                    chain_buffer.append(v_best.detach().clone())
+            if cosine_early_stop and cosine_plateau_counter >= cosine_patience:
+                break
+
+        # PID update components
+        p_term = total_grad
+        integral = integral_decay * integral + total_grad
+        i_term = integral
+        if prev_grad is None:
+            d_term = torch.zeros_like(total_grad)
+        else:
+            d_term = total_grad - prev_grad
+        prev_grad = total_grad.detach().clone()
+        update = kp * p_term + ki * i_term + kd * d_term
+
+        # Tangent projection to keep update on sphere
+        if target_norm is not None:
+            v_hat = F.normalize(v_current, dim=-1)
+            radial = (update * v_hat).sum(dim=-1, keepdim=True) * v_hat
+            update = update - radial
+
+        with torch.no_grad():
+            step_noise_scale = float(noise_scale)
+            get_step_noise_scale = getattr(pairwise_fn, "get_step_noise_scale", None)
+            if callable(get_step_noise_scale):
+                try:
+                    step_noise_scale = float(
+                        get_step_noise_scale(
+                            v_query=v_query,
+                            v_candidate=v_current,
+                            base_noise_scale=noise_scale,
+                        )
+                    )
+                except Exception:
+                    step_noise_scale = float(noise_scale)
+            step_noise_scale = max(0.0, step_noise_scale)
+
+            noise = torch.randn_like(v_current) * (2.0 * lr * step_noise_scale) ** 0.5
+            v_current = v_current - lr * update + noise
+            if target_norm is not None:
+                v_current = F.normalize(v_current, dim=-1) * target_norm
+
+        chain_history.append(v_current.detach().clone())
+        if len(chain_history) > max_chain_len:
+            chain_history = chain_history[-max_chain_len:]
+
+        if track_vectors:
+            v_trajectory.append(v_current.detach().cpu().clone())
+
+        if (step + 1) % chain_eval_every == 0 and len(chain_history) >= 3:
+            chain_tensor_eval = torch.stack(chain_history, dim=1)  # [B, L, D]
+            with torch.no_grad():
+                e_chain = chain_head(chain_tensor_eval).mean().item()
+            chain_energies.append(e_chain)
+
+            if attention_callback is not None:
+                try:
+                    attn_maps = attention_callback(step + 1, chain_tensor_eval)
+                    attention_snapshots.append((step + 1, attn_maps))
+                except Exception:
+                    pass
+
+            if e_chain < best_chain_energy:
+                best_chain_energy = e_chain
+                v_best_chain = v_current.detach().clone()
+                steps_since_improve = 0
+            else:
+                steps_since_improve += chain_eval_every
+
+            # Backtracking to best chain state if chain quality stalls
+            if steps_since_improve >= backtrack_patience:
+                v_current = v_best_chain.detach().clone()
+                backtrack_count += 1
+                steps_since_improve = 0
+                # Keep trajectory context short and re-anchor at best state
+                chain_history = chain_history[-max(3, max_chain_len // 2):]
+                chain_history.append(v_best_chain.detach().clone())
+
+    # Final decision: prioritize chain-best for System 2, else cosine-best, else pairwise-best.
+    if chain_energies:
+        v_final = v_best_chain
+    elif v_target is not None and best_cosine > float("-inf"):
+        v_final = v_best_cos
+    else:
+        v_final = v_best_energy
 
     return ThinkingResult(
-        v_final=v_best,
+        v_final=v_final,
         mode="system2",
-        num_steps=max_steps,
+        num_steps=len(energy_trajectory),
         energy_trajectory=energy_trajectory,
         chain_energies=chain_energies,
         backtrack_count=backtrack_count,

@@ -50,7 +50,7 @@
     "langevin": {
         "lr": 0.01,
         "noise_scale": 0.005,
-        "max_steps": 100,
+        "max_steps": 50,
         "target_norm": 0.2051,
         "method": "pid",
         "pid_kp": 1.0,
@@ -102,17 +102,14 @@
         "system1_weight": 0.3,
         "system2_weight": 0.7,
         "system1_steps": [
-            10,
-            20,
-            50
+            10
         ],
         "system1_cruise_ratios": [
             0.5,
             0.7
         ],
         "system2_steps": [
-            100,
-            200
+            50
         ],
         "system2_cruise_ratios": [
             0.0,
@@ -120,6 +117,16 @@
             0.3
         ],
         "chain_eval_every_steps": 5,
+        "mode_switch_gate": {
+            "lock_system2_until_simple_acc": true,
+            "unlock_metric": "pairwise_rank_acc",
+            "simple_acc_threshold": 0.95,
+            "unlock_consecutive_evals": 2,
+            "system2_monitor_source": "val",
+            "system2_monitor_metric": "chain_rank_acc",
+            "system2_monitor_min": 0.85,
+            "system2_monitor_patience": 3
+        },
         "_cruise_ratio_training": "Expose model to ALL cruise_ratio values during training (lesson)"
     },
     "data": {

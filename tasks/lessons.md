@@ -1413,3 +1413,53 @@ After RoPE fix, Phase A showed: train adj_swap 0.60->0.72, val adj_swap 0.68->0.
 2. target_energy_gap should be ~3*tau for realistic convergence
 3. Negative difficulty must scale with chain length — fixed count of perturbations dilutes as L grows
 4. Random data augmentation per access beats pre-extracted fixed samples for small datasets
+
+## 2026-04-04 - CRITICAL: System2 must share Langevin math path with System1 and chain-head must guide gradients
+
+### Pattern
+Stage3 diagnostics showed `system1` consistently outperforming `system2` despite higher step budget in `system2`.
+Root cause was architectural mismatch:
+- `system1` used PID Langevin (`run_langevin`) with robust stopping behavior.
+- `system2` used a separate plain GD+noise loop and only used Chain Head for periodic eval/backtrack.
+- With `backtracks=0`, Chain Head had near-zero control over trajectory, so long runs drifted from best cosine point.
+
+Additional metric issue:
+- Text-mode reported `cos(final,target)` against the input embedding (self-denoise), which can punish semantically valid QA-style outputs.
+
+### Fix
+- Reworked `system2` to PID-style updates with the same mathematical components as `run_langevin` path.
+- Added chain-guided gradient term to the update objective (`pairwise + w * chain`).
+- Kept chain eval/backtrack as secondary control.
+- Enforced safe limits: `system1=10 steps`, `system2<=50 steps`, `max_chain_len<=20`.
+- Made metric semantics explicit (`target_objective=qa|self_denoise`) and fixed text-mode `both` handling.
+- Fixed data target selection to sequence endpoint (`seq[-1]`) for QA-style diagnostics.
+
+### Rule
+1. Never maintain separate optimization math for System1/System2 unless explicitly required by spec and validated by ablation.
+2. If Chain Head is part of System2, it must influence gradients, not only monitor/backtrack.
+3. Cap inference hyperparameters to chain-head training distribution (avoid OOD chain length).
+4. Every cosine metric must declare target semantics (`qa` vs `self_denoise`) to avoid false regressions.
+
+## 2026-04-04 - Stage3 gating must be strict and deterministic
+
+### Pattern
+Using only random weighted sampling for mode selection can violate hard policy requirements
+("no System2 before threshold", "30/70 after unlock") due sampling variance.
+
+### Rule
+1. If mode policy is contractual, encode it as explicit state machine (`locked -> unlocked`) with checkpoint persistence.
+2. Unlock `System2` only from validation metric threshold (default simple-task `pairwise_rank_acc >= 0.95`), optionally with consecutive eval hits.
+3. After unlock, use an exact per-epoch ratio schedule (counted batches + shuffle), not just probabilistic weights.
+4. Add post-unlock quality floor monitoring with fail-streak tracking and warnings in logs.
+
+## 2026-04-04 - Keep fallback defaults aligned with model/spec math
+
+### Pattern
+Utility-layer fallback defaults in `build_ipp` drifted from model/spec defaults
+(`sigma_init=0.5`, `n_integration_steps=10`) and could silently destabilize training
+when a config misses these fields.
+
+### Rule
+1. Builder defaults must match model dataclass defaults unless there is an explicit documented override.
+2. For SONAR-space IPP, keep fallback `sigma_init` in same norm scale (`~0.05`, not `0.5`).
+3. Integration step defaults should preserve expected solver behavior (`50` for Flow IPP baseline).
