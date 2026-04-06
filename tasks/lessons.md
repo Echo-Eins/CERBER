@@ -1,5 +1,22 @@
 # Lessons
 
+## 2026-04-06 - GUI checkpoint loader must migrate old/new parametrization key layouts
+
+### Pattern
+Web GUI landscape failed on old checkpoints with mismatch:
+model expected `net.*.parametrizations.weight.*` keys, checkpoint had plain `net.*.weight`.
+
+### Root Cause
+Loader validated `load_state_dict` mismatch strictly but had no compatibility migration path.
+
+### Fix
+- Add bidirectional migration in GUI loader:
+  - plain -> parametrized (`weight` -> `parametrizations.weight.original`, keep `.0.base` defaults)
+  - parametrized -> plain (map `...original` to `weight`, drop aux parametrization keys)
+- Retry load after migration before raising mismatch.
+
+### Rule
+Any checkpoint-facing loader must support at least one backward-compat migration path across known architecture serialization changes.
 ## 2026-04-06 - Direction loss path interpolation CONFLICTS with InfoNCE (2nd-order dominance)
 
 ### Pattern
