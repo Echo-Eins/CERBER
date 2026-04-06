@@ -59,9 +59,13 @@ def detect_model_type_from_state_dict(state_dict: dict) -> str:
     Автодетекция типа модели из state_dict.
 
     Returns:
+        "conditional_critic" для ConditionalCritic
         "simple" для SimpleEnergy (pairwise, 4104 входа)
         "unconditional" для UnconditionalEnergy (1024 входа)
     """
+    if "net.0.weight" in state_dict and state_dict["net.0.weight"].shape[1] >= 5120:
+        return "conditional_critic"
+
     first_weight = state_dict.get("net.0.weight")
     if first_weight is None:
         first_weight = state_dict.get("net.0.parametrizations.weight.original")
@@ -194,6 +198,8 @@ def load_checkpoint(path: str | Path) -> dict:
             checkpoint["model_state"] = checkpoint["critic1_state"]
         elif "critic_state" in checkpoint:
             checkpoint["model_state"] = checkpoint["critic_state"]
+        elif "critic" in checkpoint:
+            checkpoint["model_state"] = checkpoint["critic"]
         else:
             raise ValueError(f"Invalid checkpoint format: no 'model_state' found in {path}")
 

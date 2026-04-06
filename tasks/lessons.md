@@ -1,5 +1,24 @@
 # Lessons
 
+## 2026-04-06 - Chain Head trained on old critic is incompatible with new critic — retrain from scratch
+
+### Pattern
+Joint training of ConditionalCritic + old Chain Head: chain_rank_acc collapsed 0.9081→0.5321 (random) within 1 epoch. cos_sim stuck at 0.06 (random).
+
+### Root Cause
+Old Chain Head was trained on self-denoise critic where "good chain" = sequence leading toward the QUERY. New ConditionalCritic leads toward the ANSWER. These are fundamentally different energy landscapes. The old chain head's knowledge is not transferable.
+
+### Fix
+Three-phase training, each with separate scripts:
+1. **Phase 1**: Train ConditionalCritic solo (`train_critic.py`) → rank_acc ≥ 0.95, cos_sim ≥ 0.25
+2. **Phase 2**: Train Chain Head v2 from scratch on frozen critic (`train_chain_v2.py`)
+3. **Phase 3**: Joint fine-tuning (existing `train_autoregressor.py`)
+
+### Rule
+When replacing the critic architecture, ALL downstream components trained on the old critic must be retrained from scratch. Never assume transfer learning works across fundamentally different energy landscapes.
+
+### Additional Fix
+`langevin_lr` was 0.01 — far too small for SONAR space. With E_pos≈-0.12 and gradients≈0.03, displacement after 10 steps was 0.003 (1.5% of v_query norm). Increased to 0.3 with 30 steps.
 ## 2026-04-06 - Self-denoise critic CANNOT solve QA: energy minimum is at v_query, not v_answer
 
 ### Pattern

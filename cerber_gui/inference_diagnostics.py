@@ -120,6 +120,16 @@ def _load_pairwise_from_checkpoint(ckpt_path: str, device: torch.device):
     # Detect model type
     model_type = ckpt.get("model_type", "simple")
 
+    # ── Phase 1 ConditionalCritic (new QA critic) ──
+    if "critic" in ckpt:
+        from cebcm.models.conditional_critic import ConditionalCritic, ConditionalCriticConfig
+        critic_cfg_dict = cfg.get("critic", {}) or {}
+        critic_cfg = ConditionalCriticConfig(**critic_cfg_dict)
+        model = ConditionalCritic(critic_cfg).to(device)
+        model.load_state_dict(ckpt["critic"])
+        model.eval()
+        return model, "conditional_critic", ckpt
+
     # Stage 1.5 twin critics
     if "critic1_state" in ckpt:
         critic_arch = str(cfg.get("critic_architecture", "homogeneous"))

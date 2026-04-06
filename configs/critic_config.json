@@ -1,0 +1,55 @@
+{
+    "seed": 42,
+
+    "critic": {
+        "dim": 1024,
+        "hidden_dims": [2048, 1024, 512],
+        "activation": "silu",
+        "dropout": 0.1,
+        "energy_output_clamp": 100.0,
+        "context_mode": "concat",
+        "use_layer_norm": true,
+        "temperature": 0.07,
+        "focal_gamma": 2.0,
+        "num_negatives": 7
+    },
+
+    "data": {
+        "path": "data/hotpotqa_sonar.pt",
+        "num_workers": 4
+    },
+
+    "training": {
+        "batch_size": 16,
+        "num_epochs": 30,
+        "lr": 3e-4,
+        "weight_decay": 1e-4,
+        "warmup_epochs": 2,
+        "lr_min_factor": 0.01,
+        "clip_grad_norm": 1.0,
+
+        "w_rank": 1.0,
+        "w_cos": 0.5,
+        "w_text": 0.2,
+        "text_loss_every": 20,
+
+        "langevin_steps": 30,
+        "langevin_lr": 0.3,
+        "hinge_margin": 0.3,
+
+        "log_every": 50,
+        "checkpoint_every": 5,
+        "early_stop_patience": 10
+    },
+
+    "amp": {
+        "enabled": true,
+        "dtype": "bfloat16"
+    },
+
+    "output": {
+        "output_dir": "experiments/11_critic/output",
+        "checkpoint_dir": "experiments/11_critic/output/checkpoints",
+        "logs_dir": "experiments/11_critic/output/logs"
+    }
+}
