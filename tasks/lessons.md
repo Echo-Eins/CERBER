@@ -1,29 +1,27 @@
 # Lessons
 
-## 2026-04-06 - Direction loss MUST sample along the full Langevin path, not just near the target
+## 2026-04-06 - Direction loss path interpolation CONFLICTS with InfoNCE (2nd-order dominance)
 
 ### Pattern
-Direction loss with `v_noisy = v_answer + small_noise` only supervises gradients in a tiny ball (~0.57°) around the answer. But Langevin starts from v_query (far away). The gradient field between query and answer is unsupervised — only shaped by InfoNCE (which teaches ranking, not gradient direction). Result: cos_sim plateaus at ~0.52 despite rank_acc=0.99.
+Full-path interpolation for direction loss (v_noisy sampled uniformly between query→answer) dramatically improved direction_cos (0.11→0.53) but DESTROYED cos_sim (0.51→0.20). The direction loss's 2nd-order gradients (create_graph=True) dominated InfoNCE's 1st-order gradients when covering the full landscape.
 
 ### Evidence
-- noise_scale=0.01 on sphere radius=0.2051 → supervision radius ≈ 0.57°
-- direction_cos only reached 0.20 (barely above random in 1024-d)
-- cos_sim plateau at 0.52 after 2.5 epochs with direction loss active
+- Run 2 (near-answer, noise=0.01): direction_cos=0.20, val cos_sim=0.51 ✓
+- Run 3 (interpolation): direction_cos=0.61, val cos_sim=0.20 ✗
+- Pattern matches lessons L1151: "MDSM 2nd-order gradients dominate ranking's 1st-order"
 
 ### Fix
-Sample v_noisy from interpolations along the full query→answer path:
+Keep near-answer sampling but increase noise_scale (0.01→0.1) + sphere projection:
 ```python
-t = torch.rand(B, 1, device=device)
-v_interp = (1 - t) * v_q + t * v_a
-v_noisy = add_noise(v_interp, noise_scale)
-v_noisy = F.normalize(v_noisy, dim=-1) * target_norm  # sphere projection
+v_noisy = add_noise(v_a, direction_noise_scale)  # 0.1, not 0.01
+v_noisy = F.normalize(v_noisy, dim=-1) * target_norm
 ```
 
 ### Rule
-1. **Never supervise gradient direction only at the target** — always include the starting region
-2. Direction loss must cover WHERE the inference MCMC/Langevin actually walks
-3. Interpolation between start and target is the minimum; using actual Langevin trajectory points is even better
-4. Always sphere-project supervision points when Langevin operates on sphere
+1. **NEVER use full-path interpolation for direction loss with InfoNCE** — 2nd-order gradient dominance
+2. Widen supervision radius via noise_scale, not via sampling position
+3. Always sphere-project v_noisy when Langevin operates on sphere
+4. If direction_cos ↑ but cos_sim ↓ → gradient conflict, reduce direction loss coverage
 
 ## 2026-04-06 - Chain Head trained on old critic is incompatible with new critic — retrain from scratch
 

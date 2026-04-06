@@ -44,6 +44,7 @@
         "langevin_lr": 0.1,
 
         "noise_scale": 0.01,
+        "direction_noise_scale": 0.1,
 
         "log_every": 50,
         "checkpoint_every": 5,
