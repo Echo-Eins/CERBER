@@ -1,5 +1,49 @@
 # Lessons
 
+## 2026-04-06 - Self-denoise critic CANNOT solve QA: energy minimum is at v_query, not v_answer
+
+### Pattern
+Stage 3 pipeline achieved cos_final ≈ 0.35-0.40 and 97% energy reduction simultaneously. Energy dropped correctly but cosine to target plateaued.
+
+### Root Cause
+Self-denoise training teaches E(v_clean, v_noisy) → minimum at v_candidate = v_query. At QA inference, v_query ≠ v_answer, so the critic drives candidate toward the question, not the answer. The 0.35 cosine is roughly cos(query, answer) plus noise drift — critic is working as designed, but it's the wrong design for QA.
+
+### Fix
+Replace self-denoise critic with ConditionalCritic that takes (v_query, v_candidate, v_context) and is trained on QA triplets: E(q, correct_answer, ctx) < E(q, distractor, ctx). The energy minimum is now at the correct answer.
+
+### Rule
+Never use a self-denoise critic for conditional generation tasks. If the target differs from the query, the critic MUST be trained with (query, target) pairs, not (target, target+noise). The critic's energy minimum determines where Langevin converges, and self-denoise always converges to the query.
+
+## 2026-04-06 - System 2 v_final selection must prefer cosine-best over chain-best
+
+### Pattern
+System 2 always selected `v_best_chain` (lowest chain head energy) as the final output, even when `v_best_cos` (highest cosine to target) was better.
+
+### Root Cause
+Chain head energy evaluates chain coherence, not answer quality. An untrained or weak chain head may assign low energy to vectors that are poor answers.
+
+### Fix
+Changed priority: cosine-best > chain-best > pairwise-energy-best. When v_target is available, always prefer the state that was closest to the answer.
+
+### Rule
+For any multi-objective inference (chain + pairwise + cosine), the selection priority should match the actual goal. For QA, cosine-to-answer is the primary signal.
+
+## 2026-04-05 - SONAR text decode must not rely on `v_final` only in self-denoise diagnostics
+
+### Pattern
+Text diagnostics produced garbage even when trajectory briefly reached better cosine states.
+
+### Root Cause
+`run_text_inference` decoded only the last state (`v_final`). In System2, late steps can move away from the best state, and decode quality is highly sensitive to off-manifold drift.
+
+### Fix
+- Decode through `decode_safe` for robustness.
+- In self-denoise diagnostics, select the best trajectory step by cosine to known target embedding and decode that state.
+- Keep transparency by reporting both decoded selected state and decoded final state, plus `decode_source`.
+
+### Rule
+For diagnostic modes where target embedding is known, never decode only terminal state. Always log terminal metrics, but allow decode readout from the best validated trajectory state.
+
 ## 2026-04-05 - Never assume one dataset schema across stages (legacy `embeddings` vs sequence payloads)
 
 ### Pattern

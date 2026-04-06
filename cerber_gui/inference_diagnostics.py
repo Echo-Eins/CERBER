@@ -61,7 +61,10 @@ class InferenceResult:
     # Text (if SONAR available)
     input_text: str | None = None
     output_text: str | None = None
+    output_text_final: str | None = None
     target_text: str | None = None
+    decode_source: str | None = None
+    decode_cosine: float | None = None
     # Metric semantics
     target_objective: str = "qa"  # "qa" or "self_denoise"
     target_note: str | None = None
@@ -560,9 +563,54 @@ def run_text_inference(
         "not QA semantic correctness."
     )
 
-    # Decode output
+    def _is_decode_error(text_out: str | None) -> bool:
+        if not text_out:
+            return True
+        return text_out.startswith("[ERROR") or text_out.startswith("[OOM]")
+
+    def _decode_at_clean_norm(vec: Tensor, max_seq_len: int = 96) -> str:
+        clean_norm = v_clean.norm(dim=-1, keepdim=True)
+        vec_proj = F.normalize(vec, dim=-1) * clean_norm
+        return _state.sonar.decode_safe(vec_proj.to(dev), max_seq_len=max_seq_len)[0]
+
+    # Decode final state first (always reported for transparency).
     try:
-        result.output_text = _state.sonar.decode(result.v_final.to(dev))[0]
+        result.output_text_final = _decode_at_clean_norm(result.v_final.to(dev))
+    except Exception as e:
+        result.output_text_final = f"[decode error: {e}]"
+
+    # For text diagnostics (self-denoise), decode the best trajectory step by cosine.
+    # This avoids showing garbage from a late overshoot while keeping final metrics unchanged.
+    result.output_text = result.output_text_final
+    result.decode_source = "final"
+    result.decode_cosine = float(result.cos_final)
+
+    try:
+        if (
+            result.v_target is not None
+            and result.v_trajectory
+            and result.target_objective == "self_denoise"
+        ):
+            v_target_dev = result.v_target.to(dev)
+            best_idx = -1
+            best_cos = float("-inf")
+            best_vec = result.v_final.to(dev)
+
+            for idx, v_step in enumerate(result.v_trajectory):
+                v_step_dev = v_step.to(dev)
+                c = F.cosine_similarity(v_step_dev, v_target_dev, dim=-1).mean().item()
+                if c > best_cos:
+                    best_cos = c
+                    best_idx = idx
+                    best_vec = v_step_dev
+
+            if best_cos > (result.cos_final + 1e-6):
+                best_text = _decode_at_clean_norm(best_vec)
+                if not _is_decode_error(best_text):
+                    result.output_text = best_text
+                    result.decode_source = f"best_self_denoise_step:{best_idx}"
+                    result.decode_cosine = float(best_cos)
+
         result.target_text = text
     except Exception as e:
         result.output_text = f"[decode error: {e}]"
@@ -928,6 +976,12 @@ def create_metrics_summary(result: InferenceResult) -> dict:
         metrics["input_text"] = result.input_text
     if result.output_text:
         metrics["output_text"] = result.output_text
+    if result.output_text_final:
+        metrics["output_text_final"] = result.output_text_final
+    if result.decode_source:
+        metrics["decode_source"] = result.decode_source
+    if result.decode_cosine is not None:
+        metrics["decode_cosine"] = round(float(result.decode_cosine), 6)
     if result.target_note:
         metrics["target_note"] = result.target_note
 
@@ -955,6 +1009,10 @@ def format_metrics_markdown(result: InferenceResult) -> str:
         f"| Energy reduction | {m['energy_reduction_pct']:.1f}% |",
         f"| v_final norm | {m.get('v_final_norm', 'N/A')} |",
     ]
+    if m.get("decode_source"):
+        lines.append(f"| Decode source | {m['decode_source']} |")
+    if m.get("decode_cosine") is not None:
+        lines.append(f"| cos(decoded_state, target) | {m['decode_cosine']:.6f} |")
 
     if m.get("chain_energy_final") is not None:
         lines.extend([
@@ -966,11 +1024,15 @@ def format_metrics_markdown(result: InferenceResult) -> str:
         ])
 
     if result.input_text:
+        output_text = result.output_text or ""
+        output_text_final = result.output_text_final or output_text
         lines.extend([
             "",
             f"**Input**: {result.input_text}",
-            f"**Output**: {result.output_text}",
+            f"**Output**: {output_text}",
         ])
+        if output_text_final != output_text:
+            lines.append(f"**Output (final state)**: {output_text_final}")
         if result.target_objective == "self_denoise":
             lines.append(
                 "**Note**: `target` in cosine metric is original input embedding "

@@ -1,5 +1,16 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-05 - Text decode garbage in Stage3 diagnostics (off-manifold final state)
+- [x] Re-audit text-mode decode path (`run_text_inference`) and verify it decodes only `v_final`
+- [x] Add safe decode path for text diagnostics (`decode_safe`) with decode-time norm alignment to clean SONAR norm
+- [x] Add best-step decode selection for self-denoise diagnostics (oracle by cosine to known target)
+- [x] Keep final-state transparency: report both selected decode and final-state decode in metrics/markdown
+
+### Review
+- Root issue: diagnostics decoded a single final state that can be worse than earlier trajectory points.
+- Fix keeps optimization math untouched and only hardens diagnostics decode/readout path.
+- Added `decode_source` + `cos(decoded_state,target)` to make selection explicit and auditable.
+
 ## 2026-04-05 - Legacy dataset compatibility + sequence-splitting audit (wikitext parse failure)
 - [x] Reproduce/confirm Stage2 loader failure mode for old `wikitext_sonar_10k.pt` (`embeddings` format)
 - [x] Add backward-compatible conversion path in `SONARSequenceDataset` (`embeddings` -> contiguous sequences)

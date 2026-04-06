@@ -85,18 +85,20 @@ def run_system1(
     cfg: System1Config,
     langevin_kwargs: dict | None = None,
     v_target: Tensor | None = None,
+    v_context: Tensor | None = None,
     track_vectors: bool = False,
 ) -> ThinkingResult:
     """
     System 1 (Fast Shot): pairwise energy + short Langevin.
 
     Args:
-        energy_fn: Pairwise energy function (SimpleEnergy or decomposed)
+        energy_fn: Energy function (SimpleEnergy, decomposed, or ConditionalCritic)
         v_query: [B, D] query vectors
-        v_init: [B, D] initial point (from IPP)
+        v_init: [B, D] initial point
         cfg: System 1 configuration
         langevin_kwargs: Additional Langevin parameters
         v_target: [B, D] optional ground truth for eval metrics
+        v_context: [B, D] optional context embedding for ConditionalCritic
         track_vectors: Store per-step vectors for trajectory visualization
 
     Returns:
@@ -104,9 +106,12 @@ def run_system1(
     """
     max_steps = random.choice(cfg.max_steps_choices)
 
+    # If energy_fn supports v_context (ConditionalCritic), wrap it
+    actual_energy_fn = _wrap_with_context(energy_fn, v_context)
+
     kwargs = dict(
         method="pid",
-        energy_fn=energy_fn,
+        energy_fn=actual_energy_fn,
         v_query=v_query,
         v_init=v_init,
         max_steps=max_steps,
@@ -136,6 +141,7 @@ def run_system2(
     cfg: System2Config,
     langevin_kwargs: dict | None = None,
     v_target: Tensor | None = None,
+    v_context: Tensor | None = None,
     track_vectors: bool = False,
     attention_callback: Callable[[int, Tensor], list[Tensor]] | None = None,
 ) -> ThinkingResult:
@@ -223,7 +229,11 @@ def run_system2(
             pairwise_fn.set_step(step)
 
         v_current_req = v_current.detach().requires_grad_(True)
-        e_pair = pairwise_fn(v_query, v_current_req)
+        # Support ConditionalCritic (with v_context) and legacy pairwise (without)
+        if v_context is not None and _accepts_context(pairwise_fn):
+            e_pair = pairwise_fn(v_query, v_current_req, v_context=v_context)
+        else:
+            e_pair = pairwise_fn(v_query, v_current_req)
         pairwise_mean = e_pair.mean().item()
 
         # Chain-guided gradient: include chain_head energy on recent trajectory + current candidate.
@@ -352,11 +362,13 @@ def run_system2(
                 chain_history = chain_history[-max(3, max_chain_len // 2):]
                 chain_history.append(v_best_chain.detach().clone())
 
-    # Final decision: prioritize chain-best for System 2, else cosine-best, else pairwise-best.
-    if chain_energies:
-        v_final = v_best_chain
-    elif v_target is not None and best_cosine > float("-inf"):
+    # Final decision: prefer cosine-best when available (most aligned with QA goal),
+    # then chain-best (if chain head has made meaningful evaluations),
+    # then pairwise-energy-best as fallback.
+    if v_target is not None and best_cosine > float("-inf"):
         v_final = v_best_cos
+    elif chain_energies:
+        v_final = v_best_chain
     else:
         v_final = v_best_energy
 
@@ -384,6 +396,7 @@ def run_thinking(
     sys2_cfg: System2Config | None = None,
     langevin_kwargs: dict | None = None,
     v_target: Tensor | None = None,
+    v_context: Tensor | None = None,
     track_vectors: bool = False,
     attention_callback: Callable[[int, Tensor], list[Tensor]] | None = None,
 ) -> ThinkingResult:
@@ -392,7 +405,7 @@ def run_thinking(
 
     Args:
         mode: "system1" or "system2"
-        pairwise_fn: Pairwise energy function
+        pairwise_fn: Pairwise energy function (or ConditionalCritic)
         chain_head: Chain Head (required for system2)
         v_query: [B, D] query vectors
         v_init: [B, D] initial points
@@ -400,6 +413,7 @@ def run_thinking(
         sys2_cfg: System 2 config
         langevin_kwargs: Shared Langevin parameters
         v_target: Optional ground truth
+        v_context: [B, D] context embedding for ConditionalCritic
         track_vectors: Store per-step vectors for trajectory visualization
         attention_callback: Called at each System 2 chain eval for attention capture
 
@@ -414,6 +428,7 @@ def run_thinking(
             cfg=sys1_cfg or System1Config(),
             langevin_kwargs=langevin_kwargs,
             v_target=v_target,
+            v_context=v_context,
             track_vectors=track_vectors,
         )
     elif mode == "system2":
@@ -426,8 +441,59 @@ def run_thinking(
             cfg=sys2_cfg or System2Config(),
             langevin_kwargs=langevin_kwargs,
             v_target=v_target,
+            v_context=v_context,
             track_vectors=track_vectors,
             attention_callback=attention_callback,
         )
     else:
         raise ValueError(f"Unknown thinking mode: {mode}")
+
+
+def _accepts_context(energy_fn: torch.nn.Module) -> bool:
+    """Check if energy_fn is a ConditionalCritic that accepts v_context."""
+    import inspect
+    sig = inspect.signature(energy_fn.forward)
+    return "v_context" in sig.parameters
+
+
+class _ContextWrappedEnergyFn(torch.nn.Module):
+    """
+    Wraps a ConditionalCritic to behave like a simple energy_fn for Langevin.
+
+    Langevin expects energy_fn(v_query, v_candidate) and
+    energy_fn.energy_and_grad(v_query, v_candidate).
+    This wrapper captures v_context and forwards it.
+    """
+
+    def __init__(self, critic: torch.nn.Module, v_context: Tensor):
+        super().__init__()
+        self._critic = critic
+        self._v_context = v_context
+
+    def forward(self, v_query: Tensor, v_candidate: Tensor, sigma: Tensor | None = None) -> Tensor:
+        return self._critic(v_query, v_candidate, v_context=self._v_context, sigma=sigma)
+
+    def energy_and_grad(
+        self, v_query: Tensor, v_candidate: Tensor, sigma: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        return self._critic.energy_and_grad(
+            v_query, v_candidate, v_context=self._v_context, sigma=sigma,
+        )
+
+    # Proxy attributes for Langevin compatibility
+    def __getattr__(self, name: str):
+        if name in ("_critic", "_v_context"):
+            return super().__getattr__(name)
+        if name in ("set_step", "get_step_noise_scale"):
+            return getattr(self._critic, name, None)
+        return super().__getattr__(name)
+
+
+def _wrap_with_context(
+    energy_fn: torch.nn.Module,
+    v_context: Tensor | None,
+) -> torch.nn.Module:
+    """Wrap energy_fn with context if it supports it."""
+    if v_context is not None and _accepts_context(energy_fn):
+        return _ContextWrappedEnergyFn(energy_fn, v_context)
+    return energy_fn
