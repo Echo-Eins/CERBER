@@ -37,7 +37,7 @@
 
         "w_rank": 1.0,
         "w_direction": 0.0,
-        "direction_warmup_epoch": 3,
+        "direction_warmup_epoch": 0,
         "w_direction_max": 0.3,
 
         "langevin_steps": 30,
