@@ -139,14 +139,15 @@ def train_step(
     w_rank = cfg.get("w_rank", 1.0)
     noise_scale = cfg.get("noise_scale", 0.01)
 
-    # Direction loss warmup: ramps from 0 to w_direction_max
-    dir_warmup = cfg.get("direction_warmup_epoch", 3)
+    # Direction loss: ramps from w_direction_max/ramp_epochs to w_direction_max
+    dir_warmup = cfg.get("direction_warmup_epoch", 0)
     w_dir_max = cfg.get("w_direction_max", 0.3)
+    ramp_epochs = cfg.get("direction_ramp_epochs", 3)
     if epoch < dir_warmup:
         w_dir = 0.0
     else:
-        # Linear ramp over 3 epochs after warmup
-        ramp = min(1.0, (epoch - dir_warmup) / 3.0)
+        # Linear ramp: starts at 1/ramp_epochs, reaches 1.0 after ramp_epochs
+        ramp = min(1.0, (epoch - dir_warmup + 1) / ramp_epochs)
         w_dir = w_dir_max * ramp
 
     optimizer.zero_grad()
