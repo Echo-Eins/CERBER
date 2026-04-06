@@ -1,0 +1,64 @@
+{
+    "seed": 42,
+
+    "critic": {
+        "angular": {
+            "dim": 1024,
+            "hidden_dims": [2048, 1024, 512],
+            "activation": "silu",
+            "dropout": 0.1,
+            "use_layer_norm": true,
+            "energy_output_clamp": 50.0,
+            "include_context": true,
+            "temperature": 0.07,
+            "focal_gamma": 2.0,
+            "num_negatives": 7
+        },
+        "radial": {
+            "target_norm": 0.2051,
+            "scale": 1.0
+        },
+        "lambda_radial": 5.0
+    },
+
+    "data": {
+        "path": "data/hotpotqa_sonar.pt",
+        "num_workers": 4
+    },
+
+    "training": {
+        "batch_size": 16,
+        "num_epochs": 30,
+        "lr": 3e-4,
+        "weight_decay": 1e-4,
+        "warmup_epochs": 2,
+        "lr_min_factor": 0.01,
+        "clip_grad_norm": 1.0,
+
+        "w_rank": 1.0,
+        "w_direction": 0.0,
+        "direction_warmup_epoch": 0,
+        "w_direction_max": 0.3,
+
+        "langevin_steps": 30,
+        "langevin_lr": 0.1,
+
+        "noise_scale": 0.01,
+        "direction_noise_scale": 0.1,
+
+        "log_every": 50,
+        "checkpoint_every": 5,
+        "early_stop_patience": 10
+    },
+
+    "amp": {
+        "enabled": true,
+        "dtype": "bfloat16"
+    },
+
+    "output": {
+        "output_dir": "experiments/12_composite_critic/output",
+        "checkpoint_dir": "experiments/12_composite_critic/output/checkpoints",
+        "logs_dir": "experiments/12_composite_critic/output/logs"
+    }
+}
