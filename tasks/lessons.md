@@ -1624,3 +1624,17 @@ position-content binding. ALiBi is distance bias, not content-anchored positiona
 1. For context global-token attention, inject explicit absolute positional encoding into Q/KV.
 2. Preserve true token positions for selected global tokens; do not lose chronology when top-k filtering.
 3. Keep ALiBi optional as extra bias, never as the only positional mechanism for this head.
+
+## 2026-04-06 - Hand-written Langevin loops MUST include sphere projection
+
+### Pattern
+CompositeCritic training script had hand-written Langevin assessment loops (train_step and eval_step) that omitted tangent projection and sphere projection. The production langevin.py applies both when target_norm is set. Without projection, ||v|| drifted from 0.2051 to 0.40+ over 30 steps despite the AnalyticalRadialGuard (λ=5 too weak vs discrete step accumulation).
+
+### Root Cause
+Angular gradient is tangential at the computation point, but after a discrete Langevin step the norm changes slightly. Over 30 steps this drift accumulates. The radial guard's restoring force is weak (quadratic near target) and tamed gradient further dampens it.
+
+### Rule
+1. NEVER write Langevin loops without sphere projection when target_norm is known. Always: `v = F.normalize(v) * target_norm` after each step.
+2. ALWAYS add tangent projection before the step: remove radial component from gradient before applying update.
+3. Prefer using the production `run_langevin()` from `cebcm/inference/langevin.py` instead of hand-writing loops — it already handles all projections correctly.
+4. If you must hand-write a loop (e.g., for training with create_graph=True), copy the exact projection pattern from langevin.py.
