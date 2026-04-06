@@ -1,5 +1,51 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-06 - ChainGenerator: Autoregressive Transformer Decoder in SONAR Space
+
+### Architecture
+Pure autoregressive Transformer decoder — NOT a denoiser. Direct QA neural network.
+
+```
+Input:  v_query [B, 1024]  (question embedding)
+Output: chain [B, N, 1024]  (reasoning steps + answer, all decodable to text)
+
+ChainGenerator:
+  - Learned [START] token (1024d)
+  - N × Decoder Block (Pre-Norm):
+    a. Causal Self-Attention (RoPE) — chain ordering
+    b. Cross-Attention to v_query — semantic grounding (NO positional enc)
+    c. FFN (SiLU, 1024 → 4096 → 1024)
+  - Output projection → 1024d
+  - Sphere projection: normalize → scale to target_norm (0.2051)
+
+System 1: generate 1 step (direct answer)
+System 2: generate N steps (reasoning chain → answer)
+Each step is a valid SONAR vector — decodable to text at inference
+```
+
+### Key Design Decisions
+- RoPE for self-attention (position-content binding for chain order)
+- Cross-attention to v_query without positional encoding (semantic only)
+- Causal mask (autoregressive: step i sees only steps 1..i)
+- SiLU activation (matches angular critic)
+- Sphere projection enforces SONAR manifold
+- CompositeCritic as optional reranker (NOT navigator)
+- NO CE, IPP, SP — all proven dead ends
+
+### Training
+- Teacher forcing on v_steps + v_answer from HotpotQA data
+- Loss: cosine similarity + MSE per chain step
+- Curriculum: start System 1 (1-step), ramp to System 2 (N-step)
+
+### Tasks
+- [x] Write architecture plan
+- [ ] Implement `cebcm/models/chain_generator.py`
+- [ ] Create `configs/chain_generator_config.json`
+- [ ] Create `experiments/13_chain_generator/train_chain_generator.py`
+- [ ] Update `tasks/lessons.md` with navigation failure lessons
+- [ ] Verify: model forward pass, parameter count, gradient flow
+
+
 ## 2026-04-06 - GUI landscape: backward-compatible checkpoint loading (old/new parametrization keys)
 - [x] Reproduce mismatch source in `cerber_gui/app.py::_load_energy_model_from_checkpoint`
 - [x] Add automatic state_dict migration for `net.*.weight` <-> `net.*.parametrizations.weight.*`

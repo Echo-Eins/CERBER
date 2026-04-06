@@ -1678,3 +1678,41 @@ Angular gradient is tangential at the computation point, but after a discrete La
 2. ALWAYS add tangent projection before the step: remove radial component from gradient before applying update.
 3. Prefer using the production `run_langevin()` from `cebcm/inference/langevin.py` instead of hand-writing loops — it already handles all projections correctly.
 4. If you must hand-write a loop (e.g., for training with create_graph=True), copy the exact projection pattern from langevin.py.
+
+## 2026-04-06 - Langevin/Flow/ODE navigation is fundamentally broken in 1024D multi-basin QA
+
+### Pattern
+ALL iterative navigation methods fail for conditional QA search in SONAR 1024d:
+- Langevin: -∇E points to NEAREST basin, not TARGET. With 81k answer basins, nearest ≠ target.
+- Path-contrastive: perfect energy ordering (violations→0.001) but cos_sim FELL from 0.20 to 0.03.
+  Proved that the problem is NOT 2nd-order dominance — path-contrastive is purely 1st-order.
+- Flow/ODE: compounding integration error (train cos=0.93, eval cos=0.017).
+- Direction loss: 2nd-order gradient dominates 1st-order in MDSM, but NOT the root cause.
+
+### Root Cause
+In 1024D with 81k competing answer basins, the gradient landscape has too many local attractors.
+A ranking critic can perfectly DISCRIMINATE (rank_acc=0.99) but cannot NAVIGATE because:
+- "Ranking teaches VALUES not GRADIENTS" (lesson L1252)
+- Energy landscape is locally smooth but globally multi-modal
+- Any iterative method (Langevin, Flow, ODE) gets trapped by nearest-basin gravity
+
+### Rule
+1. NEVER use iterative navigation (Langevin, Flow, ODE, direction loss) for conditional QA in high-D multi-basin spaces.
+2. Use DIRECT PREDICTION (autoregressive generation) for answer synthesis.
+3. Keep the trained critic as a RERANKER only (it ranks perfectly, just can't navigate).
+4. For QA: ChainGenerator (autoregressive Transformer decoder) + CompositeCritic (reranker).
+
+## 2026-04-06 - CE/IPP/SP are dead ends for SONAR QA
+
+### Pattern
+Extensive experimentation proved all three approaches hit hard ceilings:
+- CE (Context Encoder): cos_sim plateaus at ≈0.60 — information ceiling
+- IPP (FlowIPP): train cos=0.93, eval cos=0.017 — catastrophic generalization failure
+- IPP (MLPIPP): just matches CE ceiling, adds nothing
+- Joint CE+IPP: no improvement over CE alone
+- SP (Surprise Predictor): overfits
+
+### Rule
+1. Do NOT use CE, IPP, or SP in new architectures. They are dead code.
+2. For QA answer generation, use autoregressive prediction (ChainGenerator), not encoding/denoising.
+3. The only surviving component is CompositeCritic (Angular + Radial Guard) as a reranker.
