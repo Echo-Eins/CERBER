@@ -163,7 +163,14 @@ def train_step(
     # ── LOSS 2: Direction loss (outside autocast for 2nd-order stability) ──
     dir_metrics: dict[str, float] = {}
     if w_dir > 0:
-        v_noisy = add_noise(v_a, noise_scale)
+        # Sample points along the ENTIRE query→answer path, not just near answer.
+        # This trains the gradient field where Langevin actually operates.
+        B = v_a.shape[0]
+        t = torch.rand(B, 1, device=device)  # interpolation factor [0, 1]
+        v_interp = (1 - t) * v_q + t * v_a
+        v_noisy = add_noise(v_interp, noise_scale)
+        # Project to sphere for geometric consistency with Langevin
+        v_noisy = F.normalize(v_noisy, dim=-1) * critic.radial.target_norm
         loss_dir, dir_metrics = critic.compute_direction_loss(
             v_q, v_noisy, v_a, v_context=v_ctx,
         )
