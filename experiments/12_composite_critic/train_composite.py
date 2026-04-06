@@ -172,6 +172,8 @@ def train_step(
     langevin_steps = cfg.get("langevin_steps", 30)
     langevin_lr = cfg.get("langevin_lr", 0.1)
 
+    target_norm = critic.radial.target_norm
+
     with torch.no_grad():
         v_current = add_noise(v_q, noise_scale * 2)  # start from noisy query
         for _ in range(langevin_steps):
@@ -182,7 +184,13 @@ def train_step(
             # Tamed gradient: grad / (1 + lr * ||grad||)
             grad_norm = grad_ld.norm(dim=-1, keepdim=True)
             tamed = grad_ld / (1.0 + langevin_lr * grad_norm)
+            # Tangent projection (remove radial component before step)
+            v_hat = F.normalize(v_current.detach(), dim=-1)
+            radial = (tamed * v_hat).sum(dim=-1, keepdim=True) * v_hat
+            tamed = tamed - radial
             v_current = (v_current - langevin_lr * tamed).detach()
+            # Sphere projection (lessons: "taming before projection, target_norm still applies")
+            v_current = F.normalize(v_current, dim=-1) * target_norm
 
     v_predicted = v_current.detach()
     cos_sim = F.cosine_similarity(v_predicted, v_a, dim=-1)
@@ -241,6 +249,7 @@ def eval_step(
         energy_gap = (E_neg.mean(dim=1) - E_pos).mean().item()
 
     # Mini-Langevin for cosine assessment
+    target_norm = critic.radial.target_norm
     with torch.enable_grad():
         v_current = add_noise(v_q, noise_scale * 2)
         for _ in range(langevin_steps):
@@ -249,7 +258,12 @@ def eval_step(
             grad = torch.autograd.grad(e.sum(), v_current)[0]
             grad_norm = grad.norm(dim=-1, keepdim=True)
             tamed = grad / (1.0 + langevin_lr * grad_norm)
+            # Tangent projection + sphere projection (match langevin.py)
+            v_hat = F.normalize(v_current.detach(), dim=-1)
+            radial = (tamed * v_hat).sum(dim=-1, keepdim=True) * v_hat
+            tamed = tamed - radial
             v_current = (v_current - langevin_lr * tamed).detach()
+            v_current = F.normalize(v_current, dim=-1) * target_norm
 
     cos_sim = F.cosine_similarity(v_current.detach(), v_a, dim=-1)
     v_pred_norm = v_current.detach().norm(dim=-1)

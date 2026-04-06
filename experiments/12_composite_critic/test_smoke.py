@@ -303,16 +303,27 @@ def test_composite_langevin_compatibility():
     assert e2.shape == (B,)
     assert g2.shape == (B, D)
 
-    # Mini Langevin loop
+    # Mini Langevin loop WITH tangent + sphere projection (as in train_composite.py)
     v_current = v_q.clone()
     lr = 0.01
-    for _ in range(5):
+    target_norm = critic.radial.target_norm
+    for _ in range(30):
         v_current = v_current.detach().requires_grad_(True)
         e_step = wrapped(v_q, v_current)
         grad = torch.autograd.grad(e_step.sum(), v_current)[0]
+        # Tangent projection
+        v_hat = F.normalize(v_current.detach(), dim=-1)
+        radial_comp = (grad * v_hat).sum(dim=-1, keepdim=True) * v_hat
+        grad = grad - radial_comp
         v_current = (v_current - lr * grad).detach()
+        # Sphere projection
+        v_current = F.normalize(v_current, dim=-1) * target_norm
 
-    print(f"  [PASS] Langevin API compatible (5 steps, final ‖v‖={v_current.norm(dim=-1).mean():.4f})")
+    final_norm = v_current.norm(dim=-1).mean().item()
+    assert abs(final_norm - TARGET_NORM) < 1e-5, (
+        f"Sphere projection failed: ‖v‖={final_norm:.6f}, target={TARGET_NORM}"
+    )
+    print(f"  [PASS] Langevin API + sphere projection (30 steps, ‖v‖={final_norm:.6f} == target)")
 
 
 def test_composite_losses():
