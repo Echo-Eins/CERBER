@@ -1,5 +1,30 @@
 # Lessons
 
+## 2026-04-06 - Direction loss MUST sample along the full Langevin path, not just near the target
+
+### Pattern
+Direction loss with `v_noisy = v_answer + small_noise` only supervises gradients in a tiny ball (~0.57°) around the answer. But Langevin starts from v_query (far away). The gradient field between query and answer is unsupervised — only shaped by InfoNCE (which teaches ranking, not gradient direction). Result: cos_sim plateaus at ~0.52 despite rank_acc=0.99.
+
+### Evidence
+- noise_scale=0.01 on sphere radius=0.2051 → supervision radius ≈ 0.57°
+- direction_cos only reached 0.20 (barely above random in 1024-d)
+- cos_sim plateau at 0.52 after 2.5 epochs with direction loss active
+
+### Fix
+Sample v_noisy from interpolations along the full query→answer path:
+```python
+t = torch.rand(B, 1, device=device)
+v_interp = (1 - t) * v_q + t * v_a
+v_noisy = add_noise(v_interp, noise_scale)
+v_noisy = F.normalize(v_noisy, dim=-1) * target_norm  # sphere projection
+```
+
+### Rule
+1. **Never supervise gradient direction only at the target** — always include the starting region
+2. Direction loss must cover WHERE the inference MCMC/Langevin actually walks
+3. Interpolation between start and target is the minimum; using actual Langevin trajectory points is even better
+4. Always sphere-project supervision points when Langevin operates on sphere
+
 ## 2026-04-06 - Chain Head trained on old critic is incompatible with new critic — retrain from scratch
 
 ### Pattern
