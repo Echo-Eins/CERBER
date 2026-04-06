@@ -7,18 +7,22 @@ with a cleaner loss design than Phase 1:
 
   1. Focal-InfoNCE contrastive: E(q, answer, ctx) < E(q, distractor, ctx)
      — Primary loss, always on.
-  2. Direction loss (warmup): -∇E should point toward v_target
-     — Gradient supervision, activated after warmup_epoch.
-     — Bounded [0, 2], no Hessian-vector products.
+  2. Path-contrastive loss (warmup): monotonically decreasing energy along
+     the geodesic from v_query → v_answer.
+     — 1st-order only (no create_graph/Hessian).  Covers the ENTIRE
+       navigation path, not just near-answer neighborhood.
+     — NOT the same as interp_gp (lessons Phase 2e: GP flattens gradients).
+       This enforces energy ORDERING → gradients naturally point toward answer.
 
 Removed from Phase 1:
   • Hinge loss (lessons: died at epoch 1, E_target < E_predicted trivially)
   • REINFORCE text loss (lessons: always 0, add only after ranking+cosine work)
+  • Direction loss (lessons: 2nd-order dominance, only covers near-answer area)
 
 Architecture improvements:
   • Angular critic operates on unit sphere — gradient tangential by construction
   • Radial guard (analytical, no training) keeps ‖v‖ on SONAR manifold
-  • Direction loss warmup prevents 2nd-order/1st-order gradient conflict
+  • Path-contrastive is 1st-order — no 2nd/1st-order gradient conflict
 
 Usage:
     python experiments/12_composite_critic/train_composite.py
@@ -139,16 +143,17 @@ def train_step(
     w_rank = cfg.get("w_rank", 1.0)
     noise_scale = cfg.get("noise_scale", 0.01)
 
-    # Direction loss: ramps from w_direction_max/ramp_epochs to w_direction_max
-    dir_warmup = cfg.get("direction_warmup_epoch", 0)
-    w_dir_max = cfg.get("w_direction_max", 0.3)
-    ramp_epochs = cfg.get("direction_ramp_epochs", 3)
-    if epoch < dir_warmup:
-        w_dir = 0.0
+    # Path-contrastive loss: ramps from w_path_max/ramp_epochs to w_path_max
+    # Replaces direction_loss — 1st-order only (no create_graph/Hessian),
+    # covers the ENTIRE navigation path (not just near-answer neighborhood).
+    path_warmup = cfg.get("path_warmup_epoch", 0)
+    w_path_max = cfg.get("w_path_max", 0.3)
+    ramp_epochs = cfg.get("path_ramp_epochs", 3)
+    if epoch < path_warmup:
+        w_path = 0.0
     else:
-        # Linear ramp: starts at 1/ramp_epochs, reaches 1.0 after ramp_epochs
-        ramp = min(1.0, (epoch - dir_warmup + 1) / ramp_epochs)
-        w_dir = w_dir_max * ramp
+        ramp = min(1.0, (epoch - path_warmup + 1) / ramp_epochs)
+        w_path = w_path_max * ramp
 
     optimizer.zero_grad()
 
@@ -160,20 +165,16 @@ def train_step(
 
         total_loss = w_rank * loss_rank
 
-    # ── LOSS 2: Direction loss (outside autocast for 2nd-order stability) ──
-    dir_metrics: dict[str, float] = {}
-    if w_dir > 0:
-        # Near-answer sampling with wider radius + sphere projection.
-        # Lessons: full-path interpolation causes 2nd-order/1st-order gradient conflict
-        # with InfoNCE. Wider noise around answer is safer.
-        dir_noise = cfg.get("direction_noise_scale", 0.1)
-        v_noisy = add_noise(v_a, dir_noise)
-        # Sphere projection for geometric consistency with Langevin
-        v_noisy = F.normalize(v_noisy, dim=-1) * critic.radial.target_norm
-        loss_dir, dir_metrics = critic.compute_direction_loss(
-            v_q, v_noisy, v_a, v_context=v_ctx,
-        )
-        total_loss = total_loss + w_dir * loss_dir
+        # ── LOSS 2: Path-contrastive (1st-order, no Hessian) ──
+        path_metrics: dict[str, float] = {}
+        if w_path > 0:
+            loss_path, path_metrics = critic.compute_path_contrastive_loss(
+                v_q, v_a, v_context=v_ctx,
+                num_waypoints=cfg.get("path_num_waypoints", 5),
+                waypoint_noise=cfg.get("path_waypoint_noise", 0.02),
+                margin=cfg.get("path_margin", 0.1),
+            )
+            total_loss = total_loss + w_path * loss_path
 
     # ── Langevin assessment (detached, for monitoring only) ──
     langevin_steps = cfg.get("langevin_steps", 30)
@@ -215,10 +216,10 @@ def train_step(
 
     metrics = {
         **rank_metrics,
-        **dir_metrics,
+        **path_metrics,
         "total_loss": total_loss.item(),
         "loss_rank": loss_rank.item(),
-        "w_direction": w_dir,
+        "w_path": w_path,
         "cos_sim_mean": cos_sim.mean().item(),
         "cos_sim_min": cos_sim.min().item(),
         "cos_sim_max": cos_sim.max().item(),
@@ -393,8 +394,9 @@ def main():
 
     print(f"\nStarting training: {num_epochs} epochs, {len(train_loader)} batches/epoch")
     print(f"Losses: InfoNCE (w={train_cfg.get('w_rank', 1.0)}) "
-          f"+ Direction (warmup@E{train_cfg.get('direction_warmup_epoch', 3)}, "
-          f"max={train_cfg.get('w_direction_max', 0.3)})")
+          f"+ PathContrastive (warmup@E{train_cfg.get('path_warmup_epoch', 0)}, "
+          f"max={train_cfg.get('w_path_max', 0.3)}, "
+          f"waypoints={train_cfg.get('path_num_waypoints', 5)})")
     print(f"Langevin: {train_cfg.get('langevin_steps', 30)} steps, "
           f"lr={train_cfg.get('langevin_lr', 0.1)}, tamed=True")
 
@@ -421,8 +423,8 @@ def main():
                     f"rank_acc={avg.get('rank_acc', 0):.4f} "
                     f"cos_sim={avg.get('cos_sim_mean', 0):.4f} "
                     f"E_gap={avg.get('energy_gap', 0):.4f} "
-                    f"‖v‖={avg.get('v_pred_norm_mean', 0):.4f} "
-                    f"w_dir={avg.get('w_direction', 0):.3f} "
+                    f"path_viol={avg.get('path_violations', 0):.3f} "
+                    f"w_path={avg.get('w_path', 0):.3f} "
                     f"lr={current_lr:.2e}"
                 )
 

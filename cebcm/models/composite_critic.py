@@ -162,6 +162,23 @@ class CompositeCritic(nn.Module):
             v_query, v_noisy, v_target, v_context=v_context,
         )
 
+    def compute_path_contrastive_loss(
+        self,
+        v_query: Tensor,
+        v_answer: Tensor,
+        v_context: Tensor | None = None,
+        num_waypoints: int = 5,
+        waypoint_noise: float = 0.02,
+        margin: float = 0.1,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Path-contrastive loss from angular critic (1st-order, no Hessian)."""
+        return self.angular.compute_path_contrastive_loss(
+            v_query, v_answer, v_context=v_context,
+            num_waypoints=num_waypoints,
+            waypoint_noise=waypoint_noise,
+            margin=margin,
+        )
+
     def compute_cosine_loss(
         self,
         v_predicted: Tensor,

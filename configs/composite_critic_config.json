@@ -36,15 +36,18 @@
         "clip_grad_norm": 1.0,
 
         "w_rank": 1.0,
-        "w_direction": 0.0,
-        "direction_warmup_epoch": 0,
-        "w_direction_max": 0.3,
+
+        "w_path_max": 0.3,
+        "path_warmup_epoch": 0,
+        "path_ramp_epochs": 3,
+        "path_num_waypoints": 5,
+        "path_waypoint_noise": 0.02,
+        "path_margin": 0.1,
 
         "langevin_steps": 30,
         "langevin_lr": 0.1,
 
         "noise_scale": 0.01,
-        "direction_noise_scale": 0.1,
 
         "log_every": 50,
         "checkpoint_every": 5,

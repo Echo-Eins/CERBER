@@ -385,6 +385,105 @@ class ConditionalAngularCritic(nn.Module):
             "direction_cos": cos_sim.mean().item(),
         }
 
+    def compute_path_contrastive_loss(
+        self,
+        v_query: Tensor,           # [B, D]
+        v_answer: Tensor,          # [B, D]
+        v_context: Tensor | None = None,
+        num_waypoints: int = 5,
+        waypoint_noise: float = 0.02,
+        margin: float = 0.1,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """
+        Path-contrastive loss: enforce monotonically decreasing energy
+        along the geodesic from v_query → v_answer.
+
+        For waypoints at t_i along the SLERP path (t=0 at query, t=1 at answer):
+            E(q, v_{t_i}) < E(q, v_{t_j})  when t_i > t_j
+
+        This is **1st-order only** (no create_graph) and covers the actual
+        Langevin navigation path, unlike direction_loss which only covers a
+        neighborhood of v_answer.
+
+        NOT the same as interp_gp (lessons: Phase 2e):
+          - interp_gp penalised ||∇E||² → flattened gradients → killed Langevin
+          - This enforces energy ORDERING → creates monotonic descent → gradients
+            naturally point toward answer
+
+        Implemented as softplus margin loss on adjacent waypoint pairs.
+        """
+        B, D = v_query.shape
+        _EPS = 1e-6
+
+        # Waypoint positions along geodesic: t ∈ (0, 1]
+        # Skip t=0 (query itself), include t=1 (answer)
+        t_values = torch.linspace(
+            1.0 / num_waypoints, 1.0, num_waypoints,
+            device=v_query.device, dtype=v_query.dtype,
+        )  # e.g. [0.2, 0.4, 0.6, 0.8, 1.0] for num_waypoints=5
+
+        # SLERP on unit sphere
+        q_hat = F.normalize(v_query, dim=-1)     # [B, D]
+        a_hat = F.normalize(v_answer, dim=-1)     # [B, D]
+
+        cos_angle = (q_hat * a_hat).sum(dim=-1, keepdim=True)       # [B, 1]
+        cos_angle = cos_angle.clamp(-1.0 + _EPS, 1.0 - _EPS)
+        angle = torch.acos(cos_angle)                                # [B, 1]
+        sin_angle = angle.sin().clamp(min=_EPS)                      # [B, 1]
+
+        # Compute energies at each waypoint
+        energies = []
+        for t in t_values:
+            # SLERP: w_t = sin((1-t)θ)/sin(θ) · q̂ + sin(tθ)/sin(θ) · â
+            w_q = torch.sin((1.0 - t) * angle) / sin_angle  # [B, 1]
+            w_a = torch.sin(t * angle) / sin_angle           # [B, 1]
+            w_t = w_q * q_hat + w_a * a_hat                  # [B, D]
+
+            # Add small tangent-space noise for robustness
+            if waypoint_noise > 0:
+                noise = torch.randn_like(w_t)
+                # Project noise to tangent space at w_t
+                w_t_hat = F.normalize(w_t, dim=-1)
+                noise = noise - (noise * w_t_hat).sum(dim=-1, keepdim=True) * w_t_hat
+                w_t = w_t + waypoint_noise * noise
+                w_t = F.normalize(w_t, dim=-1)
+
+            e = self.forward(v_query, w_t, v_context=v_context)  # [B]
+            energies.append(e)
+
+        # Softplus margin loss on adjacent pairs: E(closer) < E(farther)
+        total_loss = torch.zeros(1, device=v_query.device, dtype=v_query.dtype)
+        violation_count = 0.0
+        num_pairs = 0
+
+        for i in range(1, len(energies)):
+            e_near = energies[i]      # higher t = closer to answer → lower energy
+            e_far = energies[i - 1]   # lower t = farther from answer → higher energy
+            # softplus(e_near - e_far + margin): 0 when e_near << e_far
+            pair_loss = F.softplus(e_near - e_far + margin)
+            total_loss = total_loss + pair_loss.mean()
+
+            with torch.no_grad():
+                violation_count += (e_near > e_far).float().mean().item()
+            num_pairs += 1
+
+        total_loss = total_loss / max(num_pairs, 1)
+
+        with torch.no_grad():
+            # Energy at answer (last waypoint) vs energy at first waypoint
+            e_answer = energies[-1].mean().item()
+            e_first = energies[0].mean().item()
+            path_gap = e_first - e_answer  # positive = correct ordering
+
+        metrics = {
+            "path_loss": total_loss.item(),
+            "path_violations": violation_count / max(num_pairs, 1),
+            "path_energy_gap": path_gap,
+            "path_E_answer": e_answer,
+            "path_E_first": e_first,
+        }
+        return total_loss, metrics
+
     def compute_cosine_loss(
         self,
         v_predicted: Tensor,   # [B, D]
