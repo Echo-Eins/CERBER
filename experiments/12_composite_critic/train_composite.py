@@ -371,9 +371,13 @@ def main():
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         critic.load_state_dict(ckpt["critic"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt.get("epoch", 0) + 1
         best_metric = ckpt.get("best_metric", 0.0)
         print(f"  Resumed from epoch {start_epoch}, best_metric={best_metric:.4f}")
+        print(f"  Scheduler restored: {'yes' if 'scheduler' in ckpt else 'NO (will restart)'}")
+        print(f"  Current lr: {optimizer.param_groups[0]['lr']:.2e}")
 
     # ── Training loop ──
     log_every = train_cfg.get("log_every", 50)
@@ -449,6 +453,7 @@ def main():
                 {
                     "critic": critic.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "epoch": epoch,
                     "best_metric": best_metric,
                     "val_metrics": val_avg,
@@ -471,6 +476,7 @@ def main():
                 {
                     "critic": critic.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "epoch": epoch,
                     "best_metric": best_metric,
                 },
