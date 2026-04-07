@@ -113,6 +113,72 @@ def _load_pairwise_from_checkpoint(ckpt_path: str, device: torch.device):
     from cebcm.models.energy import SimpleEnergy
     from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
 
+    def _load_compat_state(model_obj: nn.Module, state_dict: dict, label: str) -> None:
+        """
+        Load state dict with backward-compatible migration between
+        plain linear keys and parametrized keys.
+        """
+        def _mismatch(load_res) -> tuple[list[str], list[str]]:
+            missing_keys = [k for k in load_res.missing_keys if k != "_sigma_freqs"]
+            unexpected_keys = [k for k in load_res.unexpected_keys]
+            return missing_keys, unexpected_keys
+
+        def _prepare_migration(model_target: nn.Module, source_sd: dict) -> tuple[dict | None, str | None]:
+            model_sd = model_target.state_dict()
+            model_has_param = any("parametrizations.weight.original" in k for k in model_sd.keys())
+            source_has_param = any("parametrizations.weight.original" in k for k in source_sd.keys())
+
+            if model_has_param and not source_has_param:
+                migrated = {}
+                for new_key, new_val in model_sd.items():
+                    if new_key in source_sd:
+                        migrated[new_key] = source_sd[new_key]
+                        continue
+                    if "parametrizations.weight.original" in new_key:
+                        old_key = new_key.replace("parametrizations.weight.original", "weight")
+                        if old_key in source_sd:
+                            migrated[new_key] = source_sd[old_key]
+                            continue
+                    migrated[new_key] = new_val
+                return migrated, "plain->parametrized"
+
+            if (not model_has_param) and source_has_param:
+                migrated = {}
+                for key, value in source_sd.items():
+                    if "parametrizations.weight.original" in key:
+                        bare_key = key.replace("parametrizations.weight.original", "weight")
+                        migrated[bare_key] = value
+                        continue
+                    if ".parametrizations.weight." in key:
+                        continue
+                    migrated[key] = value
+                return migrated, "parametrized->plain"
+
+            return None, None
+
+        load_result = model_obj.load_state_dict(state_dict, strict=False)
+        missing, unexpected = _mismatch(load_result)
+        if not (missing or unexpected):
+            return
+
+        migrated, tag = _prepare_migration(model_obj, state_dict)
+        if migrated is not None:
+            retry_result = model_obj.load_state_dict(migrated, strict=False)
+            missing_retry, unexpected_retry = _mismatch(retry_result)
+            if not (missing_retry or unexpected_retry):
+                return
+            missing, unexpected = missing_retry, unexpected_retry
+
+        missing_preview = ", ".join(missing[:8])
+        unexpected_preview = ", ".join(unexpected[:8])
+        migration_note = f" Migration attempted: {tag}." if tag else ""
+        raise RuntimeError(
+            f"Pairwise checkpoint/model mismatch ({label}). "
+            f"Missing({len(missing)}): {missing_preview}. "
+            f"Unexpected({len(unexpected)}): {unexpected_preview}."
+            f"{migration_note}"
+        )
+
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt.get("config", {}) or {}
     model_state = ckpt.get("model_state_dict") or ckpt.get("model") or {}
@@ -142,7 +208,7 @@ def _load_pairwise_from_checkpoint(ckpt_path: str, device: torch.device):
                 norm_mode=cfg.get("angular_norm_mode", "none"),
                 activation=cfg.get("angular_activation", "silu"),
             ).to(device)
-            c1.load_state_dict(ckpt["critic1_state"])
+            _load_compat_state(c1, ckpt["critic1_state"], "critic1_state")
             c1.eval()
             return c1, "angular", ckpt
         else:
@@ -152,7 +218,7 @@ def _load_pairwise_from_checkpoint(ckpt_path: str, device: torch.device):
                 norm_mode=cfg.get("norm_mode", "none"),
                 activation=cfg.get("activation", "silu"),
             ).to(device)
-            c1.load_state_dict(ckpt["critic1_state"])
+            _load_compat_state(c1, ckpt["critic1_state"], "critic1_state")
             c1.eval()
             return c1, "simple_twin", ckpt
 
@@ -166,7 +232,7 @@ def _load_pairwise_from_checkpoint(ckpt_path: str, device: torch.device):
             norm_mode=cfg.get("norm_mode", "none"),
             activation=cfg.get("activation", "silu"),
         ).to(device)
-        model.load_state_dict(model_state)
+        _load_compat_state(model, model_state, "model_state")
         model.eval()
         return model, model_type, ckpt
 

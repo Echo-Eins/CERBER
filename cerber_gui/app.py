@@ -497,6 +497,38 @@ class _TwinConditionalEnergyAdapter:
         return energy.detach(), grad.detach()
 
 
+class _ConditionalCriticEnergyAdapter:
+    """
+    Adapter for ConditionalCritic to bridge E(q, v, ctx) into pairwise E(q, v).
+    Uses v_query as default context for landscape scans and testing.
+    """
+    def __init__(self, model):
+        self.model = model
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def __call__(
+        self,
+        v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+        sigma: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(v_query, v_candidate, v_context=v_query, sigma=sigma)
+
+    def energy_and_grad(
+        self,
+        v_query: torch.Tensor,
+        v_candidate: torch.Tensor,
+        sigma: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        v_req = v_candidate.detach().requires_grad_(True)
+        energy = self(v_query, v_req, sigma=sigma)
+        grad = torch.autograd.grad(energy.sum(), v_req, create_graph=False)[0]
+        return energy.detach(), grad.detach()
+
+
 def load_checkpoints_fn(files):
     """Load uploaded checkpoint files and refresh dropdown choices."""
     if not files:
@@ -946,18 +978,83 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
     from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
     from cebcm.models.energy_unconditional import UnconditionalEnergy
 
+    def _prepare_migrated_state_dict(model_obj, state_dict: dict) -> tuple[dict | None, str | None]:
+        """
+        Try to migrate between old and new parametrization key layouts.
+
+        Supported:
+        - old plain keys: net.X.weight
+          -> new parametrized keys: net.X.parametrizations.weight.original (+ keep .0.base defaults)
+        - new parametrized keys -> plain keys (drop aux parametrization buffers)
+        """
+        model_sd = model_obj.state_dict()
+        model_keys = set(model_sd.keys())
+        state_keys = set(state_dict.keys())
+
+        model_has_param = any("parametrizations.weight.original" in k for k in model_keys)
+        state_has_param = any("parametrizations.weight.original" in k for k in state_keys)
+
+        # Old -> new (plain to parametrized)
+        if model_has_param and not state_has_param:
+            migrated = {}
+            for new_key, new_val in model_sd.items():
+                if new_key in state_dict:
+                    migrated[new_key] = state_dict[new_key]
+                    continue
+                if "parametrizations.weight.original" in new_key:
+                    old_key = new_key.replace("parametrizations.weight.original", "weight")
+                    if old_key in state_dict:
+                        migrated[new_key] = state_dict[old_key]
+                        continue
+                # Keep model defaults for aux parametrization tensors (e.g., .0.base) and missing keys
+                migrated[new_key] = new_val
+            return migrated, "plain->parametrized"
+
+        # New -> old (parametrized to plain)
+        if (not model_has_param) and state_has_param:
+            migrated = {}
+            for key, value in state_dict.items():
+                if "parametrizations.weight.original" in key:
+                    bare_key = key.replace("parametrizations.weight.original", "weight")
+                    migrated[bare_key] = value
+                    continue
+                # Drop auxiliary parametrization buffers/params unsupported by plain Linear
+                if ".parametrizations.weight." in key:
+                    continue
+                migrated[key] = value
+            return migrated, "parametrized->plain"
+
+        return None, None
+
     def _load_state_or_raise(model_obj, state_dict: dict, label: str) -> None:
+        def _mismatch(load_res) -> tuple[list[str], list[str]]:
+            missing_keys = [k for k in load_res.missing_keys if k != "_sigma_freqs"]
+            unexpected_keys = [k for k in load_res.unexpected_keys]
+            return missing_keys, unexpected_keys
+
         load_result = model_obj.load_state_dict(state_dict, strict=False)
-        missing = [k for k in load_result.missing_keys if k != "_sigma_freqs"]
-        unexpected = [k for k in load_result.unexpected_keys]
-        if missing or unexpected:
-            missing_preview = ", ".join(missing[:8])
-            unexpected_preview = ", ".join(unexpected[:8])
-            raise RuntimeError(
-                "Checkpoint/model mismatch while loading GUI model. "
-                f"{label} | Missing({len(missing)}): {missing_preview}. "
-                f"Unexpected({len(unexpected)}): {unexpected_preview}."
-            )
+        missing, unexpected = _mismatch(load_result)
+        if not (missing or unexpected):
+            return
+
+        migrated_state, migration_tag = _prepare_migrated_state_dict(model_obj, state_dict)
+        if migrated_state is not None:
+            retry_result = model_obj.load_state_dict(migrated_state, strict=False)
+            missing_retry, unexpected_retry = _mismatch(retry_result)
+            if not (missing_retry or unexpected_retry):
+                return
+            missing = missing_retry
+            unexpected = unexpected_retry
+
+        missing_preview = ", ".join(missing[:8])
+        unexpected_preview = ", ".join(unexpected[:8])
+        migration_note = f" Migration attempted: {migration_tag}." if migration_tag else ""
+        raise RuntimeError(
+            "Checkpoint/model mismatch while loading GUI model. "
+            f"{label} | Missing({len(missing)}): {missing_preview}. "
+            f"Unexpected({len(unexpected)}): {unexpected_preview}."
+            f"{migration_note}"
+        )
 
     model_type = checkpoint["model_type"]
     model_state = checkpoint["model_state"]
@@ -1047,6 +1144,14 @@ def _load_energy_model_from_checkpoint(checkpoint: dict, device: torch.device):
             activation=activation,
             energy_output_clamp=None,  # keep true energy scale for visualization/debugging
         ).to(device)
+    elif model_type == "conditional_critic":
+        from cebcm.models.conditional_critic import ConditionalCritic, ConditionalCriticConfig
+        cfg_dict = checkpoint.get("config", {}).get("critic", {}) or {}
+        critic_cfg = ConditionalCriticConfig(**cfg_dict)
+        model = ConditionalCritic(critic_cfg).to(device)
+        _load_state_or_raise(model, model_state, "conditional_critic")
+        model.eval()
+        return _ConditionalCriticEnergyAdapter(model), model_type
     else:
         model = UnconditionalEnergy(
             dim=dim,

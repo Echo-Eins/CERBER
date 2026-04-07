@@ -1,5 +1,23 @@
 # Lessons
 
+## 2026-04-06 - GUI checkpoint loader must migrate old/new parametrization key layouts
+
+### Pattern
+Web GUI landscape failed on old checkpoints with mismatch:
+model expected `net.*.parametrizations.weight.*` keys, checkpoint had plain `net.*.weight`.
+
+### Root Cause
+Loader validated `load_state_dict` mismatch strictly but had no compatibility migration path.
+
+### Fix
+- Add bidirectional migration in GUI loader:
+  - plain -> parametrized (`weight` -> `parametrizations.weight.original`, keep `.0.base` defaults)
+  - parametrized -> plain (map `...original` to `weight`, drop aux parametrization keys)
+- Retry load after migration before raising mismatch.
+
+### Rule
+Any checkpoint-facing loader must support at least one backward-compat migration path across known architecture serialization changes.
+
 ## 2026-04-06 - Chain Head trained on old critic is incompatible with new critic — retrain from scratch
 
 ### Pattern
@@ -1624,3 +1642,4 @@ position-content binding. ALiBi is distance bias, not content-anchored positiona
 1. For context global-token attention, inject explicit absolute positional encoding into Q/KV.
 2. Preserve true token positions for selected global tokens; do not lose chronology when top-k filtering.
 3. Keep ALiBi optional as extra bias, never as the only positional mechanism for this head.
+

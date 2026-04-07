@@ -1,5 +1,15 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-06 - GUI landscape: backward-compatible checkpoint loading (old/new parametrization keys)
+- [x] Reproduce mismatch source in `cerber_gui/app.py::_load_energy_model_from_checkpoint`
+- [x] Add automatic state_dict migration for `net.*.weight` <-> `net.*.parametrizations.weight.*`
+- [x] Keep strict mismatch reporting when migration cannot resolve incompatibility
+- [x] Validate syntax for `cerber_gui/app.py`
+
+### Review
+- Root cause: GUI loader expected current parametrized key layout and rejected old Stage1.5 checkpoints with bare linear weights.
+- Added bidirectional migration fallback in loader, so old and new checkpoints can be loaded by GUI landscape path.
+
 ## 2026-04-05 - Text decode garbage in Stage3 diagnostics (off-manifold final state)
 - [x] Re-audit text-mode decode path (`run_text_inference`) and verify it decodes only `v_final`
 - [x] Add safe decode path for text diagnostics (`decode_safe`) with decode-time norm alignment to clean SONAR norm
