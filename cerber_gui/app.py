@@ -88,7 +88,7 @@ from cerber_gui.chain_generator_diagnostics import (
     create_cross_attention_plot as cg_cross_attn_plot,
     create_step_metrics_plot as cg_step_metrics_plot,
     create_energy_landscape_3d as cg_landscape_3d_plot,
-    create_norm_plot as cg_norm_plot,
+    create_norm_plot as cg_create_norm_plot,
     format_metrics_markdown as cg_format_md,
     export_metrics_json as cg_export_json,
     export_metrics_csv as cg_export_csv,
@@ -3656,7 +3656,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
         ah_fig = cg_all_heads_plot(result, layer_idx=0)
         ca_fig = cg_cross_attn_plot(result, layer_idx=0)
         landscape_fig = cg_landscape_3d_plot(result)
-        norm_fig = cg_norm_plot(result)
+        norm_fig = cg_create_norm_plot(result)
         return md, step_fig, sa_fig, ah_fig, ca_fig, landscape_fig, norm_fig
 
     def cg_run_data_fn(data_path, sample_idx, mode, num_steps, num_candidates, grid_size):
