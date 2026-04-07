@@ -349,7 +349,7 @@ def main():
             tracker.update(metrics)
 
             if (step + 1) % log_every == 0:
-                avg = tracker.average()
+                avg = tracker.get()
                 lr_now = optimizer.param_groups[0]["lr"]
                 print(
                     f"  [E{epoch} S{step+1}] "
@@ -375,7 +375,7 @@ def main():
             )
             val_tracker.update(vm)
 
-        val_avg = val_tracker.average()
+        val_avg = val_tracker.get()
         val_cos = val_avg.get("val_gen_cos_mean", 0)
         val_tf_cos = val_avg.get("val_tf_cos_sim", 0)
 
