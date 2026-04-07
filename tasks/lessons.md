@@ -1716,3 +1716,36 @@ Extensive experimentation proved all three approaches hit hard ceilings:
 1. Do NOT use CE, IPP, or SP in new architectures. They are dead code.
 2. For QA answer generation, use autoregressive prediction (ChainGenerator), not encoding/denoising.
 3. The only surviving component is CompositeCritic (Angular + Radial Guard) as a reranker.
+
+## 2026-04-07 - ChainGenerator V1 training analysis: autoregressive collapse after step 2-3
+
+### Pattern
+ChainGenerator (101.8M params, 6-layer decoder) trained for 35 epochs on HotpotQA.
+- System 1 (1 step): tf_cos=0.245, gen_cos=0.195 — genuine learning but low
+- System 2 (3 steps): gen_cos=0.68, tf_cos=0.37 — phase transition at E15!
+- System 2 (5 steps): gen_cos degrades from 0.687 to 0.640, cos_last=0.11
+
+At inference, decoded chain shows collapse:
+```
+Step 1: "The Theoretical theory of relativity..." (coherent)
+Step 2: "Theoretical Theory of Quantum Physics..." (still connected)
+Step 3: "Scientology" (one word)
+Step 4-20: "Theoretical", "Theoretical"... (fixed point loop)
+```
+
+### Root Causes Identified from Attention Analysis
+1. **Cross-attention is trivial**: single KV token (v_query) → softmax always = 1.0 → cross-attn reduces to a fixed linear transform of v_query, identical for every position. No dynamic conditioning.
+2. **Self-attention degenerates**: most heads learn identity (diagonal) or "look at previous only". No long-range patterns. Teacher forcing removes incentive to learn deep chain analysis.
+3. **Error accumulation**: at generation time, error from step 1 feeds into step 2 etc. By step 3-4, model enters attractor basin (fixed point like "Theoretical").
+4. **tf_cos vs gen_cos anomaly explained**: tf_cos = mean cos over ALL chain steps (including hard intermediates). gen_cos = cos of LAST generated step to GT answer. gen_cos >> tf_cos because the final step metric is different from the average.
+
+### Rule
+1. Single-token cross-attention is degenerate. For meaningful conditioning, either:
+   a. Project v_query through multiple "pseudo-tokens" (learned query decomposition)
+   b. Use v_query as additive bias instead of cross-attention
+   c. Inject v_query at multiple points (not just cross-attn)
+2. Teacher forcing alone causes exposure bias in SONAR space. Consider:
+   a. Scheduled sampling (mix GT and predicted inputs during training)
+   b. Add noise to teacher-forced inputs to simulate generation errors
+3. Chain length curriculum must be more conservative. 3 steps was the sweet spot; 4-5 broke the model. Start with 1-3 and stay there until metrics stabilize.
+4. Monitor cos_last (final step quality) as the PRIMARY metric, not cos_sim_mean.
