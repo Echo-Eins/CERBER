@@ -1,160 +1,699 @@
-(.venv) lenovo@Alienware-X17-R2:~/projects/CERBER$ python experiments/10_autoregressor/train_autoregressor.py --config configs/autoregressor_config.json
+(.venv) lenovo@Alienware-X17-R2:~/projects/CERBER$ python experiments/11_critic/train_critic.py --config configs/critic_config.json
 ============================================================
-CEBM Autoregressor: ConditionalCritic + Chain Head Training
+Phase 1: ConditionalCritic Solo Training
 Device: cuda
 ============================================================
-  ConditionalCritic: 13,134,849 parameters
-  Chain Head: 17,319,937 parameters
-  Chain Head loaded from experiments/09_stage3_chain/output/checkpoints/best_chain_head.pt
-  Total trainable: 30,454,786 parameters
+  ConditionalCritic: 13,127,681 parameters
   Loading data from data/hotpotqa_sonar.pt
   Train: 81378, Val: 9042
   SONAR loaded for text loss
 
 Starting training: 30 epochs, 5086 batches/epoch
-Loss weights: rank=1.0, cos=0.5, chain=0.3, text=0.2
+Loss weights: rank=1.0, hinge=0.5, text=0.2
+Langevin: 30 steps, lr=0.3, hinge_margin=0.3
 /home/lenovo/projects/CERBER/.venv/lib/python3.12/site-packages/torch/optim/lr_scheduler.py:224: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
   warnings.warn(
-  [E0 S50] total=2.7234 rank=2.0556 cos=0.0995 chain=2.0600 rank_acc=0.5477 cos_sim=0.0536 text_r=0.0000 lr=3.00e-06
-  [E0 S100] total=2.6813 rank=2.0189 cos=0.0979 chain=2.0449 rank_acc=0.5866 cos_sim=0.0561 text_r=0.0000 lr=3.00e-06
-  [E0 S150] total=2.6420 rank=1.9834 cos=0.0936 chain=2.0393 rank_acc=0.6017 cos_sim=0.0558 text_r=0.0000 lr=4.42e-06
-  [E0 S200] total=2.5982 rank=1.9493 cos=0.0876 chain=2.0171 rank_acc=0.6129 cos_sim=0.0563 text_r=0.0000 lr=5.90e-06
-  [E0 S250] total=2.5683 rank=1.9242 cos=0.0788 chain=2.0155 rank_acc=0.6201 cos_sim=0.0561 text_r=0.0000 lr=7.37e-06
-  [E0 S300] total=2.5112 rank=1.8819 cos=0.0677 chain=1.9850 rank_acc=0.6364 cos_sim=0.0566 text_r=0.0000 lr=8.85e-06
-  [E0 S350] total=2.4652 rank=1.8433 cos=0.0593 chain=1.9741 rank_acc=0.6469 cos_sim=0.0565 text_r=0.0000 lr=1.03e-05
-  [E0 S400] total=2.4210 rank=1.8084 cos=0.0525 chain=1.9544 rank_acc=0.6574 cos_sim=0.0568 text_r=0.0000 lr=1.18e-05
-  [E0 S450] total=2.3765 rank=1.7727 cos=0.0472 chain=1.9339 rank_acc=0.6667 cos_sim=0.0571 text_r=0.0000 lr=1.33e-05
-  [E0 S500] total=2.3412 rank=1.7427 cos=0.0428 chain=1.9235 rank_acc=0.6759 cos_sim=0.0572 text_r=0.0000 lr=1.47e-05
-  [E0 S550] total=2.3127 rank=1.7209 cos=0.0391 chain=1.9075 rank_acc=0.6822 cos_sim=0.0571 text_r=0.0000 lr=1.62e-05
-  [E0 S600] total=2.2852 rank=1.6988 cos=0.0360 chain=1.8946 rank_acc=0.6883 cos_sim=0.0569 text_r=0.0000 lr=1.77e-05
-  [E0 S650] total=2.2611 rank=1.6803 cos=0.0333 chain=1.8805 rank_acc=0.6935 cos_sim=0.0569 text_r=0.0000 lr=1.92e-05
-  [E0 S700] total=2.2352 rank=1.6608 cos=0.0310 chain=1.8628 rank_acc=0.6984 cos_sim=0.0569 text_r=0.0000 lr=2.06e-05
-  [E0 S750] total=2.2133 rank=1.6437 cos=0.0290 chain=1.8501 rank_acc=0.7029 cos_sim=0.0570 text_r=0.0000 lr=2.21e-05
-  [E0 S800] total=2.1886 rank=1.6248 cos=0.0275 chain=1.8336 rank_acc=0.7081 cos_sim=0.0570 text_r=0.0000 lr=2.36e-05
-  [E0 S850] total=2.1644 rank=1.6057 cos=0.0259 chain=1.8189 rank_acc=0.7127 cos_sim=0.0570 text_r=0.0000 lr=2.51e-05
-  [E0 S900] total=2.1375 rank=1.5842 cos=0.0245 chain=1.8032 rank_acc=0.7179 cos_sim=0.0570 text_r=0.0000 lr=2.65e-05
-  [E0 S950] total=2.1143 rank=1.5655 cos=0.0234 chain=1.7903 rank_acc=0.7225 cos_sim=0.0570 text_r=0.0000 lr=2.80e-05
-  [E0 S1000] total=2.0891 rank=1.5442 cos=0.0223 chain=1.7794 rank_acc=0.7276 cos_sim=0.0570 text_r=0.0000 lr=2.95e-05
-  [E0 S1050] total=2.0635 rank=1.5224 cos=0.0213 chain=1.7683 rank_acc=0.7329 cos_sim=0.0570 text_r=0.0000 lr=3.10e-05
-  [E0 S1100] total=2.0392 rank=1.5020 cos=0.0205 chain=1.7565 rank_acc=0.7377 cos_sim=0.0571 text_r=0.0000 lr=3.24e-05
-  [E0 S1150] total=2.0172 rank=1.4837 cos=0.0197 chain=1.7454 rank_acc=0.7420 cos_sim=0.0571 text_r=0.0000 lr=3.39e-05
-  [E0 S1200] total=1.9889 rank=1.4597 cos=0.0189 chain=1.7323 rank_acc=0.7471 cos_sim=0.0570 text_r=0.0000 lr=3.54e-05
-  [E0 S1250] total=1.9680 rank=1.4424 cos=0.0183 chain=1.7216 rank_acc=0.7512 cos_sim=0.0569 text_r=0.0000 lr=3.69e-05
-  [E0 S1300] total=1.9440 rank=1.4223 cos=0.0176 chain=1.7097 rank_acc=0.7557 cos_sim=0.0568 text_r=0.0000 lr=3.83e-05
-  [E0 S1350] total=1.9210 rank=1.4024 cos=0.0171 chain=1.7002 rank_acc=0.7599 cos_sim=0.0569 text_r=0.0000 lr=3.98e-05
-  [E0 S1400] total=1.8981 rank=1.3826 cos=0.0166 chain=1.6906 rank_acc=0.7640 cos_sim=0.0569 text_r=0.0000 lr=4.13e-05
-  [E0 S1450] total=1.8768 rank=1.3644 cos=0.0161 chain=1.6812 rank_acc=0.7676 cos_sim=0.0569 text_r=0.0000 lr=4.28e-05
-  [E0 S1500] total=1.8544 rank=1.3446 cos=0.0156 chain=1.6731 rank_acc=0.7717 cos_sim=0.0569 text_r=0.0000 lr=4.42e-05
-  [E0 S1550] total=1.8330 rank=1.3261 cos=0.0152 chain=1.6646 rank_acc=0.7754 cos_sim=0.0570 text_r=0.0000 lr=4.57e-05
-  [E0 S1600] total=1.8145 rank=1.3101 cos=0.0148 chain=1.6567 rank_acc=0.7787 cos_sim=0.0570 text_r=0.0000 lr=4.72e-05
-  [E0 S1650] total=1.7962 rank=1.2944 cos=0.0144 chain=1.6484 rank_acc=0.7819 cos_sim=0.0569 text_r=0.0000 lr=4.87e-05
-  [E0 S1700] total=1.7785 rank=1.2790 cos=0.0140 chain=1.6417 rank_acc=0.7851 cos_sim=0.0569 text_r=0.0000 lr=5.01e-05
-  [E0 S1750] total=1.7626 rank=1.2653 cos=0.0137 chain=1.6351 rank_acc=0.7879 cos_sim=0.0569 text_r=0.0000 lr=5.16e-05
-  [E0 S1800] total=1.7460 rank=1.2507 cos=0.0134 chain=1.6286 rank_acc=0.7907 cos_sim=0.0569 text_r=0.0000 lr=5.31e-05
-  [E0 S1850] total=1.7289 rank=1.2355 cos=0.0131 chain=1.6226 rank_acc=0.7936 cos_sim=0.0570 text_r=0.0000 lr=5.46e-05
-  [E0 S1900] total=1.7130 rank=1.2217 cos=0.0129 chain=1.6161 rank_acc=0.7963 cos_sim=0.0570 text_r=0.0000 lr=5.60e-05
-  [E0 S1950] total=1.6982 rank=1.2088 cos=0.0126 chain=1.6103 rank_acc=0.7987 cos_sim=0.0570 text_r=0.0000 lr=5.75e-05
-  [E0 S2000] total=1.6833 rank=1.1956 cos=0.0124 chain=1.6050 rank_acc=0.8014 cos_sim=0.0569 text_r=0.0000 lr=5.90e-05
-  [E0 S2050] total=1.6699 rank=1.1838 cos=0.0122 chain=1.6001 rank_acc=0.8035 cos_sim=0.0569 text_r=0.0000 lr=6.05e-05
-  [E0 S2100] total=1.6551 rank=1.1706 cos=0.0119 chain=1.5952 rank_acc=0.8061 cos_sim=0.0570 text_r=0.0000 lr=6.19e-05
-  [E0 S2150] total=1.6430 rank=1.1600 cos=0.0118 chain=1.5905 rank_acc=0.8082 cos_sim=0.0569 text_r=0.0000 lr=6.34e-05
-  [E0 S2200] total=1.6305 rank=1.1489 cos=0.0116 chain=1.5860 rank_acc=0.8104 cos_sim=0.0570 text_r=0.0000 lr=6.49e-05
-  [E0 S2250] total=1.6193 rank=1.1390 cos=0.0114 chain=1.5819 rank_acc=0.8124 cos_sim=0.0570 text_r=0.0000 lr=6.64e-05
-  [E0 S2300] total=1.6055 rank=1.1266 cos=0.0111 chain=1.5776 rank_acc=0.8147 cos_sim=0.0570 text_r=0.0000 lr=6.78e-05
-  [E0 S2350] total=1.5939 rank=1.1164 cos=0.0110 chain=1.5735 rank_acc=0.8168 cos_sim=0.0570 text_r=0.0000 lr=6.93e-05
-  [E0 S2400] total=1.5810 rank=1.1047 cos=0.0108 chain=1.5697 rank_acc=0.8190 cos_sim=0.0571 text_r=0.0000 lr=7.08e-05
-  [E0 S2450] total=1.5701 rank=1.0950 cos=0.0106 chain=1.5660 rank_acc=0.8210 cos_sim=0.0573 text_r=0.0000 lr=7.23e-05
-  [E0 S2500] total=1.5583 rank=1.0843 cos=0.0105 chain=1.5625 rank_acc=0.8231 cos_sim=0.0573 text_r=0.0000 lr=7.37e-05
-  [E0 S2550] total=1.5482 rank=1.0753 cos=0.0103 chain=1.5590 rank_acc=0.8248 cos_sim=0.0574 text_r=0.0000 lr=7.52e-05
-  [E0 S2600] total=1.5377 rank=1.0659 cos=0.0101 chain=1.5559 rank_acc=0.8266 cos_sim=0.0574 text_r=0.0000 lr=7.67e-05
-  [E0 S2650] total=1.5270 rank=1.0562 cos=0.0100 chain=1.5528 rank_acc=0.8284 cos_sim=0.0575 text_r=0.0000 lr=7.82e-05
-  [E0 S2700] total=1.5163 rank=1.0466 cos=0.0098 chain=1.5491 rank_acc=0.8302 cos_sim=0.0575 text_r=0.0000 lr=7.96e-05
-  [E0 S2750] total=1.5069 rank=1.0381 cos=0.0097 chain=1.5462 rank_acc=0.8318 cos_sim=0.0576 text_r=0.0000 lr=8.11e-05
-  [E0 S2800] total=1.4979 rank=1.0302 cos=0.0095 chain=1.5434 rank_acc=0.8333 cos_sim=0.0577 text_r=0.0000 lr=8.26e-05
-  [E0 S2850] total=1.4891 rank=1.0223 cos=0.0094 chain=1.5404 rank_acc=0.8349 cos_sim=0.0577 text_r=0.0000 lr=8.41e-05
-  [E0 S2900] total=1.4804 rank=1.0144 cos=0.0093 chain=1.5380 rank_acc=0.8365 cos_sim=0.0578 text_r=0.0000 lr=8.55e-05
-  [E0 S2950] total=1.4717 rank=1.0065 cos=0.0091 chain=1.5355 rank_acc=0.8379 cos_sim=0.0579 text_r=0.0000 lr=8.70e-05
-  [E0 S3000] total=1.4632 rank=0.9988 cos=0.0090 chain=1.5330 rank_acc=0.8394 cos_sim=0.0581 text_r=0.0000 lr=8.85e-05
-  [E0 S3050] total=1.4545 rank=0.9909 cos=0.0089 chain=1.5302 rank_acc=0.8409 cos_sim=0.0583 text_r=0.0000 lr=9.00e-05
-  [E0 S3100] total=1.4462 rank=0.9834 cos=0.0088 chain=1.5278 rank_acc=0.8423 cos_sim=0.0583 text_r=0.0000 lr=9.14e-05
-  [E0 S3150] total=1.4375 rank=0.9755 cos=0.0087 chain=1.5256 rank_acc=0.8437 cos_sim=0.0585 text_r=0.0000 lr=9.29e-05
-  [E0 S3200] total=1.4295 rank=0.9682 cos=0.0086 chain=1.5233 rank_acc=0.8451 cos_sim=0.0586 text_r=0.0000 lr=9.44e-05
-  [E0 S3250] total=1.4211 rank=0.9607 cos=0.0085 chain=1.5204 rank_acc=0.8464 cos_sim=0.0587 text_r=0.0000 lr=9.59e-05
-  [E0 S3300] total=1.4135 rank=0.9538 cos=0.0084 chain=1.5184 rank_acc=0.8477 cos_sim=0.0587 text_r=0.0000 lr=9.73e-05
-  [E0 S3350] total=1.4063 rank=0.9472 cos=0.0082 chain=1.5165 rank_acc=0.8489 cos_sim=0.0587 text_r=0.0000 lr=9.88e-05
-  [E0 S3400] total=1.3988 rank=0.9403 cos=0.0081 chain=1.5146 rank_acc=0.8502 cos_sim=0.0587 text_r=0.0000 lr=1.00e-04
-  [E0 S3450] total=1.3906 rank=0.9327 cos=0.0081 chain=1.5127 rank_acc=0.8515 cos_sim=0.0588 text_r=0.0000 lr=1.02e-04
-  [E0 S3500] total=1.3836 rank=0.9263 cos=0.0080 chain=1.5109 rank_acc=0.8526 cos_sim=0.0589 text_r=0.0000 lr=1.03e-04
-  [E0 S3550] total=1.3764 rank=0.9197 cos=0.0079 chain=1.5092 rank_acc=0.8538 cos_sim=0.0590 text_r=0.0000 lr=1.05e-04
-  [E0 S3600] total=1.3702 rank=0.9140 cos=0.0078 chain=1.5075 rank_acc=0.8548 cos_sim=0.0590 text_r=0.0000 lr=1.06e-04
-  [E0 S3650] total=1.3634 rank=0.9077 cos=0.0077 chain=1.5060 rank_acc=0.8560 cos_sim=0.0591 text_r=0.0000 lr=1.08e-04
-  [E0 S3700] total=1.3572 rank=0.9022 cos=0.0076 chain=1.5039 rank_acc=0.8570 cos_sim=0.0591 text_r=0.0000 lr=1.09e-04
-  [E0 S3750] total=1.3507 rank=0.8962 cos=0.0075 chain=1.5024 rank_acc=0.8581 cos_sim=0.0592 text_r=0.0000 lr=1.11e-04
-  [E0 S3800] total=1.3444 rank=0.8905 cos=0.0074 chain=1.5005 rank_acc=0.8592 cos_sim=0.0592 text_r=0.0000 lr=1.12e-04
-  [E0 S3850] total=1.3384 rank=0.8851 cos=0.0073 chain=1.4987 rank_acc=0.8602 cos_sim=0.0593 text_r=0.0000 lr=1.14e-04
-  [E0 S3900] total=1.3321 rank=0.8793 cos=0.0072 chain=1.4973 rank_acc=0.8613 cos_sim=0.0593 text_r=0.0000 lr=1.15e-04
-  [E0 S3950] total=1.3265 rank=0.8743 cos=0.0072 chain=1.4956 rank_acc=0.8622 cos_sim=0.0594 text_r=0.0000 lr=1.16e-04
-  [E0 S4000] total=1.3208 rank=0.8689 cos=0.0071 chain=1.4942 rank_acc=0.8632 cos_sim=0.0595 text_r=0.0000 lr=1.18e-04
-  [E0 S4050] total=1.3152 rank=0.8639 cos=0.0070 chain=1.4927 rank_acc=0.8641 cos_sim=0.0595 text_r=0.0000 lr=1.19e-04
-  [E0 S4100] total=1.3101 rank=0.8592 cos=0.0070 chain=1.4914 rank_acc=0.8650 cos_sim=0.0596 text_r=0.0000 lr=1.21e-04
-  [E0 S4150] total=1.3043 rank=0.8539 cos=0.0069 chain=1.4898 rank_acc=0.8659 cos_sim=0.0596 text_r=0.0000 lr=1.22e-04
-  [E0 S4200] total=1.2996 rank=0.8497 cos=0.0068 chain=1.4885 rank_acc=0.8667 cos_sim=0.0597 text_r=0.0000 lr=1.24e-04
-  [E0 S4250] total=1.2945 rank=0.8449 cos=0.0068 chain=1.4874 rank_acc=0.8676 cos_sim=0.0598 text_r=0.0000 lr=1.25e-04
-  [E0 S4300] total=1.2897 rank=0.8406 cos=0.0067 chain=1.4861 rank_acc=0.8684 cos_sim=0.0598 text_r=0.0000 lr=1.27e-04
-  [E0 S4350] total=1.2850 rank=0.8362 cos=0.0066 chain=1.4850 rank_acc=0.8692 cos_sim=0.0598 text_r=0.0000 lr=1.28e-04
-  [E0 S4400] total=1.2798 rank=0.8314 cos=0.0066 chain=1.4838 rank_acc=0.8701 cos_sim=0.0598 text_r=0.0000 lr=1.30e-04
-  [E0 S4450] total=1.2743 rank=0.8262 cos=0.0065 chain=1.4826 rank_acc=0.8710 cos_sim=0.0599 text_r=0.0000 lr=1.31e-04
-  [E0 S4500] total=1.2698 rank=0.8221 cos=0.0064 chain=1.4814 rank_acc=0.8717 cos_sim=0.0599 text_r=0.0000 lr=1.33e-04
-  [E0 S4550] total=1.2652 rank=0.8179 cos=0.0064 chain=1.4803 rank_acc=0.8724 cos_sim=0.0599 text_r=0.0000 lr=1.34e-04
-  [E0 S4600] total=1.2610 rank=0.8141 cos=0.0063 chain=1.4792 rank_acc=0.8731 cos_sim=0.0600 text_r=0.0000 lr=1.36e-04
-  [E0 S4650] total=1.2567 rank=0.8101 cos=0.0063 chain=1.4782 rank_acc=0.8738 cos_sim=0.0601 text_r=0.0000 lr=1.37e-04
-  [E0 S4700] total=1.2521 rank=0.8059 cos=0.0062 chain=1.4769 rank_acc=0.8746 cos_sim=0.0602 text_r=0.0000 lr=1.39e-04
-  [E0 S4750] total=1.2477 rank=0.8018 cos=0.0062 chain=1.4759 rank_acc=0.8753 cos_sim=0.0603 text_r=0.0000 lr=1.40e-04
-  [E0 S4800] total=1.2431 rank=0.7976 cos=0.0061 chain=1.4748 rank_acc=0.8760 cos_sim=0.0603 text_r=0.0000 lr=1.42e-04
-  [E0 S4850] total=1.2388 rank=0.7936 cos=0.0061 chain=1.4737 rank_acc=0.8767 cos_sim=0.0603 text_r=0.0000 lr=1.43e-04
-  [E0 S4900] total=1.2344 rank=0.7897 cos=0.0060 chain=1.4722 rank_acc=0.8775 cos_sim=0.0604 text_r=0.0000 lr=1.45e-04
-  [E0 S4950] total=1.2302 rank=0.7858 cos=0.0060 chain=1.4712 rank_acc=0.8782 cos_sim=0.0605 text_r=0.0000 lr=1.46e-04
-  [E0 S5000] total=1.2261 rank=0.7820 cos=0.0059 chain=1.4703 rank_acc=0.8788 cos_sim=0.0606 text_r=0.0000 lr=1.47e-04
-  [E0 S5050] total=1.2215 rank=0.7778 cos=0.0059 chain=1.4692 rank_acc=0.8796 cos_sim=0.0607 text_r=0.0000 lr=1.49e-04
+  [E0 S50] total=2.2294 rank=2.0794 hinge=0.3000 rank_acc=0.5200 cos_sim=0.0511 text_r=0.0000 E_gap=0.0000 lr=3.00e-06
+  [E0 S100] total=2.2294 rank=2.0794 hinge=0.3000 rank_acc=0.5683 cos_sim=0.0530 text_r=0.0000 E_gap=0.0000 lr=3.00e-06
+  [E0 S150] total=2.2293 rank=2.0792 hinge=0.3000 rank_acc=0.5917 cos_sim=0.0544 text_r=0.0000 E_gap=0.0000 lr=4.42e-06
+  [E0 S200] total=2.2288 rank=2.0788 hinge=0.3000 rank_acc=0.5997 cos_sim=0.0550 text_r=0.0000 E_gap=0.0000 lr=5.90e-06
+  [E0 S250] total=2.2271 rank=2.0771 hinge=0.2999 rank_acc=0.6029 cos_sim=0.0560 text_r=0.0000 E_gap=0.0001 lr=7.37e-06
+  [E0 S300] total=2.2207 rank=2.0708 hinge=0.2997 rank_acc=0.6078 cos_sim=0.0609 text_r=0.0000 E_gap=0.0005 lr=8.85e-06
+  [E0 S350] total=2.2060 rank=2.0561 hinge=0.2998 rank_acc=0.6111 cos_sim=0.0775 text_r=0.0000 E_gap=0.0013 lr=1.03e-05
+  [E0 S400] total=2.1843 rank=2.0333 hinge=0.3022 rank_acc=0.6152 cos_sim=0.1034 text_r=0.0000 E_gap=0.0029 lr=1.18e-05
+  [E0 S450] total=2.1664 rank=2.0151 hinge=0.3027 rank_acc=0.6177 cos_sim=0.1248 text_r=0.0000 E_gap=0.0044 lr=1.33e-05
+  [E0 S500] total=2.1501 rank=1.9992 hinge=0.3018 rank_acc=0.6194 cos_sim=0.1431 text_r=0.0000 E_gap=0.0057 lr=1.47e-05
+  [E0 S550] total=2.1323 rank=1.9826 hinge=0.2995 rank_acc=0.6223 cos_sim=0.1587 text_r=0.0000 E_gap=0.0069 lr=1.62e-05
+  [E0 S600] total=2.1180 rank=1.9697 hinge=0.2967 rank_acc=0.6233 cos_sim=0.1738 text_r=0.0000 E_gap=0.0080 lr=1.77e-05
+  [E0 S650] total=2.1044 rank=1.9590 hinge=0.2908 rank_acc=0.6237 cos_sim=0.1860 text_r=0.0000 E_gap=0.0088 lr=1.92e-05
+  [E0 S700] total=2.0875 rank=1.9481 hinge=0.2788 rank_acc=0.6257 cos_sim=0.1960 text_r=0.0000 E_gap=0.0097 lr=2.06e-05
+  [E0 S750] total=2.0742 rank=1.9411 hinge=0.2664 rank_acc=0.6265 cos_sim=0.2063 text_r=0.0000 E_gap=0.0103 lr=2.21e-05
+  [E0 S800] total=2.0601 rank=1.9335 hinge=0.2532 rank_acc=0.6274 cos_sim=0.2156 text_r=0.0000 E_gap=0.0111 lr=2.36e-05
+  [E0 S850] total=2.0448 rank=1.9234 hinge=0.2428 rank_acc=0.6291 cos_sim=0.2228 text_r=0.0000 E_gap=0.0121 lr=2.51e-05
+  [E0 S900] total=2.0335 rank=1.9168 hinge=0.2333 rank_acc=0.6302 cos_sim=0.2272 text_r=0.0000 E_gap=0.0129 lr=2.65e-05
+  [E0 S950] total=2.0189 rank=1.9058 hinge=0.2261 rank_acc=0.6326 cos_sim=0.2320 text_r=0.0000 E_gap=0.0140 lr=2.80e-05
+  [E0 S1000] total=2.0116 rank=1.9018 hinge=0.2195 rank_acc=0.6333 cos_sim=0.2371 text_r=0.0000 E_gap=0.0145 lr=2.95e-05
+  [E0 S1050] total=2.0034 rank=1.8966 hinge=0.2137 rank_acc=0.6338 cos_sim=0.2409 text_r=0.0000 E_gap=0.0151 lr=3.10e-05
+  [E0 S1100] total=1.9950 rank=1.8907 hinge=0.2087 rank_acc=0.6352 cos_sim=0.2460 text_r=0.0000 E_gap=0.0157 lr=3.24e-05
+  [E0 S1150] total=1.9885 rank=1.8869 hinge=0.2033 rank_acc=0.6349 cos_sim=0.2492 text_r=0.0000 E_gap=0.0161 lr=3.39e-05
+  [E0 S1200] total=1.9834 rank=1.8841 hinge=0.1986 rank_acc=0.6352 cos_sim=0.2519 text_r=0.0000 E_gap=0.0165 lr=3.54e-05
+  [E0 S1250] total=1.9784 rank=1.8812 hinge=0.1945 rank_acc=0.6354 cos_sim=0.2564 text_r=0.0000 E_gap=0.0167 lr=3.69e-05
+  [E0 S1300] total=1.9735 rank=1.8782 hinge=0.1907 rank_acc=0.6354 cos_sim=0.2602 text_r=0.0000 E_gap=0.0170 lr=3.83e-05
+  [E0 S1350] total=1.9685 rank=1.8747 hinge=0.1876 rank_acc=0.6361 cos_sim=0.2628 text_r=0.0000 E_gap=0.0173 lr=3.98e-05
+  [E0 S1400] total=1.9644 rank=1.8722 hinge=0.1845 rank_acc=0.6369 cos_sim=0.2648 text_r=0.0000 E_gap=0.0176 lr=4.13e-05
+  [E0 S1450] total=1.9611 rank=1.8703 hinge=0.1816 rank_acc=0.6376 cos_sim=0.2684 text_r=0.0000 E_gap=0.0177 lr=4.28e-05
+  [E0 S1500] total=1.9572 rank=1.8680 hinge=0.1785 rank_acc=0.6384 cos_sim=0.2700 text_r=0.0000 E_gap=0.0180 lr=4.42e-05
+  [E0 S1550] total=1.9529 rank=1.8648 hinge=0.1761 rank_acc=0.6391 cos_sim=0.2724 text_r=0.0000 E_gap=0.0183 lr=4.57e-05
+  [E0 S1600] total=1.9495 rank=1.8628 hinge=0.1733 rank_acc=0.6396 cos_sim=0.2742 text_r=0.0000 E_gap=0.0184 lr=4.72e-05
+  [E0 S1650] total=1.9470 rank=1.8612 hinge=0.1715 rank_acc=0.6397 cos_sim=0.2758 text_r=0.0000 E_gap=0.0185 lr=4.87e-05
+  [E0 S1700] total=1.9441 rank=1.8594 hinge=0.1693 rank_acc=0.6404 cos_sim=0.2768 text_r=0.0000 E_gap=0.0187 lr=5.01e-05
+  [E0 S1750] total=1.9410 rank=1.8573 hinge=0.1674 rank_acc=0.6407 cos_sim=0.2777 text_r=0.0000 E_gap=0.0189 lr=5.16e-05
+  [E0 S1800] total=1.9380 rank=1.8552 hinge=0.1656 rank_acc=0.6412 cos_sim=0.2793 text_r=0.0000 E_gap=0.0190 lr=5.31e-05
+  [E0 S1850] total=1.9356 rank=1.8534 hinge=0.1643 rank_acc=0.6414 cos_sim=0.2806 text_r=0.0000 E_gap=0.0192 lr=5.46e-05
+  [E0 S1900] total=1.9346 rank=1.8529 hinge=0.1634 rank_acc=0.6415 cos_sim=0.2818 text_r=0.0000 E_gap=0.0192 lr=5.60e-05
+  [E0 S1950] total=1.9315 rank=1.8506 hinge=0.1619 rank_acc=0.6424 cos_sim=0.2826 text_r=0.0000 E_gap=0.0195 lr=5.75e-05
+  [E0 S2000] total=1.9307 rank=1.8503 hinge=0.1608 rank_acc=0.6422 cos_sim=0.2833 text_r=0.0000 E_gap=0.0195 lr=5.90e-05
+  [E0 S2050] total=1.9289 rank=1.8490 hinge=0.1599 rank_acc=0.6428 cos_sim=0.2841 text_r=0.0000 E_gap=0.0196 lr=6.05e-05
+  [E0 S2100] total=1.9272 rank=1.8478 hinge=0.1588 rank_acc=0.6431 cos_sim=0.2841 text_r=0.0000 E_gap=0.0197 lr=6.19e-05
+  [E0 S2150] total=1.9261 rank=1.8472 hinge=0.1579 rank_acc=0.6431 cos_sim=0.2846 text_r=0.0000 E_gap=0.0198 lr=6.34e-05
+  [E0 S2200] total=1.9252 rank=1.8466 hinge=0.1572 rank_acc=0.6433 cos_sim=0.2849 text_r=0.0000 E_gap=0.0198 lr=6.49e-05
+  [E0 S2250] total=1.9234 rank=1.8453 hinge=0.1562 rank_acc=0.6436 cos_sim=0.2845 text_r=0.0000 E_gap=0.0200 lr=6.64e-05
+  [E0 S2300] total=1.9218 rank=1.8444 hinge=0.1550 rank_acc=0.6437 cos_sim=0.2846 text_r=0.0000 E_gap=0.0201 lr=6.78e-05
+  [E0 S2350] total=1.9200 rank=1.8428 hinge=0.1544 rank_acc=0.6443 cos_sim=0.2848 text_r=0.0000 E_gap=0.0202 lr=6.93e-05
+  [E0 S2400] total=1.9190 rank=1.8422 hinge=0.1537 rank_acc=0.6449 cos_sim=0.2850 text_r=0.0000 E_gap=0.0203 lr=7.08e-05
+  [E0 S2450] total=1.9172 rank=1.8406 hinge=0.1531 rank_acc=0.6451 cos_sim=0.2847 text_r=0.0000 E_gap=0.0204 lr=7.23e-05
+  [E0 S2500] total=1.9163 rank=1.8401 hinge=0.1524 rank_acc=0.6450 cos_sim=0.2843 text_r=0.0000 E_gap=0.0205 lr=7.37e-05
+  [E0 S2550] total=1.9149 rank=1.8389 hinge=0.1521 rank_acc=0.6457 cos_sim=0.2841 text_r=0.0000 E_gap=0.0206 lr=7.52e-05
+  [E0 S2600] total=1.9152 rank=1.8397 hinge=0.1510 rank_acc=0.6454 cos_sim=0.2832 text_r=0.0000 E_gap=0.0205 lr=7.67e-05
+  [E0 S2650] total=1.9152 rank=1.8400 hinge=0.1503 rank_acc=0.6453 cos_sim=0.2829 text_r=0.0000 E_gap=0.0205 lr=7.82e-05
+  [E0 S2700] total=1.9142 rank=1.8394 hinge=0.1496 rank_acc=0.6455 cos_sim=0.2829 text_r=0.0000 E_gap=0.0205 lr=7.96e-05
+  [E0 S2750] total=1.9129 rank=1.8385 hinge=0.1488 rank_acc=0.6458 cos_sim=0.2833 text_r=0.0000 E_gap=0.0206 lr=8.11e-05
+  [E0 S2800] total=1.9113 rank=1.8372 hinge=0.1482 rank_acc=0.6459 cos_sim=0.2829 text_r=0.0000 E_gap=0.0207 lr=8.26e-05
+  [E0 S2850] total=1.9103 rank=1.8364 hinge=0.1479 rank_acc=0.6463 cos_sim=0.2827 text_r=0.0000 E_gap=0.0208 lr=8.41e-05
+  [E0 S2900] total=1.9094 rank=1.8356 hinge=0.1475 rank_acc=0.6465 cos_sim=0.2825 text_r=0.0000 E_gap=0.0209 lr=8.55e-05
+  [E0 S2950] total=1.9079 rank=1.8343 hinge=0.1473 rank_acc=0.6471 cos_sim=0.2818 text_r=0.0000 E_gap=0.0210 lr=8.70e-05
+  [E0 S3000] total=1.9069 rank=1.8335 hinge=0.1468 rank_acc=0.6474 cos_sim=0.2806 text_r=0.0000 E_gap=0.0210 lr=8.85e-05
+  [E0 S3050] total=1.9058 rank=1.8325 hinge=0.1465 rank_acc=0.6479 cos_sim=0.2797 text_r=0.0000 E_gap=0.0211 lr=9.00e-05
+  [E0 S3100] total=1.9045 rank=1.8315 hinge=0.1461 rank_acc=0.6485 cos_sim=0.2785 text_r=0.0000 E_gap=0.0212 lr=9.14e-05
+  [E0 S3150] total=1.9029 rank=1.8299 hinge=0.1460 rank_acc=0.6491 cos_sim=0.2773 text_r=0.0000 E_gap=0.0214 lr=9.29e-05
+  [E0 S3200] total=1.9011 rank=1.8282 hinge=0.1458 rank_acc=0.6498 cos_sim=0.2757 text_r=0.0000 E_gap=0.0215 lr=9.44e-05
+  [E0 S3250] total=1.8996 rank=1.8268 hinge=0.1456 rank_acc=0.6504 cos_sim=0.2743 text_r=0.0000 E_gap=0.0217 lr=9.59e-05
+  [E0 S3300] total=1.8990 rank=1.8265 hinge=0.1450 rank_acc=0.6505 cos_sim=0.2725 text_r=0.0000 E_gap=0.0217 lr=9.73e-05
+  [E0 S3350] total=1.8968 rank=1.8245 hinge=0.1446 rank_acc=0.6513 cos_sim=0.2710 text_r=0.0000 E_gap=0.0219 lr=9.88e-05
+  [E0 S3400] total=1.8942 rank=1.8223 hinge=0.1438 rank_acc=0.6521 cos_sim=0.2688 text_r=0.0000 E_gap=0.0221 lr=1.00e-04
+  [E0 S3450] total=1.8913 rank=1.8198 hinge=0.1431 rank_acc=0.6528 cos_sim=0.2660 text_r=0.0000 E_gap=0.0224 lr=1.02e-04
+  [E0 S3500] total=1.8889 rank=1.8178 hinge=0.1423 rank_acc=0.6535 cos_sim=0.2634 text_r=0.0000 E_gap=0.0225 lr=1.03e-04
+  [E0 S3550] total=1.8854 rank=1.8146 hinge=0.1415 rank_acc=0.6546 cos_sim=0.2607 text_r=0.0000 E_gap=0.0229 lr=1.05e-04
+  [E0 S3600] total=1.8811 rank=1.8110 hinge=0.1403 rank_acc=0.6557 cos_sim=0.2581 text_r=0.0000 E_gap=0.0232 lr=1.06e-04
+  [E0 S3650] total=1.8747 rank=1.8052 hinge=0.1389 rank_acc=0.6572 cos_sim=0.2561 text_r=0.0000 E_gap=0.0240 lr=1.08e-04
+  [E0 S3700] total=1.8686 rank=1.7998 hinge=0.1376 rank_acc=0.6587 cos_sim=0.2541 text_r=0.0000 E_gap=0.0247 lr=1.09e-04
+  [E0 S3750] total=1.8625 rank=1.7944 hinge=0.1363 rank_acc=0.6603 cos_sim=0.2522 text_r=0.0000 E_gap=0.0254 lr=1.11e-04
+  [E0 S3800] total=1.8569 rank=1.7895 hinge=0.1347 rank_acc=0.6616 cos_sim=0.2508 text_r=0.0000 E_gap=0.0260 lr=1.12e-04
+  [E0 S3850] total=1.8510 rank=1.7842 hinge=0.1335 rank_acc=0.6630 cos_sim=0.2489 text_r=0.0000 E_gap=0.0268 lr=1.14e-04
+  [E0 S3900] total=1.8447 rank=1.7787 hinge=0.1321 rank_acc=0.6644 cos_sim=0.2471 text_r=0.0000 E_gap=0.0275 lr=1.15e-04
+  [E0 S3950] total=1.8383 rank=1.7729 hinge=0.1308 rank_acc=0.6659 cos_sim=0.2456 text_r=0.0000 E_gap=0.0284 lr=1.16e-04
+  [E0 S4000] total=1.8312 rank=1.7666 hinge=0.1294 rank_acc=0.6675 cos_sim=0.2438 text_r=0.0000 E_gap=0.0294 lr=1.18e-04
+  [E0 S4050] total=1.8243 rank=1.7602 hinge=0.1281 rank_acc=0.6690 cos_sim=0.2425 text_r=0.0000 E_gap=0.0305 lr=1.19e-04
+  [E0 S4100] total=1.8182 rank=1.7548 hinge=0.1268 rank_acc=0.6704 cos_sim=0.2407 text_r=0.0000 E_gap=0.0313 lr=1.21e-04
+  [E0 S4150] total=1.8110 rank=1.7482 hinge=0.1256 rank_acc=0.6720 cos_sim=0.2391 text_r=0.0000 E_gap=0.0324 lr=1.22e-04
+  [E0 S4200] total=1.8044 rank=1.7423 hinge=0.1242 rank_acc=0.6735 cos_sim=0.2375 text_r=0.0000 E_gap=0.0334 lr=1.24e-04
+  [E0 S4250] total=1.7971 rank=1.7358 hinge=0.1227 rank_acc=0.6752 cos_sim=0.2359 text_r=0.0000 E_gap=0.0345 lr=1.25e-04
+  [E0 S4300] total=1.7895 rank=1.7288 hinge=0.1213 rank_acc=0.6769 cos_sim=0.2341 text_r=0.0000 E_gap=0.0357 lr=1.27e-04
+  [E0 S4350] total=1.7824 rank=1.7224 hinge=0.1199 rank_acc=0.6785 cos_sim=0.2324 text_r=0.0000 E_gap=0.0369 lr=1.28e-04
+  [E0 S4400] total=1.7747 rank=1.7154 hinge=0.1186 rank_acc=0.6801 cos_sim=0.2305 text_r=0.0000 E_gap=0.0381 lr=1.30e-04
+  [E0 S4450] total=1.7663 rank=1.7077 hinge=0.1172 rank_acc=0.6820 cos_sim=0.2287 text_r=0.0000 E_gap=0.0395 lr=1.31e-04
+  [E0 S4500] total=1.7583 rank=1.7003 hinge=0.1159 rank_acc=0.6836 cos_sim=0.2268 text_r=0.0000 E_gap=0.0410 lr=1.33e-04
+  [E0 S4550] total=1.7506 rank=1.6933 hinge=0.1147 rank_acc=0.6853 cos_sim=0.2250 text_r=0.0000 E_gap=0.0425 lr=1.34e-04
+  [E0 S4600] total=1.7427 rank=1.6860 hinge=0.1134 rank_acc=0.6870 cos_sim=0.2232 text_r=0.0000 E_gap=0.0438 lr=1.36e-04
+  [E0 S4650] total=1.7354 rank=1.6793 hinge=0.1122 rank_acc=0.6887 cos_sim=0.2215 text_r=0.0000 E_gap=0.0450 lr=1.37e-04
+  [E0 S4700] total=1.7276 rank=1.6721 hinge=0.1110 rank_acc=0.6903 cos_sim=0.2196 text_r=0.0000 E_gap=0.0463 lr=1.39e-04
+  [E0 S4750] total=1.7201 rank=1.6652 hinge=0.1099 rank_acc=0.6920 cos_sim=0.2180 text_r=0.0000 E_gap=0.0476 lr=1.40e-04
+  [E0 S4800] total=1.7128 rank=1.6584 hinge=0.1087 rank_acc=0.6936 cos_sim=0.2164 text_r=0.0000 E_gap=0.0489 lr=1.42e-04
+  [E0 S4850] total=1.7050 rank=1.6512 hinge=0.1076 rank_acc=0.6954 cos_sim=0.2147 text_r=0.0000 E_gap=0.0503 lr=1.43e-04
+  [E0 S4900] total=1.6979 rank=1.6447 hinge=0.1065 rank_acc=0.6969 cos_sim=0.2130 text_r=0.0000 E_gap=0.0517 lr=1.45e-04
+  [E0 S4950] total=1.6911 rank=1.6384 hinge=0.1055 rank_acc=0.6983 cos_sim=0.2113 text_r=0.0000 E_gap=0.0529 lr=1.46e-04
+  [E0 S5000] total=1.6837 rank=1.6315 hinge=0.1044 rank_acc=0.6999 cos_sim=0.2097 text_r=0.0000 E_gap=0.0541 lr=1.47e-04
+  [E0 S5050] total=1.6765 rank=1.6248 hinge=0.1034 rank_acc=0.7015 cos_sim=0.2083 text_r=0.0000 E_gap=0.0555 lr=1.49e-04
 
-  Epoch 0 train (381.8s):
-    E_neg_mean: 0.0885
-    E_pos_mean: -0.1209
+  Epoch 0 train (287.7s):
+    E_neg_mean: -0.0945
+    E_pos_mean: -0.1509
+    E_predicted_mean: 13.2817
+    E_target_mean: -0.1508
     advantage_mean: 0.0000
     advantage_std: 0.0000
-    chain_E_neg_mean: 0.2828
-    chain_E_pos_mean: 0.2815
-    chain_energy_gap: 0.0013
-    chain_energy_norm_reg: 0.0000
-    chain_grad_penalty: 3.2965
-    chain_loss: 1.4686
-    chain_nce_loss: 1.4409
-    chain_rank_acc: 0.5321
-    contrastive_loss: 0.7755
-    cos_sim_max: 0.1675
-    cos_sim_mean: 0.0607
-    cos_sim_min: -0.0159
-    cosine_loss: 0.9393
+    contrastive_loss: 1.6204
+    cos_sim_max: 0.4014
+    cos_sim_mean: 0.2071
+    cos_sim_min: 0.0300
     decode_success_rate: 0.0000
-    energy_gap: 0.2095
-    loss_chain: 1.4686
-    loss_cos: 0.0058
-    loss_rank: 0.7755
-    rank_acc: 0.8800
+    energy_gap: 0.0563
+    loss_hinge: 0.1027
+    loss_rank: 1.6204
+    rank_acc: 0.7025
     reinforce_loss: 0.0000
     reward_baseline: 0.0000
-    reward_cos_mean: 0.0606
+    reward_cos_mean: 0.2077
     roundtrip_cos_mean: 0.0000
     text_reward_mean: 0.0000
     text_reward_std: 0.0000
-    total_loss: 1.2190
+    total_loss: 1.6717
   Epoch 0 val:
-    val_E_neg_mean: 0.2240
-    val_E_pos_mean: -0.1207
-    val_cos_sim_max: 0.1677
-    val_cos_sim_mean: 0.0657
-    val_cos_sim_min: -0.0082
-    val_energy_gap: 0.3446
-    val_rank_acc: 0.9473
-  >> New best: combined=0.0623 (rank_acc=0.9473 × cos_sim=0.0657)
-  [E1 S50] total=0.7782 rank=0.3669 cos=0.0017 chain=1.3681 rank_acc=0.9473 cos_sim=0.0672 text_r=0.0000 lr=1.51e-04
+    val_E_neg_mean: 0.1661
+    val_E_pos_mean: -0.0156
+    val_cos_sim_max: 0.2095
+    val_cos_sim_mean: 0.0445
+    val_cos_sim_min: -0.1192
+    val_energy_gap: 0.1817
+    val_rank_acc: 0.8555
+  >> New best: combined=0.0381 (rank_acc=0.8555 × cos_sim=0.0445)
+  [E1 S50] total=0.8987 rank=0.8987 hinge=0.0000 rank_acc=0.8698 cos_sim=0.0400 text_r=0.0000 E_gap=0.1981 lr=1.51e-04
+  [E1 S100] total=0.9251 rank=0.9249 hinge=0.0004 rank_acc=0.8639 cos_sim=0.0432 text_r=0.0000 E_gap=0.1995 lr=1.53e-04
+  [E1 S150] total=0.9293 rank=0.9289 hinge=0.0006 rank_acc=0.8633 cos_sim=0.0458 text_r=0.0000 E_gap=0.1971 lr=1.54e-04
+  [E1 S200] total=0.9367 rank=0.9363 hinge=0.0008 rank_acc=0.8612 cos_sim=0.0495 text_r=0.0000 E_gap=0.1926 lr=1.56e-04
+  [E1 S250] total=0.9294 rank=0.9289 hinge=0.0011 rank_acc=0.8617 cos_sim=0.0475 text_r=0.0000 E_gap=0.1944 lr=1.57e-04
+  [E1 S300] total=0.9232 rank=0.9227 hinge=0.0011 rank_acc=0.8618 cos_sim=0.0477 text_r=0.0000 E_gap=0.1954 lr=1.59e-04
+  [E1 S350] total=0.9255 rank=0.9248 hinge=0.0013 rank_acc=0.8611 cos_sim=0.0462 text_r=0.0000 E_gap=0.1954 lr=1.60e-04
+  [E1 S400] total=0.9220 rank=0.9213 hinge=0.0013 rank_acc=0.8615 cos_sim=0.0452 text_r=0.0000 E_gap=0.1959 lr=1.62e-04
+  [E1 S450] total=0.9238 rank=0.9231 hinge=0.0015 rank_acc=0.8611 cos_sim=0.0436 text_r=0.0000 E_gap=0.1965 lr=1.63e-04
+  [E1 S500] total=0.9251 rank=0.9244 hinge=0.0015 rank_acc=0.8615 cos_sim=0.0419 text_r=0.0000 E_gap=0.1970 lr=1.65e-04
+  [E1 S550] total=0.9311 rank=0.9304 hinge=0.0014 rank_acc=0.8598 cos_sim=0.0409 text_r=0.0000 E_gap=0.1963 lr=1.66e-04
+  [E1 S600] total=0.9335 rank=0.9327 hinge=0.0016 rank_acc=0.8597 cos_sim=0.0414 text_r=0.0000 E_gap=0.1950 lr=1.68e-04
+  [E1 S650] total=0.9312 rank=0.9305 hinge=0.0016 rank_acc=0.8599 cos_sim=0.0412 text_r=0.0000 E_gap=0.1950 lr=1.69e-04
+  [E1 S700] total=0.9340 rank=0.9332 hinge=0.0015 rank_acc=0.8589 cos_sim=0.0422 text_r=0.0000 E_gap=0.1946 lr=1.71e-04
+  [E1 S750] total=0.9362 rank=0.9354 hinge=0.0015 rank_acc=0.8583 cos_sim=0.0451 text_r=0.0000 E_gap=0.1937 lr=1.72e-04
+  [E1 S800] total=0.9369 rank=0.9362 hinge=0.0014 rank_acc=0.8580 cos_sim=0.0473 text_r=0.0000 E_gap=0.1931 lr=1.74e-04
+  [E1 S850] total=0.9379 rank=0.9372 hinge=0.0014 rank_acc=0.8578 cos_sim=0.0484 text_r=0.0000 E_gap=0.1930 lr=1.75e-04
+  [E1 S900] total=0.9380 rank=0.9373 hinge=0.0015 rank_acc=0.8579 cos_sim=0.0498 text_r=0.0000 E_gap=0.1933 lr=1.77e-04
+  [E1 S950] total=0.9383 rank=0.9376 hinge=0.0015 rank_acc=0.8578 cos_sim=0.0517 text_r=0.0000 E_gap=0.1943 lr=1.78e-04
+  [E1 S1000] total=0.9384 rank=0.9377 hinge=0.0015 rank_acc=0.8577 cos_sim=0.0543 text_r=0.0000 E_gap=0.1942 lr=1.79e-04
+  [E1 S1050] total=0.9377 rank=0.9370 hinge=0.0014 rank_acc=0.8576 cos_sim=0.0572 text_r=0.0000 E_gap=0.1939 lr=1.81e-04
+  [E1 S1100] total=0.9374 rank=0.9368 hinge=0.0014 rank_acc=0.8576 cos_sim=0.0594 text_r=0.0000 E_gap=0.1939 lr=1.82e-04
+  [E1 S1150] total=0.9382 rank=0.9375 hinge=0.0013 rank_acc=0.8573 cos_sim=0.0614 text_r=0.0000 E_gap=0.1938 lr=1.84e-04
+  [E1 S1200] total=0.9391 rank=0.9385 hinge=0.0013 rank_acc=0.8572 cos_sim=0.0640 text_r=0.0000 E_gap=0.1933 lr=1.85e-04
+  [E1 S1250] total=0.9379 rank=0.9373 hinge=0.0012 rank_acc=0.8573 cos_sim=0.0655 text_r=0.0000 E_gap=0.1933 lr=1.87e-04
+  [E1 S1300] total=0.9399 rank=0.9393 hinge=0.0012 rank_acc=0.8569 cos_sim=0.0662 text_r=0.0000 E_gap=0.1934 lr=1.88e-04
+  [E1 S1350] total=0.9363 rank=0.9357 hinge=0.0012 rank_acc=0.8576 cos_sim=0.0665 text_r=0.0000 E_gap=0.1943 lr=1.90e-04
+  [E1 S1400] total=0.9341 rank=0.9336 hinge=0.0011 rank_acc=0.8579 cos_sim=0.0667 text_r=0.0000 E_gap=0.1949 lr=1.91e-04
+  [E1 S1450] total=0.9342 rank=0.9337 hinge=0.0012 rank_acc=0.8578 cos_sim=0.0680 text_r=0.0000 E_gap=0.1950 lr=1.93e-04
+  [E1 S1500] total=0.9325 rank=0.9319 hinge=0.0011 rank_acc=0.8582 cos_sim=0.0696 text_r=0.0000 E_gap=0.1954 lr=1.94e-04
+  [E1 S1550] total=0.9305 rank=0.9300 hinge=0.0011 rank_acc=0.8585 cos_sim=0.0711 text_r=0.0000 E_gap=0.1958 lr=1.96e-04
+  [E1 S1600] total=0.9287 rank=0.9282 hinge=0.0011 rank_acc=0.8587 cos_sim=0.0731 text_r=0.0000 E_gap=0.1963 lr=1.97e-04
+  [E1 S1650] total=0.9290 rank=0.9284 hinge=0.0011 rank_acc=0.8588 cos_sim=0.0750 text_r=0.0000 E_gap=0.1961 lr=1.99e-04
+  [E1 S1700] total=0.9283 rank=0.9277 hinge=0.0012 rank_acc=0.8589 cos_sim=0.0763 text_r=0.0000 E_gap=0.1963 lr=2.00e-04
+  [E1 S1750] total=0.9282 rank=0.9276 hinge=0.0012 rank_acc=0.8590 cos_sim=0.0774 text_r=0.0000 E_gap=0.1964 lr=2.02e-04
+  [E1 S1800] total=0.9277 rank=0.9271 hinge=0.0012 rank_acc=0.8590 cos_sim=0.0792 text_r=0.0000 E_gap=0.1962 lr=2.03e-04
+  [E1 S1850] total=0.9279 rank=0.9273 hinge=0.0012 rank_acc=0.8589 cos_sim=0.0807 text_r=0.0000 E_gap=0.1966 lr=2.05e-04
+  [E1 S1900] total=0.9267 rank=0.9261 hinge=0.0012 rank_acc=0.8591 cos_sim=0.0822 text_r=0.0000 E_gap=0.1968 lr=2.06e-04
+  [E1 S1950] total=0.9255 rank=0.9249 hinge=0.0012 rank_acc=0.8593 cos_sim=0.0828 text_r=0.0000 E_gap=0.1972 lr=2.08e-04
+  [E1 S2000] total=0.9243 rank=0.9237 hinge=0.0012 rank_acc=0.8595 cos_sim=0.0837 text_r=0.0000 E_gap=0.1978 lr=2.09e-04
+  [E1 S2050] total=0.9240 rank=0.9234 hinge=0.0012 rank_acc=0.8596 cos_sim=0.0851 text_r=0.0000 E_gap=0.1977 lr=2.10e-04
+  [E1 S2100] total=0.9228 rank=0.9222 hinge=0.0012 rank_acc=0.8597 cos_sim=0.0857 text_r=0.0000 E_gap=0.1978 lr=2.12e-04
+  [E1 S2150] total=0.9230 rank=0.9224 hinge=0.0012 rank_acc=0.8598 cos_sim=0.0864 text_r=0.0000 E_gap=0.1978 lr=2.13e-04
+  [E1 S2200] total=0.9223 rank=0.9217 hinge=0.0012 rank_acc=0.8601 cos_sim=0.0877 text_r=0.0000 E_gap=0.1978 lr=2.15e-04
+  [E1 S2250] total=0.9217 rank=0.9211 hinge=0.0012 rank_acc=0.8602 cos_sim=0.0890 text_r=0.0000 E_gap=0.1979 lr=2.16e-04
+  [E1 S2300] total=0.9212 rank=0.9205 hinge=0.0013 rank_acc=0.8603 cos_sim=0.0903 text_r=0.0000 E_gap=0.1980 lr=2.18e-04
+  [E1 S2350] total=0.9219 rank=0.9212 hinge=0.0012 rank_acc=0.8602 cos_sim=0.0905 text_r=0.0000 E_gap=0.1979 lr=2.19e-04
+  [E1 S2400] total=0.9206 rank=0.9199 hinge=0.0012 rank_acc=0.8604 cos_sim=0.0890 text_r=0.0000 E_gap=0.1984 lr=2.21e-04
+  [E1 S2450] total=0.9186 rank=0.9179 hinge=0.0012 rank_acc=0.8608 cos_sim=0.0889 text_r=0.0000 E_gap=0.1988 lr=2.22e-04
+  [E1 S2500] total=0.9179 rank=0.9172 hinge=0.0012 rank_acc=0.8608 cos_sim=0.0883 text_r=0.0000 E_gap=0.1995 lr=2.24e-04
+  [E1 S2550] total=0.9175 rank=0.9169 hinge=0.0012 rank_acc=0.8610 cos_sim=0.0876 text_r=0.0000 E_gap=0.1996 lr=2.25e-04
+  [E1 S2600] total=0.9170 rank=0.9164 hinge=0.0012 rank_acc=0.8611 cos_sim=0.0873 text_r=0.0000 E_gap=0.1996 lr=2.27e-04
+  [E1 S2650] total=0.9166 rank=0.9160 hinge=0.0012 rank_acc=0.8612 cos_sim=0.0868 text_r=0.0000 E_gap=0.2000 lr=2.28e-04
+  [E1 S2700] total=0.9163 rank=0.9157 hinge=0.0012 rank_acc=0.8613 cos_sim=0.0864 text_r=0.0000 E_gap=0.2001 lr=2.30e-04
+  [E1 S2750] total=0.9140 rank=0.9135 hinge=0.0011 rank_acc=0.8617 cos_sim=0.0861 text_r=0.0000 E_gap=0.2003 lr=2.31e-04
+  [E1 S2800] total=0.9133 rank=0.9127 hinge=0.0011 rank_acc=0.8619 cos_sim=0.0858 text_r=0.0000 E_gap=0.2009 lr=2.33e-04
+  [E1 S2850] total=0.9125 rank=0.9120 hinge=0.0011 rank_acc=0.8620 cos_sim=0.0862 text_r=0.0000 E_gap=0.2012 lr=2.34e-04
+  [E1 S2900] total=0.9098 rank=0.9093 hinge=0.0011 rank_acc=0.8624 cos_sim=0.0861 text_r=0.0000 E_gap=0.2019 lr=2.36e-04
+  [E1 S2950] total=0.9075 rank=0.9069 hinge=0.0011 rank_acc=0.8628 cos_sim=0.0862 text_r=0.0000 E_gap=0.2024 lr=2.37e-04
+  [E1 S3000] total=0.9068 rank=0.9062 hinge=0.0011 rank_acc=0.8629 cos_sim=0.0864 text_r=0.0000 E_gap=0.2029 lr=2.38e-04
+  [E1 S3050] total=0.9041 rank=0.9035 hinge=0.0011 rank_acc=0.8634 cos_sim=0.0874 text_r=0.0000 E_gap=0.2033 lr=2.40e-04
+  [E1 S3100] total=0.9024 rank=0.9019 hinge=0.0011 rank_acc=0.8636 cos_sim=0.0882 text_r=0.0000 E_gap=0.2040 lr=2.41e-04
+  [E1 S3150] total=0.9005 rank=0.8999 hinge=0.0012 rank_acc=0.8639 cos_sim=0.0890 text_r=0.0000 E_gap=0.2047 lr=2.43e-04
+  [E1 S3200] total=0.8996 rank=0.8990 hinge=0.0012 rank_acc=0.8640 cos_sim=0.0900 text_r=0.0000 E_gap=0.2049 lr=2.44e-04
+  [E1 S3250] total=0.8990 rank=0.8984 hinge=0.0011 rank_acc=0.8640 cos_sim=0.0905 text_r=0.0000 E_gap=0.2050 lr=2.46e-04
+  [E1 S3300] total=0.8972 rank=0.8966 hinge=0.0012 rank_acc=0.8644 cos_sim=0.0912 text_r=0.0000 E_gap=0.2053 lr=2.47e-04
+  [E1 S3350] total=0.8952 rank=0.8946 hinge=0.0012 rank_acc=0.8647 cos_sim=0.0915 text_r=0.0000 E_gap=0.2059 lr=2.49e-04
+  [E1 S3400] total=0.8927 rank=0.8921 hinge=0.0012 rank_acc=0.8651 cos_sim=0.0920 text_r=0.0000 E_gap=0.2066 lr=2.50e-04
+  [E1 S3450] total=0.8901 rank=0.8896 hinge=0.0011 rank_acc=0.8655 cos_sim=0.0924 text_r=0.0000 E_gap=0.2073 lr=2.52e-04
+  [E1 S3500] total=0.8882 rank=0.8876 hinge=0.0011 rank_acc=0.8659 cos_sim=0.0927 text_r=0.0000 E_gap=0.2078 lr=2.53e-04
+  [E1 S3550] total=0.8861 rank=0.8855 hinge=0.0011 rank_acc=0.8662 cos_sim=0.0936 text_r=0.0000 E_gap=0.2083 lr=2.55e-04
+  [E1 S3600] total=0.8841 rank=0.8835 hinge=0.0011 rank_acc=0.8666 cos_sim=0.0943 text_r=0.0000 E_gap=0.2086 lr=2.56e-04
+  [E1 S3650] total=0.8822 rank=0.8817 hinge=0.0011 rank_acc=0.8668 cos_sim=0.0945 text_r=0.0000 E_gap=0.2089 lr=2.58e-04
+  [E1 S3700] total=0.8797 rank=0.8792 hinge=0.0011 rank_acc=0.8673 cos_sim=0.0950 text_r=0.0000 E_gap=0.2095 lr=2.59e-04
+  [E1 S3750] total=0.8778 rank=0.8772 hinge=0.0011 rank_acc=0.8676 cos_sim=0.0958 text_r=0.0000 E_gap=0.2098 lr=2.61e-04
+  [E1 S3800] total=0.8754 rank=0.8748 hinge=0.0011 rank_acc=0.8679 cos_sim=0.0966 text_r=0.0000 E_gap=0.2105 lr=2.62e-04
+  [E1 S3850] total=0.8745 rank=0.8739 hinge=0.0011 rank_acc=0.8681 cos_sim=0.0973 text_r=0.0000 E_gap=0.2107 lr=2.64e-04
+  [E1 S3900] total=0.8731 rank=0.8725 hinge=0.0011 rank_acc=0.8683 cos_sim=0.0981 text_r=0.0000 E_gap=0.2111 lr=2.65e-04
+  [E1 S3950] total=0.8721 rank=0.8716 hinge=0.0011 rank_acc=0.8685 cos_sim=0.0988 text_r=0.0000 E_gap=0.2112 lr=2.66e-04
+  [E1 S4000] total=0.8706 rank=0.8701 hinge=0.0011 rank_acc=0.8687 cos_sim=0.0990 text_r=0.0000 E_gap=0.2115 lr=2.68e-04
+  [E1 S4050] total=0.8694 rank=0.8689 hinge=0.0011 rank_acc=0.8690 cos_sim=0.0993 text_r=0.0000 E_gap=0.2117 lr=2.69e-04
+  [E1 S4100] total=0.8682 rank=0.8676 hinge=0.0011 rank_acc=0.8692 cos_sim=0.0997 text_r=0.0000 E_gap=0.2119 lr=2.71e-04
+  [E1 S4150] total=0.8665 rank=0.8659 hinge=0.0010 rank_acc=0.8695 cos_sim=0.1004 text_r=0.0000 E_gap=0.2122 lr=2.72e-04
+  [E1 S4200] total=0.8646 rank=0.8641 hinge=0.0010 rank_acc=0.8699 cos_sim=0.1008 text_r=0.0000 E_gap=0.2126 lr=2.74e-04
+  [E1 S4250] total=0.8630 rank=0.8625 hinge=0.0010 rank_acc=0.8701 cos_sim=0.1013 text_r=0.0000 E_gap=0.2129 lr=2.75e-04
+  [E1 S4300] total=0.8610 rank=0.8605 hinge=0.0010 rank_acc=0.8705 cos_sim=0.1018 text_r=0.0000 E_gap=0.2134 lr=2.77e-04
+  [E1 S4350] total=0.8598 rank=0.8592 hinge=0.0010 rank_acc=0.8707 cos_sim=0.1023 text_r=0.0000 E_gap=0.2136 lr=2.78e-04
+  [E1 S4400] total=0.8584 rank=0.8579 hinge=0.0010 rank_acc=0.8710 cos_sim=0.1030 text_r=0.0000 E_gap=0.2137 lr=2.80e-04
+  [E1 S4450] total=0.8559 rank=0.8554 hinge=0.0010 rank_acc=0.8714 cos_sim=0.1036 text_r=0.0000 E_gap=0.2143 lr=2.81e-04
+  [E1 S4500] total=0.8541 rank=0.8536 hinge=0.0010 rank_acc=0.8717 cos_sim=0.1042 text_r=0.0000 E_gap=0.2148 lr=2.83e-04
+  [E1 S4550] total=0.8534 rank=0.8529 hinge=0.0010 rank_acc=0.8718 cos_sim=0.1045 text_r=0.0000 E_gap=0.2149 lr=2.84e-04
+  [E1 S4600] total=0.8520 rank=0.8515 hinge=0.0010 rank_acc=0.8720 cos_sim=0.1050 text_r=0.0000 E_gap=0.2153 lr=2.86e-04
+  [E1 S4650] total=0.8500 rank=0.8495 hinge=0.0010 rank_acc=0.8723 cos_sim=0.1055 text_r=0.0000 E_gap=0.2156 lr=2.87e-04
+  [E1 S4700] total=0.8487 rank=0.8483 hinge=0.0010 rank_acc=0.8725 cos_sim=0.1058 text_r=0.0000 E_gap=0.2160 lr=2.89e-04
+  [E1 S4750] total=0.8472 rank=0.8468 hinge=0.0010 rank_acc=0.8728 cos_sim=0.1060 text_r=0.0000 E_gap=0.2162 lr=2.90e-04
+  [E1 S4800] total=0.8463 rank=0.8458 hinge=0.0009 rank_acc=0.8730 cos_sim=0.1065 text_r=0.0000 E_gap=0.2164 lr=2.92e-04
+  [E1 S4850] total=0.8452 rank=0.8447 hinge=0.0009 rank_acc=0.8732 cos_sim=0.1068 text_r=0.0000 E_gap=0.2165 lr=2.93e-04
+  [E1 S4900] total=0.8441 rank=0.8437 hinge=0.0009 rank_acc=0.8734 cos_sim=0.1071 text_r=0.0000 E_gap=0.2168 lr=2.95e-04
+  [E1 S4950] total=0.8426 rank=0.8422 hinge=0.0009 rank_acc=0.8737 cos_sim=0.1074 text_r=0.0000 E_gap=0.2169 lr=2.96e-04
+  [E1 S5000] total=0.8412 rank=0.8407 hinge=0.0009 rank_acc=0.8739 cos_sim=0.1076 text_r=0.0000 E_gap=0.2175 lr=2.97e-04
+  [E1 S5050] total=0.8401 rank=0.8396 hinge=0.0009 rank_acc=0.8741 cos_sim=0.1077 text_r=0.0000 E_gap=0.2178 lr=2.99e-04
+
+  Epoch 1 train (288.0s):
+    E_neg_mean: 0.1414
+    E_pos_mean: -0.0765
+    E_predicted_mean: 38.0566
+    E_target_mean: -0.0765
+    advantage_mean: 0.0000
+    advantage_std: 0.0000
+    contrastive_loss: 0.8391
+    cos_sim_max: 0.2696
+    cos_sim_mean: 0.1080
+    cos_sim_min: -0.0426
+    decode_success_rate: 0.0000
+    energy_gap: 0.2179
+    loss_hinge: 0.0009
+    loss_rank: 0.8391
+    rank_acc: 0.8742
+    reinforce_loss: 0.0000
+    reward_baseline: 0.0000
+    reward_cos_mean: 0.1083
+    roundtrip_cos_mean: 0.0000
+    text_reward_mean: 0.0000
+    text_reward_std: 0.0000
+    total_loss: 0.8396
+  Epoch 1 val:
+    val_E_neg_mean: 0.1115
+    val_E_pos_mean: -0.1085
+    val_cos_sim_max: 0.3891
+    val_cos_sim_mean: 0.1768
+    val_cos_sim_min: 0.0315
+    val_energy_gap: 0.2200
+    val_rank_acc: 0.8960
+  >> New best: combined=0.1584 (rank_acc=0.8960 × cos_sim=0.1768)
+  [E2 S50] total=0.7080 rank=0.7079 hinge=0.0003 rank_acc=0.9005 cos_sim=0.1559 text_r=0.0000 E_gap=0.2502 lr=3.00e-04
+  [E2 S100] total=0.6824 rank=0.6823 hinge=0.0002 rank_acc=0.9015 cos_sim=0.1495 text_r=0.0000 E_gap=0.2560 lr=3.00e-04
+  [E2 S150] total=0.6616 rank=0.6615 hinge=0.0002 rank_acc=0.9038 cos_sim=0.1455 text_r=0.0000 E_gap=0.2647 lr=3.00e-04
+  [E2 S200] total=0.6741 rank=0.6740 hinge=0.0001 rank_acc=0.9009 cos_sim=0.1375 text_r=0.0000 E_gap=0.2631 lr=3.00e-04
+  [E2 S250] total=0.6704 rank=0.6704 hinge=0.0001 rank_acc=0.9015 cos_sim=0.1316 text_r=0.0000 E_gap=0.2637 lr=3.00e-04
+  [E2 S300] total=0.6691 rank=0.6690 hinge=0.0001 rank_acc=0.9022 cos_sim=0.1262 text_r=0.0000 E_gap=0.2645 lr=3.00e-04
+  [E2 S350] total=0.6619 rank=0.6618 hinge=0.0001 rank_acc=0.9038 cos_sim=0.1228 text_r=0.0000 E_gap=0.2670 lr=3.00e-04
+  [E2 S400] total=0.6583 rank=0.6582 hinge=0.0001 rank_acc=0.9039 cos_sim=0.1157 text_r=0.0000 E_gap=0.2683 lr=3.00e-04
+  [E2 S450] total=0.6687 rank=0.6686 hinge=0.0001 rank_acc=0.9022 cos_sim=0.1086 text_r=0.0000 E_gap=0.2662 lr=3.00e-04
+  [E2 S500] total=0.6674 rank=0.6674 hinge=0.0001 rank_acc=0.9027 cos_sim=0.1040 text_r=0.0000 E_gap=0.2654 lr=3.00e-04
+  [E2 S550] total=0.6672 rank=0.6672 hinge=0.0001 rank_acc=0.9031 cos_sim=0.1000 text_r=0.0000 E_gap=0.2644 lr=3.00e-04
+  [E2 S600] total=0.6714 rank=0.6714 hinge=0.0001 rank_acc=0.9024 cos_sim=0.0939 text_r=0.0000 E_gap=0.2626 lr=3.00e-04
+  [E2 S650] total=0.6710 rank=0.6710 hinge=0.0001 rank_acc=0.9026 cos_sim=0.0887 text_r=0.0000 E_gap=0.2621 lr=3.00e-04
+  [E2 S700] total=0.6651 rank=0.6651 hinge=0.0001 rank_acc=0.9035 cos_sim=0.0831 text_r=0.0000 E_gap=0.2638 lr=3.00e-04
+  [E2 S750] total=0.6624 rank=0.6624 hinge=0.0000 rank_acc=0.9040 cos_sim=0.0796 text_r=0.0000 E_gap=0.2643 lr=3.00e-04
+  [E2 S800] total=0.6623 rank=0.6622 hinge=0.0000 rank_acc=0.9042 cos_sim=0.0768 text_r=0.0000 E_gap=0.2643 lr=3.00e-04
+  [E2 S850] total=0.6608 rank=0.6607 hinge=0.0000 rank_acc=0.9045 cos_sim=0.0730 text_r=0.0000 E_gap=0.2650 lr=3.00e-04
+  [E2 S900] total=0.6638 rank=0.6638 hinge=0.0000 rank_acc=0.9040 cos_sim=0.0688 text_r=0.0000 E_gap=0.2641 lr=3.00e-04
+  [E2 S950] total=0.6600 rank=0.6600 hinge=0.0000 rank_acc=0.9047 cos_sim=0.0658 text_r=0.0000 E_gap=0.2645 lr=3.00e-04
+  [E2 S1000] total=0.6584 rank=0.6584 hinge=0.0000 rank_acc=0.9049 cos_sim=0.0638 text_r=0.0000 E_gap=0.2651 lr=3.00e-04
+  [E2 S1050] total=0.6572 rank=0.6572 hinge=0.0000 rank_acc=0.9052 cos_sim=0.0617 text_r=0.0000 E_gap=0.2659 lr=3.00e-04
+  [E2 S1100] total=0.6563 rank=0.6563 hinge=0.0000 rank_acc=0.9054 cos_sim=0.0621 text_r=0.0000 E_gap=0.2651 lr=3.00e-04
+  [E2 S1150] total=0.6552 rank=0.6552 hinge=0.0000 rank_acc=0.9057 cos_sim=0.0613 text_r=0.0000 E_gap=0.2658 lr=3.00e-04
+  [E2 S1200] total=0.6543 rank=0.6542 hinge=0.0000 rank_acc=0.9058 cos_sim=0.0600 text_r=0.0000 E_gap=0.2660 lr=3.00e-04
+  [E2 S1250] total=0.6538 rank=0.6538 hinge=0.0000 rank_acc=0.9058 cos_sim=0.0585 text_r=0.0000 E_gap=0.2663 lr=3.00e-04
+  [E2 S1300] total=0.6544 rank=0.6544 hinge=0.0000 rank_acc=0.9058 cos_sim=0.0569 text_r=0.0000 E_gap=0.2671 lr=3.00e-04
+  [E2 S1350] total=0.6546 rank=0.6546 hinge=0.0000 rank_acc=0.9060 cos_sim=0.0557 text_r=0.0000 E_gap=0.2673 lr=3.00e-04
+  [E2 S1400] total=0.6556 rank=0.6556 hinge=0.0000 rank_acc=0.9058 cos_sim=0.0550 text_r=0.0000 E_gap=0.2673 lr=3.00e-04
+  [E2 S1450] total=0.6549 rank=0.6549 hinge=0.0000 rank_acc=0.9060 cos_sim=0.0531 text_r=0.0000 E_gap=0.2676 lr=3.00e-04
+  [E2 S1500] total=0.6542 rank=0.6542 hinge=0.0000 rank_acc=0.9062 cos_sim=0.0516 text_r=0.0000 E_gap=0.2677 lr=3.00e-04
+  [E2 S1550] total=0.6519 rank=0.6519 hinge=0.0000 rank_acc=0.9065 cos_sim=0.0519 text_r=0.0000 E_gap=0.2684 lr=3.00e-04
+  [E2 S1600] total=0.6523 rank=0.6523 hinge=0.0000 rank_acc=0.9064 cos_sim=0.0531 text_r=0.0000 E_gap=0.2685 lr=3.00e-04
+  [E2 S1650] total=0.6506 rank=0.6506 hinge=0.0000 rank_acc=0.9066 cos_sim=0.0544 text_r=0.0000 E_gap=0.2689 lr=3.00e-04
+  [E2 S1700] total=0.6497 rank=0.6497 hinge=0.0000 rank_acc=0.9069 cos_sim=0.0555 text_r=0.0000 E_gap=0.2697 lr=3.00e-04
+  [E2 S1750] total=0.6479 rank=0.6479 hinge=0.0000 rank_acc=0.9070 cos_sim=0.0561 text_r=0.0000 E_gap=0.2703 lr=3.00e-04
+  [E2 S1800] total=0.6483 rank=0.6483 hinge=0.0000 rank_acc=0.9069 cos_sim=0.0559 text_r=0.0000 E_gap=0.2701 lr=3.00e-04
+  [E2 S1850] total=0.6477 rank=0.6477 hinge=0.0000 rank_acc=0.9070 cos_sim=0.0558 text_r=0.0000 E_gap=0.2705 lr=3.00e-04
+  [E2 S1900] total=0.6463 rank=0.6463 hinge=0.0000 rank_acc=0.9072 cos_sim=0.0560 text_r=0.0000 E_gap=0.2707 lr=3.00e-04
+  [E2 S1950] total=0.6450 rank=0.6450 hinge=0.0000 rank_acc=0.9074 cos_sim=0.0563 text_r=0.0000 E_gap=0.2710 lr=3.00e-04
+  [E2 S2000] total=0.6441 rank=0.6441 hinge=0.0000 rank_acc=0.9074 cos_sim=0.0570 text_r=0.0000 E_gap=0.2712 lr=3.00e-04
+  [E2 S2050] total=0.6433 rank=0.6433 hinge=0.0000 rank_acc=0.9076 cos_sim=0.0579 text_r=0.0000 E_gap=0.2716 lr=3.00e-04
+  [E2 S2100] total=0.6421 rank=0.6421 hinge=0.0000 rank_acc=0.9079 cos_sim=0.0586 text_r=0.0000 E_gap=0.2722 lr=3.00e-04
+  [E2 S2150] total=0.6413 rank=0.6413 hinge=0.0000 rank_acc=0.9079 cos_sim=0.0595 text_r=0.0000 E_gap=0.2725 lr=3.00e-04
+  [E2 S2200] total=0.6408 rank=0.6407 hinge=0.0000 rank_acc=0.9080 cos_sim=0.0601 text_r=0.0000 E_gap=0.2726 lr=3.00e-04
+  [E2 S2250] total=0.6387 rank=0.6387 hinge=0.0000 rank_acc=0.9084 cos_sim=0.0595 text_r=0.0000 E_gap=0.2734 lr=3.00e-04
+  [E2 S2300] total=0.6389 rank=0.6388 hinge=0.0000 rank_acc=0.9083 cos_sim=0.0593 text_r=0.0000 E_gap=0.2734 lr=3.00e-04
+  [E2 S2350] total=0.6373 rank=0.6373 hinge=0.0000 rank_acc=0.9085 cos_sim=0.0594 text_r=0.0000 E_gap=0.2738 lr=3.00e-04
+  [E2 S2400] total=0.6359 rank=0.6358 hinge=0.0000 rank_acc=0.9087 cos_sim=0.0605 text_r=0.0000 E_gap=0.2746 lr=3.00e-04
+  [E2 S2450] total=0.6359 rank=0.6359 hinge=0.0000 rank_acc=0.9087 cos_sim=0.0621 text_r=0.0000 E_gap=0.2745 lr=3.00e-04
+  [E2 S2500] total=0.6352 rank=0.6352 hinge=0.0000 rank_acc=0.9088 cos_sim=0.0634 text_r=0.0000 E_gap=0.2748 lr=3.00e-04
+^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~^[[21~  [E2 S2550] total=0.6343 rank=0.6342 hinge=0.0000 rank_acc=0.9089 cos_sim=0.0650 text_r=0.0000 E_gap=0.2752 lr=3.00e-04
+  [E2 S2600] total=0.6339 rank=0.6339 hinge=0.0000 rank_acc=0.9090 cos_sim=0.0664 text_r=0.0000 E_gap=0.2757 lr=3.00e-04
+  [E2 S2650] total=0.6331 rank=0.6331 hinge=0.0000 rank_acc=0.9091 cos_sim=0.0676 text_r=0.0000 E_gap=0.2759 lr=3.00e-04
+  [E2 S2700] total=0.6335 rank=0.6335 hinge=0.0000 rank_acc=0.9090 cos_sim=0.0680 text_r=0.0000 E_gap=0.2762 lr=3.00e-04
+  [E2 S2750] total=0.6322 rank=0.6322 hinge=0.0000 rank_acc=0.9092 cos_sim=0.0687 text_r=0.0000 E_gap=0.2767 lr=3.00e-04
+  [E2 S2800] total=0.6318 rank=0.6317 hinge=0.0000 rank_acc=0.9093 cos_sim=0.0697 text_r=0.0000 E_gap=0.2769 lr=3.00e-04
+  [E2 S2850] total=0.6303 rank=0.6303 hinge=0.0000 rank_acc=0.9094 cos_sim=0.0708 text_r=0.0000 E_gap=0.2777 lr=3.00e-04
+  [E2 S2900] total=0.6294 rank=0.6294 hinge=0.0001 rank_acc=0.9096 cos_sim=0.0716 text_r=0.0000 E_gap=0.2784 lr=3.00e-04
+  [E2 S2950] total=0.6292 rank=0.6292 hinge=0.0001 rank_acc=0.9096 cos_sim=0.0731 text_r=0.0000 E_gap=0.2786 lr=3.00e-04
+  [E2 S3000] total=0.6280 rank=0.6280 hinge=0.0001 rank_acc=0.9098 cos_sim=0.0737 text_r=0.0000 E_gap=0.2791 lr=3.00e-04
+  [E2 S3050] total=0.6283 rank=0.6282 hinge=0.0001 rank_acc=0.9098 cos_sim=0.0749 text_r=0.0000 E_gap=0.2794 lr=3.00e-04
+  [E2 S3100] total=0.6275 rank=0.6275 hinge=0.0001 rank_acc=0.9099 cos_sim=0.0760 text_r=0.0000 E_gap=0.2797 lr=3.00e-04
+  [E2 S3150] total=0.6269 rank=0.6269 hinge=0.0001 rank_acc=0.9100 cos_sim=0.0769 text_r=0.0000 E_gap=0.2799 lr=3.00e-04
+  [E2 S3200] total=0.6266 rank=0.6265 hinge=0.0001 rank_acc=0.9101 cos_sim=0.0775 text_r=0.0000 E_gap=0.2802 lr=3.00e-04
+  [E2 S3250] total=0.6264 rank=0.6264 hinge=0.0001 rank_acc=0.9101 cos_sim=0.0787 text_r=0.0000 E_gap=0.2802 lr=3.00e-04
+  [E2 S3300] total=0.6258 rank=0.6257 hinge=0.0001 rank_acc=0.9102 cos_sim=0.0795 text_r=0.0000 E_gap=0.2803 lr=3.00e-04
+  [E2 S3350] total=0.6253 rank=0.6253 hinge=0.0001 rank_acc=0.9103 cos_sim=0.0807 text_r=0.0000 E_gap=0.2806 lr=3.00e-04
+  [E2 S3400] total=0.6256 rank=0.6255 hinge=0.0001 rank_acc=0.9103 cos_sim=0.0804 text_r=0.0000 E_gap=0.2805 lr=3.00e-04
+  [E2 S3450] total=0.6247 rank=0.6246 hinge=0.0001 rank_acc=0.9105 cos_sim=0.0800 text_r=0.0000 E_gap=0.2807 lr=3.00e-04
+  [E2 S3500] total=0.6244 rank=0.6243 hinge=0.0001 rank_acc=0.9105 cos_sim=0.0808 text_r=0.0000 E_gap=0.2808 lr=3.00e-04
+  [E2 S3550] total=0.6238 rank=0.6237 hinge=0.0001 rank_acc=0.9107 cos_sim=0.0815 text_r=0.0000 E_gap=0.2810 lr=3.00e-04
+  [E2 S3600] total=0.6232 rank=0.6232 hinge=0.0001 rank_acc=0.9108 cos_sim=0.0819 text_r=0.0000 E_gap=0.2812 lr=3.00e-04
+  [E2 S3650] total=0.6228 rank=0.6227 hinge=0.0001 rank_acc=0.9108 cos_sim=0.0822 text_r=0.0000 E_gap=0.2816 lr=3.00e-04
+  [E2 S3700] total=0.6228 rank=0.6227 hinge=0.0001 rank_acc=0.9109 cos_sim=0.0833 text_r=0.0000 E_gap=0.2816 lr=3.00e-04
+  [E2 S3750] total=0.6226 rank=0.6226 hinge=0.0001 rank_acc=0.9110 cos_sim=0.0834 text_r=0.0000 E_gap=0.2817 lr=2.99e-04
+  [E2 S3800] total=0.6222 rank=0.6221 hinge=0.0001 rank_acc=0.9111 cos_sim=0.0851 text_r=0.0000 E_gap=0.2818 lr=2.99e-04
+  [E2 S3850] total=0.6224 rank=0.6224 hinge=0.0001 rank_acc=0.9110 cos_sim=0.0864 text_r=0.0000 E_gap=0.2817 lr=2.99e-04
+  [E2 S3900] total=0.6227 rank=0.6227 hinge=0.0001 rank_acc=0.9110 cos_sim=0.0879 text_r=0.0000 E_gap=0.2819 lr=2.99e-04
+  [E2 S3950] total=0.6228 rank=0.6228 hinge=0.0001 rank_acc=0.9110 cos_sim=0.0892 text_r=0.0000 E_gap=0.2819 lr=2.99e-04
+  [E2 S4000] total=0.6220 rank=0.6219 hinge=0.0001 rank_acc=0.9111 cos_sim=0.0902 text_r=0.0000 E_gap=0.2820 lr=2.99e-04
+  [E2 S4050] total=0.6214 rank=0.6213 hinge=0.0001 rank_acc=0.9112 cos_sim=0.0913 text_r=0.0000 E_gap=0.2823 lr=2.99e-04
+  [E2 S4100] total=0.6208 rank=0.6207 hinge=0.0001 rank_acc=0.9112 cos_sim=0.0922 text_r=0.0000 E_gap=0.2825 lr=2.99e-04
+  [E2 S4150] total=0.6200 rank=0.6199 hinge=0.0001 rank_acc=0.9114 cos_sim=0.0931 text_r=0.0000 E_gap=0.2830 lr=2.99e-04
+  [E2 S4200] total=0.6193 rank=0.6192 hinge=0.0001 rank_acc=0.9115 cos_sim=0.0940 text_r=0.0000 E_gap=0.2835 lr=2.99e-04
+  [E2 S4250] total=0.6194 rank=0.6193 hinge=0.0001 rank_acc=0.9115 cos_sim=0.0955 text_r=0.0000 E_gap=0.2836 lr=2.99e-04
+  [E2 S4300] total=0.6187 rank=0.6186 hinge=0.0001 rank_acc=0.9116 cos_sim=0.0963 text_r=0.0000 E_gap=0.2842 lr=2.99e-04
+  [E2 S4350] total=0.6186 rank=0.6185 hinge=0.0001 rank_acc=0.9116 cos_sim=0.0973 text_r=0.0000 E_gap=0.2843 lr=2.99e-04
+  [E2 S4400] total=0.6189 rank=0.6189 hinge=0.0001 rank_acc=0.9116 cos_sim=0.0983 text_r=0.0000 E_gap=0.2845 lr=2.99e-04
+  [E2 S4450] total=0.6183 rank=0.6183 hinge=0.0001 rank_acc=0.9117 cos_sim=0.0994 text_r=0.0000 E_gap=0.2846 lr=2.99e-04
+  [E2 S4500] total=0.6175 rank=0.6175 hinge=0.0001 rank_acc=0.9118 cos_sim=0.1004 text_r=0.0000 E_gap=0.2849 lr=2.99e-04
+  [E2 S4550] total=0.6172 rank=0.6172 hinge=0.0001 rank_acc=0.9119 cos_sim=0.1007 text_r=0.0000 E_gap=0.2851 lr=2.99e-04
+  [E2 S4600] total=0.6167 rank=0.6166 hinge=0.0001 rank_acc=0.9119 cos_sim=0.1016 text_r=0.0000 E_gap=0.2856 lr=2.99e-04
+  [E2 S4650] total=0.6166 rank=0.6166 hinge=0.0001 rank_acc=0.9120 cos_sim=0.1030 text_r=0.0000 E_gap=0.2856 lr=2.99e-04
+  [E2 S4700] total=0.6159 rank=0.6158 hinge=0.0001 rank_acc=0.9122 cos_sim=0.1044 text_r=0.0000 E_gap=0.2859 lr=2.99e-04
+  [E2 S4750] total=0.6149 rank=0.6149 hinge=0.0001 rank_acc=0.9123 cos_sim=0.1056 text_r=0.0000 E_gap=0.2866 lr=2.99e-04
+  [E2 S4800] total=0.6145 rank=0.6145 hinge=0.0001 rank_acc=0.9124 cos_sim=0.1065 text_r=0.0000 E_gap=0.2870 lr=2.99e-04
+  [E2 S4850] total=0.6140 rank=0.6139 hinge=0.0001 rank_acc=0.9125 cos_sim=0.1075 text_r=0.0000 E_gap=0.2875 lr=2.99e-04
+  [E2 S4900] total=0.6135 rank=0.6134 hinge=0.0001 rank_acc=0.9126 cos_sim=0.1081 text_r=0.0000 E_gap=0.2877 lr=2.99e-04
+  [E2 S4950] total=0.6126 rank=0.6125 hinge=0.0001 rank_acc=0.9127 cos_sim=0.1086 text_r=0.0000 E_gap=0.2882 lr=2.99e-04
+  [E2 S5000] total=0.6125 rank=0.6124 hinge=0.0001 rank_acc=0.9128 cos_sim=0.1093 text_r=0.0000 E_gap=0.2883 lr=2.99e-04
+  [E2 S5050] total=0.6116 rank=0.6115 hinge=0.0001 rank_acc=0.9130 cos_sim=0.1095 text_r=0.0000 E_gap=0.2887 lr=2.99e-04
+
+  Epoch 2 train (316.7s):
+    E_neg_mean: 0.1661
+    E_pos_mean: -0.1228
+    E_predicted_mean: 10.8542
+    E_target_mean: -0.1228
+    advantage_mean: 0.0000
+    advantage_std: 0.0000
+    contrastive_loss: 0.6113
+    cos_sim_max: 0.2361
+    cos_sim_mean: 0.1096
+    cos_sim_min: -0.0161
+    decode_success_rate: 0.0000
+    energy_gap: 0.2889
+    loss_hinge: 0.0001
+    loss_rank: 0.6113
+    rank_acc: 0.9130
+    reinforce_loss: 0.0000
+    reward_baseline: 0.0000
+    reward_cos_mean: 0.1091
+    roundtrip_cos_mean: 0.0000
+    text_reward_mean: 0.0000
+    text_reward_std: 0.0000
+    total_loss: 0.6113
+  Epoch 2 val:
+    val_E_neg_mean: 0.1469
+    val_E_pos_mean: -0.1769
+    val_cos_sim_max: 0.2584
+    val_cos_sim_mean: 0.1096
+    val_cos_sim_min: -0.0257
+    val_energy_gap: 0.3237
+    val_rank_acc: 0.9209
+  [E3 S50] total=0.4973 rank=0.4973 hinge=0.0000 rank_acc=0.9321 cos_sim=0.0877 text_r=0.0000 E_gap=0.3784 lr=2.99e-04
+  [E3 S100] total=0.5046 rank=0.5046 hinge=0.0000 rank_acc=0.9295 cos_sim=0.1007 text_r=0.0000 E_gap=0.3683 lr=2.99e-04
+  [E3 S150] total=0.5215 rank=0.5215 hinge=0.0000 rank_acc=0.9268 cos_sim=0.1170 text_r=0.0000 E_gap=0.3463 lr=2.99e-04
+  [E3 S200] total=0.5173 rank=0.5173 hinge=0.0000 rank_acc=0.9275 cos_sim=0.1198 text_r=0.0000 E_gap=0.3525 lr=2.99e-04
+  [E3 S250] total=0.5256 rank=0.5256 hinge=0.0000 rank_acc=0.9266 cos_sim=0.1250 text_r=0.0000 E_gap=0.3431 lr=2.99e-04
+  [E3 S300] total=0.5275 rank=0.5275 hinge=0.0000 rank_acc=0.9251 cos_sim=0.1284 text_r=0.0000 E_gap=0.3376 lr=2.99e-04
+  [E3 S350] total=0.5286 rank=0.5286 hinge=0.0000 rank_acc=0.9246 cos_sim=0.1322 text_r=0.0000 E_gap=0.3368 lr=2.99e-04
+  [E3 S400] total=0.5273 rank=0.5273 hinge=0.0000 rank_acc=0.9249 cos_sim=0.1390 text_r=0.0000 E_gap=0.3361 lr=2.99e-04
+  [E3 S450] total=0.5250 rank=0.5250 hinge=0.0000 rank_acc=0.9259 cos_sim=0.1449 text_r=0.0000 E_gap=0.3398 lr=2.99e-04
+  [E3 S500] total=0.5260 rank=0.5260 hinge=0.0000 rank_acc=0.9257 cos_sim=0.1490 text_r=0.0000 E_gap=0.3398 lr=2.99e-04
+  [E3 S550] total=0.5259 rank=0.5258 hinge=0.0002 rank_acc=0.9258 cos_sim=0.1533 text_r=0.0000 E_gap=0.3383 lr=2.99e-04
+  [E3 S600] total=0.5274 rank=0.5273 hinge=0.0001 rank_acc=0.9255 cos_sim=0.1558 text_r=0.0000 E_gap=0.3372 lr=2.99e-04
+  [E3 S650] total=0.5289 rank=0.5288 hinge=0.0001 rank_acc=0.9255 cos_sim=0.1586 text_r=0.0000 E_gap=0.3371 lr=2.99e-04
+  [E3 S700] total=0.5303 rank=0.5303 hinge=0.0001 rank_acc=0.9251 cos_sim=0.1602 text_r=0.0000 E_gap=0.3364 lr=2.99e-04
+  [E3 S750] total=0.5327 rank=0.5326 hinge=0.0001 rank_acc=0.9248 cos_sim=0.1613 text_r=0.0000 E_gap=0.3356 lr=2.99e-04
+  [E3 S800] total=0.5332 rank=0.5331 hinge=0.0001 rank_acc=0.9247 cos_sim=0.1624 text_r=0.0000 E_gap=0.3363 lr=2.99e-04
+  [E3 S850] total=0.5310 rank=0.5310 hinge=0.0001 rank_acc=0.9251 cos_sim=0.1629 text_r=0.0000 E_gap=0.3376 lr=2.99e-04
+  [E3 S900] total=0.5310 rank=0.5309 hinge=0.0002 rank_acc=0.9249 cos_sim=0.1622 text_r=0.0000 E_gap=0.3380 lr=2.99e-04
+  [E3 S950] total=0.5295 rank=0.5294 hinge=0.0002 rank_acc=0.9251 cos_sim=0.1609 text_r=0.0000 E_gap=0.3383 lr=2.99e-04
+  [E3 S1000] total=0.5291 rank=0.5290 hinge=0.0002 rank_acc=0.9252 cos_sim=0.1602 text_r=0.0000 E_gap=0.3377 lr=2.99e-04
+  [E3 S1050] total=0.5278 rank=0.5277 hinge=0.0002 rank_acc=0.9253 cos_sim=0.1581 text_r=0.0000 E_gap=0.3399 lr=2.99e-04
+  [E3 S1100] total=0.5249 rank=0.5248 hinge=0.0002 rank_acc=0.9259 cos_sim=0.1567 text_r=0.0000 E_gap=0.3399 lr=2.99e-04
+  [E3 S1150] total=0.5253 rank=0.5252 hinge=0.0002 rank_acc=0.9259 cos_sim=0.1555 text_r=0.0000 E_gap=0.3391 lr=2.99e-04
+  [E3 S1200] total=0.5233 rank=0.5232 hinge=0.0002 rank_acc=0.9262 cos_sim=0.1551 text_r=0.0000 E_gap=0.3396 lr=2.99e-04
+  [E3 S1250] total=0.5233 rank=0.5232 hinge=0.0002 rank_acc=0.9263 cos_sim=0.1538 text_r=0.0000 E_gap=0.3395 lr=2.99e-04
+  [E3 S1300] total=0.5251 rank=0.5251 hinge=0.0002 rank_acc=0.9259 cos_sim=0.1533 text_r=0.0000 E_gap=0.3393 lr=2.99e-04
+  [E3 S1350] total=0.5270 rank=0.5269 hinge=0.0002 rank_acc=0.9257 cos_sim=0.1530 text_r=0.0000 E_gap=0.3386 lr=2.98e-04
+  [E3 S1400] total=0.5271 rank=0.5270 hinge=0.0002 rank_acc=0.9256 cos_sim=0.1518 text_r=0.0000 E_gap=0.3382 lr=2.98e-04
+  [E3 S1450] total=0.5262 rank=0.5261 hinge=0.0002 rank_acc=0.9258 cos_sim=0.1501 text_r=0.0000 E_gap=0.3391 lr=2.98e-04
+  [E3 S1500] total=0.5233 rank=0.5233 hinge=0.0002 rank_acc=0.9262 cos_sim=0.1483 text_r=0.0000 E_gap=0.3402 lr=2.98e-04
+  [E3 S1550] total=0.5251 rank=0.5251 hinge=0.0002 rank_acc=0.9259 cos_sim=0.1467 text_r=0.0000 E_gap=0.3400 lr=2.98e-04
+  [E3 S1600] total=0.5234 rank=0.5233 hinge=0.0001 rank_acc=0.9262 cos_sim=0.1452 text_r=0.0000 E_gap=0.3416 lr=2.98e-04
+  [E3 S1650] total=0.5251 rank=0.5250 hinge=0.0001 rank_acc=0.9258 cos_sim=0.1453 text_r=0.0000 E_gap=0.3419 lr=2.98e-04
+  [E3 S1700] total=0.5252 rank=0.5251 hinge=0.0001 rank_acc=0.9258 cos_sim=0.1448 text_r=0.0000 E_gap=0.3431 lr=2.98e-04
+  [E3 S1750] total=0.5225 rank=0.5224 hinge=0.0001 rank_acc=0.9261 cos_sim=0.1435 text_r=0.0000 E_gap=0.3450 lr=2.98e-04
+  [E3 S1800] total=0.5206 rank=0.5205 hinge=0.0001 rank_acc=0.9264 cos_sim=0.1429 text_r=0.0000 E_gap=0.3456 lr=2.98e-04
+  [E3 S1850] total=0.5198 rank=0.5197 hinge=0.0001 rank_acc=0.9267 cos_sim=0.1438 text_r=0.0000 E_gap=0.3461 lr=2.98e-04
+  [E3 S1900] total=0.5205 rank=0.5204 hinge=0.0001 rank_acc=0.9265 cos_sim=0.1453 text_r=0.0000 E_gap=0.3459 lr=2.98e-04
+  [E3 S1950] total=0.5201 rank=0.5200 hinge=0.0001 rank_acc=0.9265 cos_sim=0.1461 text_r=0.0000 E_gap=0.3467 lr=2.98e-04
+  [E3 S2000] total=0.5197 rank=0.5196 hinge=0.0001 rank_acc=0.9265 cos_sim=0.1464 text_r=0.0000 E_gap=0.3469 lr=2.98e-04
+  [E3 S2050] total=0.5193 rank=0.5192 hinge=0.0001 rank_acc=0.9267 cos_sim=0.1457 text_r=0.0000 E_gap=0.3472 lr=2.98e-04
+  [E3 S2100] total=0.5188 rank=0.5187 hinge=0.0001 rank_acc=0.9268 cos_sim=0.1452 text_r=0.0000 E_gap=0.3471 lr=2.98e-04
+  [E3 S2150] total=0.5172 rank=0.5172 hinge=0.0001 rank_acc=0.9270 cos_sim=0.1449 text_r=0.0000 E_gap=0.3481 lr=2.98e-04
+  [E3 S2200] total=0.5173 rank=0.5172 hinge=0.0001 rank_acc=0.9270 cos_sim=0.1447 text_r=0.0000 E_gap=0.3484 lr=2.98e-04
+  [E3 S2250] total=0.5170 rank=0.5170 hinge=0.0001 rank_acc=0.9270 cos_sim=0.1455 text_r=0.0000 E_gap=0.3484 lr=2.98e-04
+  [E3 S2300] total=0.5167 rank=0.5166 hinge=0.0001 rank_acc=0.9271 cos_sim=0.1459 text_r=0.0000 E_gap=0.3494 lr=2.98e-04
+  [E3 S2350] total=0.5163 rank=0.5163 hinge=0.0001 rank_acc=0.9270 cos_sim=0.1466 text_r=0.0000 E_gap=0.3493 lr=2.98e-04
+  [E3 S2400] total=0.5145 rank=0.5144 hinge=0.0001 rank_acc=0.9274 cos_sim=0.1468 text_r=0.0000 E_gap=0.3503 lr=2.98e-04
+  [E3 S2450] total=0.5128 rank=0.5127 hinge=0.0001 rank_acc=0.9276 cos_sim=0.1463 text_r=0.0000 E_gap=0.3514 lr=2.98e-04
+  [E3 S2500] total=0.5128 rank=0.5128 hinge=0.0001 rank_acc=0.9276 cos_sim=0.1458 text_r=0.0000 E_gap=0.3522 lr=2.98e-04
+  [E3 S2550] total=0.5125 rank=0.5124 hinge=0.0001 rank_acc=0.9277 cos_sim=0.1452 text_r=0.0000 E_gap=0.3531 lr=2.98e-04
+  [E3 S2600] total=0.5121 rank=0.5120 hinge=0.0001 rank_acc=0.9277 cos_sim=0.1448 text_r=0.0000 E_gap=0.3541 lr=2.98e-04
+  [E3 S2650] total=0.5123 rank=0.5122 hinge=0.0001 rank_acc=0.9277 cos_sim=0.1444 text_r=0.0000 E_gap=0.3542 lr=2.98e-04
+  [E3 S2700] total=0.5123 rank=0.5122 hinge=0.0001 rank_acc=0.9277 cos_sim=0.1440 text_r=0.0000 E_gap=0.3543 lr=2.98e-04
+  [E3 S2750] total=0.5119 rank=0.5118 hinge=0.0001 rank_acc=0.9278 cos_sim=0.1434 text_r=0.0000 E_gap=0.3548 lr=2.98e-04
+  [E3 S2800] total=0.5110 rank=0.5110 hinge=0.0001 rank_acc=0.9278 cos_sim=0.1434 text_r=0.0000 E_gap=0.3552 lr=2.98e-04
+  [E3 S2850] total=0.5108 rank=0.5107 hinge=0.0001 rank_acc=0.9278 cos_sim=0.1432 text_r=0.0000 E_gap=0.3557 lr=2.98e-04
+  [E3 S2900] total=0.5098 rank=0.5098 hinge=0.0001 rank_acc=0.9280 cos_sim=0.1433 text_r=0.0000 E_gap=0.3562 lr=2.98e-04
+  [E3 S2950] total=0.5091 rank=0.5090 hinge=0.0001 rank_acc=0.9282 cos_sim=0.1433 text_r=0.0000 E_gap=0.3568 lr=2.98e-04
+  [E3 S3000] total=0.5090 rank=0.5089 hinge=0.0001 rank_acc=0.9282 cos_sim=0.1433 text_r=0.0000 E_gap=0.3567 lr=2.98e-04
+  [E3 S3050] total=0.5081 rank=0.5081 hinge=0.0001 rank_acc=0.9283 cos_sim=0.1427 text_r=0.0000 E_gap=0.3575 lr=2.98e-04
+  [E3 S3100] total=0.5071 rank=0.5071 hinge=0.0001 rank_acc=0.9284 cos_sim=0.1423 text_r=0.0000 E_gap=0.3581 lr=2.98e-04
+  [E3 S3150] total=0.5063 rank=0.5062 hinge=0.0001 rank_acc=0.9285 cos_sim=0.1419 text_r=0.0000 E_gap=0.3592 lr=2.98e-04
+  [E3 S3200] total=0.5055 rank=0.5054 hinge=0.0001 rank_acc=0.9286 cos_sim=0.1418 text_r=0.0000 E_gap=0.3599 lr=2.98e-04
+  [E3 S3250] total=0.5051 rank=0.5050 hinge=0.0001 rank_acc=0.9287 cos_sim=0.1425 text_r=0.0000 E_gap=0.3603 lr=2.97e-04
+  [E3 S3300] total=0.5043 rank=0.5043 hinge=0.0001 rank_acc=0.9288 cos_sim=0.1432 text_r=0.0000 E_gap=0.3603 lr=2.97e-04
+  [E3 S3350] total=0.5042 rank=0.5042 hinge=0.0001 rank_acc=0.9289 cos_sim=0.1439 text_r=0.0000 E_gap=0.3604 lr=2.97e-04
+  [E3 S3400] total=0.5037 rank=0.5036 hinge=0.0001 rank_acc=0.9289 cos_sim=0.1446 text_r=0.0000 E_gap=0.3607 lr=2.97e-04
+  [E3 S3450] total=0.5035 rank=0.5035 hinge=0.0001 rank_acc=0.9290 cos_sim=0.1453 text_r=0.0000 E_gap=0.3605 lr=2.97e-04
+  [E3 S3500] total=0.5036 rank=0.5036 hinge=0.0001 rank_acc=0.9289 cos_sim=0.1457 text_r=0.0000 E_gap=0.3606 lr=2.97e-04
+  [E3 S3550] total=0.5038 rank=0.5037 hinge=0.0001 rank_acc=0.9289 cos_sim=0.1464 text_r=0.0000 E_gap=0.3604 lr=2.97e-04
+  [E3 S3600] total=0.5035 rank=0.5035 hinge=0.0001 rank_acc=0.9289 cos_sim=0.1470 text_r=0.0000 E_gap=0.3604 lr=2.97e-04
+  [E3 S3650] total=0.5029 rank=0.5029 hinge=0.0001 rank_acc=0.9291 cos_sim=0.1476 text_r=0.0000 E_gap=0.3607 lr=2.97e-04
+  [E3 S3700] total=0.5029 rank=0.5028 hinge=0.0001 rank_acc=0.9290 cos_sim=0.1483 text_r=0.0000 E_gap=0.3605 lr=2.97e-04
+  [E3 S3750] total=0.5020 rank=0.5020 hinge=0.0001 rank_acc=0.9292 cos_sim=0.1488 text_r=0.0000 E_gap=0.3609 lr=2.97e-04
+  [E3 S3800] total=0.5008 rank=0.5007 hinge=0.0001 rank_acc=0.9293 cos_sim=0.1488 text_r=0.0000 E_gap=0.3613 lr=2.97e-04
+  [E3 S3850] total=0.5010 rank=0.5010 hinge=0.0001 rank_acc=0.9293 cos_sim=0.1488 text_r=0.0000 E_gap=0.3615 lr=2.97e-04
+  [E3 S3900] total=0.5010 rank=0.5009 hinge=0.0001 rank_acc=0.9293 cos_sim=0.1492 text_r=0.0000 E_gap=0.3614 lr=2.97e-04
+  [E3 S3950] total=0.5006 rank=0.5005 hinge=0.0001 rank_acc=0.9293 cos_sim=0.1492 text_r=0.0000 E_gap=0.3613 lr=2.97e-04
+  [E3 S4000] total=0.5000 rank=0.5000 hinge=0.0001 rank_acc=0.9294 cos_sim=0.1493 text_r=0.0000 E_gap=0.3615 lr=2.97e-04
+  [E3 S4050] total=0.4997 rank=0.4996 hinge=0.0001 rank_acc=0.9294 cos_sim=0.1491 text_r=0.0000 E_gap=0.3618 lr=2.97e-04
+  [E3 S4100] total=0.4996 rank=0.4996 hinge=0.0001 rank_acc=0.9294 cos_sim=0.1492 text_r=0.0000 E_gap=0.3617 lr=2.97e-04
+  [E3 S4150] total=0.4994 rank=0.4994 hinge=0.0001 rank_acc=0.9294 cos_sim=0.1493 text_r=0.0000 E_gap=0.3617 lr=2.97e-04
+  [E3 S4200] total=0.4990 rank=0.4989 hinge=0.0001 rank_acc=0.9295 cos_sim=0.1492 text_r=0.0000 E_gap=0.3618 lr=2.97e-04
+  [E3 S4250] total=0.4988 rank=0.4987 hinge=0.0002 rank_acc=0.9296 cos_sim=0.1491 text_r=0.0000 E_gap=0.3617 lr=2.97e-04
+  [E3 S4300] total=0.4989 rank=0.4988 hinge=0.0002 rank_acc=0.9295 cos_sim=0.1492 text_r=0.0000 E_gap=0.3618 lr=2.97e-04
+  [E3 S4350] total=0.4981 rank=0.4981 hinge=0.0002 rank_acc=0.9296 cos_sim=0.1492 text_r=0.0000 E_gap=0.3619 lr=2.97e-04
+  [E3 S4400] total=0.4976 rank=0.4975 hinge=0.0002 rank_acc=0.9297 cos_sim=0.1490 text_r=0.0000 E_gap=0.3621 lr=2.97e-04
+  [E3 S4450] total=0.4970 rank=0.4970 hinge=0.0002 rank_acc=0.9299 cos_sim=0.1489 text_r=0.0000 E_gap=0.3622 lr=2.97e-04
+  [E3 S4500] total=0.4966 rank=0.4965 hinge=0.0002 rank_acc=0.9299 cos_sim=0.1491 text_r=0.0000 E_gap=0.3621 lr=2.97e-04
+  [E3 S4550] total=0.4960 rank=0.4959 hinge=0.0002 rank_acc=0.9300 cos_sim=0.1493 text_r=0.0000 E_gap=0.3623 lr=2.97e-04
+  [E3 S4600] total=0.4949 rank=0.4948 hinge=0.0002 rank_acc=0.9302 cos_sim=0.1493 text_r=0.0000 E_gap=0.3626 lr=2.97e-04
+  [E3 S4650] total=0.4941 rank=0.4940 hinge=0.0002 rank_acc=0.9303 cos_sim=0.1495 text_r=0.0000 E_gap=0.3630 lr=2.97e-04
+  [E3 S4700] total=0.4936 rank=0.4935 hinge=0.0002 rank_acc=0.9304 cos_sim=0.1495 text_r=0.0000 E_gap=0.3632 lr=2.97e-04
+  [E3 S4750] total=0.4933 rank=0.4932 hinge=0.0002 rank_acc=0.9305 cos_sim=0.1498 text_r=0.0000 E_gap=0.3633 lr=2.96e-04
+  [E3 S4800] total=0.4933 rank=0.4932 hinge=0.0002 rank_acc=0.9305 cos_sim=0.1499 text_r=0.0000 E_gap=0.3632 lr=2.96e-04
+  [E3 S4850] total=0.4931 rank=0.4930 hinge=0.0001 rank_acc=0.9305 cos_sim=0.1498 text_r=0.0000 E_gap=0.3636 lr=2.96e-04
+  [E3 S4900] total=0.4931 rank=0.4931 hinge=0.0002 rank_acc=0.9305 cos_sim=0.1498 text_r=0.0000 E_gap=0.3636 lr=2.96e-04
+  [E3 S4950] total=0.4921 rank=0.4920 hinge=0.0002 rank_acc=0.9307 cos_sim=0.1498 text_r=0.0000 E_gap=0.3639 lr=2.96e-04
+  [E3 S5000] total=0.4918 rank=0.4918 hinge=0.0001 rank_acc=0.9308 cos_sim=0.1497 text_r=0.0000 E_gap=0.3641 lr=2.96e-04
+  [E3 S5050] total=0.4916 rank=0.4916 hinge=0.0001 rank_acc=0.9308 cos_sim=0.1497 text_r=0.0000 E_gap=0.3643 lr=2.96e-04
+
+  Epoch 3 train (322.8s):
+    E_neg_mean: 0.1861
+    E_pos_mean: -0.1788
+    E_predicted_mean: 43.2886
+    E_target_mean: -0.1787
+    advantage_mean: 0.0000
+    advantage_std: 0.0000
+    contrastive_loss: 0.4910
+    cos_sim_max: 0.3098
+    cos_sim_mean: 0.1494
+    cos_sim_min: -0.0011
+    decode_success_rate: 0.0000
+    energy_gap: 0.3648
+    loss_hinge: 0.0001
+    loss_rank: 0.4910
+    rank_acc: 0.9309
+    reinforce_loss: 0.0000
+    reward_baseline: 0.0000
+    reward_cos_mean: 0.1523
+    roundtrip_cos_mean: 0.0000
+    text_reward_mean: 0.0000
+    text_reward_std: 0.0000
+    total_loss: 0.4910
+  Epoch 3 val:
+    val_E_neg_mean: 0.2870
+    val_E_pos_mean: -0.1419
+    val_cos_sim_max: 0.2237
+    val_cos_sim_mean: 0.1119
+    val_cos_sim_min: -0.0125
+    val_energy_gap: 0.4289
+    val_rank_acc: 0.9383
+  [E4 S50] total=0.4103 rank=0.4103 hinge=0.0000 rank_acc=0.9425 cos_sim=0.1299 text_r=0.0000 E_gap=0.4149 lr=2.96e-04
+  [E4 S100] total=0.4024 rank=0.4024 hinge=0.0000 rank_acc=0.9421 cos_sim=0.1315 text_r=0.0000 E_gap=0.4240 lr=2.96e-04
+  [E4 S150] total=0.4080 rank=0.4080 hinge=0.0000 rank_acc=0.9422 cos_sim=0.1287 text_r=0.0000 E_gap=0.4209 lr=2.96e-04
+  [E4 S200] total=0.3975 rank=0.3975 hinge=0.0000 rank_acc=0.9439 cos_sim=0.1240 text_r=0.0000 E_gap=0.4338 lr=2.96e-04
+  [E4 S250] total=0.3985 rank=0.3985 hinge=0.0000 rank_acc=0.9434 cos_sim=0.1225 text_r=0.0000 E_gap=0.4291 lr=2.96e-04
+  [E4 S300] total=0.3955 rank=0.3953 hinge=0.0006 rank_acc=0.9443 cos_sim=0.1203 text_r=0.0000 E_gap=0.4362 lr=2.96e-04
+  [E4 S350] total=0.3986 rank=0.3984 hinge=0.0005 rank_acc=0.9442 cos_sim=0.1198 text_r=0.0000 E_gap=0.4325 lr=2.96e-04
+  [E4 S400] total=0.4033 rank=0.4031 hinge=0.0004 rank_acc=0.9434 cos_sim=0.1204 text_r=0.0000 E_gap=0.4296 lr=2.96e-04
+  [E4 S450] total=0.4128 rank=0.4126 hinge=0.0004 rank_acc=0.9419 cos_sim=0.1224 text_r=0.0000 E_gap=0.4220 lr=2.96e-04
+  [E4 S500] total=0.4135 rank=0.4133 hinge=0.0003 rank_acc=0.9419 cos_sim=0.1228 text_r=0.0000 E_gap=0.4187 lr=2.96e-04
+  [E4 S550] total=0.4127 rank=0.4123 hinge=0.0009 rank_acc=0.9420 cos_sim=0.1228 text_r=0.0000 E_gap=0.4192 lr=2.96e-04
+  [E4 S600] total=0.4094 rank=0.4090 hinge=0.0009 rank_acc=0.9424 cos_sim=0.1215 text_r=0.0000 E_gap=0.4219 lr=2.96e-04
+  [E4 S650] total=0.4109 rank=0.4105 hinge=0.0008 rank_acc=0.9422 cos_sim=0.1207 text_r=0.0000 E_gap=0.4211 lr=2.96e-04
+  [E4 S700] total=0.4108 rank=0.4104 hinge=0.0007 rank_acc=0.9423 cos_sim=0.1214 text_r=0.0000 E_gap=0.4223 lr=2.96e-04
+  [E4 S750] total=0.4125 rank=0.4121 hinge=0.0007 rank_acc=0.9419 cos_sim=0.1211 text_r=0.0000 E_gap=0.4208 lr=2.96e-04
+  [E4 S800] total=0.4111 rank=0.4107 hinge=0.0007 rank_acc=0.9419 cos_sim=0.1206 text_r=0.0000 E_gap=0.4216 lr=2.96e-04
+  [E4 S850] total=0.4095 rank=0.4092 hinge=0.0006 rank_acc=0.9423 cos_sim=0.1201 text_r=0.0000 E_gap=0.4247 lr=2.96e-04
+  [E4 S900] total=0.4093 rank=0.4090 hinge=0.0006 rank_acc=0.9424 cos_sim=0.1200 text_r=0.0000 E_gap=0.4241 lr=2.96e-04
+  [E4 S950] total=0.4110 rank=0.4108 hinge=0.0005 rank_acc=0.9421 cos_sim=0.1209 text_r=0.0000 E_gap=0.4233 lr=2.96e-04
+  [E4 S1000] total=0.4125 rank=0.4123 hinge=0.0005 rank_acc=0.9416 cos_sim=0.1213 text_r=0.0000 E_gap=0.4219 lr=2.95e-04
+  [E4 S1050] total=0.4121 rank=0.4118 hinge=0.0005 rank_acc=0.9418 cos_sim=0.1211 text_r=0.0000 E_gap=0.4214 lr=2.95e-04
+  [E4 S1100] total=0.4104 rank=0.4102 hinge=0.0005 rank_acc=0.9422 cos_sim=0.1211 text_r=0.0000 E_gap=0.4228 lr=2.95e-04
+  [E4 S1150] total=0.4107 rank=0.4105 hinge=0.0005 rank_acc=0.9420 cos_sim=0.1214 text_r=0.0000 E_gap=0.4217 lr=2.95e-04
+  [E4 S1200] total=0.4096 rank=0.4094 hinge=0.0004 rank_acc=0.9423 cos_sim=0.1218 text_r=0.0000 E_gap=0.4229 lr=2.95e-04
+  [E4 S1250] total=0.4093 rank=0.4091 hinge=0.0004 rank_acc=0.9424 cos_sim=0.1212 text_r=0.0000 E_gap=0.4234 lr=2.95e-04
+  [E4 S1300] total=0.4089 rank=0.4087 hinge=0.0004 rank_acc=0.9425 cos_sim=0.1211 text_r=0.0000 E_gap=0.4237 lr=2.95e-04
+  [E4 S1350] total=0.4086 rank=0.4085 hinge=0.0004 rank_acc=0.9427 cos_sim=0.1213 text_r=0.0000 E_gap=0.4236 lr=2.95e-04
+  [E4 S1400] total=0.4093 rank=0.4091 hinge=0.0004 rank_acc=0.9426 cos_sim=0.1214 text_r=0.0000 E_gap=0.4219 lr=2.95e-04
+  [E4 S1450] total=0.4102 rank=0.4100 hinge=0.0004 rank_acc=0.9426 cos_sim=0.1214 text_r=0.0000 E_gap=0.4215 lr=2.95e-04
+  [E4 S1500] total=0.4112 rank=0.4110 hinge=0.0004 rank_acc=0.9424 cos_sim=0.1212 text_r=0.0000 E_gap=0.4203 lr=2.95e-04
+  [E4 S1550] total=0.4113 rank=0.4110 hinge=0.0004 rank_acc=0.9424 cos_sim=0.1213 text_r=0.0000 E_gap=0.4197 lr=2.95e-04
+  [E4 S1600] total=0.4110 rank=0.4108 hinge=0.0004 rank_acc=0.9424 cos_sim=0.1214 text_r=0.0000 E_gap=0.4200 lr=2.95e-04
+  [E4 S1650] total=0.4112 rank=0.4110 hinge=0.0004 rank_acc=0.9424 cos_sim=0.1213 text_r=0.0000 E_gap=0.4198 lr=2.95e-04
+  [E4 S1700] total=0.4121 rank=0.4119 hinge=0.0005 rank_acc=0.9423 cos_sim=0.1211 text_r=0.0000 E_gap=0.4198 lr=2.95e-04
+  [E4 S1750] total=0.4122 rank=0.4120 hinge=0.0005 rank_acc=0.9424 cos_sim=0.1210 text_r=0.0000 E_gap=0.4198 lr=2.95e-04
+  [E4 S1800] total=0.4123 rank=0.4121 hinge=0.0004 rank_acc=0.9422 cos_sim=0.1208 text_r=0.0000 E_gap=0.4195 lr=2.95e-04
+  [E4 S1850] total=0.4124 rank=0.4122 hinge=0.0004 rank_acc=0.9422 cos_sim=0.1207 text_r=0.0000 E_gap=0.4190 lr=2.95e-04
+  [E4 S1900] total=0.4281 rank=0.4131 hinge=0.0301 rank_acc=0.9420 cos_sim=0.1205 text_r=0.0000 E_gap=0.4188 lr=2.95e-04
+  [E4 S1950] total=0.4278 rank=0.4132 hinge=0.0293 rank_acc=0.9420 cos_sim=0.1202 text_r=0.0000 E_gap=0.4189 lr=2.95e-04
+  [E4 S2000] total=0.4272 rank=0.4129 hinge=0.0286 rank_acc=0.9420 cos_sim=0.1199 text_r=0.0000 E_gap=0.4192 lr=2.95e-04
+  [E4 S2050] total=0.4263 rank=0.4124 hinge=0.0279 rank_acc=0.9421 cos_sim=0.1199 text_r=0.0000 E_gap=0.4192 lr=2.95e-04
+  [E4 S2100] total=0.4261 rank=0.4125 hinge=0.0272 rank_acc=0.9420 cos_sim=0.1200 text_r=0.0000 E_gap=0.4195 lr=2.95e-04
+  [E4 S2150] total=0.4256 rank=0.4123 hinge=0.0266 rank_acc=0.9420 cos_sim=0.1200 text_r=0.0000 E_gap=0.4197 lr=2.94e-04
+  [E4 S2200] total=0.4250 rank=0.4120 hinge=0.0260 rank_acc=0.9420 cos_sim=0.1198 text_r=0.0000 E_gap=0.4200 lr=2.94e-04
+  [E4 S2250] total=0.4251 rank=0.4124 hinge=0.0254 rank_acc=0.9420 cos_sim=0.1197 text_r=0.0000 E_gap=0.4191 lr=2.94e-04
+  [E4 S2300] total=0.4259 rank=0.4135 hinge=0.0248 rank_acc=0.9419 cos_sim=0.1195 text_r=0.0000 E_gap=0.4184 lr=2.94e-04
+  [E4 S2350] total=0.4256 rank=0.4134 hinge=0.0243 rank_acc=0.9419 cos_sim=0.1193 text_r=0.0000 E_gap=0.4181 lr=2.94e-04
+  [E4 S2400] total=0.4249 rank=0.4130 hinge=0.0238 rank_acc=0.9419 cos_sim=0.1191 text_r=0.0000 E_gap=0.4181 lr=2.94e-04
+  [E4 S2450] total=0.4252 rank=0.4136 hinge=0.0233 rank_acc=0.9419 cos_sim=0.1190 text_r=0.0000 E_gap=0.4181 lr=2.94e-04
+  [E4 S2500] total=0.4252 rank=0.4132 hinge=0.0239 rank_acc=0.9420 cos_sim=0.1191 text_r=0.0000 E_gap=0.4185 lr=2.94e-04
+  [E4 S2550] total=0.4253 rank=0.4135 hinge=0.0234 rank_acc=0.9420 cos_sim=0.1188 text_r=0.0000 E_gap=0.4187 lr=2.94e-04
+  [E4 S2600] total=0.4253 rank=0.4138 hinge=0.0230 rank_acc=0.9419 cos_sim=0.1189 text_r=0.0000 E_gap=0.4186 lr=2.94e-04
+  [E4 S2650] total=0.4256 rank=0.4143 hinge=0.0226 rank_acc=0.9418 cos_sim=0.1187 text_r=0.0000 E_gap=0.4184 lr=2.94e-04
+  [E4 S2700] total=0.4254 rank=0.4143 hinge=0.0222 rank_acc=0.9417 cos_sim=0.1186 text_r=0.0000 E_gap=0.4179 lr=2.94e-04
+  [E4 S2750] total=0.4246 rank=0.4136 hinge=0.0218 rank_acc=0.9418 cos_sim=0.1189 text_r=0.0000 E_gap=0.4183 lr=2.94e-04
+  [E4 S2800] total=0.4252 rank=0.4144 hinge=0.0215 rank_acc=0.9416 cos_sim=0.1192 text_r=0.0000 E_gap=0.4178 lr=2.94e-04
+  [E4 S2850] total=0.4244 rank=0.4138 hinge=0.0211 rank_acc=0.9416 cos_sim=0.1193 text_r=0.0000 E_gap=0.4185 lr=2.94e-04
+  [E4 S2900] total=0.4240 rank=0.4136 hinge=0.0207 rank_acc=0.9416 cos_sim=0.1190 text_r=0.0000 E_gap=0.4188 lr=2.94e-04
+  [E4 S2950] total=0.4230 rank=0.4128 hinge=0.0204 rank_acc=0.9417 cos_sim=0.1186 text_r=0.0000 E_gap=0.4195 lr=2.94e-04
+  [E4 S3000] total=0.4224 rank=0.4124 hinge=0.0200 rank_acc=0.9418 cos_sim=0.1183 text_r=0.0000 E_gap=0.4202 lr=2.94e-04
+  [E4 S3050] total=0.4225 rank=0.4127 hinge=0.0197 rank_acc=0.9417 cos_sim=0.1181 text_r=0.0000 E_gap=0.4198 lr=2.94e-04
+  [E4 S3100] total=0.4225 rank=0.4128 hinge=0.0194 rank_acc=0.9417 cos_sim=0.1179 text_r=0.0000 E_gap=0.4194 lr=2.94e-04
+  [E4 S3150] total=0.4239 rank=0.4143 hinge=0.0191 rank_acc=0.9416 cos_sim=0.1176 text_r=0.0000 E_gap=0.4186 lr=2.94e-04
+  [E4 S3200] total=0.4231 rank=0.4137 hinge=0.0188 rank_acc=0.9417 cos_sim=0.1173 text_r=0.0000 E_gap=0.4190 lr=2.94e-04
+  [E4 S3250] total=0.4224 rank=0.4132 hinge=0.0185 rank_acc=0.9418 cos_sim=0.1168 text_r=0.0000 E_gap=0.4189 lr=2.93e-04
+  [E4 S3300] total=0.4216 rank=0.4125 hinge=0.0182 rank_acc=0.9419 cos_sim=0.1164 text_r=0.0000 E_gap=0.4192 lr=2.93e-04
+  [E4 S3350] total=0.4220 rank=0.4130 hinge=0.0180 rank_acc=0.9418 cos_sim=0.1160 text_r=0.0000 E_gap=0.4188 lr=2.93e-04
+  [E4 S3400] total=0.4219 rank=0.4130 hinge=0.0179 rank_acc=0.9418 cos_sim=0.1157 text_r=0.0000 E_gap=0.4185 lr=2.93e-04
+  [E4 S3450] total=0.4220 rank=0.4132 hinge=0.0176 rank_acc=0.9418 cos_sim=0.1155 text_r=0.0000 E_gap=0.4183 lr=2.93e-04
+  [E4 S3500] total=0.4216 rank=0.4129 hinge=0.0174 rank_acc=0.9418 cos_sim=0.1153 text_r=0.0000 E_gap=0.4182 lr=2.93e-04
+  [E4 S3550] total=0.4204 rank=0.4119 hinge=0.0171 rank_acc=0.9420 cos_sim=0.1150 text_r=0.0000 E_gap=0.4187 lr=2.93e-04
+  [E4 S3600] total=0.4200 rank=0.4116 hinge=0.0169 rank_acc=0.9421 cos_sim=0.1145 text_r=0.0000 E_gap=0.4190 lr=2.93e-04
+  [E4 S3650] total=0.4197 rank=0.4114 hinge=0.0166 rank_acc=0.9421 cos_sim=0.1140 text_r=0.0000 E_gap=0.4192 lr=2.93e-04
+  [E4 S3700] total=0.4193 rank=0.4110 hinge=0.0167 rank_acc=0.9422 cos_sim=0.1137 text_r=0.0000 E_gap=0.4193 lr=2.93e-04
+  [E4 S3750] total=0.4194 rank=0.4112 hinge=0.0165 rank_acc=0.9421 cos_sim=0.1133 text_r=0.0000 E_gap=0.4190 lr=2.93e-04
+  [E4 S3800] total=0.4191 rank=0.4110 hinge=0.0163 rank_acc=0.9422 cos_sim=0.1130 text_r=0.0000 E_gap=0.4187 lr=2.93e-04
+  [E4 S3850] total=0.4188 rank=0.4108 hinge=0.0161 rank_acc=0.9423 cos_sim=0.1132 text_r=0.0000 E_gap=0.4185 lr=2.93e-04
+  [E4 S3900] total=0.4190 rank=0.4111 hinge=0.0159 rank_acc=0.9422 cos_sim=0.1132 text_r=0.0000 E_gap=0.4182 lr=2.93e-04
+  [E4 S3950] total=0.4191 rank=0.4112 hinge=0.0158 rank_acc=0.9422 cos_sim=0.1132 text_r=0.0000 E_gap=0.4178 lr=2.93e-04
+  [E4 S4000] total=0.4188 rank=0.4110 hinge=0.0156 rank_acc=0.9422 cos_sim=0.1131 text_r=0.0000 E_gap=0.4179 lr=2.93e-04
+  [E4 S4050] total=0.4190 rank=0.4105 hinge=0.0170 rank_acc=0.9422 cos_sim=0.1129 text_r=0.0000 E_gap=0.4181 lr=2.93e-04
+  [E4 S4100] total=0.4186 rank=0.4102 hinge=0.0168 rank_acc=0.9422 cos_sim=0.1127 text_r=0.0000 E_gap=0.4184 lr=2.93e-04
+  [E4 S4150] total=0.4181 rank=0.4098 hinge=0.0166 rank_acc=0.9423 cos_sim=0.1124 text_r=0.0000 E_gap=0.4190 lr=2.93e-04
+  [E4 S4200] total=0.4182 rank=0.4100 hinge=0.0164 rank_acc=0.9422 cos_sim=0.1121 text_r=0.0000 E_gap=0.4189 lr=2.93e-04
+  [E4 S4250] total=0.4185 rank=0.4101 hinge=0.0168 rank_acc=0.9422 cos_sim=0.1118 text_r=0.0000 E_gap=0.4191 lr=2.92e-04
+  [E4 S4300] total=0.4182 rank=0.4099 hinge=0.0166 rank_acc=0.9422 cos_sim=0.1115 text_r=0.0000 E_gap=0.4193 lr=2.92e-04
+  [E4 S4350] total=0.4183 rank=0.4101 hinge=0.0164 rank_acc=0.9422 cos_sim=0.1112 text_r=0.0000 E_gap=0.4199 lr=2.92e-04
+  [E4 S4400] total=0.4180 rank=0.4099 hinge=0.0162 rank_acc=0.9423 cos_sim=0.1110 text_r=0.0000 E_gap=0.4205 lr=2.92e-04
+  [E4 S4450] total=0.4176 rank=0.4096 hinge=0.0160 rank_acc=0.9423 cos_sim=0.1108 text_r=0.0000 E_gap=0.4206 lr=2.92e-04
+  [E4 S4500] total=0.4174 rank=0.4095 hinge=0.0159 rank_acc=0.9423 cos_sim=0.1106 text_r=0.0000 E_gap=0.4209 lr=2.92e-04
+  [E4 S4550] total=0.4173 rank=0.4095 hinge=0.0157 rank_acc=0.9424 cos_sim=0.1104 text_r=0.0000 E_gap=0.4208 lr=2.92e-04
+  [E4 S4600] total=0.4169 rank=0.4091 hinge=0.0155 rank_acc=0.9424 cos_sim=0.1103 text_r=0.0000 E_gap=0.4207 lr=2.92e-04
+  [E4 S4650] total=0.4170 rank=0.4093 hinge=0.0153 rank_acc=0.9424 cos_sim=0.1103 text_r=0.0000 E_gap=0.4206 lr=2.92e-04
+  [E4 S4700] total=0.4168 rank=0.4092 hinge=0.0152 rank_acc=0.9424 cos_sim=0.1103 text_r=0.0000 E_gap=0.4205 lr=2.92e-04
+  [E4 S4750] total=0.4163 rank=0.4088 hinge=0.0150 rank_acc=0.9424 cos_sim=0.1102 text_r=0.0000 E_gap=0.4211 lr=2.92e-04
+  [E4 S4800] total=0.4163 rank=0.4088 hinge=0.0149 rank_acc=0.9424 cos_sim=0.1101 text_r=0.0000 E_gap=0.4210 lr=2.92e-04
+  [E4 S4850] total=0.4161 rank=0.4087 hinge=0.0147 rank_acc=0.9425 cos_sim=0.1101 text_r=0.0000 E_gap=0.4212 lr=2.92e-04
+  [E4 S4900] total=0.4157 rank=0.4084 hinge=0.0146 rank_acc=0.9425 cos_sim=0.1101 text_r=0.0000 E_gap=0.4210 lr=2.92e-04
+  [E4 S4950] total=0.4153 rank=0.4081 hinge=0.0144 rank_acc=0.9426 cos_sim=0.1098 text_r=0.0000 E_gap=0.4212 lr=2.92e-04
+  [E4 S5000] total=0.4148 rank=0.4077 hinge=0.0143 rank_acc=0.9426 cos_sim=0.1096 text_r=0.0000 E_gap=0.4215 lr=2.92e-04
+  [E4 S5050] total=0.4145 rank=0.4074 hinge=0.0142 rank_acc=0.9427 cos_sim=0.1094 text_r=0.0000 E_gap=0.4218 lr=2.92e-04
+
+  Epoch 4 train (329.9s):
+    E_neg_mean: 0.2814
+    E_pos_mean: -0.1405
+    E_predicted_mean: 32.1226
+    E_target_mean: -0.1405
+    advantage_mean: 0.0000
+    advantage_std: 0.0000
+    contrastive_loss: 0.4071
+    cos_sim_max: 0.2125
+    cos_sim_mean: 0.1094
+    cos_sim_min: -0.0057
+    decode_success_rate: 0.0000
+    energy_gap: 0.4219
+    loss_hinge: 0.0141
+    loss_rank: 0.4071
+    rank_acc: 0.9427
+    reinforce_loss: 0.0000
+    reward_baseline: 0.0000
+    reward_cos_mean: 0.1098
+    roundtrip_cos_mean: 0.0000
+    text_reward_mean: 0.0000
+    text_reward_std: 0.0000
+    total_loss: 0.4141
+  Epoch 4 val:
+    val_E_neg_mean: 0.3196
+    val_E_pos_mean: -0.1326
+    val_cos_sim_max: 0.2056
+    val_cos_sim_mean: 0.0939
+    val_cos_sim_min: -0.0264
+    val_energy_gap: 0.4521
+    val_rank_acc: 0.9423
+  [E5 S50] total=0.3250 rank=0.3250 hinge=0.0000 rank_acc=0.9550 cos_sim=0.0874 text_r=0.0000 E_gap=0.5066 lr=2.92e-04
+  [E5 S100] total=0.3420 rank=0.3420 hinge=0.0000 rank_acc=0.9514 cos_sim=0.0940 text_r=0.0000 E_gap=0.4881 lr=2.91e-04
+  [E5 S150] total=0.3411 rank=0.3411 hinge=0.0000 rank_acc=0.9523 cos_sim=0.0926 text_r=0.0000 E_gap=0.4813 lr=2.91e-04
+  [E5 S200] total=0.3497 rank=0.3497 hinge=0.0000 rank_acc=0.9506 cos_sim=0.0887 text_r=0.0000 E_gap=0.4761 lr=2.91e-04
+  [E5 S250] total=0.3582 rank=0.3580 hinge=0.0004 rank_acc=0.9499 cos_sim=0.0878 text_r=0.0000 E_gap=0.4691 lr=2.91e-04
+  [E5 S300] total=0.3628 rank=0.3627 hinge=0.0003 rank_acc=0.9496 cos_sim=0.0908 text_r=0.0000 E_gap=0.4657 lr=2.91e-04
+  [E5 S350] total=0.3595 rank=0.3593 hinge=0.0003 rank_acc=0.9505 cos_sim=0.0940 text_r=0.0000 E_gap=0.4643 lr=2.91e-04
+  [E5 S400] total=0.3749 rank=0.3586 hinge=0.0326 rank_acc=0.9506 cos_sim=0.0970 text_r=0.0000 E_gap=0.4638 lr=2.91e-04
+  [E5 S450] total=0.3766 rank=0.3622 hinge=0.0290 rank_acc=0.9497 cos_sim=0.0980 text_r=0.0000 E_gap=0.4572 lr=2.91e-04
+  [E5 S500] total=0.3974 rank=0.3651 hinge=0.0645 rank_acc=0.9495 cos_sim=0.0965 text_r=0.0000 E_gap=0.4529 lr=2.91e-04
+  [E5 S550] total=0.3917 rank=0.3623 hinge=0.0586 rank_acc=0.9499 cos_sim=0.0955 text_r=0.0000 E_gap=0.4516 lr=2.91e-04
+  [E5 S600] total=0.3859 rank=0.3590 hinge=0.0538 rank_acc=0.9504 cos_sim=0.0948 text_r=0.0000 E_gap=0.4524 lr=2.91e-04
+  [E5 S650] total=0.3859 rank=0.3611 hinge=0.0496 rank_acc=0.9499 cos_sim=0.0957 text_r=0.0000 E_gap=0.4486 lr=2.91e-04
+  [E5 S700] total=0.3831 rank=0.3601 hinge=0.0461 rank_acc=0.9499 cos_sim=0.0969 text_r=0.0000 E_gap=0.4494 lr=2.91e-04
+  [E5 S750] total=0.3835 rank=0.3620 hinge=0.0430 rank_acc=0.9498 cos_sim=0.0976 text_r=0.0000 E_gap=0.4482 lr=2.91e-04
+  [E5 S800] total=0.3833 rank=0.3631 hinge=0.0403 rank_acc=0.9496 cos_sim=0.0980 text_r=0.0000 E_gap=0.4497 lr=2.91e-04
+  [E5 S850] total=0.3823 rank=0.3634 hinge=0.0379 rank_acc=0.9494 cos_sim=0.0979 text_r=0.0000 E_gap=0.4491 lr=2.91e-04
