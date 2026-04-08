@@ -1,5 +1,28 @@
 # Lessons
 
+## 2026-04-08 - Autoregressor needs convergence training and adaptive stopping
+
+### Pattern
+ChainGenerator had no EOS equivalent. At inference, the model couldn't signal "I'm done reasoning." Generating past the training horizon (N steps) produced OOD garbage. The model memorized fixed-length chains but couldn't adapt to variable reasoning depth.
+
+### Root Causes
+1. Training chain = [steps..., answer] with no continuation signal after answer
+2. generate() had fixed `num_steps` with no adaptive stopping
+3. No way to resume generation from a previous chain (no "continue thinking")
+4. compute_loss MSE was double-divided by d_model (0.008% contribution = dead)
+
+### Fixes
+1. **Answer-repeat padding**: Chain becomes [steps..., answer, answer, answer]. Model learns: after finding the answer, keep outputting it. Consecutive similarity at inference = convergence signal.
+2. **Convergence stopping**: `convergence_cos > 0` in generate() — stop when last W outputs have pairwise cosine > threshold. SONAR-space EOS.
+3. **Chain prefix (resume)**: `chain_prefix` parameter lets you feed a previous chain and continue generating. Enables "append final vector and keep thinking" workflow.
+4. **MSE fix**: Removed redundant `/d_model` division.
+
+### Rules
+1. An autoregressor MUST have a stopping criterion — either learned (answer-repeat convergence) or external (critic energy threshold).
+2. Train with answer-repeat padding to teach convergence behavior. Without it, the model is OOD after the answer token.
+3. Free-run rollout must use non-zero noise; otherwise it's a copy of teacher-forcing loss.
+4. Always test that generate() preserves gradient flow for exposure-bias correction.
+
 ## 2026-04-08 - Post-review bugfixes for Stage 13/14 pipeline
 
 ### Bugs Found and Fixed

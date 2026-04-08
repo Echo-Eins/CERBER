@@ -38,10 +38,17 @@ from cebcm.training.stage2_utils import (
 class ChainDataset(Dataset):
     """Dataset for chain generator training with context memory-bank."""
 
-    def __init__(self, samples: list[dict], max_chain_len: int = 20, context_bank_size: int = 4):
+    def __init__(
+        self,
+        samples: list[dict],
+        max_chain_len: int = 20,
+        context_bank_size: int = 4,
+        answer_repeat_pad: int = 2,
+    ):
         self.samples = samples
         self.max_chain_len = int(max_chain_len)
         self.context_bank_size = max(1, int(context_bank_size))
+        self.answer_repeat_pad = max(0, int(answer_repeat_pad))
         if self.max_chain_len < 1:
             raise ValueError("max_chain_len must be >= 1")
 
@@ -54,11 +61,20 @@ class ChainDataset(Dataset):
         v_a = s["v_answer"]          # [D]
         v_steps = s["v_steps"]       # [S, D]
 
-        # Chain target: [steps..., answer], preserving answer as last token.
+        # Chain target: [steps..., answer, answer, answer, ...]
+        # Answer-repeat padding teaches the model to CONVERGE: after reaching
+        # the answer, keep outputting it. At inference, consecutive similarity
+        # (cos > threshold) becomes a natural stopping signal — the SONAR-space
+        # equivalent of EOS.
         if v_steps.shape[0] > 0:
             chain = torch.cat([v_steps, v_a.unsqueeze(0)], dim=0)
         else:
             chain = v_a.unsqueeze(0)
+
+        # Pad with answer repeats (before truncation to max_chain_len).
+        if self.answer_repeat_pad > 0:
+            pad = v_a.unsqueeze(0).expand(self.answer_repeat_pad, -1)
+            chain = torch.cat([chain, pad], dim=0)
 
         if chain.shape[0] > self.max_chain_len:
             keep_reasoning = max(self.max_chain_len - 1, 0)
@@ -449,19 +465,23 @@ def main() -> None:
         train_cfg["max_chain_steps"] = max_chain_steps
 
     context_bank_size = int(train_cfg.get("context_bank_size", 4))
+    answer_repeat_pad = int(train_cfg.get("answer_repeat_pad", 2))
 
     train_ds = ChainDataset(
         data["train"],
         max_chain_len=gen_cfg.max_chain_len,
         context_bank_size=context_bank_size,
+        answer_repeat_pad=answer_repeat_pad,
     )
     val_ds = ChainDataset(
         data["val"],
         max_chain_len=gen_cfg.max_chain_len,
         context_bank_size=context_bank_size,
+        answer_repeat_pad=answer_repeat_pad,
     )
 
-    print(f"Data: train={len(train_ds)}, val={len(val_ds)}, context_bank_size={context_bank_size}")
+    print(f"Data: train={len(train_ds)}, val={len(val_ds)}, "
+          f"context_bank_size={context_bank_size}, answer_repeat_pad={answer_repeat_pad}")
 
     batch_size = int(train_cfg.get("batch_size", 16))
     num_workers = int(data_cfg.get("num_workers", 4))

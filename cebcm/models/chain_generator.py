@@ -309,10 +309,26 @@ class ChainGenerator(nn.Module):
         stagnation_patience: int = 0,
         stagnation_delta_energy: float = 1e-4,
         stagnation_delta_cos: float = 1e-4,
+        convergence_cos: float = 0.0,
+        convergence_window: int = 2,
+        chain_prefix: Tensor | None = None,
         return_info: bool = False,
     ) -> Tensor | tuple[Tensor, dict[str, float | int | bool]]:
         """
-        Autoregressive generation with optional stochasticity and anti-loop controls.
+        Autoregressive generation with adaptive stopping and resume support.
+
+        Stopping modes (checked in order):
+          1. convergence_cos > 0: stop when the last `convergence_window`
+             consecutive outputs all have pairwise cosine > convergence_cos.
+             This is the SONAR-space equivalent of EOS — the model has
+             converged to its answer and keeps repeating it.
+          2. stagnation_patience > 0: stop when energy/cosine metrics are flat.
+          3. num_steps reached (hard cap).
+
+        Resume mode:
+          If chain_prefix is provided [B, P, D], generation resumes from that
+          chain instead of starting from start_token. This enables the
+          "append final vector and keep going" workflow.
 
         Returns:
             chain [B, T, D] or (chain, info) when return_info=True.
@@ -328,16 +344,32 @@ class ChainGenerator(nn.Module):
         repeat_ban_threshold = float(repeat_ban_threshold)
         repeat_ban_max_retries = max(int(repeat_ban_max_retries), 0)
         stagnation_patience = max(int(stagnation_patience), 0)
+        convergence_cos = float(convergence_cos)
+        convergence_window = max(2, int(convergence_window))
 
-        chain = self.start_token.expand(bsz, -1, -1)
-        if start_noise_std > 0.0:
-            chain = chain + start_noise_std * torch.randn_like(chain)
+        # Resume from prefix or start fresh.
+        if chain_prefix is not None:
+            if chain_prefix.dim() == 2:
+                chain_prefix = chain_prefix.unsqueeze(0)  # [1, P, D]
+            if chain_prefix.shape[0] == 1 and bsz > 1:
+                chain_prefix = chain_prefix.expand(bsz, -1, -1)
+            start = self.start_token.expand(bsz, -1, -1)
+            chain = torch.cat([start, chain_prefix], dim=1)
+            # Pre-seed generated list with prefix vectors for anti-loop checks.
+            generated: list[Tensor] = [
+                chain_prefix[:, i : i + 1, :] for i in range(chain_prefix.shape[1])
+            ]
+        else:
+            chain = self.start_token.expand(bsz, -1, -1)
+            if start_noise_std > 0.0:
+                chain = chain + start_noise_std * torch.randn_like(chain)
+            generated = []
 
-        generated: list[Tensor] = []
         energy_hist: list[float] = []
         cos_hist: list[float] = []
         early_stop = False
         early_stop_step = -1
+        early_stop_reason = ""
         repeat_resamples = 0
 
         t_target = None
@@ -399,6 +431,24 @@ class ChainGenerator(nn.Module):
             generated.append(next_vec)
             chain = torch.cat([chain, next_vec], dim=1)
 
+            # ── Convergence check (SONAR-space EOS) ──
+            # If the last W outputs are all mutually similar (cos > threshold),
+            # the model has converged to its answer. This is trained via
+            # answer-repeat padding: [steps..., answer, answer, answer].
+            if convergence_cos > 0 and len(generated) >= convergence_window:
+                window = torch.cat(generated[-convergence_window:], dim=1)  # [B, W, D]
+                # Check all consecutive pairs in window.
+                w1 = window[:, :-1, :]   # [B, W-1, D]
+                w2 = window[:, 1:, :]    # [B, W-1, D]
+                pair_cos = F.cosine_similarity(w1, w2, dim=-1)  # [B, W-1]
+                # Converged if ALL pairs exceed threshold (mean across batch).
+                min_pair_cos = pair_cos.min(dim=1).values.mean().item()
+                if min_pair_cos > convergence_cos:
+                    early_stop = True
+                    early_stop_step = step_idx + 1
+                    early_stop_reason = "convergence"
+                    break
+
             if energy_fn is not None:
                 try:
                     e_val = energy_fn(v_query, next_vec.squeeze(1))
@@ -410,15 +460,12 @@ class ChainGenerator(nn.Module):
                     import warnings
                     if step_idx == 0:
                         warnings.warn(f"energy_fn failed at step 0: {exc}", stacklevel=2)
-                    # Continue without energy tracking for this step.
 
             if t_target is not None:
                 cos_val = F.cosine_similarity(next_vec.squeeze(1), t_target, dim=-1)
                 cos_hist.append(float(cos_val.mean().item()))
 
             if stagnation_patience > 0 and step_idx + 1 >= (stagnation_patience + 1):
-                # Stagnation if ALL available metrics are flat.
-                # If no metric is available, don't trigger.
                 checks = []
                 if len(energy_hist) > stagnation_patience:
                     de = abs(energy_hist[-1] - energy_hist[-1 - stagnation_patience])
@@ -430,18 +477,26 @@ class ChainGenerator(nn.Module):
                 if stagnated:
                     early_stop = True
                     early_stop_step = step_idx + 1
+                    early_stop_reason = "stagnation"
                     break
 
-        chain_out = torch.cat(generated, dim=1)
+        # Only return newly generated steps (exclude prefix).
+        prefix_len = chain_prefix.shape[1] if chain_prefix is not None else 0
+        new_generated = generated[prefix_len:]
+        chain_out = torch.cat(new_generated, dim=1) if new_generated else torch.zeros(
+            bsz, 0, v_query.shape[-1], device=v_query.device
+        )
 
         if not return_info:
             return chain_out
 
-        info: dict[str, float | int | bool] = {
+        info: dict[str, float | int | bool | str] = {
             "early_stop": early_stop,
             "early_stop_step": int(early_stop_step),
+            "early_stop_reason": early_stop_reason,
             "repeat_resamples": int(repeat_resamples),
             "steps_generated": int(chain_out.shape[1]),
+            "prefix_len": int(prefix_len),
             "temperature": float(temp),
             "latent_noise_std": float(latent_noise_std),
             "start_noise_std": float(start_noise_std),
@@ -486,7 +541,7 @@ class ChainGenerator(nn.Module):
         cos_loss = ((1.0 - cos_sim) * mask).sum() / mask_sum
 
         mse_per_step = (v_pred - v_target_chain).pow(2).mean(dim=-1)
-        mse_loss = (mse_per_step * mask).sum() / mask_sum / self.cfg.d_model
+        mse_loss = (mse_per_step * mask).sum() / mask_sum  # .mean(-1) already averages over D
 
         loss = self.cfg.loss_cosine_weight * cos_loss + self.cfg.loss_mse_weight * mse_loss
 
