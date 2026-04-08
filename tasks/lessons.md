@@ -1,5 +1,56 @@
 # Lessons
 
+## 2026-04-08 - Autoregressive QA: never train on padded tokens or prefix-only curriculum that drops answer
+
+### Pattern
+ChainGenerator plateau/collapse was amplified by three coupled pipeline mistakes:
+- padding mask was computed but not used in loss;
+- sequence truncation could drop the final answer token;
+- `System1` curriculum (`target_steps=1`) trained on the first reasoning step instead of answer.
+
+### Root Cause
+Training objective was misaligned with inference target:
+- model optimized padded zeros and early-chain prefixes;
+- direct-answer mode was not actually direct-answer;
+- validation repeated the same masking bug.
+
+### Fix
+- Add `loss_mask` to `ChainGenerator.compute_loss` and use masked reductions.
+- Preserve answer on truncation (`keep_last` policy).
+- Build curriculum targets as suffix ending at answer (`System1 => answer-only`).
+- Apply masking in both train and validation paths.
+
+### Rule
+1. For variable-length autoregressive chains, masking must be part of the model loss API, not only data loader logic.
+2. Any truncation policy must explicitly preserve supervision target (final answer token).
+3. Curriculum labels must be audited against declared mode semantics (`System1` must optimize answer directly).
+4. Best-of-N reranking is invalid if candidate generation is deterministic; enforce stochastic diversity.
+
+## 2026-04-08 - Critic parity and horizon discipline must be enforced in GUI/runtime
+
+### Pattern
+Online diagnostics diverged from training behavior:
+- critic was trained with `v_context` but inference reranking called critic without context;
+- GUI allowed long rollouts beyond training horizon;
+- critic training relied on easy random negatives, which inflated rank metrics.
+
+### Root Cause
+Evaluation path did not preserve the same conditioning and hardness assumptions as training.
+
+### Fix
+- Pass `v_context` through all critic calls in diagnostics (rerank, per-step energy, chain analysis, landscape).
+- Add compatibility wrapper for legacy critics that do not support `v_context`.
+- Clamp inference steps by checkpoint-trained horizon (`training.max_chain_steps`) and architectural cap (`max_chain_len`).
+- Add mixed-negative strategy in critic training: random negatives + in-batch hard negatives.
+- Add optional generator-hard negatives (from current generator checkpoint) with false-negative guard by cosine threshold.
+
+### Rule
+1. Critic train/eval/inference signatures must be context-parity compatible.
+2. Runtime inference must be horizon-capped by what the model actually saw during training.
+3. Do not accept rank metrics from easy random-negative-only training.
+4. Every GUI export should expose whether runtime safety caps were applied.
+5. For critic reranking quality, train with mixed negatives: random + in-batch hard + generator-hard (when checkpoint is available).
+
 ## 2026-04-06 - GUI checkpoint loader must migrate old/new parametrization key layouts
 
 ### Pattern
@@ -1749,3 +1800,25 @@ Step 4-20: "Theoretical", "Theoretical"... (fixed point loop)
    b. Add noise to teacher-forced inputs to simulate generation errors
 3. Chain length curriculum must be more conservative. 3 steps was the sweet spot; 4-5 broke the model. Start with 1-3 and stay there until metrics stabilize.
 4. Monitor cos_last (final step quality) as the PRIMARY metric, not cos_sim_mean.
+
+## 2026-04-08 - Free-run objective and memory-bank context are mandatory for autoregressive QA
+
+### Pattern
+Teacher-forced-only chain supervision can look stable in logs but collapses in real rollout (loops/repetition) and gives degenerate best-of-N candidates.
+
+### Root Cause
+- Exposure bias: model never optimized on its own generated trajectories.
+- Cross-attention with a single context token cannot learn useful selection over evidence.
+- Deterministic candidate generation makes reranking ineffective.
+
+### Fix
+- Use composite objective with free-run and in-batch contrastive terms:
+  - `L = lambda_step*L_step_masked + lambda_ans*L_final_answer + lambda_roll*L_free_run + lambda_rank*L_inbatch_contrastive`.
+- Feed a context memory bank (`query + evidence slots`) into cross-attention with proper mask.
+- Make system2 candidate generation stochastic and anti-loop constrained (repeat penalty, repeat-ban, stagnation early-stop).
+
+### Rule
+1. For autoregressive QA, never rely on teacher-forcing loss alone.
+2. If cross-attention key length is 1, do not treat attention plots as evidence of context reasoning.
+3. Reranker quality requires candidate diversity; deterministic best-of-N is a no-op.
+4. Train and inference horizons must be aligned or explicitly capped.

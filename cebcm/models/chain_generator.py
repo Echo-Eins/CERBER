@@ -1,105 +1,43 @@
-"""
-ChainGenerator — Autoregressive Transformer Decoder in SONAR 1024d space.
-
-Pure QA neural network. NOT a denoiser.
-
-Architecture:
-    Input:  v_query [B, D]     — question embedding (SONAR 1024d)
-    Output: chain   [B, N, D]  — reasoning steps + final answer
-
-    Each generated step is a valid SONAR vector (on manifold, decodable to text).
-
-    Decoder Block (Pre-Norm, repeated N_layers times):
-        1. Causal Self-Attention with RoPE  — chain ordering
-        2. Cross-Attention to v_query        — semantic grounding (no positional enc)
-        3. FFN (SiLU, D → 4D → D)
-
-    Output: Linear(D, D) → sphere projection (normalize × target_norm)
-
-Inference modes:
-    System 1: generate 1 step  (direct answer)
-    System 2: generate N steps (visible reasoning chain → final answer)
-
-Training:
-    Teacher forcing on ground-truth reasoning chains (v_steps from HotpotQA).
-    Loss: cosine similarity + MSE per step.
-
-Design rationale:
-    - RoPE for self-attention: position-content binding critical for chain ordering
-      (same content at different positions → different attention patterns)
-    - Cross-attention to v_query WITHOUT positional encoding: query is semantic
-      anchor, not a sequence element — no position bias needed
-    - Causal mask: autoregressive generation, step i sees only steps 0..i
-    - Sphere projection: every output is on SONAR manifold (target_norm=0.2051)
-    - SiLU activation: matches angular critic, smooth gradients
-    - Pre-Norm: stable training with deep networks
-
-CompositeCritic serves as optional reranker at inference (beam search / best-of-N).
-"""
-
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from cebcm.models.chain_head import _build_rope_cache, _apply_rope
+from cebcm.models.chain_head import _apply_rope, _build_rope_cache
 
-
-# ─── Config ────────────────────────────────────────────────────────────
 
 @dataclass
 class ChainGeneratorConfig:
-    """Configuration for the ChainGenerator."""
+    """Configuration for autoregressive chain generation in SONAR space."""
 
     d_model: int = 1024
-    """SONAR embedding dimension."""
-
     n_heads: int = 8
-    """Number of attention heads."""
-
     n_layers: int = 6
-    """Number of decoder layers."""
-
     dim_feedforward: int = 4096
-    """FFN hidden dimension (4× d_model)."""
-
     max_chain_len: int = 20
-    """Maximum reasoning chain length."""
-
     dropout: float = 0.1
-    """Dropout rate."""
-
     target_norm: float = 0.2051
-    """SONAR manifold target L2 norm for output vectors."""
 
-    # Training
+    # Supervised teacher-forcing step loss.
     loss_cosine_weight: float = 1.0
-    """Weight for cosine similarity loss."""
-
     loss_mse_weight: float = 0.1
-    """Weight for MSE loss (scaled by 1/D for numerical balance)."""
 
-
-# ─── Cross-Attention ───────────────────────────────────────────────────
 
 class CrossAttention(nn.Module):
-    """
-    Multi-head cross-attention to v_query.
-
-    No positional encoding — v_query is a semantic anchor, not sequenced.
-    Uses SDPA for Flash Attention support.
-    """
+    """Multi-head cross-attention over context bank [B, K, D]."""
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        assert d_model % n_heads == 0
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -107,46 +45,48 @@ class CrossAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout_p = dropout
 
-    def forward(self, x: Tensor, context: Tensor) -> Tensor:
+    def forward(self, x: Tensor, context: Tensor, context_mask: Tensor | None = None) -> Tensor:
         """
         Args:
-            x:       [B, L, D] decoder sequence (chain so far)
-            context: [B, 1, D] query embedding (unsqueezed for KV)
-
-        Returns:
-            [B, L, D] attended output
+            x: [B, L, D]
+            context: [B, K, D]
+            context_mask: optional [B, K] bool/float (1=valid, 0=masked)
         """
-        B, L, D = x.shape
+        bsz, seq_len, d_model = x.shape
+        ctx_len = context.shape[1]
 
-        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(context).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(context).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
-        # q: [B, H, L, Dh], k/v: [B, H, 1, Dh]
+        q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(context).view(bsz, ctx_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(context).view(bsz, ctx_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        attn_mask = None
+        if context_mask is not None:
+            cm = context_mask.to(device=x.device)
+            if cm.shape != (bsz, ctx_len):
+                raise ValueError(
+                    f"context_mask shape {tuple(cm.shape)} does not match context shape {(bsz, ctx_len)}"
+                )
+            # SDPA additive mask: 0 for valid, -inf for invalid.
+            invalid = cm <= 0
+            attn_mask = torch.zeros((bsz, self.n_heads, seq_len, ctx_len), device=x.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(invalid[:, None, None, :], float("-inf"))
 
         dropout_p = self.dropout_p if self.training else 0.0
         out = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
             dropout_p=dropout_p,
             scale=self.head_dim ** -0.5,
-        )  # [B, H, L, Dh]
+        )
 
-        out = out.transpose(1, 2).contiguous().view(B, L, D)
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, d_model)
         return self.out_proj(out)
 
 
-# ─── Causal Self-Attention with RoPE ──────────────────────────────────
-
 class CausalRoPESelfAttention(nn.Module):
-    """
-    Causal multi-head self-attention with RoPE.
-
-    Combines:
-      - RoPE for position-content binding (chain ordering)
-      - Causal mask (autoregressive: step i sees steps 0..i only)
-      - SDPA for Flash Attention
-
-    Reuses RoPE infrastructure from chain_head.py.
-    """
+    """Causal self-attention with RoPE."""
 
     def __init__(
         self,
@@ -156,11 +96,14 @@ class CausalRoPESelfAttention(nn.Module):
         max_seq_len: int = 32,
     ):
         super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        assert d_model % n_heads == 0
-        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -181,46 +124,32 @@ class CausalRoPESelfAttention(nn.Module):
         return rope
 
     def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: [B, L, D] sequence
+        bsz, seq_len, _ = x.shape
 
-        Returns:
-            [B, L, D] with causal masking applied
-        """
-        B, L, _ = x.shape
+        q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-
-        # RoPE on Q and K
-        rope = self._get_rope(L, x.device)
+        rope = self._get_rope(seq_len, x.device)
         q = _apply_rope(q, rope)
         k = _apply_rope(k, rope)
 
-        # Causal attention via SDPA is_causal flag
         dropout_p = self.dropout_p if self.training else 0.0
         out = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             dropout_p=dropout_p,
             is_causal=True,
             scale=self.head_dim ** -0.5,
-        )  # [B, H, L, Dh]
+        )
 
-        out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
         return self.out_proj(out)
 
 
-# ─── Decoder Block ────────────────────────────────────────────────────
-
 class DecoderBlock(nn.Module):
-    """
-    Single decoder block: causal self-attn → cross-attn → FFN.
-
-    Pre-Norm architecture (LayerNorm before each sub-layer).
-    Residual connections throughout.
-    """
+    """Pre-norm decoder block: self-attn -> cross-attn -> ffn."""
 
     def __init__(
         self,
@@ -232,7 +161,6 @@ class DecoderBlock(nn.Module):
     ):
         super().__init__()
 
-        # Causal self-attention with RoPE
         self.norm_self = nn.LayerNorm(d_model)
         self.self_attn = CausalRoPESelfAttention(
             d_model=d_model,
@@ -241,7 +169,6 @@ class DecoderBlock(nn.Module):
             max_seq_len=max_seq_len,
         )
 
-        # Cross-attention to query
         self.norm_cross = nn.LayerNorm(d_model)
         self.cross_attn = CrossAttention(
             d_model=d_model,
@@ -249,7 +176,6 @@ class DecoderBlock(nn.Module):
             dropout=dropout,
         )
 
-        # FFN
         self.norm_ffn = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
@@ -259,228 +185,333 @@ class DecoderBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: Tensor, context: Tensor) -> Tensor:
-        """
-        Args:
-            x:       [B, L, D] chain sequence
-            context: [B, 1, D] query embedding
-
-        Returns:
-            [B, L, D]
-        """
-        # Causal self-attention
+    def forward(self, x: Tensor, context: Tensor, context_mask: Tensor | None = None) -> Tensor:
         x = x + self.self_attn(self.norm_self(x))
-        # Cross-attention to query
-        x = x + self.cross_attn(self.norm_cross(x), context)
-        # FFN
+        x = x + self.cross_attn(self.norm_cross(x), context, context_mask=context_mask)
         x = x + self.ffn(self.norm_ffn(x))
         return x
 
 
-# ─── ChainGenerator ──────────────────────────────────────────────────
-
 class ChainGenerator(nn.Module):
-    """
-    Autoregressive Transformer Decoder in SONAR embedding space.
-
-    Generates reasoning chains conditioned on v_query.
-    Each output step is a valid SONAR vector (decodable to text).
-
-    NOT a denoiser. Direct prediction of answer embeddings.
-
-    Training: teacher forcing with ground-truth chains.
-    Inference: autoregressive generation (System 1: 1 step, System 2: N steps).
-    """
+    """Autoregressive transformer decoder in SONAR embedding space."""
 
     def __init__(self, cfg: ChainGeneratorConfig | None = None):
         super().__init__()
-        if cfg is None:
-            cfg = ChainGeneratorConfig()
-        self.cfg = cfg
+        self.cfg = cfg if cfg is not None else ChainGeneratorConfig()
 
-        # Learned [START] token — initiates chain generation
-        self.start_token = nn.Parameter(torch.randn(1, 1, cfg.d_model) * 0.02)
+        self.start_token = nn.Parameter(torch.randn(1, 1, self.cfg.d_model) * 0.02)
 
-        # Decoder layers
-        max_seq = cfg.max_chain_len + 1  # +1 for START token
-        self.layers = nn.ModuleList([
-            DecoderBlock(
-                d_model=cfg.d_model,
-                n_heads=cfg.n_heads,
-                dim_feedforward=cfg.dim_feedforward,
-                dropout=cfg.dropout,
-                max_seq_len=max_seq,
-            )
-            for _ in range(cfg.n_layers)
-        ])
+        max_seq = self.cfg.max_chain_len + 1
+        self.layers = nn.ModuleList(
+            [
+                DecoderBlock(
+                    d_model=self.cfg.d_model,
+                    n_heads=self.cfg.n_heads,
+                    dim_feedforward=self.cfg.dim_feedforward,
+                    dropout=self.cfg.dropout,
+                    max_seq_len=max_seq,
+                )
+                for _ in range(self.cfg.n_layers)
+            ]
+        )
 
-        # Final norm (Pre-Norm arch needs post-decoder norm)
-        self.final_norm = nn.LayerNorm(cfg.d_model)
-
-        # Output projection: D → D (stays in SONAR space)
-        self.output_proj = nn.Linear(cfg.d_model, cfg.d_model)
+        self.final_norm = nn.LayerNorm(self.cfg.d_model)
+        self.output_proj = nn.Linear(self.cfg.d_model, self.cfg.d_model)
 
         self._init_weights()
 
-    def _init_weights(self):
-        """Xavier init. Small-scale output projection for stable start."""
+    def _init_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Small-scale init for output projection (not zero — sphere projection
-        # needs non-zero input to produce valid gradients through F.normalize)
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.01)
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
 
     def _sphere_project(self, v: Tensor) -> Tensor:
-        """Project vectors onto SONAR manifold sphere."""
         return F.normalize(v, dim=-1) * self.cfg.target_norm
 
-    # ── Training forward (teacher forcing) ──────────────────────────
+    def _prepare_context(
+        self,
+        v_query: Tensor,
+        v_context_bank: Tensor | None,
+        context_mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        bsz, d_model = v_query.shape
+
+        if v_context_bank is None:
+            context = v_query.unsqueeze(1)
+            mask = torch.ones((bsz, 1), device=v_query.device, dtype=torch.bool)
+            return context, mask
+
+        context = v_context_bank
+        if context.dim() == 2:
+            context = context.unsqueeze(1)
+        if context.dim() != 3:
+            raise ValueError(f"v_context_bank must have shape [B,K,D] or [B,D], got {tuple(context.shape)}")
+        if context.shape[0] != bsz or context.shape[2] != d_model:
+            raise ValueError(
+                f"v_context_bank shape {tuple(context.shape)} incompatible with v_query {(bsz, d_model)}"
+            )
+
+        if context_mask is None:
+            mask = torch.ones((bsz, context.shape[1]), device=v_query.device, dtype=torch.bool)
+        else:
+            mask = context_mask.to(device=v_query.device)
+            if mask.shape != (bsz, context.shape[1]):
+                raise ValueError(
+                    f"context_mask shape {tuple(mask.shape)} does not match context shape {(bsz, context.shape[1])}"
+                )
+            mask = mask > 0
+        return context, mask
 
     def forward(
         self,
         v_query: Tensor,
         v_target_chain: Tensor,
+        v_context_bank: Tensor | None = None,
+        context_mask: Tensor | None = None,
     ) -> Tensor:
-        """
-        Teacher-forced forward pass.
+        """Teacher-forced forward pass."""
+        bsz, num_steps, _ = v_target_chain.shape
 
-        Args:
-            v_query:        [B, D] question embedding
-            v_target_chain: [B, N, D] ground-truth chain (reasoning steps + answer)
+        start = self.start_token.expand(bsz, -1, -1)
+        decoder_input = torch.cat([start, v_target_chain[:, :-1, :]], dim=1)
 
-        Returns:
-            v_predicted: [B, N, D] predicted chain vectors (on sphere)
+        context, ctx_mask = self._prepare_context(v_query, v_context_bank, context_mask)
 
-        During training, the input to the decoder is:
-            [START, target_step_1, target_step_2, ..., target_step_{N-1}]
-        and the output predicts:
-            [pred_step_1, pred_step_2, ..., pred_step_N]
-
-        This is standard teacher forcing: shifted input → output alignment.
-        """
-        B, N, D = v_target_chain.shape
-
-        # Build decoder input: [START, step_1, ..., step_{N-1}]
-        start = self.start_token.expand(B, -1, -1)  # [B, 1, D]
-        decoder_input = torch.cat([start, v_target_chain[:, :-1, :]], dim=1)  # [B, N, D]
-
-        # Context for cross-attention: v_query as single KV token
-        context = v_query.unsqueeze(1)  # [B, 1, D]
-
-        # Run through decoder layers
         x = decoder_input
         for layer in self.layers:
-            x = layer(x, context)
+            x = layer(x, context, context_mask=ctx_mask)
 
         x = self.final_norm(x)
+        v_pred = self.output_proj(x)
+        return self._sphere_project(v_pred)
 
-        # Project to SONAR space and onto sphere
-        v_predicted = self.output_proj(x)  # [B, N, D]
-        v_predicted = self._sphere_project(v_predicted)
-
-        return v_predicted
-
-    # ── Autoregressive generation (inference) ───────────────────────
-
-    @torch.no_grad()
     def generate(
         self,
         v_query: Tensor,
         num_steps: int = 1,
-    ) -> Tensor:
+        v_context_bank: Tensor | None = None,
+        context_mask: Tensor | None = None,
+        temperature: float = 1.0,
+        latent_noise_std: float = 0.0,
+        start_noise_std: float = 0.0,
+        repeat_penalty: float = 0.0,
+        repeat_cos_threshold: float = 0.98,
+        repeat_ban_threshold: float = 0.995,
+        repeat_ban_max_retries: int = 4,
+        energy_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
+        target_vec: Tensor | None = None,
+        stagnation_patience: int = 0,
+        stagnation_delta_energy: float = 1e-4,
+        stagnation_delta_cos: float = 1e-4,
+        return_info: bool = False,
+    ) -> Tensor | tuple[Tensor, dict[str, float | int | bool]]:
         """
-        Autoregressive chain generation.
-
-        Args:
-            v_query:   [B, D] question embedding
-            num_steps: number of chain steps to generate
-                       1 = System 1 (direct answer)
-                       N = System 2 (reasoning chain → answer)
+        Autoregressive generation with optional stochasticity and anti-loop controls.
 
         Returns:
-            chain: [B, num_steps, D] generated chain (all on sphere)
+            chain [B, T, D] or (chain, info) when return_info=True.
         """
-        B, D = v_query.shape
-        device = v_query.device
-        context = v_query.unsqueeze(1)  # [B, 1, D]
+        bsz, _ = v_query.shape
+        context, ctx_mask = self._prepare_context(v_query, v_context_bank, context_mask)
 
-        # Start with [START] token
-        chain = self.start_token.expand(B, -1, -1)  # [B, 1, D]
+        temp = max(float(temperature), 1e-4)
+        latent_noise_std = max(float(latent_noise_std), 0.0)
+        start_noise_std = max(float(start_noise_std), 0.0)
+        repeat_penalty = max(float(repeat_penalty), 0.0)
+        repeat_cos_threshold = float(repeat_cos_threshold)
+        repeat_ban_threshold = float(repeat_ban_threshold)
+        repeat_ban_max_retries = max(int(repeat_ban_max_retries), 0)
+        stagnation_patience = max(int(stagnation_patience), 0)
 
-        generated = []
-        for step in range(num_steps):
-            # Run decoder on current chain
+        chain = self.start_token.expand(bsz, -1, -1)
+        if start_noise_std > 0.0:
+            chain = chain + start_noise_std * torch.randn_like(chain)
+
+        generated: list[Tensor] = []
+        energy_hist: list[float] = []
+        cos_hist: list[float] = []
+        early_stop = False
+        early_stop_step = -1
+        repeat_resamples = 0
+
+        t_target = None
+        if target_vec is not None:
+            t_target = target_vec
+            if t_target.dim() == 1:
+                t_target = t_target.unsqueeze(0)
+            t_target = t_target.to(device=v_query.device)
+
+        steps = max(1, int(num_steps))
+        for step_idx in range(steps):
             x = chain
             for layer in self.layers:
-                x = layer(x, context)
+                x = layer(x, context, context_mask=ctx_mask)
 
             x = self.final_norm(x)
+            raw_next = self.output_proj(x[:, -1:, :])
 
-            # Take last position output
-            last_hidden = x[:, -1:, :]  # [B, 1, D]
-            next_vec = self.output_proj(last_hidden)  # [B, 1, D]
-            next_vec = self._sphere_project(next_vec)
+            if generated and repeat_penalty > 0.0:
+                hist = torch.cat(generated, dim=1)
+                cos_hist_tensor = F.cosine_similarity(
+                    raw_next.expand(-1, hist.shape[1], -1),
+                    hist,
+                    dim=-1,
+                )
+                max_cos, max_idx = cos_hist_tensor.max(dim=1)
+                over = (max_cos - repeat_cos_threshold).clamp(min=0.0)
+                if torch.any(over > 0):
+                    repel = hist[torch.arange(bsz, device=hist.device), max_idx].unsqueeze(1)
+                    raw_next = raw_next - repeat_penalty * over.view(bsz, 1, 1) * repel
+
+            noise_std = latent_noise_std
+            if temp > 1.0:
+                noise_std = noise_std + 0.01 * (temp - 1.0)
+            elif temp < 1.0:
+                noise_std = noise_std * temp
+
+            if noise_std > 0.0:
+                raw_next = raw_next + noise_std * torch.randn_like(raw_next)
+
+            next_vec = self._sphere_project(raw_next)
+
+            if generated and repeat_ban_threshold < 1.0 and repeat_ban_max_retries > 0:
+                hist = torch.cat(generated, dim=1)
+                jitter_std = max(noise_std, 0.01)
+                for _ in range(repeat_ban_max_retries):
+                    cos_to_hist = F.cosine_similarity(
+                        next_vec.expand(-1, hist.shape[1], -1),
+                        hist,
+                        dim=-1,
+                    )
+                    max_cos = cos_to_hist.max(dim=1).values
+                    repeat_mask = max_cos > repeat_ban_threshold
+                    if not torch.any(repeat_mask):
+                        break
+
+                    candidate = self._sphere_project(raw_next + jitter_std * torch.randn_like(raw_next))
+                    mask3 = repeat_mask.view(bsz, 1, 1)
+                    next_vec = torch.where(mask3, candidate, next_vec)
+                    repeat_resamples += int(repeat_mask.sum().item())
 
             generated.append(next_vec)
+            chain = torch.cat([chain, next_vec], dim=1)
 
-            # Append to chain for next step
-            chain = torch.cat([chain, next_vec], dim=1)  # [B, step+2, D]
+            if energy_fn is not None:
+                try:
+                    e_val = energy_fn(v_query, next_vec.squeeze(1))
+                    if torch.is_tensor(e_val):
+                        energy_hist.append(float(e_val.detach().mean().item()))
+                    else:
+                        energy_hist.append(float(e_val))
+                except Exception:
+                    pass
 
-        return torch.cat(generated, dim=1)  # [B, num_steps, D]
+            if t_target is not None:
+                cos_val = F.cosine_similarity(next_vec.squeeze(1), t_target, dim=-1)
+                cos_hist.append(float(cos_val.mean().item()))
 
-    # ── Loss computation ────────────────────────────────────────────
+            if stagnation_patience > 0 and step_idx + 1 >= (stagnation_patience + 1):
+                stagnated = False
+                if energy_hist:
+                    de = abs(energy_hist[-1] - energy_hist[-1 - stagnation_patience])
+                    stagnated = de <= stagnation_delta_energy
+                if cos_hist:
+                    dc = abs(cos_hist[-1] - cos_hist[-1 - stagnation_patience])
+                    stagnated = stagnated and (dc <= stagnation_delta_cos)
+                if stagnated:
+                    early_stop = True
+                    early_stop_step = step_idx + 1
+                    break
+
+        chain_out = torch.cat(generated, dim=1)
+
+        if not return_info:
+            return chain_out
+
+        info: dict[str, float | int | bool] = {
+            "early_stop": early_stop,
+            "early_stop_step": int(early_stop_step),
+            "repeat_resamples": int(repeat_resamples),
+            "steps_generated": int(chain_out.shape[1]),
+            "temperature": float(temp),
+            "latent_noise_std": float(latent_noise_std),
+            "start_noise_std": float(start_noise_std),
+            "repeat_penalty": float(repeat_penalty),
+        }
+        if energy_hist:
+            info["energy_final"] = float(energy_hist[-1])
+        if cos_hist:
+            info["cos_final"] = float(cos_hist[-1])
+
+        return chain_out, info
 
     def compute_loss(
         self,
         v_query: Tensor,
         v_target_chain: Tensor,
+        loss_mask: Tensor | None = None,
+        v_context_bank: Tensor | None = None,
+        context_mask: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
-        """
-        Compute training loss with teacher forcing.
+        """Masked teacher-forcing loss."""
+        v_pred = self.forward(
+            v_query,
+            v_target_chain,
+            v_context_bank=v_context_bank,
+            context_mask=context_mask,
+        )
 
-        Loss = w_cos × (1 - cos_sim) + w_mse × MSE
+        bsz, num_steps, _ = v_pred.shape
+        if loss_mask is None:
+            mask = torch.ones(bsz, num_steps, device=v_pred.device, dtype=v_pred.dtype)
+        else:
+            mask = loss_mask.to(device=v_pred.device, dtype=v_pred.dtype)
+            if mask.shape != (bsz, num_steps):
+                raise ValueError(
+                    f"loss_mask shape {tuple(mask.shape)} does not match (B,N)=({bsz},{num_steps})"
+                )
 
-        Args:
-            v_query:        [B, D] question embedding
-            v_target_chain: [B, N, D] ground-truth chain
+        mask_sum = mask.sum().clamp(min=1.0)
 
-        Returns:
-            loss: scalar
-            metrics: diagnostic dict
-        """
-        v_pred = self.forward(v_query, v_target_chain)  # [B, N, D]
+        cos_sim = F.cosine_similarity(v_pred, v_target_chain, dim=-1)
+        cos_loss = ((1.0 - cos_sim) * mask).sum() / mask_sum
 
-        # Cosine similarity loss: 1 - cos(pred, target), averaged over steps
-        cos_sim = F.cosine_similarity(v_pred, v_target_chain, dim=-1)  # [B, N]
-        cos_loss = (1.0 - cos_sim).mean()
-
-        # MSE loss (normalized by D for numerical balance)
-        mse_loss = F.mse_loss(v_pred, v_target_chain) / self.cfg.d_model
+        mse_per_step = (v_pred - v_target_chain).pow(2).mean(dim=-1)
+        mse_loss = (mse_per_step * mask).sum() / mask_sum / self.cfg.d_model
 
         loss = self.cfg.loss_cosine_weight * cos_loss + self.cfg.loss_mse_weight * mse_loss
 
         with torch.no_grad():
-            # Per-step cosine for diagnostics
-            cos_per_step = cos_sim.mean(dim=0)  # [N]
+            valid_per_step = mask.sum(dim=0).clamp(min=1.0)
+            sample_valid_counts = mask.sum(dim=1).long().clamp(min=1)
+            last_idx = (sample_valid_counts - 1).clamp(min=0)
+            cos_last = cos_sim.gather(1, last_idx.unsqueeze(1)).squeeze(1).mean().item()
+            cos_first = cos_sim[:, 0].mean().item()
+
             metrics = {
-                "loss": loss.item(),
-                "cos_loss": cos_loss.item(),
-                "mse_loss": mse_loss.item(),
-                "cos_sim_mean": cos_sim.mean().item(),
-                "cos_sim_last": cos_sim[:, -1].mean().item(),  # answer quality
-                "cos_sim_first": cos_sim[:, 0].mean().item(),  # first step
-                "pred_norm_mean": v_pred.norm(dim=-1).mean().item(),
+                "loss": float(loss.item()),
+                "cos_loss": float(cos_loss.item()),
+                "mse_loss": float(mse_loss.item()),
+                "cos_sim_mean": float(((cos_sim * mask).sum() / mask_sum).item()),
+                "cos_sim_last": float(cos_last),
+                "cos_sim_first": float(cos_first),
+                "pred_norm_mean": float(((v_pred.norm(dim=-1) * mask).sum() / mask_sum).item()),
+                "valid_tokens": float(mask_sum.item()),
+                "valid_tokens_per_sample": float(sample_valid_counts.float().mean().item()),
+                "cos_step0": float(((cos_sim[:, 0] * mask[:, 0]).sum() / mask[:, 0].sum().clamp(min=1.0)).item()),
+                "cos_step_last_masked": float(cos_last),
+                "cos_step_mean_masked": float(((cos_sim * mask).sum() / mask_sum).item()),
+                "valid_steps": float(mask_sum.item()),
+                "valid_steps_per_sample": float(sample_valid_counts.float().mean().item()),
             }
 
         return loss, metrics
-
-    # ── Properties ──────────────────────────────────────────────────
 
     @property
     def num_params(self) -> int:

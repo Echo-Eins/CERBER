@@ -25,6 +25,8 @@ from torch import Tensor
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from cebcm.models.chain_head import _apply_rope
+
 
 # ── Data Classes ─────────────────────────────────────────────────
 
@@ -35,6 +37,9 @@ class GenerationResult:
     # Mode
     mode: str = "system1"  # "system1" or "system2"
     num_steps: int = 1
+    requested_steps: int = 1
+    step_cap_applied: bool = False
+    step_cap_reason: str | None = None
 
     # Input / Output
     v_query: Tensor | None = None
@@ -52,8 +57,9 @@ class GenerationResult:
     step_critic_energies: list[float] = field(default_factory=list)
 
     # Attention maps: list of dicts per layer
-    # Each dict: {"self_attn": [H, L, L], "cross_attn": [H, L, 1]}
+    # Each dict: {"self_attn": [H, L, L], "cross_attn": [H, L, K]}
     attention_maps: list[dict[str, Tensor]] = field(default_factory=list)
+    context_labels: list[str] = field(default_factory=list)
 
     # Critic analysis
     critic_rank_acc: float | None = None
@@ -67,6 +73,12 @@ class GenerationResult:
     rerank_candidates: list[dict] | None = None  # [{chain, cos, energy}]
     rerank_best_idx: int | None = None
 
+    # Anti-loop diagnostics
+    early_stop: bool = False
+    early_stop_step: int = -1
+    repeat_resamples: int = 0
+    diversity_cos_mean: float | None = None
+
     # Timing
     elapsed_ms: float = 0.0
 
@@ -77,6 +89,8 @@ class DiagState:
 
     generator: nn.Module | None = None
     generator_cfg: Any = None
+    generator_train_max_steps: int | None = None
+    generator_context_bank_size: int | None = None
     critic: nn.Module | None = None
     critic_cfg: Any = None
     sonar: Any = None
@@ -219,6 +233,15 @@ def load_generator(ckpt_path: str, device: str = "auto") -> str:
         else:
             cfg = ChainGeneratorConfig()
 
+        train_max_steps = None
+        context_bank_size = None
+        if "config" in ckpt and isinstance(ckpt["config"], dict):
+            tr_cfg = ckpt["config"].get("training", {}) or {}
+            if isinstance(tr_cfg, dict) and tr_cfg.get("max_chain_steps") is not None:
+                train_max_steps = int(tr_cfg["max_chain_steps"])
+            if isinstance(tr_cfg, dict) and tr_cfg.get("context_bank_size") is not None:
+                context_bank_size = int(tr_cfg["context_bank_size"])
+
         model = ChainGenerator(cfg).to(dev)
 
         # Load state dict
@@ -232,14 +255,21 @@ def load_generator(ckpt_path: str, device: str = "auto") -> str:
         model.eval()
         _state.generator = model
         _state.generator_cfg = cfg
+        _state.generator_train_max_steps = train_max_steps
+        _state.generator_context_bank_size = context_bank_size
         _state.device = str(dev)
 
         epoch = ckpt.get("epoch", "?")
         best = ckpt.get("best_metric", "?")
+        train_steps_text = (
+            str(train_max_steps) if train_max_steps is not None else "unknown"
+        )
         return (
             f"ChainGenerator loaded: {model.num_params:,} params\n"
             f"  Epoch: {epoch}, Best cos: {best}\n"
             f"  Layers: {cfg.n_layers}, Heads: {cfg.n_heads}, FFN: {cfg.dim_feedforward}\n"
+            f"  Train max steps: {train_steps_text}, Arch max len: {cfg.max_chain_len}\n"
+            f"  Context bank size: {context_bank_size if context_bank_size is not None else 'unknown'}\n"
             f"  Device: {dev}"
         )
     except Exception as e:
@@ -462,124 +492,197 @@ def load_sonar(device: str = "auto") -> str:
 
 # ── Attention Extraction ─────────────────────────────────────────
 
-def _extract_attention_maps(model: nn.Module, v_query: Tensor, chain_input: Tensor) -> list[dict]:
+def _extract_attention_maps(
+    model: nn.Module,
+    v_query: Tensor,
+    chain_input: Tensor,
+    v_context_bank: Tensor | None = None,
+    context_mask: Tensor | None = None,
+) -> list[dict]:
     """
     Extract self-attention and cross-attention maps from all decoder layers.
 
-    Args:
-        model: ChainGenerator
-        v_query: [1, D]
-        chain_input: [1, L, D] decoder input sequence
-
     Returns:
-        List of dicts per layer: {"self_attn": [H, L, L], "cross_attn": [H, L, 1]}
+        List of dicts per layer: {"self_attn": [H, L, L], "cross_attn": [H, L, K]}
     """
-    attention_maps = []
+    attention_maps: list[dict] = []
     hooks = []
+    captured: dict[int, dict[str, dict[str, Tensor]]] = {}
 
-    def make_self_attn_hook(layer_idx):
-        def hook(module, args, output):
-            # CausalRoPESelfAttention.forward captures q, k after RoPE
-            pass  # We use a different strategy — intercept SDPA
-        return hook
-
-    # Strategy: temporarily replace SDPA with a version that captures weights
-    captured = {}
-
-    def make_capture_hook(name):
-        def hook(module, args, kwargs, output):
-            # For SDPA-based attention, we need to compute weights manually
-            # from Q, K that were already processed
-            pass
-        return hook
-
-    # Simpler approach: run forward with hooks on the projection outputs
     for layer_idx, layer in enumerate(model.layers):
-        layer_maps = {}
-
-        # --- Self attention ---
         sa = layer.self_attn
-        q_captured = {}
-
-        def make_qk_hook(attn_module, storage, prefix):
-            def q_hook(mod, inp, out):
-                storage[f"{prefix}_out"] = out.detach()
-            return q_hook
-
-        hq = sa.q_proj.register_forward_hook(make_qk_hook(sa, q_captured, "q"))
-        hk = sa.k_proj.register_forward_hook(make_qk_hook(sa, q_captured, "k"))
-        hooks.extend([hq, hk])
-
-        # --- Cross attention ---
         ca = layer.cross_attn
-        cross_captured = {}
-        hcq = ca.q_proj.register_forward_hook(make_qk_hook(ca, cross_captured, "q"))
-        hck = ca.k_proj.register_forward_hook(make_qk_hook(ca, cross_captured, "k"))
-        hooks.extend([hcq, hck])
+        self_cap: dict[str, Tensor] = {}
+        cross_cap: dict[str, Tensor] = {}
 
-        captured[layer_idx] = {"self": q_captured, "cross": cross_captured}
+        def make_hook(storage: dict[str, Tensor], key: str):
+            def _hook(_, __, out):
+                storage[key] = out.detach()
 
-    # Run forward pass
-    # v_query is [D], needs to be [1, 1, D] for cross-attention KV
-    context = v_query.unsqueeze(0).unsqueeze(0)  # [1, 1, D]
+            return _hook
+
+        hooks.append(sa.q_proj.register_forward_hook(make_hook(self_cap, "q_out")))
+        hooks.append(sa.k_proj.register_forward_hook(make_hook(self_cap, "k_out")))
+        hooks.append(ca.q_proj.register_forward_hook(make_hook(cross_cap, "q_out")))
+        hooks.append(ca.k_proj.register_forward_hook(make_hook(cross_cap, "k_out")))
+
+        captured[layer_idx] = {"self": self_cap, "cross": cross_cap}
+
+    if v_context_bank is None:
+        context = v_query.unsqueeze(0).unsqueeze(0)  # [1,1,D]
+        ctx_mask = torch.ones((1, 1), device=context.device, dtype=torch.bool)
+    else:
+        context = v_context_bank.to(chain_input.device)
+        if context.dim() == 2:
+            context = context.unsqueeze(0)
+        if context_mask is None:
+            ctx_mask = torch.ones((context.shape[0], context.shape[1]), device=context.device, dtype=torch.bool)
+        else:
+            ctx_mask = context_mask.to(device=context.device, dtype=torch.bool)
+
     x = chain_input
     with torch.no_grad():
         for layer in model.layers:
-            x = layer(x, context)
+            x = layer(x, context, context_mask=ctx_mask)
 
-    # Compute attention weights from captured Q, K
     for layer_idx in range(len(model.layers)):
         sa = model.layers[layer_idx].self_attn
         ca = model.layers[layer_idx].cross_attn
         sc = captured[layer_idx]["self"]
         cc = captured[layer_idx]["cross"]
+        layer_map: dict[str, Tensor] = {}
 
-        layer_map = {}
-
-        # Self-attention weights
         if "q_out" in sc and "k_out" in sc:
-            H = sa.n_heads
-            Dh = sa.head_dim
-            q = sc["q_out"].view(1, -1, H, Dh).transpose(1, 2)  # [1, H, L, Dh]
-            k = sc["k_out"].view(1, -1, H, Dh).transpose(1, 2)
+            n_heads = sa.n_heads
+            head_dim = sa.head_dim
+            q = sc["q_out"].view(1, -1, n_heads, head_dim).transpose(1, 2)
+            k = sc["k_out"].view(1, -1, n_heads, head_dim).transpose(1, 2)
 
-            # Apply RoPE
-            L = q.shape[2]
-            rope = sa._get_rope(L, q.device)
-            from cebcm.models.chain_head import _apply_rope
+            seq_len = q.shape[2]
+            rope = sa._get_rope(seq_len, q.device)
             q = _apply_rope(q, rope)
             k = _apply_rope(k, rope)
 
-            # Compute attention weights
-            scale = Dh ** -0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            # Apply causal mask
-            causal = torch.triu(torch.ones(L, L, device=attn.device) * float("-inf"), diagonal=1)
-            attn = attn + causal
-            attn = F.softmax(attn, dim=-1)
-            layer_map["self_attn"] = attn[0].cpu()  # [H, L, L]
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (head_dim ** -0.5)
+            causal = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            )
+            scores = scores + causal
+            attn = F.softmax(scores, dim=-1)
+            layer_map["self_attn"] = attn[0].cpu()
 
-        # Cross-attention weights
         if "q_out" in cc and "k_out" in cc:
-            H = ca.n_heads
-            Dh = ca.head_dim
-            q = cc["q_out"].view(1, -1, H, Dh).transpose(1, 2)
-            k = cc["k_out"].view(1, -1, H, Dh).transpose(1, 2)
-            scale = Dh ** -0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            attn = F.softmax(attn, dim=-1)
-            layer_map["cross_attn"] = attn[0].cpu()  # [H, L, 1]
+            n_heads = ca.n_heads
+            head_dim = ca.head_dim
+            q = cc["q_out"].view(1, -1, n_heads, head_dim).transpose(1, 2)
+            k = cc["k_out"].view(1, -1, n_heads, head_dim).transpose(1, 2)
+
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (head_dim ** -0.5)
+            if ctx_mask is not None:
+                invalid = ~ctx_mask.bool()
+                scores = scores.masked_fill(invalid[:, None, None, :], float("-inf"))
+            attn = F.softmax(scores, dim=-1)
+            layer_map["cross_attn"] = attn[0].cpu()
 
         attention_maps.append(layer_map)
 
-    # Remove hooks
     for h in hooks:
         h.remove()
 
     return attention_maps
 
 
+
 # ── Generation with Full Diagnostics ─────────────────────────────
+
+def _generate_stochastic_chain(
+    model: nn.Module,
+    v_query: Tensor,
+    num_steps: int,
+    v_context_bank: Tensor | None = None,
+    context_mask: Tensor | None = None,
+    temperature: float = 1.0,
+    latent_noise_std: float = 0.0,
+    start_noise_std: float = 0.0,
+    repeat_penalty: float = 0.0,
+    repeat_cos_threshold: float = 0.98,
+    repeat_ban_threshold: float = 0.995,
+    repeat_ban_retries: int = 2,
+    energy_fn=None,
+    target_vec: Tensor | None = None,
+    stagnation_patience: int = 0,
+    stagnation_delta_energy: float = 1e-4,
+    stagnation_delta_cos: float = 1e-4,
+) -> tuple[Tensor, dict]:
+    """Generate one candidate chain with stochastic + anti-loop controls."""
+    chain, info = model.generate(
+        v_query,
+        num_steps=num_steps,
+        v_context_bank=v_context_bank,
+        context_mask=context_mask,
+        temperature=temperature,
+        latent_noise_std=latent_noise_std,
+        start_noise_std=start_noise_std,
+        repeat_penalty=repeat_penalty,
+        repeat_cos_threshold=repeat_cos_threshold,
+        repeat_ban_threshold=repeat_ban_threshold,
+        repeat_ban_max_retries=repeat_ban_retries,
+        energy_fn=energy_fn,
+        target_vec=target_vec,
+        stagnation_patience=stagnation_patience,
+        stagnation_delta_energy=stagnation_delta_energy,
+        stagnation_delta_cos=stagnation_delta_cos,
+        return_info=True,
+    )
+    return chain, info
+
+
+def _resolve_num_steps(requested_steps: int) -> tuple[int, bool, str | None]:
+    """
+    Clamp requested chain length to safe limits from loaded checkpoint/config.
+    Prevent OOD rollout when inference horizon exceeds trained horizon.
+    """
+    req = max(1, int(requested_steps))
+    caps: list[int] = []
+    reasons: list[str] = []
+
+    if _state.generator_cfg is not None and hasattr(_state.generator_cfg, "max_chain_len"):
+        arch_cap = int(_state.generator_cfg.max_chain_len)
+        if arch_cap > 0:
+            caps.append(arch_cap)
+            reasons.append(f"arch_max={arch_cap}")
+
+    if _state.generator_train_max_steps is not None:
+        tr_cap = int(_state.generator_train_max_steps)
+        if tr_cap > 0:
+            caps.append(tr_cap)
+            reasons.append(f"train_max={tr_cap}")
+
+    if not caps:
+        return req, False, None
+
+    cap = min(caps)
+    eff = min(req, cap)
+    if eff == req:
+        return eff, False, None
+    return eff, True, f"requested={req}, cap={cap} ({', '.join(reasons)})"
+
+
+def _call_critic_energy(
+    critic: nn.Module,
+    v_query: Tensor,
+    v_candidate: Tensor,
+    v_context: Tensor | None = None,
+) -> Tensor:
+    """Call critic with context when supported; fallback for legacy adapters."""
+    if v_context is not None:
+        try:
+            return critic(v_query, v_candidate, v_context=v_context)
+        except TypeError:
+            pass
+    return critic(v_query, v_candidate)
+
 
 @torch.no_grad()
 def run_generation(
@@ -587,18 +690,21 @@ def run_generation(
     num_steps: int = 1,
     v_target: Tensor | None = None,
     num_candidates: int = 1,
+    v_context: Tensor | None = None,
+    v_context_bank: Tensor | None = None,
+    context_labels: list[str] | None = None,
 ) -> GenerationResult:
     """
     Run ChainGenerator with full diagnostics.
 
     Args:
-        v_query:  [D] question embedding
-        num_steps: chain length (1 = System 1, N = System 2)
-        v_target: [D] optional ground-truth for metrics
-        num_candidates: >1 enables best-of-N with critic reranking
-
-    Returns:
-        GenerationResult with all diagnostics populated
+        v_query: [D] question embedding
+        num_steps: chain length
+        v_target: optional [D] answer embedding for diagnostics
+        num_candidates: best-of-N candidates for system2 reranking
+        v_context: optional [D] critic context (if None, fallback to query)
+        v_context_bank: optional [K, D] memory bank for generator cross-attention
+        context_labels: labels for context memory slots
     """
     if _state.generator is None:
         raise RuntimeError("ChainGenerator not loaded. Load checkpoint first.")
@@ -607,81 +713,213 @@ def run_generation(
     device = torch.device(_state.device)
     t0 = time.time()
 
+    effective_steps, step_cap_applied, step_cap_reason = _resolve_num_steps(num_steps)
+
     v_q = v_query.unsqueeze(0).to(device)  # [1, D]
+    v_ctx = v_q if v_context is None else v_context.unsqueeze(0).to(device)
 
-    # ── Generate chain(s) ──
-    if num_candidates > 1 and _state.critic is not None:
-        # Best-of-N reranking
-        candidates = []
-        for _ in range(num_candidates):
-            chain = model.generate(v_q, num_steps=num_steps)  # [1, N, D]
-            candidates.append(chain[0])  # [N, D]
+    if v_context_bank is None:
+        gen_ctx = v_q.unsqueeze(1)  # [1,1,D]
+        gen_ctx_mask = torch.ones((1, 1), device=device, dtype=torch.bool)
+        labels = context_labels or ["query"]
+    else:
+        gen_ctx = v_context_bank.to(device)
+        if gen_ctx.dim() == 2:
+            gen_ctx = gen_ctx.unsqueeze(0)
+        gen_ctx_mask = torch.ones((gen_ctx.shape[0], gen_ctx.shape[1]), device=device, dtype=torch.bool)
+        if context_labels is None:
+            labels = [f"ctx_{i}" for i in range(gen_ctx.shape[1])]
+        else:
+            labels = context_labels[: gen_ctx.shape[1]]
 
-        # Rank by critic energy on final step
-        best_idx = 0
+    def _energy_fn(q_batch: Tensor, c_batch: Tensor) -> Tensor:
+        if _state.critic is None:
+            return torch.zeros(c_batch.shape[0], device=c_batch.device)
+        return _call_critic_energy(_state.critic, q_batch, c_batch, v_context=v_ctx)
+
+    target_for_stop = None if v_target is None else v_target.to(device).unsqueeze(0)
+
+    candidates: list[Tensor] = []
+    candidate_infos: list[dict] = []
+
+    use_stochastic = (num_candidates > 1)
+    n_candidates = max(1, int(num_candidates))
+
+    for cand_idx in range(n_candidates):
+        if not use_stochastic or cand_idx == 0:
+            temperature = 1.0
+            latent_noise_std = 0.0
+            start_noise_std = 0.0
+        else:
+            temperature = 1.0 + 0.15 * ((cand_idx - 1) % 4)
+            latent_noise_std = 0.006 + 0.004 * ((cand_idx - 1) % 3)
+            start_noise_std = 0.003 + 0.002 * ((cand_idx - 1) % 2)
+
+        repeat_penalty = 0.2 if effective_steps > 1 else 0.0
+        repeat_cos_thr = 0.985
+        repeat_ban_thr = 0.997
+        repeat_ban_retries = 3
+
+        stagnation_patience = 4 if effective_steps > 1 else 0
+        stagnation_delta_energy = 5e-4
+        stagnation_delta_cos = 5e-4
+
+        chain, info = _generate_stochastic_chain(
+            model,
+            v_q,
+            num_steps=effective_steps,
+            v_context_bank=gen_ctx,
+            context_mask=gen_ctx_mask,
+            temperature=temperature,
+            latent_noise_std=latent_noise_std,
+            start_noise_std=start_noise_std,
+            repeat_penalty=repeat_penalty,
+            repeat_cos_threshold=repeat_cos_thr,
+            repeat_ban_threshold=repeat_ban_thr,
+            repeat_ban_retries=repeat_ban_retries,
+            energy_fn=_energy_fn if _state.critic is not None else None,
+            target_vec=target_for_stop,
+            stagnation_patience=stagnation_patience,
+            stagnation_delta_energy=stagnation_delta_energy,
+            stagnation_delta_cos=stagnation_delta_cos,
+        )
+
+        # Diversity guard: if final state is almost identical to previous candidates,
+        # re-sample once with stronger noise.
+        if use_stochastic and candidates:
+            final_vec = chain[0, -1]
+            prev_finals = torch.stack([c[-1] for c in candidates], dim=0)
+            sim_prev = F.cosine_similarity(final_vec.unsqueeze(0), prev_finals, dim=-1)
+            if float(sim_prev.max().item()) > 0.997:
+                chain, info = _generate_stochastic_chain(
+                    model,
+                    v_q,
+                    num_steps=effective_steps,
+                    v_context_bank=gen_ctx,
+                    context_mask=gen_ctx_mask,
+                    temperature=max(temperature, 1.15),
+                    latent_noise_std=max(latent_noise_std, 0.012),
+                    start_noise_std=max(start_noise_std, 0.006),
+                    repeat_penalty=repeat_penalty,
+                    repeat_cos_threshold=repeat_cos_thr,
+                    repeat_ban_threshold=repeat_ban_thr,
+                    repeat_ban_retries=repeat_ban_retries,
+                    energy_fn=_energy_fn if _state.critic is not None else None,
+                    target_vec=target_for_stop,
+                    stagnation_patience=stagnation_patience,
+                    stagnation_delta_energy=stagnation_delta_energy,
+                    stagnation_delta_cos=stagnation_delta_cos,
+                )
+
+        candidates.append(chain[0])
+        candidate_infos.append(
+            {
+                "idx": cand_idx,
+                "temperature": float(temperature),
+                "latent_noise_std": float(latent_noise_std),
+                "start_noise_std": float(start_noise_std),
+                "early_stop": bool(info.get("early_stop", False)),
+                "steps_generated": int(info.get("steps_generated", chain.shape[1])),
+                "repeat_resamples": int(info.get("repeat_resamples", 0)),
+            }
+        )
+
+    # Diversity metric over candidate finals.
+    diversity_cos_mean = None
+    if len(candidates) > 1:
+        finals = torch.stack([c[-1] for c in candidates], dim=0)
+        sims = []
+        for i in range(finals.shape[0]):
+            for j in range(i + 1, finals.shape[0]):
+                sims.append(float(F.cosine_similarity(finals[i:i+1], finals[j:j+1], dim=-1).item()))
+        if sims:
+            diversity_cos_mean = sum(sims) / len(sims)
+
+    # Rerank by critic energy on final step when critic is available.
+    cand_info: list[dict] | None = None
+    best_idx = 0
+    if _state.critic is not None:
         best_energy = float("inf")
         cand_info = []
         for i, c in enumerate(candidates):
-            v_ans = c[-1:]  # [1, D]
-            e = _state.critic(v_q[0:1], v_ans).item()
-            cos = F.cosine_similarity(v_ans, v_target.unsqueeze(0).to(device), dim=-1).item() if v_target is not None else 0.0
-            cand_info.append({"idx": i, "energy": e, "cos": cos})
-            if e < best_energy:
-                best_energy = e
+            v_ans = c[-1:].to(device)
+            energy = float(_call_critic_energy(_state.critic, v_q[0:1], v_ans, v_context=v_ctx).item())
+            cos = (
+                float(F.cosine_similarity(v_ans, v_target.unsqueeze(0).to(device), dim=-1).item())
+                if v_target is not None
+                else 0.0
+            )
+            merged = {
+                "idx": i,
+                "energy": energy,
+                "cos": cos,
+                **candidate_infos[i],
+            }
+            cand_info.append(merged)
+            if energy < best_energy:
+                best_energy = energy
                 best_idx = i
 
-        v_chain = candidates[best_idx]
-    else:
-        v_chain = model.generate(v_q, num_steps=num_steps)[0]  # [N, D]
-        cand_info = None
-        best_idx = None
+    v_chain = candidates[best_idx]
+    selected_info = candidate_infos[best_idx]
 
     result = GenerationResult(
-        mode="system1" if num_steps == 1 else "system2",
-        num_steps=num_steps,
+        mode="system1" if effective_steps == 1 else "system2",
+        num_steps=int(v_chain.shape[0]),
+        requested_steps=int(num_steps),
+        step_cap_applied=step_cap_applied,
+        step_cap_reason=step_cap_reason,
         v_query=v_query.cpu(),
         v_chain=v_chain.cpu(),
         v_target=v_target.cpu() if v_target is not None else None,
+        context_labels=labels,
+        early_stop=bool(selected_info.get("early_stop", False)),
+        early_stop_step=int(selected_info.get("steps_generated", v_chain.shape[0])),
+        repeat_resamples=int(selected_info.get("repeat_resamples", 0)),
+        diversity_cos_mean=diversity_cos_mean,
     )
 
-    # ── Per-step metrics ──
+    # Per-step metrics.
     for i in range(v_chain.shape[0]):
-        result.step_norms.append(v_chain[i].norm().item())
+        result.step_norms.append(float(v_chain[i].norm().item()))
         if v_target is not None:
-            cos = F.cosine_similarity(
-                v_chain[i:i+1].to(device),
-                v_target.unsqueeze(0).to(device), dim=-1
-            ).item()
-            result.step_cos_to_target.append(cos)
+            cos = F.cosine_similarity(v_chain[i:i+1].to(device), v_target.unsqueeze(0).to(device), dim=-1).item()
+            result.step_cos_to_target.append(float(cos))
 
-    # ── Critic energy along chain ──
+    # Critic energies along trajectory.
     if _state.critic is not None:
         for i in range(v_chain.shape[0]):
-            v_step = v_chain[i:i+1].to(device)
-            e = _state.critic(v_q[0:1], v_step).item()
-            result.step_critic_energies.append(e)
+            v_step = v_chain[i : i + 1].to(device)
+            e = _call_critic_energy(_state.critic, v_q[0:1], v_step, v_context=v_ctx).item()
+            result.step_critic_energies.append(float(e))
 
-        # Energy at query position and answer
-        e_q = _state.critic(v_q[0:1], v_q[0:1]).item()
-        result.critic_energy_query = e_q
+        result.critic_energy_query = float(
+            _call_critic_energy(_state.critic, v_q[0:1], v_q[0:1], v_context=v_ctx).item()
+        )
         if v_target is not None:
-            e_a = _state.critic(v_q[0:1], v_target.unsqueeze(0).to(device)).item()
-            result.critic_energy_answer = e_a
+            result.critic_energy_answer = float(
+                _call_critic_energy(_state.critic, v_q[0:1], v_target.unsqueeze(0).to(device), v_context=v_ctx).item()
+            )
 
-    # ── Extract attention maps ──
-    # Re-run forward to capture attention (teacher-forced with generated chain)
-    start = model.start_token.expand(1, -1, -1)  # [1, 1, D]
-    decoder_input = torch.cat([start, v_chain[:-1].unsqueeze(0).to(device)], dim=1)  # [1, N, D]
-    result.attention_maps = _extract_attention_maps(model, v_q[0], decoder_input)
+    # Attention extraction on selected chain.
+    start = model.start_token.expand(1, -1, -1)
+    decoder_input = torch.cat([start, v_chain[:-1].unsqueeze(0).to(device)], dim=1)
+    result.attention_maps = _extract_attention_maps(
+        model,
+        v_q[0],
+        decoder_input,
+        v_context_bank=gen_ctx,
+        context_mask=gen_ctx_mask,
+    )
 
-    # ── Reranking info ──
     if cand_info is not None:
         result.rerank_candidates = cand_info
         result.rerank_best_idx = best_idx
 
-    result.elapsed_ms = (time.time() - t0) * 1000
+    result.elapsed_ms = (time.time() - t0) * 1000.0
     _state.last_result = result
     return result
+
 
 
 # ── Critic Analysis on Chain ─────────────────────────────────────
@@ -691,6 +929,7 @@ def analyze_critic_on_chain(
     v_query: Tensor,
     v_chain: Tensor,
     v_target: Tensor | None = None,
+    v_context: Tensor | None = None,
     num_random_negatives: int = 20,
 ) -> dict:
     """
@@ -708,18 +947,21 @@ def analyze_critic_on_chain(
     device = torch.device(_state.device)
     critic = _state.critic
     v_q = v_query.unsqueeze(0).to(device)
+    v_ctx = v_q if v_context is None else v_context.unsqueeze(0).to(device)
 
     # Per-step energy
     per_step = []
     for i in range(v_chain.shape[0]):
         v = v_chain[i:i+1].to(device)
-        e = critic(v_q, v).item()
+        e = _call_critic_energy(critic, v_q, v, v_context=v_ctx).item()
         per_step.append(e)
 
     # Target energy
     e_target = None
     if v_target is not None:
-        e_target = critic(v_q, v_target.unsqueeze(0).to(device)).item()
+        e_target = _call_critic_energy(
+            critic, v_q, v_target.unsqueeze(0).to(device), v_context=v_ctx
+        ).item()
 
     # Random negative energies
     target_norm = v_chain.norm(dim=-1).mean().item()
@@ -727,7 +969,7 @@ def analyze_critic_on_chain(
     random_energies = []
     for i in range(num_random_negatives):
         v = random_vecs[i:i+1].to(device)
-        e = critic(v_q, v).item()
+        e = _call_critic_energy(critic, v_q, v, v_context=v_ctx).item()
         random_energies.append(e)
 
     # Rank accuracy: how many random negatives have higher energy than answer?
@@ -740,7 +982,7 @@ def analyze_critic_on_chain(
         "energy_target": e_target,
         "energy_random": random_energies,
         "rank_acc": rank_acc,
-        "energy_query": critic(v_q, v_q).item(),
+        "energy_query": _call_critic_energy(critic, v_q, v_q, v_context=v_ctx).item(),
     }
 
 
@@ -750,6 +992,7 @@ def analyze_critic_on_chain(
 def compute_chain_landscape(
     v_query: Tensor,
     v_chain: Tensor,
+    v_context: Tensor | None = None,
     grid_size: int = 30,
     spread: float = 0.05,
 ) -> dict:
@@ -768,6 +1011,7 @@ def compute_chain_landscape(
     device = torch.device(_state.device)
     critic = _state.critic
     v_q = v_query.unsqueeze(0).to(device)
+    v_ctx = v_q if v_context is None else v_context.unsqueeze(0).to(device)
     chain = v_chain.to(device)  # [N, D]
     N, D = chain.shape
 
@@ -812,13 +1056,15 @@ def compute_chain_landscape(
             # Reconstruct point in D-dimensional space
             v = base + (x - base_x) * d1 + (y - base_y) * d2
             v = F.normalize(v, dim=-1) * target_norm  # project to sphere
-            e = critic(v_q, v.unsqueeze(0)).item()
+            e = _call_critic_energy(
+                critic, v_q, v.unsqueeze(0), v_context=v_ctx
+            ).item()
             energy_grid[i, j] = e
 
     # Chain step energies
     chain_energies = []
     for i in range(N):
-        e = critic(v_q, chain[i:i+1]).item()
+        e = _call_critic_energy(critic, v_q, chain[i:i+1], v_context=v_ctx).item()
         chain_energies.append(e)
 
     return {
@@ -914,7 +1160,7 @@ def create_all_heads_attention_plot(result: GenerationResult, layer_idx: int = 0
 
 
 def create_cross_attention_plot(result: GenerationResult, layer_idx: int = 0) -> go.Figure:
-    """Bar chart of cross-attention weights to v_query per head."""
+    """Cross-attention heatmap over context bank tokens."""
     if not result.attention_maps or layer_idx >= len(result.attention_maps):
         fig = go.Figure()
         fig.update_layout(title="No attention data")
@@ -926,17 +1172,29 @@ def create_cross_attention_plot(result: GenerationResult, layer_idx: int = 0) ->
         fig.update_layout(title="Cross-attention not captured")
         return fig
 
-    attn = layer_map["cross_attn"]  # [H, L, 1]
-    avg = attn.mean(dim=0).squeeze(-1).numpy()  # [L]
-    L = len(avg)
-    labels = ["[START]"] + [f"step_{i+1}" for i in range(L - 1)]
+    attn = layer_map["cross_attn"]  # [H, L, K]
+    avg = attn.mean(dim=0).numpy()  # [L, K]
+    l_chain, k_ctx = avg.shape
+    y_labels = ["[START]"] + [f"step_{i+1}" for i in range(l_chain - 1)]
+    if result.context_labels and len(result.context_labels) >= k_ctx:
+        x_labels = result.context_labels[:k_ctx]
+    else:
+        x_labels = [f"ctx_{i}" for i in range(k_ctx)]
 
-    fig = go.Figure(data=go.Bar(x=labels, y=avg, marker_color="cyan"))
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=avg,
+            x=x_labels,
+            y=y_labels,
+            colorscale="Viridis",
+            colorbar=dict(title="Weight"),
+        )
+    )
     fig.update_layout(
-        title=f"Cross-Attention to Query (Layer {layer_idx}, avg heads)",
-        xaxis_title="Chain Position",
-        yaxis_title="Attention Weight",
-        height=350,
+        title=f"Cross-Attention to Context Bank (Layer {layer_idx}, avg heads)",
+        xaxis_title="Context Token",
+        yaxis_title="Chain Position",
+        height=450,
         template="plotly_dark",
     )
     return fig
@@ -1073,9 +1331,22 @@ def format_metrics_markdown(result: GenerationResult) -> str:
     """Format GenerationResult as readable Markdown."""
     lines = [
         f"### Generation Results ({result.mode.upper()})",
-        f"- **Steps**: {result.num_steps} | **Time**: {result.elapsed_ms:.0f} ms",
+        f"- **Steps**: {result.num_steps} (requested {result.requested_steps}) | **Time**: {result.elapsed_ms:.0f} ms",
         "",
     ]
+    if result.step_cap_applied and result.step_cap_reason:
+        lines.append(f"- **Step cap applied**: `{result.step_cap_reason}`")
+        lines.append("")
+    if result.early_stop:
+        lines.append(f"- **Early stop**: yes (step {result.early_stop_step})")
+    else:
+        lines.append("- **Early stop**: no")
+    lines.append(f"- **Repeat resamples**: {result.repeat_resamples}")
+    if result.diversity_cos_mean is not None:
+        lines.append(f"- **Candidate diversity (pairwise cos mean)**: {result.diversity_cos_mean:.4f}")
+    if result.context_labels:
+        lines.append(f"- **Context bank**: {', '.join(result.context_labels)}")
+    lines.append("")
 
     if result.step_cos_to_target:
         lines.append("#### Cosine to Target")
@@ -1129,6 +1400,14 @@ def export_metrics_json(result: GenerationResult) -> str:
     data = {
         "mode": result.mode,
         "num_steps": result.num_steps,
+        "requested_steps": result.requested_steps,
+        "step_cap_applied": result.step_cap_applied,
+        "step_cap_reason": result.step_cap_reason,
+        "early_stop": result.early_stop,
+        "early_stop_step": result.early_stop_step,
+        "repeat_resamples": result.repeat_resamples,
+        "diversity_cos_mean": result.diversity_cos_mean,
+        "context_labels": result.context_labels,
         "elapsed_ms": result.elapsed_ms,
         "step_cos_to_target": result.step_cos_to_target,
         "step_norms": result.step_norms,
@@ -1159,6 +1438,27 @@ def export_metrics_csv(result: GenerationResult) -> str:
 
 # ── High-Level Entry Points ──────────────────────────────────────
 
+def _build_context_bank_from_steps(
+    v_query: Tensor,
+    v_steps: Tensor | None,
+    max_slots: int,
+) -> tuple[Tensor, list[str]]:
+    """Build context memory bank [K, D] = [query, evidence slots...]."""
+    max_slots = max(1, int(max_slots))
+    labels = ["query"]
+    if v_steps is None or not isinstance(v_steps, torch.Tensor) or v_steps.ndim != 2 or v_steps.shape[0] == 0:
+        return v_query.unsqueeze(0), labels
+
+    evidence_slots = max(0, max_slots - 1)
+    if evidence_slots == 0:
+        return v_query.unsqueeze(0), labels
+
+    evidence = v_steps[:evidence_slots]
+    labels.extend([f"ev_{i+1}" for i in range(evidence.shape[0])])
+    bank = torch.cat([v_query.unsqueeze(0), evidence], dim=0)
+    return bank, labels
+
+
 def run_from_data(
     data_path: str,
     sample_idx: int = 0,
@@ -1180,19 +1480,35 @@ def run_from_data(
 
     v_query = sample["v_question"]
     v_answer = sample["v_answer"]
+    v_steps = sample.get("v_steps", None)
+    context_slots = _state.generator_context_bank_size or 4
+    v_context_bank, context_labels = _build_context_bank_from_steps(v_query, v_steps, context_slots)
+    if isinstance(v_steps, torch.Tensor) and v_steps.ndim == 2 and v_steps.shape[0] > 0:
+        v_context = v_steps.mean(dim=0)
+    else:
+        v_context = v_query
 
-    result = run_generation(v_query, num_steps=num_steps,
-                            v_target=v_answer, num_candidates=num_candidates)
+    result = run_generation(
+        v_query,
+        num_steps=num_steps,
+        v_target=v_answer,
+        num_candidates=num_candidates,
+        v_context=v_context,
+        v_context_bank=v_context_bank,
+        context_labels=context_labels,
+    )
 
     # Compute 3D landscape
     if _state.critic is not None and result.v_chain is not None:
         result.landscape_data = compute_chain_landscape(
-            v_query, result.v_chain, grid_size=grid_size,
+            v_query, result.v_chain, v_context=v_context, grid_size=grid_size,
         )
 
     # Critic analysis
     if _state.critic is not None and result.v_chain is not None:
-        critic_info = analyze_critic_on_chain(v_query, result.v_chain, v_answer)
+        critic_info = analyze_critic_on_chain(
+            v_query, result.v_chain, v_target=v_answer, v_context=v_context
+        )
         result.critic_rank_acc = critic_info.get("rank_acc")
 
     return result
@@ -1218,9 +1534,17 @@ def run_from_text(
 
     # Encode query
     v_query = _state.sonar.encode([text]).squeeze(0).cpu()  # [D]
+    v_context_bank = v_query.unsqueeze(0)
+    context_labels = ["query"]
 
-    result = run_generation(v_query, num_steps=num_steps,
-                            num_candidates=num_candidates)
+    result = run_generation(
+        v_query,
+        num_steps=num_steps,
+        num_candidates=num_candidates,
+        v_context=v_query,
+        v_context_bank=v_context_bank,
+        context_labels=context_labels,
+    )
     result.input_text = text
 
     # Decode chain steps to text
@@ -1231,7 +1555,7 @@ def run_from_text(
     # Compute 3D landscape
     if _state.critic is not None and result.v_chain is not None:
         result.landscape_data = compute_chain_landscape(
-            v_query, result.v_chain, grid_size=grid_size,
+            v_query, result.v_chain, v_context=v_query, grid_size=grid_size,
         )
 
     return result

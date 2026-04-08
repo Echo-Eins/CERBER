@@ -34,6 +34,13 @@
         "warmup_epochs": 2,
         "lr_min_factor": 0.01,
         "clip_grad_norm": 1.0,
+        "enable_hard_negatives": true,
+        "hard_negatives_top_k": 2,
+        "enable_generator_hard_negatives": true,
+        "generator_hard_checkpoint": "experiments/13_chain_generator/output/checkpoints/best.pt",
+        "generator_hard_steps": 20,
+        "generator_hard_slots": 1,
+        "generator_hard_max_pos_cos": 0.98,
 
         "log_every": 50,
         "checkpoint_every": 5,

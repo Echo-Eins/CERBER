@@ -11,6 +11,7 @@ Strictly follows lessons.md:
 
 Architecture: CompositeCritic = ConditionalAngularCritic + AnalyticalRadialGuard
 Loss: Focal-InfoNCE ONLY — E(q, correct_answer) < E(q, distractor)
+Negatives: random + in-batch hard (top-k cosine)
 No path-contrastive, no direction_loss, no Langevin, no auxiliary losses.
 
 The critic's SOLE purpose is best-of-N reranking of ChainGenerator candidates.
@@ -39,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from cebcm.models.composite_critic import CompositeCritic, CompositeCriticConfig
 from cebcm.models.conditional_angular_critic import ConditionalAngularCriticConfig
 from cebcm.models.radial_guard import RadialGuardConfig
+from cebcm.models.chain_generator import ChainGenerator, ChainGeneratorConfig
 from cebcm.training.stage2_utils import (
     MetricTracker,
     get_cosine_schedule_with_warmup,
@@ -57,7 +59,8 @@ class CriticDataset(Dataset):
     Dataset for critic reranker training.
 
     Each sample has (v_question, v_answer, v_steps).
-    We sample random answers from other samples as negatives.
+    Base negatives are random answers from other samples.
+    Hard negatives are injected per-batch from nearest in-batch answers.
     Context = mean of reasoning steps (or v_question if no steps).
     """
 
@@ -103,6 +106,75 @@ def collate_critic(batch: list[dict]) -> dict:
     }
 
 
+def inject_inbatch_hard_negatives(
+    v_positive: torch.Tensor,
+    v_negatives: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, int]:
+    """
+    Replace first top_k negatives with hardest in-batch answers by cosine similarity.
+    Converts random-only negatives into mixed random+hard negatives.
+    """
+    B, N, _ = v_negatives.shape
+    k = min(int(top_k), N, max(B - 1, 0))
+    if k <= 0:
+        return v_negatives, 0
+
+    pos_norm = F.normalize(v_positive, dim=-1)  # [B, D]
+    sim = pos_norm @ pos_norm.T                 # [B, B]
+    sim.fill_diagonal_(-1e9)
+    hard_idx = sim.topk(k=k, dim=1).indices     # [B, k]
+    hard_neg = v_positive[hard_idx]             # [B, k, D]
+
+    mixed = v_negatives.clone()
+    mixed[:, :k, :] = hard_neg
+    return mixed, k
+
+
+@torch.no_grad()
+def inject_generator_hard_negatives(
+    v_query: torch.Tensor,
+    v_positive: torch.Tensor,
+    v_negatives: torch.Tensor,
+    generator: ChainGenerator | None,
+    steps: int,
+    slots: int,
+    max_pos_cos: float,
+) -> tuple[torch.Tensor, int]:
+    """
+    Replace up to `slots` negative slots with generator-produced candidates.
+
+    Generator-hard negatives are filtered to avoid turning near-positives
+    into false negatives (cos(gen, positive) too high).
+    """
+    if generator is None:
+        return v_negatives, 0
+
+    B, N, _ = v_negatives.shape
+    k = min(int(slots), N)
+    if k <= 0:
+        return v_negatives, 0
+
+    gen_steps = max(1, int(steps))
+    gen_chain = generator.generate(v_query, num_steps=gen_steps)  # [B, S, D]
+    v_gen = gen_chain[:, -1, :]  # [B, D]
+
+    # Guard against false negatives when generator already matches target too closely.
+    cos_gp = F.cosine_similarity(v_gen, v_positive, dim=-1)  # [B]
+    use_mask = cos_gp < float(max_pos_cos)
+    if not use_mask.any():
+        return v_negatives, 0
+
+    mixed = v_negatives.clone()
+    # Fill right-most slots to preserve first slots for in-batch hard negatives.
+    start = N - k
+    used_count = int(use_mask.sum().item())
+    for j in range(start, N):
+        mixed[use_mask, j, :] = v_gen[use_mask]
+
+    return mixed, used_count
+
+
 # ── Training step ────────────────────────────────────────────────
 
 def train_step(
@@ -114,6 +186,7 @@ def train_step(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     cfg: dict,
+    generator_hard_model: ChainGenerator | None = None,
 ) -> dict[str, float]:
     """
     Single training step — Focal-InfoNCE only.
@@ -126,6 +199,24 @@ def train_step(
     v_a = batch["v_answers"].to(device)
     v_ctx = batch["v_contexts"].to(device)
     v_neg = batch["v_negatives"].to(device)
+    use_hard = bool(cfg.get("enable_hard_negatives", True))
+    hard_top_k = int(cfg.get("hard_negatives_top_k", 2))
+    hard_used = 0
+    if use_hard and hard_top_k > 0:
+        v_neg, hard_used = inject_inbatch_hard_negatives(v_a, v_neg, hard_top_k)
+
+    use_gen_hard = bool(cfg.get("enable_generator_hard_negatives", False)) and (generator_hard_model is not None)
+    gen_hard_used = 0
+    if use_gen_hard:
+        v_neg, gen_hard_used = inject_generator_hard_negatives(
+            v_q,
+            v_a,
+            v_neg,
+            generator=generator_hard_model,
+            steps=int(cfg.get("generator_hard_steps", 1)),
+            slots=int(cfg.get("generator_hard_slots", 1)),
+            max_pos_cos=float(cfg.get("generator_hard_max_pos_cos", 0.98)),
+        )
 
     clip_grad = cfg.get("clip_grad_norm", 1.0)
 
@@ -145,7 +236,14 @@ def train_step(
     scaler.step(optimizer)
     scaler.update()
 
-    return {**rank_metrics, "loss": loss.item()}
+    return {
+        **rank_metrics,
+        "loss": loss.item(),
+        "hard_neg_k": float(hard_used),
+        "hard_neg_enabled": 1.0 if use_hard else 0.0,
+        "gen_hard_neg_used": float(gen_hard_used),
+        "gen_hard_enabled": 1.0 if use_gen_hard else 0.0,
+    }
 
 
 # ── Eval step ────────────────────────────────────────────────────
@@ -157,6 +255,13 @@ def eval_step(
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    hard_neg_enabled: bool = True,
+    hard_neg_top_k: int = 2,
+    generator_hard_model: ChainGenerator | None = None,
+    generator_hard_enabled: bool = False,
+    generator_hard_steps: int = 1,
+    generator_hard_slots: int = 1,
+    generator_hard_max_pos_cos: float = 0.98,
 ) -> dict[str, float]:
     """
     Evaluation: ranking accuracy + energy gap.
@@ -167,6 +272,20 @@ def eval_step(
     v_a = batch["v_answers"].to(device)
     v_ctx = batch["v_contexts"].to(device)
     v_neg = batch["v_negatives"].to(device)
+    hard_used = 0
+    if hard_neg_enabled and hard_neg_top_k > 0:
+        v_neg, hard_used = inject_inbatch_hard_negatives(v_a, v_neg, hard_neg_top_k)
+    gen_hard_used = 0
+    if generator_hard_enabled and (generator_hard_model is not None):
+        v_neg, gen_hard_used = inject_generator_hard_negatives(
+            v_q,
+            v_a,
+            v_neg,
+            generator=generator_hard_model,
+            steps=generator_hard_steps,
+            slots=generator_hard_slots,
+            max_pos_cos=generator_hard_max_pos_cos,
+        )
 
     with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_enabled):
         # Energy for positive (correct answer)
@@ -193,6 +312,8 @@ def eval_step(
         "val_E_neg_mean": E_neg.mean().item(),
         "val_E_pos_std": E_pos.std().item(),
         "val_E_neg_std": E_neg.std().item(),
+        "val_hard_neg_k": float(hard_used),
+        "val_gen_hard_neg_used": float(gen_hard_used),
     }
 
 
@@ -308,7 +429,46 @@ def main():
     print(f"\n  Epochs: {num_epochs}, Batch: {batch_size}, LR: {lr}")
     print(f"  Loss: Focal-InfoNCE (tau={ang_cfg.temperature}, gamma={ang_cfg.focal_gamma})")
     print(f"  Negatives: {num_neg} per sample")
+    print(
+        f"  Hard negatives: enabled={bool(train_cfg.get('enable_hard_negatives', True))}, "
+        f"top_k={int(train_cfg.get('hard_negatives_top_k', 2))}"
+    )
     print("=" * 60)
+
+    # ── Optional generator-hard negatives ──
+    generator_hard_model = None
+    if bool(train_cfg.get("enable_generator_hard_negatives", False)):
+        gen_ckpt_path = str(train_cfg.get("generator_hard_checkpoint", "")).strip()
+        if gen_ckpt_path:
+            gen_ckpt = Path(gen_ckpt_path)
+            if gen_ckpt.exists():
+                try:
+                    g_ckpt = torch.load(str(gen_ckpt), map_location=device, weights_only=False)
+                    if "config" in g_ckpt and "generator" in g_ckpt["config"]:
+                        g_cfg = ChainGeneratorConfig(**g_ckpt["config"]["generator"])
+                    else:
+                        g_cfg = ChainGeneratorConfig()
+                    generator_hard_model = ChainGenerator(g_cfg).to(device)
+                    if "model" in g_ckpt:
+                        generator_hard_model.load_state_dict(g_ckpt["model"])
+                    elif "generator" in g_ckpt:
+                        generator_hard_model.load_state_dict(g_ckpt["generator"])
+                    else:
+                        generator_hard_model.load_state_dict(g_ckpt)
+                    generator_hard_model.eval()
+                    for p in generator_hard_model.parameters():
+                        p.requires_grad_(False)
+                    print(
+                        f"  Generator-hard negatives: enabled from {gen_ckpt_path} "
+                        f"(steps={int(train_cfg.get('generator_hard_steps', 1))}, "
+                        f"slots={int(train_cfg.get('generator_hard_slots', 1))})"
+                    )
+                except Exception as e:
+                    print(f"  WARNING: failed to load generator-hard checkpoint '{gen_ckpt_path}': {e}")
+            else:
+                print(f"  WARNING: generator-hard checkpoint not found: {gen_ckpt_path}")
+        else:
+            print("  WARNING: enable_generator_hard_negatives=true but generator_hard_checkpoint is empty")
 
     for epoch in range(start_epoch, num_epochs):
         t0 = time.time()
@@ -319,6 +479,7 @@ def main():
             metrics = train_step(
                 critic, batch, optimizer, scaler,
                 device, amp_enabled, amp_dtype, train_cfg,
+                generator_hard_model=generator_hard_model,
             )
             tracker.update(metrics)
             scheduler.step()
@@ -343,7 +504,20 @@ def main():
         critic.eval()
         val_tracker = MetricTracker()
         for batch in val_loader:
-            vm = eval_step(critic, batch, device, amp_enabled, amp_dtype)
+            vm = eval_step(
+                critic,
+                batch,
+                device,
+                amp_enabled,
+                amp_dtype,
+                hard_neg_enabled=bool(train_cfg.get("enable_hard_negatives", True)),
+                hard_neg_top_k=int(train_cfg.get("hard_negatives_top_k", 2)),
+                generator_hard_model=generator_hard_model,
+                generator_hard_enabled=bool(train_cfg.get("enable_generator_hard_negatives", False)),
+                generator_hard_steps=int(train_cfg.get("generator_hard_steps", 1)),
+                generator_hard_slots=int(train_cfg.get("generator_hard_slots", 1)),
+                generator_hard_max_pos_cos=float(train_cfg.get("generator_hard_max_pos_cos", 0.98)),
+            )
             val_tracker.update(vm)
 
         val_avg = val_tracker.get()
