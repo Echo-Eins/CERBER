@@ -1,5 +1,35 @@
 # Lessons
 
+## 2026-04-09 - Inference pipeline missing convergence_cos → model never uses trained EOS
+
+### Pattern
+Model was trained with answer-repeat padding to learn convergence stopping (SONAR-space EOS), but the inference diagnostics code never passed `convergence_cos` to `model.generate()`. The parameter defaulted to 0.0, disabling convergence detection entirely. All early stops were from stagnation_patience, not convergence.
+
+### Root Cause
+`_generate_stochastic_chain()` didn't accept or forward `convergence_cos` / `convergence_window` parameters. The training code taught the model to converge, but inference never checked for it.
+
+### Fix
+Added `convergence_cos` and `convergence_window` to `_generate_stochastic_chain()` and `run_generation()`. Default: `convergence_cos=0.995, convergence_window=2` for multi-step.
+
+### Rule
+When adding a feature to training (convergence stopping, new loss, etc.), immediately verify the inference pipeline uses it too. Train ↔ inference feature parity must be checked explicitly.
+
+## 2026-04-09 - 1-word outputs are a data/quality issue, not missing autoregressor
+
+### Pattern
+Model generated chain_texts like ["France", "France", "France and"] — each SONAR step decoded to 1-2 words instead of full sentences. User suspected missing autoregressive capability.
+
+### Root Causes
+1. HotpotQA answers are 1-3 word named entities ("Paris", "Satan"). SONAR embedding of short text decodes to short text. The model correctly learned to produce short answers.
+2. Suffix alignment (old bug #6) prevented learning meaningful step-by-step reasoning.
+3. cos ≈ 0.73 is too low for faithful SONAR sentence reconstruction — loses syntax, keeps only topic.
+4. Answer-repeat padding trains fast convergence → model skips reasoning, goes straight to answer keyword.
+
+### Rule
+1. Each SONAR vector IS a full sentence embedding. "1-word output" means the model produces an impoverished vector, not a missing feature.
+2. To get multi-sentence responses: deduplicate chain_texts and concatenate unique steps (assemble_response).
+3. Data determines output format: HotpotQA → short answers. For longer responses, need different training data.
+
 ## 2026-04-09 - Autoregressive chain training: 8 bugs causing tf/roll gap and gradient collapse
 
 ### Pattern

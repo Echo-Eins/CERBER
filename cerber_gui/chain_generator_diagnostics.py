@@ -49,6 +49,7 @@ class GenerationResult:
     # Text
     input_text: str | None = None
     chain_texts: list[str] = field(default_factory=list)  # decoded chain steps
+    response_text: str | None = None  # assembled clean response (deduplicated chain)
     target_text: str | None = None
 
     # Per-step metrics
@@ -614,6 +615,8 @@ def _generate_stochastic_chain(
     stagnation_patience: int = 0,
     stagnation_delta_energy: float = 1e-4,
     stagnation_delta_cos: float = 1e-4,
+    convergence_cos: float = 0.0,
+    convergence_window: int = 2,
 ) -> tuple[Tensor, dict]:
     """Generate one candidate chain with stochastic + anti-loop controls."""
     chain, info = model.generate(
@@ -633,6 +636,8 @@ def _generate_stochastic_chain(
         stagnation_patience=stagnation_patience,
         stagnation_delta_energy=stagnation_delta_energy,
         stagnation_delta_cos=stagnation_delta_cos,
+        convergence_cos=convergence_cos,
+        convergence_window=convergence_window,
         return_info=True,
     )
     return chain, info
@@ -764,6 +769,10 @@ def run_generation(
         stagnation_delta_energy = 5e-4
         stagnation_delta_cos = 5e-4
 
+        # Convergence stopping: SONAR-space EOS trained via answer-repeat padding.
+        convergence_cos = 0.995 if effective_steps > 1 else 0.0
+        convergence_window = 2
+
         chain, info = _generate_stochastic_chain(
             model,
             v_q,
@@ -782,6 +791,8 @@ def run_generation(
             stagnation_patience=stagnation_patience,
             stagnation_delta_energy=stagnation_delta_energy,
             stagnation_delta_cos=stagnation_delta_cos,
+            convergence_cos=convergence_cos,
+            convergence_window=convergence_window,
         )
 
         # Diversity guard: if final state is almost identical to previous candidates,
@@ -809,6 +820,8 @@ def run_generation(
                     stagnation_patience=stagnation_patience,
                     stagnation_delta_energy=stagnation_delta_energy,
                     stagnation_delta_cos=stagnation_delta_cos,
+                    convergence_cos=convergence_cos,
+                    convergence_window=convergence_window,
                 )
 
         candidates.append(chain[0])
@@ -819,6 +832,7 @@ def run_generation(
                 "latent_noise_std": float(latent_noise_std),
                 "start_noise_std": float(start_noise_std),
                 "early_stop": bool(info.get("early_stop", False)),
+                "early_stop_reason": str(info.get("early_stop_reason", "")),
                 "steps_generated": int(info.get("steps_generated", chain.shape[1])),
                 "repeat_resamples": int(info.get("repeat_resamples", 0)),
             }
@@ -1387,12 +1401,49 @@ def format_metrics_markdown(result: GenerationResult) -> str:
             lines.append(f"- Candidate {c['idx']}: E={c['energy']:.4f}, cos={c['cos']:.4f}{marker}")
         lines.append("")
 
+    if result.response_text:
+        lines.append(f"#### Response\n> {result.response_text}\n")
+
     if result.input_text:
         lines.append(f"#### Input Text\n> {result.input_text}\n")
     if result.target_text:
         lines.append(f"#### Target Text\n> {result.target_text}\n")
 
     return "\n".join(lines)
+
+
+def assemble_response(chain_texts: list[str]) -> str:
+    """Assemble chain steps into a clean response text.
+
+    Deduplicates near-identical steps and concatenates the unique reasoning
+    steps followed by the final answer.  This is the "chat mode" view: instead
+    of showing every chain step, collapse repetitions and return a readable
+    multi-sentence response.
+    """
+    if not chain_texts:
+        return ""
+
+    # Normalize whitespace.
+    texts = [t.strip() for t in chain_texts if t.strip()]
+    if not texts:
+        return ""
+
+    # Deduplicate consecutive near-identical texts.
+    unique: list[str] = [texts[0]]
+    for t in texts[1:]:
+        prev = unique[-1].lower().rstrip(".!?,;:")
+        curr = t.lower().rstrip(".!?,;:")
+        # Skip if identical, substring, or only differs by punctuation.
+        if curr == prev:
+            continue
+        if curr in prev or prev in curr:
+            # Keep the longer version.
+            if len(t) > len(unique[-1]):
+                unique[-1] = t
+            continue
+        unique.append(t)
+
+    return " ".join(unique)
 
 
 def export_metrics_json(result: GenerationResult) -> str:
@@ -1416,6 +1467,7 @@ def export_metrics_json(result: GenerationResult) -> str:
         "critic_energy_query": result.critic_energy_query,
         "critic_rank_acc": result.critic_rank_acc,
         "chain_texts": result.chain_texts,
+        "response_text": result.response_text,
         "input_text": result.input_text,
         "target_text": result.target_text,
     }
@@ -1551,6 +1603,7 @@ def run_from_text(
     if result.v_chain is not None:
         chain_for_decode = result.v_chain.to(device)
         result.chain_texts = _state.sonar.decode_safe(chain_for_decode)
+        result.response_text = assemble_response(result.chain_texts)
 
     # Compute 3D landscape
     if _state.critic is not None and result.v_chain is not None:
