@@ -91,6 +91,108 @@ def get_state() -> DiagState:
     return _state
 
 
+class _LegacyTwinCriticAdapter:
+    """
+    Runtime adapter for legacy Stage1.5 twin critics.
+
+    Supports both:
+      - radial_angular (AngularEnergyCritic + RadialEnergyCritic)
+      - homogeneous twin (SimpleEnergy + SimpleEnergy)
+    """
+
+    def __init__(
+        self,
+        critic1: nn.Module,
+        critic2: nn.Module,
+        aggregate: str = "max",
+        softmax_temperature: float = 0.1,
+        critic_architecture: str = "homogeneous",
+        sigma_min: float = 0.01,
+        sigma_max: float = 0.3,
+        sigma_head_weighting_enabled: bool = False,
+        angular_weight_low_sigma: float = 0.5,
+        angular_weight_high_sigma: float = 0.5,
+        head_weight_power: float = 1.0,
+    ):
+        self.critic1 = critic1
+        self.critic2 = critic2
+        self.aggregate = str(aggregate)
+        self.softmax_temperature = float(softmax_temperature)
+        self.critic_architecture = str(critic_architecture)
+        self.sigma_min = float(max(sigma_min, 1e-8))
+        self.sigma_max = float(max(sigma_max, self.sigma_min + 1e-8))
+        self.sigma_head_weighting_enabled = bool(sigma_head_weighting_enabled)
+        self.angular_weight_low_sigma = float(angular_weight_low_sigma)
+        self.angular_weight_high_sigma = float(angular_weight_high_sigma)
+        self.head_weight_power = float(max(head_weight_power, 1e-6))
+
+    def eval(self):
+        self.critic1.eval()
+        self.critic2.eval()
+        return self
+
+    def _conditional_energy(
+        self,
+        v_query: Tensor,
+        v_candidate: Tensor,
+        sigma: Tensor | None = None,
+    ) -> Tensor:
+        e1 = self.critic1(v_query, v_candidate, sigma=sigma)
+        e2 = self.critic2(v_query, v_candidate, sigma=sigma)
+
+        # Stage1.5 radial_angular weighting by sigma.
+        if self.critic_architecture == "radial_angular":
+            sigma_use = sigma
+            if sigma_use is None:
+                with torch.no_grad():
+                    d = (v_candidate - v_query).norm(dim=-1, keepdim=True)
+                    qn = v_query.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    sigma_use = (d / qn).clamp(min=self.sigma_min, max=self.sigma_max)
+
+            if self.sigma_head_weighting_enabled:
+                log_s = sigma_use.clamp(min=self.sigma_min, max=self.sigma_max).log()
+                denom = max(float(torch.log(torch.tensor(self.sigma_max / self.sigma_min))), 1e-8)
+                t = ((log_s - torch.log(torch.tensor(self.sigma_min, device=log_s.device))) / denom)
+                t = t.clamp(min=0.0, max=1.0).pow(self.head_weight_power)
+                w_ang = self.angular_weight_low_sigma + (
+                    self.angular_weight_high_sigma - self.angular_weight_low_sigma
+                ) * t
+            else:
+                w_const = 0.5 * (self.angular_weight_low_sigma + self.angular_weight_high_sigma)
+                w_ang = torch.full_like(sigma_use, w_const)
+            w_ang = w_ang.clamp(min=0.0, max=1.0).squeeze(-1)
+            return w_ang * e1 + (1.0 - w_ang) * e2
+
+        if self.aggregate == "mean":
+            return 0.5 * (e1 + e2)
+        if self.aggregate == "max":
+            return torch.maximum(e1, e2)
+        if self.aggregate == "softmax":
+            tau = max(1e-6, self.softmax_temperature)
+            stacked = torch.stack([e1, e2], dim=0)
+            return tau * torch.logsumexp(stacked / tau, dim=0)
+        raise ValueError(f"Unknown twin aggregate mode: {self.aggregate}")
+
+    def __call__(
+        self,
+        v_query: Tensor,
+        v_candidate: Tensor,
+        sigma: Tensor | None = None,
+    ) -> Tensor:
+        return self._conditional_energy(v_query, v_candidate, sigma=sigma)
+
+    def energy_and_grad(
+        self,
+        v_query: Tensor,
+        v_candidate: Tensor,
+        sigma: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        v_req = v_candidate.detach().requires_grad_(True)
+        energy = self(v_query, v_req, sigma=sigma)
+        grad = torch.autograd.grad(energy.sum(), v_req, create_graph=False)[0]
+        return energy.detach(), grad.detach()
+
+
 # ── Model Loading ────────────────────────────────────────────────
 
 def _resolve_device(override: str | None = None) -> torch.device:
@@ -150,6 +252,8 @@ def load_critic(ckpt_path: str, device: str = "auto") -> str:
     from cebcm.models.composite_critic import CompositeCritic, CompositeCriticConfig
     from cebcm.models.conditional_angular_critic import ConditionalAngularCriticConfig
     from cebcm.models.radial_guard import RadialGuardConfig
+    from cebcm.models.energy import SimpleEnergy
+    from cebcm.models.energy_decomposed import AngularEnergyCritic, RadialEnergyCritic
 
     dev = _resolve_device(device)
     path = Path(ckpt_path)
@@ -158,6 +262,155 @@ def load_critic(ckpt_path: str, device: str = "auto") -> str:
 
     try:
         ckpt = torch.load(str(path), map_location=dev, weights_only=False)
+
+        def _load_compat_state(model_obj: nn.Module, state_dict: dict, label: str) -> None:
+            """
+            Load with backward-compatible migration:
+              - plain -> parametrized
+              - parametrized -> plain
+            """
+            def _mismatch(load_res) -> tuple[list[str], list[str]]:
+                missing_keys = [k for k in load_res.missing_keys if k != "_sigma_freqs"]
+                unexpected_keys = [k for k in load_res.unexpected_keys]
+                return missing_keys, unexpected_keys
+
+            def _prepare_migration(model_target: nn.Module, source_sd: dict) -> tuple[dict | None, str | None]:
+                model_sd = model_target.state_dict()
+                model_has_param = any("parametrizations.weight.original" in k for k in model_sd.keys())
+                source_has_param = any("parametrizations.weight.original" in k for k in source_sd.keys())
+
+                if model_has_param and not source_has_param:
+                    migrated = {}
+                    for new_key, new_val in model_sd.items():
+                        if new_key in source_sd:
+                            migrated[new_key] = source_sd[new_key]
+                            continue
+                        if "parametrizations.weight.original" in new_key:
+                            old_key = new_key.replace("parametrizations.weight.original", "weight")
+                            if old_key in source_sd:
+                                migrated[new_key] = source_sd[old_key]
+                                continue
+                        migrated[new_key] = new_val
+                    return migrated, "plain->parametrized"
+
+                if (not model_has_param) and source_has_param:
+                    migrated = {}
+                    for key, value in source_sd.items():
+                        if "parametrizations.weight.original" in key:
+                            bare_key = key.replace("parametrizations.weight.original", "weight")
+                            migrated[bare_key] = value
+                            continue
+                        if ".parametrizations.weight." in key:
+                            continue
+                        migrated[key] = value
+                    return migrated, "parametrized->plain"
+
+                return None, None
+
+            load_result = model_obj.load_state_dict(state_dict, strict=False)
+            missing, unexpected = _mismatch(load_result)
+            if not (missing or unexpected):
+                return
+
+            migrated, tag = _prepare_migration(model_obj, state_dict)
+            if migrated is not None:
+                retry_result = model_obj.load_state_dict(migrated, strict=False)
+                missing_retry, unexpected_retry = _mismatch(retry_result)
+                if not (missing_retry or unexpected_retry):
+                    return
+                missing, unexpected = missing_retry, unexpected_retry
+
+            missing_preview = ", ".join(missing[:10])
+            unexpected_preview = ", ".join(unexpected[:10])
+            migration_note = f" Migration attempted: {tag}." if tag else ""
+            raise RuntimeError(
+                f"Checkpoint/model mismatch ({label}). "
+                f"Missing({len(missing)}): {missing_preview}. "
+                f"Unexpected({len(unexpected)}): {unexpected_preview}."
+                f"{migration_note}"
+            )
+
+        # Legacy Stage1.5 checkpoint format (twin critics + training payload).
+        if ("critic1_state" in ckpt) or ("critic2_state" in ckpt):
+            cfg = ckpt.get("config", {}) or {}
+            dim = int(cfg.get("energy_dim", 1024))
+            arch = str(cfg.get("critic_architecture", "homogeneous"))
+            norm_mode = str(cfg.get("norm_mode", "none"))
+            activation = str(cfg.get("activation", "silu"))
+
+            if arch == "radial_angular":
+                c1 = AngularEnergyCritic(
+                    dim=dim,
+                    hidden_dims=[int(x) for x in cfg.get("angular_hidden_dims", [2048, 1024, 512])],
+                    norm_mode=str(cfg.get("angular_norm_mode", norm_mode)),
+                    activation=str(cfg.get("angular_activation", activation)),
+                    energy_output_clamp=None,
+                ).to(dev)
+                target_norm = cfg.get("target_norm", cfg.get("langevin", {}).get("target_norm", 0.2051))
+                c2 = RadialEnergyCritic(
+                    dim=dim,
+                    hidden_dims=[int(x) for x in cfg.get("radial_hidden_dims", [512, 256, 128])],
+                    norm_mode=str(cfg.get("radial_norm_mode", norm_mode)),
+                    activation=str(cfg.get("radial_activation", activation)),
+                    target_norm=float(target_norm) if target_norm is not None else None,
+                    energy_output_clamp=None,
+                ).to(dev)
+            else:
+                hidden_dims = [int(x) for x in cfg.get("energy_hidden_dims", [2048, 1024, 512])]
+                c1 = SimpleEnergy(
+                    dim=dim,
+                    hidden_dims=hidden_dims,
+                    norm_mode=norm_mode,
+                    activation=activation,
+                    energy_output_clamp=None,
+                ).to(dev)
+                c2 = SimpleEnergy(
+                    dim=dim,
+                    hidden_dims=hidden_dims,
+                    norm_mode=norm_mode,
+                    activation=activation,
+                    energy_output_clamp=None,
+                ).to(dev)
+
+            c1_state = ckpt.get("critic1_state", ckpt.get("critic_state", {}))
+            c2_state = ckpt.get("critic2_state", c1_state)
+            _load_compat_state(c1, c1_state, "legacy_critic1_state")
+            _load_compat_state(c2, c2_state, "legacy_critic2_state")
+
+            aggregate = str(cfg.get("twin_aggregate", "max"))
+            softmax_temperature = float(cfg.get("twin_softmax_temperature", 0.1))
+            model = _LegacyTwinCriticAdapter(
+                critic1=c1,
+                critic2=c2,
+                aggregate=aggregate,
+                softmax_temperature=softmax_temperature,
+                critic_architecture=arch,
+                sigma_min=float(cfg.get("sigma_min", 0.01)),
+                sigma_max=float(cfg.get("sigma_max", 0.3)),
+                sigma_head_weighting_enabled=bool(cfg.get("sigma_head_weighting_enabled", False)),
+                angular_weight_low_sigma=float(cfg.get("angular_weight_low_sigma", 0.5)),
+                angular_weight_high_sigma=float(cfg.get("angular_weight_high_sigma", 0.5)),
+                head_weight_power=float(cfg.get("head_weight_power", 1.0)),
+            )
+            model.eval()
+
+            _state.critic = model
+            _state.critic_cfg = {
+                "legacy": True,
+                "critic_architecture": arch,
+                "aggregate": aggregate,
+            }
+            _state.device = str(dev)
+
+            c1_params = sum(p.numel() for p in c1.parameters())
+            c2_params = sum(p.numel() for p in c2.parameters())
+            return (
+                f"Legacy twin critic loaded ({arch})\n"
+                f"  Critic1 params: {c1_params:,}\n"
+                f"  Critic2 params: {c2_params:,}\n"
+                f"  Aggregate: {aggregate}\n"
+                f"  Device: {dev}"
+            )
 
         critic_raw = {}
         if "config" in ckpt and "critic" in ckpt["config"]:
@@ -172,15 +425,16 @@ def load_critic(ckpt_path: str, device: str = "auto") -> str:
         model = CompositeCritic(comp_cfg).to(dev)
 
         if "model" in ckpt:
-            model.load_state_dict(ckpt["model"])
+            _load_compat_state(model, ckpt["model"], "model")
         elif "critic" in ckpt:
-            model.load_state_dict(ckpt["critic"])
+            _load_compat_state(model, ckpt["critic"], "critic")
         else:
-            model.load_state_dict(ckpt)
+            _load_compat_state(model, ckpt, "raw_checkpoint")
 
         model.eval()
         _state.critic = model
         _state.critic_cfg = comp_cfg
+        _state.device = str(dev)
 
         return (
             f"CompositeCritic loaded: {model.angular.num_params:,} angular params\n"
