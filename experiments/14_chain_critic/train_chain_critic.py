@@ -64,9 +64,10 @@ class CriticDataset(Dataset):
     Context = mean of reasoning steps (or v_question if no steps).
     """
 
-    def __init__(self, samples: list[dict], num_negatives: int = 7):
+    def __init__(self, samples: list[dict], num_negatives: int = 7, context_bank_size: int = 4):
         self.samples = samples
         self.num_negatives = num_negatives
+        self.context_bank_size = max(1, int(context_bank_size))
         self._all_answers = torch.stack([s["v_answer"] for s in samples])
 
     def __len__(self) -> int:
@@ -78,8 +79,15 @@ class CriticDataset(Dataset):
         v_a = s["v_answer"]
         v_steps = s["v_steps"]
 
-        # Context = mean of reasoning steps (semantic grounding)
-        v_context = v_steps.mean(dim=0) if v_steps.shape[0] > 0 else v_q
+        # Context must match generator's context bank: [query, evidence_slots...]
+        # Critic sees the mean of this bank (same semantic grounding as generator).
+        max_evidence = max(0, self.context_bank_size - 1)
+        if v_steps.shape[0] > 0 and max_evidence > 0:
+            evidence = v_steps[:max_evidence]
+            bank = torch.cat([v_q.unsqueeze(0), evidence], dim=0)  # [K, D]
+        else:
+            bank = v_q.unsqueeze(0)  # [1, D]
+        v_context = bank.mean(dim=0)  # [D] — mean of full context bank
 
         # Sample negatives: random answers from other samples
         neg_indices = []
@@ -166,13 +174,13 @@ def inject_generator_hard_negatives(
         return v_negatives, 0
 
     mixed = v_negatives.clone()
-    # Fill right-most slots to preserve first slots for in-batch hard negatives.
-    start = N - k
-    used_count = int(use_mask.sum().item())
-    for j in range(start, N):
-        mixed[use_mask, j, :] = v_gen[use_mask]
+    # Fill the last slot with generator-produced negative.
+    # Only 1 unique generator output per sample (single generate call),
+    # so we place it in the last slot to preserve in-batch hard negatives in first slots.
+    slot_idx = N - 1
+    mixed[use_mask, slot_idx, :] = v_gen[use_mask]
 
-    return mixed, used_count
+    return mixed, int(use_mask.sum().item())
 
 
 # ── Training step ────────────────────────────────────────────────
@@ -369,8 +377,9 @@ def main():
     data = torch.load(data_path, map_location="cpu", weights_only=False)
 
     num_neg = ang_cfg.num_negatives
-    train_ds = CriticDataset(data["train"], num_negatives=num_neg)
-    val_ds = CriticDataset(data["val"], num_negatives=num_neg)
+    ctx_bank_size = config["data"].get("context_bank_size", 4)
+    train_ds = CriticDataset(data["train"], num_negatives=num_neg, context_bank_size=ctx_bank_size)
+    val_ds = CriticDataset(data["val"], num_negatives=num_neg, context_bank_size=ctx_bank_size)
     print(f"  Train: {len(train_ds)}, Val: {len(val_ds)}")
 
     train_cfg = config["training"]

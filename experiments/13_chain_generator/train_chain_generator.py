@@ -166,8 +166,8 @@ def _masked_step_losses(
     cos_sim = F.cosine_similarity(pred, target, dim=-1)
     cos_loss = ((1.0 - cos_sim) * maskf).sum() / mask_sum
 
-    mse_per = (pred - target).pow(2).mean(dim=-1)
-    mse_loss = (mse_per * maskf).sum() / mask_sum / d_model
+    mse_per = (pred - target).pow(2).mean(dim=-1)  # already averaged over D
+    mse_loss = (mse_per * maskf).sum() / mask_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
     return loss, {
@@ -245,7 +245,7 @@ def compute_composite_objective(
     tf_final = _gather_last_valid(v_tf, valid_lens)
     tgt_final = _gather_last_valid(chains, valid_lens)
     ans_cos = (1.0 - F.cosine_similarity(tf_final, tgt_final, dim=-1)).mean()
-    ans_mse = (tf_final - tgt_final).pow(2).mean(dim=-1).mean() / d_model
+    ans_mse = (tf_final - tgt_final).pow(2).mean(dim=-1).mean()  # .mean(-1) already averages over D
     l_ans = w_cos * ans_cos + w_mse * ans_mse
 
     # 3) Free-run rollout loss (exposure-bias correction).

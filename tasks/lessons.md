@@ -1,5 +1,28 @@
 # Lessons
 
+## 2026-04-08 - Post-review bugfixes for Stage 13/14 pipeline
+
+### Bugs Found and Fixed
+
+1. **Temperature noise scaling asymmetry** (`chain_generator.py:generate`): `temp>1` added 0.01 (negligible), `temp<1` multiplied (zeroed noise). Fixed: `noise_std = latent_noise_std * temp` — consistent multiplicative scaling.
+
+2. **MSE double-division by d_model** (`train_chain_generator.py`): `.mean(dim=-1)` already averages over D=1024, then code divided by `d_model` again. Result: MSE contributed 0.008% of total loss — effectively dead. Fixed: removed redundant division. MSE now contributes meaningfully (~0.85%).
+
+3. **Deterministic free-run defaults** (`chain_generator_config.json`): `free_run_noise_std=0.0, temperature=1.0` made rollout identical to greedy teacher-forcing. L_free_run degenerated into a copy of L_step — zero exposure-bias correction. Fixed: `noise_std=0.005, temperature=1.05`.
+
+4. **Stagnation check logic** (`chain_generator.py`): When `energy_fn` failed silently, `energy_hist` was empty but `cos_hist` had data. AND logic `stagnated = False AND (cos_check)` → never triggered. Fixed: check ALL available metrics independently with proper length guards.
+
+5. **Critic context mismatch** (`train_chain_critic.py`): Critic trained on `mean(v_steps)` but generator uses context bank `[query, evidence_1, ..., evidence_K]`. At reranking time, critic sees different semantic grounding. Fixed: critic dataset now builds context = `mean([query, evidence_slots])` matching generator's bank.
+
+6. **Generator hard negative redundancy** (`train_chain_critic.py`): Loop filled k rightmost slots with identical `v_gen` vector. Fixed: single slot fill since only one generate call is made.
+
+### Rules
+1. Temperature must scale noise consistently — use multiplication, not mixed additive/multiplicative.
+2. When loss = `f(x).mean(dim=-1)`, do NOT divide by `dim_size` again. Check loss magnitudes against other components.
+3. Free-run rollout MUST have non-zero noise during training — otherwise it provides zero exposure-bias correction.
+4. Stagnation/early-stop logic must handle partial metric availability (some trackers may fail).
+5. Critic and generator MUST use the same context construction at train and inference time.
+
 ## 2026-04-08 - Autoregressive QA: never train on padded tokens or prefix-only curriculum that drops answer
 
 ### Pattern

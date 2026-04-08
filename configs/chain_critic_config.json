@@ -23,7 +23,8 @@
 
     "data": {
         "path": "data/hotpotqa_sonar.pt",
-        "num_workers": 4
+        "num_workers": 4,
+        "context_bank_size": 4
     },
 
     "training": {

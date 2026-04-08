@@ -369,11 +369,8 @@ class ChainGenerator(nn.Module):
                     repel = hist[torch.arange(bsz, device=hist.device), max_idx].unsqueeze(1)
                     raw_next = raw_next - repeat_penalty * over.view(bsz, 1, 1) * repel
 
-            noise_std = latent_noise_std
-            if temp > 1.0:
-                noise_std = noise_std + 0.01 * (temp - 1.0)
-            elif temp < 1.0:
-                noise_std = noise_std * temp
+            # Scale noise by temperature: higher temp → more noise, lower temp → less.
+            noise_std = latent_noise_std * temp
 
             if noise_std > 0.0:
                 raw_next = raw_next + noise_std * torch.randn_like(raw_next)
@@ -409,21 +406,27 @@ class ChainGenerator(nn.Module):
                         energy_hist.append(float(e_val.detach().mean().item()))
                     else:
                         energy_hist.append(float(e_val))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    import warnings
+                    if step_idx == 0:
+                        warnings.warn(f"energy_fn failed at step 0: {exc}", stacklevel=2)
+                    # Continue without energy tracking for this step.
 
             if t_target is not None:
                 cos_val = F.cosine_similarity(next_vec.squeeze(1), t_target, dim=-1)
                 cos_hist.append(float(cos_val.mean().item()))
 
             if stagnation_patience > 0 and step_idx + 1 >= (stagnation_patience + 1):
-                stagnated = False
-                if energy_hist:
+                # Stagnation if ALL available metrics are flat.
+                # If no metric is available, don't trigger.
+                checks = []
+                if len(energy_hist) > stagnation_patience:
                     de = abs(energy_hist[-1] - energy_hist[-1 - stagnation_patience])
-                    stagnated = de <= stagnation_delta_energy
-                if cos_hist:
+                    checks.append(de <= stagnation_delta_energy)
+                if len(cos_hist) > stagnation_patience:
                     dc = abs(cos_hist[-1] - cos_hist[-1 - stagnation_patience])
-                    stagnated = stagnated and (dc <= stagnation_delta_cos)
+                    checks.append(dc <= stagnation_delta_cos)
+                stagnated = len(checks) > 0 and all(checks)
                 if stagnated:
                     early_stop = True
                     early_stop_step = step_idx + 1
