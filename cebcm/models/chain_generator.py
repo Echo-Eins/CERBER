@@ -400,6 +400,7 @@ class ChainGenerator(nn.Module):
 
         energy_hist: list[float] = []
         cos_hist: list[float] = []
+        raw_norms: list[float] = []
         early_stop = False
         early_stop_step = -1
         early_stop_reason = ""
@@ -420,6 +421,8 @@ class ChainGenerator(nn.Module):
 
             x = self.final_norm(x)
             raw_next = self.output_proj(x[:, -1:, :])
+
+            raw_norms.append(float(raw_next.detach().norm(dim=-1).mean().item()))
 
             if generated and repeat_penalty > 0.0:
                 hist = torch.cat(generated, dim=1)
@@ -535,6 +538,8 @@ class ChainGenerator(nn.Module):
         if not return_info:
             return chain_out
 
+        raw_norm_mean = sum(raw_norms) / len(raw_norms) if raw_norms else 0.0
+
         info: dict[str, float | int | bool | str] = {
             "early_stop": early_stop,
             "early_stop_step": int(early_stop_step),
@@ -546,6 +551,7 @@ class ChainGenerator(nn.Module):
             "latent_noise_std": float(latent_noise_std),
             "start_noise_std": float(start_noise_std),
             "repeat_penalty": float(repeat_penalty),
+            "raw_norm_mean": float(raw_norm_mean),
         }
         if energy_hist:
             info["energy_final"] = float(energy_hist[-1])

@@ -3084,7 +3084,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     label="Sequence Index",
                 )
                 chain_length = gr.Slider(
-                    minimum=5, maximum=20, value=10, step=1,
+                    minimum=5, maximum=200, value=10, step=1,
                     label="Chain Length",
                 )
                 chain_analyze_btn = gr.Button("Analyze Chain Head", variant="primary")
@@ -3160,7 +3160,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     label="Mode (1=direct answer, 2=reasoning chain)",
                 )
                 cg_num_steps = gr.Slider(
-                    minimum=1, maximum=20, value=1, step=1,
+                    minimum=1, maximum=200, value=1, step=1,
                     label="Chain Steps (System 2)",
                 )
                 cg_num_candidates = gr.Slider(

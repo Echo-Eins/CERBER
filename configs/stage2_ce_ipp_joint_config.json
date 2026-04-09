@@ -61,7 +61,7 @@
         "weight_decay": 0.01,
         "clip_grad_norm": 1.0,
         "batch_size": 32,
-        "num_epochs": 40,
+        "num_epochs": 20,
         "warmup_epochs": 3,
         "lr_min_factor": 0.01,
         "use_surprise_features": true,
