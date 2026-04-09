@@ -274,22 +274,55 @@ class ChainGenerator(nn.Module):
         v_target_chain: Tensor,
         v_context_bank: Tensor | None = None,
         context_mask: Tensor | None = None,
+        scheduled_sampling_prob: float = 0.0,
     ) -> Tensor:
-        """Teacher-forced forward pass."""
+        """Teacher-forced forward pass with optional scheduled sampling.
+
+        When scheduled_sampling_prob > 0 and training, each position (except
+        the first) independently uses the model's own prediction instead of
+        ground truth with probability ``scheduled_sampling_prob``.
+        This bridges the teacher-forcing / free-run distribution gap.
+        """
         bsz, num_steps, _ = v_target_chain.shape
-
-        start = self.start_token.expand(bsz, -1, -1)
-        decoder_input = torch.cat([start, v_target_chain[:, :-1, :]], dim=1)
-
         context, ctx_mask = self._prepare_context(v_query, v_context_bank, context_mask)
 
-        x = decoder_input
-        for layer in self.layers:
-            x = layer(x, context, context_mask=ctx_mask)
+        ss_prob = float(scheduled_sampling_prob)
+        use_ss = self.training and ss_prob > 0.0 and num_steps > 1
 
-        x = self.final_norm(x)
-        v_pred = self.output_proj(x)
-        return self._sphere_project(v_pred)
+        if not use_ss:
+            # Pure teacher forcing (original path).
+            start = self.start_token.expand(bsz, -1, -1)
+            decoder_input = torch.cat([start, v_target_chain[:, :-1, :]], dim=1)
+
+            x = decoder_input
+            for layer in self.layers:
+                x = layer(x, context, context_mask=ctx_mask)
+
+            x = self.final_norm(x)
+            v_pred = self.output_proj(x)
+            return self._sphere_project(v_pred)
+
+        # ── Scheduled sampling: step-by-step with token mixing ──
+        seq = self.start_token.expand(bsz, -1, -1)  # [B, 1, D]
+        preds: list[Tensor] = []
+
+        for t in range(num_steps):
+            x = seq
+            for layer in self.layers:
+                x = layer(x, context, context_mask=ctx_mask)
+
+            x = self.final_norm(x)
+            raw = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+            pred_t = self._sphere_project(raw)
+            preds.append(pred_t)
+
+            if t < num_steps - 1:
+                # Decide per-sample: use own prediction or ground truth.
+                use_pred = torch.rand(bsz, 1, 1, device=v_query.device) < ss_prob
+                next_input = torch.where(use_pred, pred_t, v_target_chain[:, t:t+1, :])
+                seq = torch.cat([seq, next_input], dim=1)
+
+        return torch.cat(preds, dim=1)
 
     def generate(
         self,
@@ -409,7 +442,14 @@ class ChainGenerator(nn.Module):
 
             next_vec = self._sphere_project(raw_next)
 
-            if generated and repeat_ban_threshold < 1.0 and repeat_ban_max_retries > 0:
+            # Fix #5: Skip repeat_ban during training — torch.where with
+            # a second randn introduces piecewise gradient discontinuities.
+            if (
+                not self.training
+                and generated
+                and repeat_ban_threshold < 1.0
+                and repeat_ban_max_retries > 0
+            ):
                 hist = torch.cat(generated, dim=1)
                 jitter_std = max(noise_std, 0.01)
                 for _ in range(repeat_ban_max_retries):
@@ -428,8 +468,13 @@ class ChainGenerator(nn.Module):
                     next_vec = torch.where(mask3, candidate, next_vec)
                     repeat_resamples += int(repeat_mask.sum().item())
 
+            # Fix #3: Detach before appending so backward() through L_roll
+            # only goes one step deep, not through the entire autoregressive
+            # chain. The gradient for each step comes from comparing that
+            # step's output to the target, not from backpropagating through
+            # all subsequent steps.
             generated.append(next_vec)
-            chain = torch.cat([chain, next_vec], dim=1)
+            chain = torch.cat([chain, next_vec.detach()], dim=1)
 
             # ── Convergence check (SONAR-space EOS) ──
             # If the last W outputs are all mutually similar (cos > threshold),

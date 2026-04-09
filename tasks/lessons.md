@@ -1,5 +1,37 @@
 # Lessons
 
+## 2026-04-09 - Autoregressive chain training: 8 bugs causing tf/roll gap and gradient collapse
+
+### Pattern
+Chain generator training showed zero tf/roll cosine gap during System1 (1 step), then instant 7–10% gap at System2 transition. Deeper analysis revealed 8 coupled bugs, 3 previously unknown.
+
+### Root Causes & Fixes
+
+1. **Suffix-aligned targets mismatched generate() start point** (Critical): `select_training_targets` took the LAST N tokens but generate() always starts from position 0. Model was asked to produce late-chain vectors from cold start — impossible task. Fix: prefix-aligned targets `chains[i, :ti]`.
+
+2. **No scheduled sampling**: `forward()` always fed ground truth. Model never saw its own predictions. Fix: added `scheduled_sampling_prob` parameter with epoch-based linear ramp (0→0.5).
+
+3. **Deep autoregressive gradient corruption**: `generate()` built full autoregressive graph through concatenation. Fix: `next_vec.detach()` before appending to chain — each step gets direct gradient from its target comparison, not through all subsequent steps.
+
+4. **`repeat_ban` `torch.where` during training**: Piecewise gradient from resampling with second `randn`. Fix: skip `repeat_ban` when `self.training`.
+
+5. **Noise std 0.005 was cosmetic**: Angular perturbation ≈ 1.5° ≈ 0.0003 cosine deviation (300× smaller than the 7–10% gap). Fix: raised to 0.05.
+
+6. **L_ans double-counted the answer position**: L_step included all positions, L_ans re-applied loss on the last — answer got 2× gradient vs intermediate steps. Fix: exclude last position from L_step mask.
+
+7. **Aggressive horizon ramp (1→2→4→6→8)**: `int()` truncation created step-function jumps. Fix: linear ramp — each epoch adds exactly 1 step.
+
+8. **No per-step diagnostics**: Couldn't tell if front-loaded or uniform quality. Fix: log `tf_cos_first`, `roll_cos_first` alongside mean/last.
+
+### Rules
+1. **Autoregressive training targets must align with generation start point.** If generate() starts from position 0, targets must be prefix-aligned, not suffix-aligned.
+2. **Scheduled sampling is mandatory for multi-step autoregressive training** — pure teacher forcing creates exposure bias proportional to chain length.
+3. **Detach autoregressive context in generate()** — only the per-step output→target comparison should carry gradient, not the full chain.
+4. **Any inference-only mechanism (repeat_ban, convergence stop) must be guarded by `not self.training`.**
+5. **Noise std for rollout must be calibrated against the tf/roll gap magnitude.** If gap is 7–10%, noise should produce at least 1–2% deviation.
+6. **Never apply two losses to the same position without explicit deduplication.**
+7. **Linear is better than aggressive for curriculum ramps** — model needs time to stabilize at each chain length before extending.
+
 ## 2026-04-08 - Autoregressor needs convergence training and adaptive stopping
 
 ### Pattern

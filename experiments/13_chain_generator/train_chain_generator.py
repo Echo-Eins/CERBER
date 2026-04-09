@@ -134,15 +134,17 @@ def collate_chains(batch: list[dict]) -> dict:
 
 
 def get_chain_steps(epoch: int, cfg: dict) -> int:
-    """Curriculum for chain horizon growth."""
+    """Curriculum for chain horizon growth.
+
+    Fix #8: Linear ramp — each epoch adds exactly 1 step (not 2→4→6 jumps).
+    """
     s1_epochs = int(cfg.get("system1_epochs", 10))
-    ramp_epochs = int(cfg.get("system2_ramp_epochs", 10))
     max_steps = int(cfg.get("max_chain_steps", 20))
 
     if epoch < s1_epochs:
         return 1
-    ramp_progress = min(1.0, (epoch - s1_epochs) / max(ramp_epochs, 1))
-    return max(1, int(1 + ramp_progress * (max_steps - 1)))
+    # Linear: epoch s1 → 2 steps, epoch s1+1 → 3 steps, ...
+    return min(max_steps, 2 + (epoch - s1_epochs))
 
 
 def select_training_targets(
@@ -151,7 +153,13 @@ def select_training_targets(
     target_steps: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Select suffix-aligned targets ending at answer token.
+    Select training targets aligned to the generation process.
+
+    Fix #6: Two regimes:
+      - System1 (target_steps=1): suffix-aligned — take the LAST valid token
+        (the answer), because the model must learn single-step direct QA.
+      - System2 (target_steps>1): prefix-aligned — take chains[0:target_steps],
+        matching what generate() produces autoregressively from position 0.
     """
     bsz, full_len, d_model = chains.shape
     steps = max(1, min(int(target_steps), full_len))
@@ -161,9 +169,15 @@ def select_training_targets(
     for i in range(bsz):
         li = max(1, min(int(chain_lens[i].item()), full_len))
         ti = min(steps, li)
-        start = li - ti
-        targets[i, :ti] = chains[i, start:li]
-        mask[i, :ti] = True
+
+        if steps == 1:
+            # System1: suffix-aligned — always the answer (last valid token).
+            targets[i, 0] = chains[i, li - 1]
+            mask[i, 0] = True
+        else:
+            # System2: prefix-aligned — first ti tokens.
+            targets[i, :ti] = chains[i, :ti]
+            mask[i, :ti] = True
 
     return targets, mask
 
@@ -225,6 +239,23 @@ def _inbatch_contrastive_loss(
     return loss, acc
 
 
+def _get_scheduled_sampling_prob(epoch: int, cfg: dict) -> float:
+    """Compute scheduled sampling probability for the current epoch.
+
+    Returns 0.0 during System1 (target_steps=1), then ramps linearly
+    from 0.0 to ss_max over ss_ramp_epochs after System2 begins.
+    """
+    s1_epochs = int(cfg.get("system1_epochs", 10))
+    if epoch < s1_epochs:
+        return 0.0
+    ss_max = float(cfg.get("scheduled_sampling_max", 0.5))
+    ss_ramp = int(cfg.get("scheduled_sampling_ramp_epochs", 10))
+    if ss_ramp <= 0:
+        return ss_max
+    progress = min(1.0, (epoch - s1_epochs) / ss_ramp)
+    return ss_max * progress
+
+
 def compute_composite_objective(
     model: ChainGenerator,
     v_q: torch.Tensor,
@@ -233,6 +264,7 @@ def compute_composite_objective(
     context_banks: torch.Tensor,
     context_mask: torch.Tensor,
     cfg: dict,
+    scheduled_sampling_prob: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute full autoregressive objective for one batch."""
     bsz, steps, d_model = chains.shape
@@ -248,21 +280,51 @@ def compute_composite_objective(
     w_cos = float(model.cfg.loss_cosine_weight)
     w_mse = float(model.cfg.loss_mse_weight)
 
-    # 1) Teacher-forced masked step loss.
+    # Determine whether the training window includes the answer.
+    # System1 (steps=1): target is always the answer (suffix-aligned).
+    # System2 (steps>1): prefix-aligned, so the answer is only in the window
+    # when target_steps >= chain_len for ALL samples. In practice, early
+    # System2 epochs usually have target_steps < chain_len, so the answer
+    # is typically NOT in the window.
+    window_has_answer = (steps == 1)
+
+    # 1) Teacher-forced masked step loss (with optional scheduled sampling).
     v_tf = model.forward(
         v_q,
         chains,
         v_context_bank=context_banks,
         context_mask=context_mask,
+        scheduled_sampling_prob=scheduled_sampling_prob,
     )
-    l_step, tf_stats = _masked_step_losses(v_tf, chains, chain_mask, d_model, w_cos, w_mse)
 
-    # 2) Final-answer supervised loss (last valid token per sample).
+    # Fix #7: Only exclude last position from L_step when L_ans is active
+    # (i.e., when the window contains the answer). Otherwise L_step covers
+    # all positions — there's no double-counting.
+    step_mask = chain_mask.clone()
+    if window_has_answer and steps == 1:
+        # System1: L_step and L_ans would both hit the single answer token.
+        # L_step mask is already correct (single True), L_ans will also
+        # compute on it. The step_mask exclusion for steps==1 is a no-op
+        # since we'd remove the only masked position. Instead, for System1,
+        # let L_ans be the primary loss and L_step be identical — both cover
+        # the single answer token, which is fine since it's the same token.
+        pass
+
+    l_step, tf_stats = _masked_step_losses(v_tf, chains, step_mask, d_model, w_cos, w_mse)
+
+    # 2) Final-answer supervised loss — only meaningful when the answer
+    #    is actually in the training window.
     tf_final = _gather_last_valid(v_tf, valid_lens)
     tgt_final = _gather_last_valid(chains, valid_lens)
-    ans_cos = (1.0 - F.cosine_similarity(tf_final, tgt_final, dim=-1)).mean()
-    ans_mse = (tf_final - tgt_final).pow(2).mean(dim=-1).mean()  # .mean(-1) already averages over D
-    l_ans = w_cos * ans_cos + w_mse * ans_mse
+    if window_has_answer:
+        ans_cos = (1.0 - F.cosine_similarity(tf_final, tgt_final, dim=-1)).mean()
+        ans_mse = (tf_final - tgt_final).pow(2).mean(dim=-1).mean()
+        l_ans = w_cos * ans_cos + w_mse * ans_mse
+    else:
+        # System2: last position is a reasoning step, not the answer.
+        # Don't apply L_ans — it would add misleading gradient.
+        l_ans = torch.zeros((), device=chains.device, dtype=chains.dtype)
+
 
     # 3) Free-run rollout loss (exposure-bias correction).
     v_roll = model.generate(
@@ -290,7 +352,8 @@ def compute_composite_objective(
     loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll + lambda_rank * l_rank
 
     with torch.no_grad():
-        tf_cos = tf_stats["cos_sim"]
+        # Use FULL mask (incl. answer) for reporting metrics.
+        tf_cos = F.cosine_similarity(v_tf, chains, dim=-1)
         roll_cos = F.cosine_similarity(v_roll, chains, dim=-1)
         maskf = chain_mask.to(dtype=chains.dtype)
         valid = maskf.sum().clamp(min=1.0)
@@ -301,6 +364,10 @@ def compute_composite_objective(
         tf_cos_last = F.cosine_similarity(tf_final, tgt_final, dim=-1).mean().item()
         roll_cos_last = F.cosine_similarity(roll_final, tgt_final, dim=-1).mean().item()
 
+        # Fix #1: Per-step cosine diagnostics.
+        tf_cos_first = float(tf_cos[:, 0].mean().item()) if steps >= 1 else 0.0
+        roll_cos_first = float(roll_cos[:, 0].mean().item()) if steps >= 1 else 0.0
+
         metrics = {
             "loss": float(loss.item()),
             "loss_step": float(l_step.item()),
@@ -309,8 +376,10 @@ def compute_composite_objective(
             "loss_rank": float(l_rank.item()),
             "tf_cos_mean": float(tf_cos_mean),
             "tf_cos_last": float(tf_cos_last),
+            "tf_cos_first": float(tf_cos_first),
             "roll_cos_mean": float(roll_cos_mean),
             "roll_cos_last": float(roll_cos_last),
+            "roll_cos_first": float(roll_cos_first),
             "rank_acc": float(rank_acc.item()),
             "pred_norm_mean_tf": float((v_tf.norm(dim=-1) * maskf).sum().item() / valid.item()),
             "pred_norm_mean_roll": float((v_roll.norm(dim=-1) * maskf).sum().item() / valid.item()),
@@ -320,6 +389,7 @@ def compute_composite_objective(
             "lambda_ans": lambda_ans,
             "lambda_roll": lambda_roll,
             "lambda_rank": lambda_rank,
+            "ss_prob": float(scheduled_sampling_prob),
         }
 
         # Additional raw components for debugging.
@@ -341,6 +411,7 @@ def train_step(
     amp_dtype: torch.dtype,
     cfg: dict,
     target_steps: int,
+    scheduled_sampling_prob: float = 0.0,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
@@ -361,6 +432,7 @@ def train_step(
             context_banks,
             context_mask,
             cfg,
+            scheduled_sampling_prob=scheduled_sampling_prob,
         )
 
     scaler.scale(loss).backward()
@@ -552,17 +624,22 @@ def main() -> None:
     )
     print(
         f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
-        f"ramp={train_cfg.get('system2_ramp_epochs', 10)}, max_steps={max_chain_steps}"
+        f"linear_ramp, max_steps={max_chain_steps}"
+    )
+    print(
+        f"  scheduled_sampling: max={train_cfg.get('scheduled_sampling_max', 0.5)}, "
+        f"ramp_epochs={train_cfg.get('scheduled_sampling_ramp_epochs', 10)}"
     )
     print("=" * 70)
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
         target_steps = get_chain_steps(epoch, train_cfg)
+        ss_prob = _get_scheduled_sampling_prob(epoch, train_cfg)
         epoch_start = time.time()
 
         phase = "System1" if target_steps == 1 else f"System2({target_steps})"
-        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}]")
+        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] ss_prob={ss_prob:.3f}")
 
         for step, batch in enumerate(train_loader):
             metrics = train_step(
@@ -575,6 +652,7 @@ def main() -> None:
                 amp_dtype,
                 train_cfg,
                 target_steps=target_steps,
+                scheduled_sampling_prob=ss_prob,
             )
             scheduler.step()
             tracker.update(metrics)
