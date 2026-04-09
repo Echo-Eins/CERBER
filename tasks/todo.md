@@ -2146,3 +2146,82 @@ position-content binding for global-token fusion.
 - [x] `experiments/13_chain_generator/train_chain_generator.py`
 - [x] `cerber_gui/chain_generator_diagnostics.py`
 - [x] `configs/chain_generator_config.json`
+
+---
+
+## 2026-04-09 — Generator Fine-tune + Critic Retrain Pipeline
+
+### Context
+Training with all 8 fixes completed through E30+. Results:
+- tf_cos (VAL) = 0.890, roll_cos (VAL) = 0.793, gap = 9.7% at 20 steps
+- Significant improvement over old run (9.7% gap was at 4 steps before)
+- But roll_cos 0.793 is insufficient — SONAR decode gives approximate paraphrases, not faithful answers
+- Target: roll_cos >= 0.90 (ideally 0.93+) for correct factual answers
+
+### Phase 1: Generator Fine-tune (Experiment 13b)
+
+**Goal**: Close tf/roll gap, raise absolute roll_cos above 0.90.
+
+**Key changes from base training:**
+| Parameter | Base (E0-E50) | Fine-tune |
+|-----------|---------------|-----------|
+| lr | 1e-4 | 5e-5 |
+| system1_epochs | 10 | 0 (skip) |
+| system2_start_steps | 2 (ramp) | 20 (immediate) |
+| scheduled_sampling_max | 0.5 | 0.65 |
+| ss_ramp_epochs | 10 | 5 |
+| free_run_noise_std | 0.05 | 0.07 |
+| loss_lambda_roll | 1.0 | 1.5 |
+| num_epochs | 50 | 30 |
+| output_dir | output/ | output_finetune/ |
+
+**How to run:**
+```bash
+python experiments/13_chain_generator/train_chain_generator.py \
+    --config configs/chain_generator_finetune.json \
+    --finetune experiments/13_chain_generator/output/checkpoints/best.pt
+```
+
+**What to watch:**
+- [ ] E0-E2: tf_cos should stay near 0.88+ (no regression from lower lr)
+- [ ] E5+: roll_cos should improve as ss_prob reaches 0.65
+- [ ] VAL gap should shrink below 5% by E10
+- [ ] roll_cos (VAL) target: >= 0.88 by E15, >= 0.90 by E25
+
+### Phase 2: Retrain Critic (Experiment 14)
+
+**Prerequisite:** Phase 1 best checkpoint exists.
+
+**Before running**, update critic config:
+```bash
+# In configs/chain_critic_config.json, update:
+# "generator_hard_checkpoint": "experiments/13_chain_generator/output_finetune/checkpoints/best.pt"
+```
+
+**How to run:**
+```bash
+python experiments/14_chain_critic/train_chain_critic.py \
+    --config configs/chain_critic_config.json
+```
+
+**What to watch:**
+- [ ] val_rank_acc should reach 0.90+ (currently 0.848)
+- [ ] Generator hard negatives should be stronger (higher quality chains)
+
+### Phase 3: Evaluate Pipeline
+
+- [ ] Test inference with fine-tuned generator + retrained critic reranking
+- [ ] Verify "What is the capital of France?" gives "Paris" not "France"
+- [ ] Check multi-step chains produce full sentences, not 1-word outputs
+- [ ] Compare System1 (1-step) vs full chain (20-step) quality
+
+### Phase 4 (if needed): Joint Training or Architecture Changes
+
+Only if Phase 1-3 don't reach 0.90 roll_cos:
+- [ ] Implement generator-critic joint training (generator produces, critic scores, REINFORCE/PPO)
+- [ ] Consider increasing model capacity (8 layers, larger FFN)
+- [ ] Consider data augmentation (richer answer sentences)
+
+### Files created/modified
+- [x] `experiments/13_chain_generator/train_chain_generator.py` — added `--finetune` flag, `system2_start_steps`
+- [x] `configs/chain_generator_finetune.json` — fine-tune config

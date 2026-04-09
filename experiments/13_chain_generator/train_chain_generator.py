@@ -137,14 +137,16 @@ def get_chain_steps(epoch: int, cfg: dict) -> int:
     """Curriculum for chain horizon growth.
 
     Fix #8: Linear ramp — each epoch adds exactly 1 step (not 2→4→6 jumps).
+    Supports system2_start_steps for fine-tuning (skip ramp, start at N).
     """
     s1_epochs = int(cfg.get("system1_epochs", 10))
     max_steps = int(cfg.get("max_chain_steps", 20))
+    start_steps = int(cfg.get("system2_start_steps", 2))
 
     if epoch < s1_epochs:
         return 1
-    # Linear: epoch s1 → 2 steps, epoch s1+1 → 3 steps, ...
-    return min(max_steps, 2 + (epoch - s1_epochs))
+    # Linear: epoch s1 → start_steps, epoch s1+1 → start_steps+1, ...
+    return min(max_steps, start_steps + (epoch - s1_epochs))
 
 
 def select_training_targets(
@@ -501,6 +503,11 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--finetune", default=None,
+        help="Path to checkpoint for fine-tuning (loads model weights only, "
+             "fresh optimizer/scheduler/epoch).",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -597,7 +604,14 @@ def main() -> None:
 
     start_epoch = 0
     best_metric = float("-inf")
-    if args.resume:
+    if args.finetune:
+        ckpt = torch.load(args.finetune, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        src_epoch = ckpt.get("epoch", "?")
+        src_metric = ckpt.get("best_metric", "?")
+        print(f"Fine-tune from {args.finetune} (src epoch={src_epoch}, metric={src_metric})")
+        print("  Fresh optimizer, scheduler, epoch counter.")
+    elif args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
