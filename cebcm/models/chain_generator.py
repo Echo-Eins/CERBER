@@ -440,10 +440,13 @@ class ChainGenerator(nn.Module):
             # Scale noise by temperature: higher temp → more noise, lower temp → less.
             noise_std = latent_noise_std * temp
 
-            if noise_std > 0.0:
-                raw_next = raw_next + noise_std * torch.randn_like(raw_next)
+            clean_next_vec = self._sphere_project(raw_next)
 
-            next_vec = self._sphere_project(raw_next)
+            if noise_std > 0.0:
+                raw_next_noisy = raw_next + noise_std * torch.randn_like(raw_next)
+                next_vec_for_chain = self._sphere_project(raw_next_noisy)
+            else:
+                next_vec_for_chain = clean_next_vec
 
             # Fix #5: Skip repeat_ban during training — torch.where with
             # a second randn introduces piecewise gradient discontinuities.
@@ -457,7 +460,7 @@ class ChainGenerator(nn.Module):
                 jitter_std = max(noise_std, 0.01)
                 for _ in range(repeat_ban_max_retries):
                     cos_to_hist = F.cosine_similarity(
-                        next_vec.expand(-1, hist.shape[1], -1),
+                        next_vec_for_chain.expand(-1, hist.shape[1], -1),
                         hist,
                         dim=-1,
                     )
@@ -466,18 +469,23 @@ class ChainGenerator(nn.Module):
                     if not torch.any(repeat_mask):
                         break
 
-                    candidate = self._sphere_project(raw_next + jitter_std * torch.randn_like(raw_next))
+                    candidate_noisy = raw_next + jitter_std * torch.randn_like(raw_next)
+                    candidate = self._sphere_project(candidate_noisy)
                     mask3 = repeat_mask.view(bsz, 1, 1)
-                    next_vec = torch.where(mask3, candidate, next_vec)
+                    next_vec_for_chain = torch.where(mask3, candidate, next_vec_for_chain)
                     repeat_resamples += int(repeat_mask.sum().item())
 
+            # Mathematical Fix: The model's TRUE prediction is the clean vector.
+            # We must evaluate the loss (and report metrics) on the clean vector.
+            # In contrast, the context chain gets the NOISY vector to train the
+            # model to recover from exposure bias.
+            # If we evaluated the noisy vector, we'd penalize the model for random
+            # noise it couldn't predict, capping the max possible validation cosine.
+            generated.append(clean_next_vec)
+
             # Fix #3: Detach before appending so backward() through L_roll
-            # only goes one step deep, not through the entire autoregressive
-            # chain. The gradient for each step comes from comparing that
-            # step's output to the target, not from backpropagating through
-            # all subsequent steps.
-            generated.append(next_vec)
-            chain = torch.cat([chain, next_vec.detach()], dim=1)
+            # only goes one step deep, not through the entire autoregressive chain.
+            chain = torch.cat([chain, next_vec_for_chain.detach()], dim=1)
 
             # ── Convergence check (SONAR-space EOS) ──
             # If the last W outputs are all mutually similar (cos > threshold),
@@ -499,7 +507,7 @@ class ChainGenerator(nn.Module):
 
             if energy_fn is not None:
                 try:
-                    e_val = energy_fn(v_query, next_vec.squeeze(1))
+                    e_val = energy_fn(v_query, clean_next_vec.squeeze(1))
                     if torch.is_tensor(e_val):
                         energy_hist.append(float(e_val.detach().mean().item()))
                     else:
@@ -510,7 +518,7 @@ class ChainGenerator(nn.Module):
                         warnings.warn(f"energy_fn failed at step 0: {exc}", stacklevel=2)
 
             if t_target is not None:
-                cos_val = F.cosine_similarity(next_vec.squeeze(1), t_target, dim=-1)
+                cos_val = F.cosine_similarity(clean_next_vec.squeeze(1), t_target, dim=-1)
                 cos_hist.append(float(cos_val.mean().item()))
 
             if stagnation_patience > 0 and step_idx + 1 >= (stagnation_patience + 1):

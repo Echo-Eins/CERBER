@@ -258,15 +258,35 @@ def _get_scheduled_sampling_prob(epoch: int, cfg: dict) -> float:
     return ss_max * progress
 
 
+def _get_scheduled_noise_std(epoch: int, cfg: dict) -> float:
+    """Compute noise std for the current epoch.
+
+    Returns base noise during System1, then ramps linearly
+    to max_noise over ss_ramp_epochs after System2 begins.
+    """
+    s1_epochs = int(cfg.get("system1_epochs", 10))
+    base_noise = float(cfg.get("free_run_noise_std", 0.0))
+    if epoch < s1_epochs:
+        return base_noise
+    max_noise = float(cfg.get("free_run_noise_std_max", base_noise))
+    ss_ramp = int(cfg.get("scheduled_sampling_ramp_epochs", 10))
+    if ss_ramp <= 0:
+        return max_noise
+    progress = min(1.0, (epoch - s1_epochs) / ss_ramp)
+    return base_noise + (max_noise - base_noise) * progress
+
+
 def compute_composite_objective(
     model: ChainGenerator,
     v_q: torch.Tensor,
     chains: torch.Tensor,
     chain_mask: torch.Tensor,
+    chain_lens: torch.Tensor,
     context_banks: torch.Tensor,
     context_mask: torch.Tensor,
     cfg: dict,
     scheduled_sampling_prob: float = 0.0,
+    free_run_noise_std: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute full autoregressive objective for one batch."""
     bsz, steps, d_model = chains.shape
@@ -282,13 +302,10 @@ def compute_composite_objective(
     w_cos = float(model.cfg.loss_cosine_weight)
     w_mse = float(model.cfg.loss_mse_weight)
 
-    # Determine whether the training window includes the answer.
+    # Determine whether the training window includes the answer per-sample.
     # System1 (steps=1): target is always the answer (suffix-aligned).
-    # System2 (steps>1): prefix-aligned, so the answer is only in the window
-    # when target_steps >= chain_len for ALL samples. In practice, early
-    # System2 epochs usually have target_steps < chain_len, so the answer
-    # is typically NOT in the window.
-    window_has_answer = (steps == 1)
+    # System2 (steps>1): answer is contained if the full chain fits in the window.
+    has_answer = (chain_lens <= steps) | (steps == 1)
 
     # 1) Teacher-forced masked step loss (with optional scheduled sampling).
     v_tf = model.forward(
@@ -300,46 +317,42 @@ def compute_composite_objective(
     )
 
     # Fix #7: Only exclude last position from L_step when L_ans is active
-    # (i.e., when the window contains the answer). Otherwise L_step covers
-    # all positions — there's no double-counting.
+    # for that specific sample (i.e., when the window contains the answer).
     step_mask = chain_mask.clone()
-    if window_has_answer and steps == 1:
-        # System1: L_step and L_ans would both hit the single answer token.
-        # L_step mask is already correct (single True), L_ans will also
-        # compute on it. The step_mask exclusion for steps==1 is a no-op
-        # since we'd remove the only masked position. Instead, for System1,
-        # let L_ans be the primary loss and L_step be identical — both cover
-        # the single answer token, which is fine since it's the same token.
-        pass
+    for i in range(bsz):
+        if has_answer[i]:
+            last_idx = int(valid_lens[i].item()) - 1
+            if last_idx >= 0:
+                step_mask[i, last_idx] = False
 
     l_step, tf_stats = _masked_step_losses(v_tf, chains, step_mask, d_model, w_cos, w_mse)
 
-    # 2) Final-answer supervised loss — only meaningful when the answer
-    #    is actually in the training window.
+    # 2) Final-answer supervised loss — only on samples that reached the answer.
     tf_final = _gather_last_valid(v_tf, valid_lens)
     tgt_final = _gather_last_valid(chains, valid_lens)
-    if window_has_answer:
-        ans_cos = (1.0 - F.cosine_similarity(tf_final, tgt_final, dim=-1)).mean()
-        ans_mse = (tf_final - tgt_final).pow(2).mean(dim=-1).mean()
+    
+    if has_answer.any():
+        ans_cos = (1.0 - F.cosine_similarity(tf_final[has_answer], tgt_final[has_answer], dim=-1)).mean()
+        ans_mse = (tf_final[has_answer] - tgt_final[has_answer]).pow(2).mean(dim=-1).mean()
         l_ans = w_cos * ans_cos + w_mse * ans_mse
     else:
-        # System2: last position is a reasoning step, not the answer.
-        # Don't apply L_ans — it would add misleading gradient.
+        # System2: No sample reached the answer in this window.
         l_ans = torch.zeros((), device=chains.device, dtype=chains.dtype)
 
 
     # 3) Free-run rollout loss (exposure-bias correction).
-    v_roll = model.generate(
+    v_roll, roll_info = model.generate(
         v_q,
         num_steps=steps,
         v_context_bank=context_banks,
         context_mask=context_mask,
         temperature=float(cfg.get("free_run_temperature", 1.0)),
-        latent_noise_std=float(cfg.get("free_run_noise_std", 0.0)),
+        latent_noise_std=free_run_noise_std,
         repeat_penalty=float(cfg.get("free_run_repeat_penalty", 0.0)),
         repeat_cos_threshold=float(cfg.get("free_run_repeat_cos_threshold", 0.98)),
         repeat_ban_threshold=float(cfg.get("free_run_repeat_ban_threshold", 0.995)),
         repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 2)),
+        return_info=True,
     )
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
 
@@ -392,6 +405,8 @@ def compute_composite_objective(
             "lambda_roll": lambda_roll,
             "lambda_rank": lambda_rank,
             "ss_prob": float(scheduled_sampling_prob),
+            "free_run_noise_std": float(free_run_noise_std),
+            "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
         }
 
         # Additional raw components for debugging.
@@ -414,6 +429,7 @@ def train_step(
     cfg: dict,
     target_steps: int,
     scheduled_sampling_prob: float = 0.0,
+    free_run_noise_std: float = 0.0,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
@@ -431,10 +447,12 @@ def train_step(
             v_q,
             chains_trunc,
             chain_mask,
+            chain_lens,
             context_banks,
             context_mask,
             cfg,
             scheduled_sampling_prob=scheduled_sampling_prob,
+            free_run_noise_std=free_run_noise_std,
         )
 
     scaler.scale(loss).backward()
@@ -476,9 +494,11 @@ def eval_step(
             v_q,
             chains_trunc,
             chain_mask,
+            chain_lens,
             context_banks,
             context_mask,
             cfg,
+            free_run_noise_std=float(cfg.get("free_run_noise_std", 0.0)),
         )
 
     return {
@@ -650,10 +670,11 @@ def main() -> None:
         model.train()
         target_steps = get_chain_steps(epoch, train_cfg)
         ss_prob = _get_scheduled_sampling_prob(epoch, train_cfg)
+        noise_std = _get_scheduled_noise_std(epoch, train_cfg)
         epoch_start = time.time()
 
         phase = "System1" if target_steps == 1 else f"System2({target_steps})"
-        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] ss_prob={ss_prob:.3f}")
+        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] ss_prob={ss_prob:.3f} noise_std={noise_std:.4f}")
 
         for step, batch in enumerate(train_loader):
             metrics = train_step(
@@ -667,6 +688,7 @@ def main() -> None:
                 train_cfg,
                 target_steps=target_steps,
                 scheduled_sampling_prob=ss_prob,
+                free_run_noise_std=noise_std,
             )
             scheduler.step()
             tracker.update(metrics)
@@ -684,6 +706,7 @@ def main() -> None:
                     f"tf_cos={avg.get('tf_cos_mean', 0.0):.4f} "
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
+                    f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
                     f"lr={lr_now:.2e}"
                 )
                 tracker.reset()
