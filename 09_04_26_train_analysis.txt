@@ -1,0 +1,118 @@
+---
+Show less
+## Findings
+### 1. Gradient flow through L_roll: it works, but it is shallow and noisy
+**What the code does.**
+`model.generate()` is called inside `compute_composite_objective()` with no `torch.no_grad()` wrapper. The function is not decorated `@torch.no_grad()` (that decorator only appears on `eval_step`). So the computation graph *does* exist, and `l_roll.backward()` will send gradients back through the chain.
+**The real problem: gradient depth degrades step-by-step.**
+The autoregressive loop at `/home/user/CERBER/cebcm/models/chain_generator.py` lines 383-432 builds the chain this way:
+```python
+chain = self.start_token.expand(bsz, -1, -1)
+for step_idx in range(steps):
+    x = chain                           # input grows by 1 each step
+    for layer in self.layers:
+        x = layer(x, context, ...)      # full forward through 6 layers
+    raw_next = self.output_proj(x[:, -1:, :])
+    # -- noise injected HERE, adds random leaf to graph --
+    if noise_std > 0.0:
+        raw_next = raw_next + noise_std * torch.randn_like(raw_next)
+    next_vec = self._sphere_project(raw_next)
+    generated.append(next_vec)
+    chain = torch.cat([chain, next_vec], dim=1)  # next_vec wired into next step
+```
+The gradient path from step T back to step T-k passes through `torch.cat`, `_sphere_project` (normalize + scale), and k full transformer passes. That is formally correct, but in practice:
+- The gradient of cosine similarity w.r.t. the *pre-sphere-project* raw vector is already weak (cosine loss penalizes direction, not magnitude; after projection all norms are fixed at 0.2051, so the MSE gradient on the magnitude component is zero by construction).
+- The `torch.randn_like(raw_next)` noise creates a stochastic node. Its gradient is zero (randn has no parameters), but it *does not break the graph*. What it does is add high-variance noise to the gradient of `raw_next` at each step, which multiplies through the chain. For `steps` steps the effective gradient variance grows as O(steps).
+- The repeat-ban branch (lines 412-429) calls `torch.where(mask3, candidate, next_vec)`. `candidate` is computed from a *separate* `raw_next + jitter_std * torch.randn_like(raw_next)` sample, making the masked positions have a completely different gradient path than the unmasked positions. This introduces a discontinuous gradient that frequently fires (2 retries, threshold 0.995) and silently corrupts the rollout gradient.
+**Conclusion:** Gradient *does* flow, but only reliably for step 1. Deeper steps receive degraded, high-variance gradients from the stochastic noise injections and the `torch.where` discontinuity. The effective gradient for step T is the product of T Jacobians each of rank-1 after sphere projection. This means L_roll is mostly pushing the first-step output; it provides almost no useful signal for intermediate steps, which is exactly where the exposure-bias gap accumulates.
+---
+### 2. Noise level 0.005 is too small to matter
+**Exact calculation.**
+- `target_norm = 0.2051` (config, line 24 of chain_generator.py, line 11 of config)
+- `free_run_noise_std = 0.005` (config)
+- `free_run_temperature = 1.05` (config)
+- Effective noise in generate(): `noise_std = latent_noise_std * temp = 0.005 * 1.05 = 0.00525`
+The noise is added to `raw_next` *before* sphere-projection. After `_sphere_project` (line 410: `F.normalize(v, dim=-1) * 0.2051`), the perturbation is divided out by the norm of `raw_next`. If `raw_next` has norm ~0.2051, the angular perturbation caused by adding noise of std 0.00525 is approximately:
+```
+angular_std ≈ arcsin(noise_std / raw_norm) ≈ noise_std / raw_norm
+            ≈ 0.00525 / 0.2051 ≈ 0.0256 radians ≈ 1.5°
+```
+In cosine space this corresponds to a cosine change of roughly `1 - cos(0.026) ≈ 0.00033`. This is 3.3e-4 — an order of magnitude smaller than the 0.074–0.097 gap (tf_cos - roll_cos). The noise is cosmetically present but contributes essentially zero distributional shift between teacher-forced inputs and rollout inputs. The free-run model is operating in almost the same input distribution as the teacher-forced model — so L_roll is not training anything different from L_step.
+**The correctly scaled noise.** To produce a 5% cosine perturbation (cos deviation ≈ 0.05), you need:
+```
+angular_shift = arccos(0.95) ≈ 0.317 rad
+noise_std ≈ raw_norm * sin(0.317) ≈ 0.2051 * 0.311 ≈ 0.064
+```
+So `free_run_noise_std` should be ~0.04–0.08 to actually perturb inputs into the regime the model will see during inference. A value of 0.005 is 8–16x too small.
+---
+### 3. L_roll magnitude vs L_step: lambda_roll=1.0 appears balanced but is deceptive
+**Numerical analysis.**
+From the reported metrics:
+- `tf_cos = 0.808`, so `tf_cos_loss_raw ≈ 1 - 0.808 = 0.192`. With `w_cos=1.0, w_mse=0.1`: `L_step ≈ 0.192 + 0.1 * mse_step`.
+- `roll_cos = 0.734`, so `roll_cos_loss_raw ≈ 1 - 0.734 = 0.266`. `L_roll ≈ 0.266 + 0.1 * mse_roll`.
+At E11: `L_roll / L_step ≈ 0.266 / 0.192 ≈ 1.38`. So L_roll is 38% larger than L_step in raw magnitude. With `lambda_step = lambda_roll = 1.0`, L_roll actually dominates. But this doesn't help because:
+1. L_roll gradient is noisy/shallow (problem 1 above).
+2. When L_roll is large because the rollout is bad, the model is being pushed to mimic targets from a bad rollout starting point — the target still comes from `chains` (ground truth), but the *predictions* are from a distributional mismatch. With shallow gradients the optimizer sees a large loss signal for mostly the first step, causing the model to over-optimize step-1 while intermediate steps degrade.
+The loss at E12 (tf=0.771, roll=0.674) shows the gap *widening* from 7.4% to 9.7% despite lambda_roll=1.0. This confirms lambda_roll weighting is not the bottleneck.
+---
+### 4. Scheduled sampling is absent and would directly address the root cause
+The `forward()` method (lines 271-292) is pure teacher forcing: it always feeds ground-truth targets as decoder input (line 282: `decoder_input = torch.cat([start, v_target_chain[:, :-1, :]], dim=1)`). There is no mixing of autoregressive predictions. The entire `forward()` path sees only ground-truth inputs.
+The `generate()` path corrects distributional shift but cannot do so efficiently due to the issues in problem 1. Scheduled sampling would directly inject autoregressive inputs *inside* `forward()`, making the model learn to handle its own outputs while still supporting clean gradient flow (one forward pass, same computational graph structure as teacher forcing, no stochastic nodes).
+---
+## Concrete Fixes
+### Fix 1 — Implement scheduled sampling in `forward()` (highest impact)
+Add a `ss_prob` parameter to `forward()`. When `ss_prob > 0`, at each position, replace the teacher-forced input token with the model's own previous output with probability `ss_prob`. This keeps the computation graph intact (one forward pass, no sequential loop), but requires unrolling the sequence position-by-position only when mixing.
+The cleanest architecture-compatible approach is **professor forcing / mixed decoding**: at training time run the forward pass *twice* — once teacher-forced to get clean targets, once with the predicted sequence shifted in. The rollout predictions from the first pass are used as inputs for the next positions in the second pass. This avoids the stochastic-node gradient problem entirely.
+Alternatively, modify `forward()` to accept an `ss_prob` argument and implement token-level mixing:
+```python
+# In forward(), after computing all predictions in one shot, do a second pass
+# mixing ground-truth and predicted inputs based on ss_prob schedule.
+# Start ss_prob=0 (pure TF), linearly ramp to ss_prob=0.5 by epoch 20.
+```
+In `train_chain_generator.py`, add to the training config:
+```json
+"scheduled_sampling_start_epoch": 12,
+"scheduled_sampling_end_epoch": 30,
+"scheduled_sampling_max_prob": 0.5
+```
+Compute `ss_prob` per epoch in `train_step()` and pass to `compute_composite_objective()`.
+### Fix 2 — Raise `free_run_noise_std` to 0.05–0.07
+Change in `/home/user/CERBER/configs/chain_generator_config.json` line 62:
+```json
+"free_run_noise_std": 0.05
+```
+This shifts `noise_std = 0.05 * 1.05 = 0.0525`, producing an angular shift of ~15° (cos deviation ~0.035), enough to genuinely perturb the rollout input distribution while not completely destroying structure. Consider a curriculum: start at 0.02, ramp to 0.07 over 10 epochs.
+### Fix 3 — Detach rollout inputs to prevent gradient-through-noise corruption
+The stochastic nodes inside `generate()` are corrupting gradients. The cleanest fix is to treat rollout as a *policy rollout with stopped gradients on the inputs*, using REINFORCE-style or straight-through gradients. The minimal change:
+In `generate()`, detach `next_vec` before appending to `chain` but keep gradient on the final collected outputs. This means changing line 432 from:
+```python
+chain = torch.cat([chain, next_vec], dim=1)
+```
+to:
+```python
+chain = torch.cat([chain, next_vec.detach()], dim=1)
+```
+This makes each step generate from a *stopped* previous prediction (matching inference behavior exactly) while still allowing the loss at each step to gradient-flow through that step's forward pass. The result is parallel single-step gradients instead of a deep autoregressive graph — clean, low-variance, and equivalent to training the model to handle its own outputs at each step independently.
+### Fix 4 — Remove the repeat_ban `torch.where` from the training rollout
+Lines 412-429 in `generate()` fire during training (`repeat_ban_max_retries=2`, `repeat_ban_threshold=0.995`) and inject a second `torch.randn_like` sample via `torch.where(mask3, candidate, next_vec)`. This creates a piecewise gradient with a discontinuity at the mask boundary. During training this should be disabled:
+```python
+# In compute_composite_objective(), call generate() with:
+repeat_ban_max_retries=0,   # disable during training
+```
+Or add a separate `training_mode` flag to `generate()`.
+### Fix 5 — Add a "step-to-step cosine drift" diagnostic metric
+To quantify the bias gap more precisely, log the per-step cosine separately. Currently only the mean across all steps is logged (`tf_cos_mean`, `roll_cos_mean`). Adding per-step metrics (step 1 vs step N) will reveal whether the gap is front-loaded (gradient is already working for step 1) or uniform (deeper architectural issue). Add to `compute_composite_objective()`:
+```python
+# Per-step diagnostics — log step 0 and step -1 separately
+tf_cos_step0 = ((tf_cos[:, 0] * chain_mask[:, 0]).sum() / chain_mask[:, 0].sum().clamp(min=1)).item()
+roll_cos_step0 = ((roll_cos[:, 0] * chain_mask[:, 0]).sum() / chain_mask[:, 0].sum().clamp(min=1)).item()
+```
+---
+## Summary Table
+| Issue | Root Cause | Fix | Impact |
+|---|---|---|---|
+| L_roll gradient degrades with depth | Autoregressive chain builds a deep stochastic graph; randn nodes add variance; sphere projection collapses magnitude gradient | Detach chain inputs inside generate() (Fix 3); implement scheduled sampling in forward() (Fix 1) | High |
+| Noise too small to shift distribution | 0.005 * 1.05 = 0.00525 → ~0.03% cosine shift vs 7-10% gap | Raise to 0.05-0.07 (Fix 2) | Medium |
+| repeat_ban torch.where corrupts gradients | Piecewise sampling with separate randn produces discontinuous gradient | Disable repeat_ban during training via max_retries=0 (Fix 4) | Medium |
+| Scheduled sampling absent | forward() is pure TF; model never trains on its own outputs | Implement ss_prob ramp starting epoch 12 (Fix 1) | High |
+| Per-step gap invisible | Only mean cos logged | Add step-0 and step-last per-mode cosine metrics (Fix 5) | Diagnostic |

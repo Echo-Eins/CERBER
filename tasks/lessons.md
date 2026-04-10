@@ -1,5 +1,164 @@
 # Lessons
 
+## 2026-04-09 - Inference pipeline missing convergence_cos → model never uses trained EOS
+
+### Pattern
+Model was trained with answer-repeat padding to learn convergence stopping (SONAR-space EOS), but the inference diagnostics code never passed `convergence_cos` to `model.generate()`. The parameter defaulted to 0.0, disabling convergence detection entirely. All early stops were from stagnation_patience, not convergence.
+
+### Root Cause
+`_generate_stochastic_chain()` didn't accept or forward `convergence_cos` / `convergence_window` parameters. The training code taught the model to converge, but inference never checked for it.
+
+### Fix
+Added `convergence_cos` and `convergence_window` to `_generate_stochastic_chain()` and `run_generation()`. Default: `convergence_cos=0.995, convergence_window=2` for multi-step.
+
+### Rule
+When adding a feature to training (convergence stopping, new loss, etc.), immediately verify the inference pipeline uses it too. Train ↔ inference feature parity must be checked explicitly.
+
+## 2026-04-09 - 1-word outputs are a data/quality issue, not missing autoregressor
+
+### Pattern
+Model generated chain_texts like ["France", "France", "France and"] — each SONAR step decoded to 1-2 words instead of full sentences. User suspected missing autoregressive capability.
+
+### Root Causes
+1. HotpotQA answers are 1-3 word named entities ("Paris", "Satan"). SONAR embedding of short text decodes to short text. The model correctly learned to produce short answers.
+2. Suffix alignment (old bug #6) prevented learning meaningful step-by-step reasoning.
+3. cos ≈ 0.73 is too low for faithful SONAR sentence reconstruction — loses syntax, keeps only topic.
+4. Answer-repeat padding trains fast convergence → model skips reasoning, goes straight to answer keyword.
+
+### Rule
+1. Each SONAR vector IS a full sentence embedding. "1-word output" means the model produces an impoverished vector, not a missing feature.
+2. To get multi-sentence responses: deduplicate chain_texts and concatenate unique steps (assemble_response).
+3. Data determines output format: HotpotQA → short answers. For longer responses, need different training data.
+
+## 2026-04-09 - Autoregressive chain training: 8 bugs causing tf/roll gap and gradient collapse
+
+### Pattern
+Chain generator training showed zero tf/roll cosine gap during System1 (1 step), then instant 7–10% gap at System2 transition. Deeper analysis revealed 8 coupled bugs, 3 previously unknown.
+
+### Root Causes & Fixes
+
+1. **Suffix-aligned targets mismatched generate() start point** (Critical): `select_training_targets` took the LAST N tokens but generate() always starts from position 0. Model was asked to produce late-chain vectors from cold start — impossible task. Fix: prefix-aligned targets `chains[i, :ti]`.
+
+2. **No scheduled sampling**: `forward()` always fed ground truth. Model never saw its own predictions. Fix: added `scheduled_sampling_prob` parameter with epoch-based linear ramp (0→0.5).
+
+3. **Deep autoregressive gradient corruption**: `generate()` built full autoregressive graph through concatenation. Fix: `next_vec.detach()` before appending to chain — each step gets direct gradient from its target comparison, not through all subsequent steps.
+
+4. **`repeat_ban` `torch.where` during training**: Piecewise gradient from resampling with second `randn`. Fix: skip `repeat_ban` when `self.training`.
+
+5. **Noise std 0.005 was cosmetic**: Angular perturbation ≈ 1.5° ≈ 0.0003 cosine deviation (300× smaller than the 7–10% gap). Fix: raised to 0.05.
+
+6. **L_ans double-counted the answer position**: L_step included all positions, L_ans re-applied loss on the last — answer got 2× gradient vs intermediate steps. Fix: exclude last position from L_step mask.
+
+7. **Aggressive horizon ramp (1→2→4→6→8)**: `int()` truncation created step-function jumps. Fix: linear ramp — each epoch adds exactly 1 step.
+
+8. **No per-step diagnostics**: Couldn't tell if front-loaded or uniform quality. Fix: log `tf_cos_first`, `roll_cos_first` alongside mean/last.
+
+### Rules
+1. **Autoregressive training targets must align with generation start point.** If generate() starts from position 0, targets must be prefix-aligned, not suffix-aligned.
+2. **Scheduled sampling is mandatory for multi-step autoregressive training** — pure teacher forcing creates exposure bias proportional to chain length.
+3. **Detach autoregressive context in generate()** — only the per-step output→target comparison should carry gradient, not the full chain.
+4. **Any inference-only mechanism (repeat_ban, convergence stop) must be guarded by `not self.training`.**
+5. **Noise std for rollout must be calibrated against the tf/roll gap magnitude.** If gap is 7–10%, noise should produce at least 1–2% deviation.
+6. **Never apply two losses to the same position without explicit deduplication.**
+7. **Linear is better than aggressive for curriculum ramps** — model needs time to stabilize at each chain length before extending.
+
+## 2026-04-08 - Autoregressor needs convergence training and adaptive stopping
+
+### Pattern
+ChainGenerator had no EOS equivalent. At inference, the model couldn't signal "I'm done reasoning." Generating past the training horizon (N steps) produced OOD garbage. The model memorized fixed-length chains but couldn't adapt to variable reasoning depth.
+
+### Root Causes
+1. Training chain = [steps..., answer] with no continuation signal after answer
+2. generate() had fixed `num_steps` with no adaptive stopping
+3. No way to resume generation from a previous chain (no "continue thinking")
+4. compute_loss MSE was double-divided by d_model (0.008% contribution = dead)
+
+### Fixes
+1. **Answer-repeat padding**: Chain becomes [steps..., answer, answer, answer]. Model learns: after finding the answer, keep outputting it. Consecutive similarity at inference = convergence signal.
+2. **Convergence stopping**: `convergence_cos > 0` in generate() — stop when last W outputs have pairwise cosine > threshold. SONAR-space EOS.
+3. **Chain prefix (resume)**: `chain_prefix` parameter lets you feed a previous chain and continue generating. Enables "append final vector and keep thinking" workflow.
+4. **MSE fix**: Removed redundant `/d_model` division.
+
+### Rules
+1. An autoregressor MUST have a stopping criterion — either learned (answer-repeat convergence) or external (critic energy threshold).
+2. Train with answer-repeat padding to teach convergence behavior. Without it, the model is OOD after the answer token.
+3. Free-run rollout must use non-zero noise; otherwise it's a copy of teacher-forcing loss.
+4. Always test that generate() preserves gradient flow for exposure-bias correction.
+
+## 2026-04-08 - Post-review bugfixes for Stage 13/14 pipeline
+
+### Bugs Found and Fixed
+
+1. **Temperature noise scaling asymmetry** (`chain_generator.py:generate`): `temp>1` added 0.01 (negligible), `temp<1` multiplied (zeroed noise). Fixed: `noise_std = latent_noise_std * temp` — consistent multiplicative scaling.
+
+2. **MSE double-division by d_model** (`train_chain_generator.py`): `.mean(dim=-1)` already averages over D=1024, then code divided by `d_model` again. Result: MSE contributed 0.008% of total loss — effectively dead. Fixed: removed redundant division. MSE now contributes meaningfully (~0.85%).
+
+3. **Deterministic free-run defaults** (`chain_generator_config.json`): `free_run_noise_std=0.0, temperature=1.0` made rollout identical to greedy teacher-forcing. L_free_run degenerated into a copy of L_step — zero exposure-bias correction. Fixed: `noise_std=0.005, temperature=1.05`.
+
+4. **Stagnation check logic** (`chain_generator.py`): When `energy_fn` failed silently, `energy_hist` was empty but `cos_hist` had data. AND logic `stagnated = False AND (cos_check)` → never triggered. Fixed: check ALL available metrics independently with proper length guards.
+
+5. **Critic context mismatch** (`train_chain_critic.py`): Critic trained on `mean(v_steps)` but generator uses context bank `[query, evidence_1, ..., evidence_K]`. At reranking time, critic sees different semantic grounding. Fixed: critic dataset now builds context = `mean([query, evidence_slots])` matching generator's bank.
+
+6. **Generator hard negative redundancy** (`train_chain_critic.py`): Loop filled k rightmost slots with identical `v_gen` vector. Fixed: single slot fill since only one generate call is made.
+
+### Rules
+1. Temperature must scale noise consistently — use multiplication, not mixed additive/multiplicative.
+2. When loss = `f(x).mean(dim=-1)`, do NOT divide by `dim_size` again. Check loss magnitudes against other components.
+3. Free-run rollout MUST have non-zero noise during training — otherwise it provides zero exposure-bias correction.
+4. Stagnation/early-stop logic must handle partial metric availability (some trackers may fail).
+5. Critic and generator MUST use the same context construction at train and inference time.
+
+## 2026-04-08 - Autoregressive QA: never train on padded tokens or prefix-only curriculum that drops answer
+
+### Pattern
+ChainGenerator plateau/collapse was amplified by three coupled pipeline mistakes:
+- padding mask was computed but not used in loss;
+- sequence truncation could drop the final answer token;
+- `System1` curriculum (`target_steps=1`) trained on the first reasoning step instead of answer.
+
+### Root Cause
+Training objective was misaligned with inference target:
+- model optimized padded zeros and early-chain prefixes;
+- direct-answer mode was not actually direct-answer;
+- validation repeated the same masking bug.
+
+### Fix
+- Add `loss_mask` to `ChainGenerator.compute_loss` and use masked reductions.
+- Preserve answer on truncation (`keep_last` policy).
+- Build curriculum targets as suffix ending at answer (`System1 => answer-only`).
+- Apply masking in both train and validation paths.
+
+### Rule
+1. For variable-length autoregressive chains, masking must be part of the model loss API, not only data loader logic.
+2. Any truncation policy must explicitly preserve supervision target (final answer token).
+3. Curriculum labels must be audited against declared mode semantics (`System1` must optimize answer directly).
+4. Best-of-N reranking is invalid if candidate generation is deterministic; enforce stochastic diversity.
+
+## 2026-04-08 - Critic parity and horizon discipline must be enforced in GUI/runtime
+
+### Pattern
+Online diagnostics diverged from training behavior:
+- critic was trained with `v_context` but inference reranking called critic without context;
+- GUI allowed long rollouts beyond training horizon;
+- critic training relied on easy random negatives, which inflated rank metrics.
+
+### Root Cause
+Evaluation path did not preserve the same conditioning and hardness assumptions as training.
+
+### Fix
+- Pass `v_context` through all critic calls in diagnostics (rerank, per-step energy, chain analysis, landscape).
+- Add compatibility wrapper for legacy critics that do not support `v_context`.
+- Clamp inference steps by checkpoint-trained horizon (`training.max_chain_steps`) and architectural cap (`max_chain_len`).
+- Add mixed-negative strategy in critic training: random negatives + in-batch hard negatives.
+- Add optional generator-hard negatives (from current generator checkpoint) with false-negative guard by cosine threshold.
+
+### Rule
+1. Critic train/eval/inference signatures must be context-parity compatible.
+2. Runtime inference must be horizon-capped by what the model actually saw during training.
+3. Do not accept rank metrics from easy random-negative-only training.
+4. Every GUI export should expose whether runtime safety caps were applied.
+5. For critic reranking quality, train with mixed negatives: random + in-batch hard + generator-hard (when checkpoint is available).
+
 ## 2026-04-06 - GUI checkpoint loader must migrate old/new parametrization key layouts
 
 ### Pattern
@@ -1678,3 +1837,96 @@ Angular gradient is tangential at the computation point, but after a discrete La
 2. ALWAYS add tangent projection before the step: remove radial component from gradient before applying update.
 3. Prefer using the production `run_langevin()` from `cebcm/inference/langevin.py` instead of hand-writing loops — it already handles all projections correctly.
 4. If you must hand-write a loop (e.g., for training with create_graph=True), copy the exact projection pattern from langevin.py.
+
+## 2026-04-06 - Langevin/Flow/ODE navigation is fundamentally broken in 1024D multi-basin QA
+
+### Pattern
+ALL iterative navigation methods fail for conditional QA search in SONAR 1024d:
+- Langevin: -∇E points to NEAREST basin, not TARGET. With 81k answer basins, nearest ≠ target.
+- Path-contrastive: perfect energy ordering (violations→0.001) but cos_sim FELL from 0.20 to 0.03.
+  Proved that the problem is NOT 2nd-order dominance — path-contrastive is purely 1st-order.
+- Flow/ODE: compounding integration error (train cos=0.93, eval cos=0.017).
+- Direction loss: 2nd-order gradient dominates 1st-order in MDSM, but NOT the root cause.
+
+### Root Cause
+In 1024D with 81k competing answer basins, the gradient landscape has too many local attractors.
+A ranking critic can perfectly DISCRIMINATE (rank_acc=0.99) but cannot NAVIGATE because:
+- "Ranking teaches VALUES not GRADIENTS" (lesson L1252)
+- Energy landscape is locally smooth but globally multi-modal
+- Any iterative method (Langevin, Flow, ODE) gets trapped by nearest-basin gravity
+
+### Rule
+1. NEVER use iterative navigation (Langevin, Flow, ODE, direction loss) for conditional QA in high-D multi-basin spaces.
+2. Use DIRECT PREDICTION (autoregressive generation) for answer synthesis.
+3. Keep the trained critic as a RERANKER only (it ranks perfectly, just can't navigate).
+4. For QA: ChainGenerator (autoregressive Transformer decoder) + CompositeCritic (reranker).
+
+## 2026-04-06 - CE/IPP/SP are dead ends for SONAR QA
+
+### Pattern
+Extensive experimentation proved all three approaches hit hard ceilings:
+- CE (Context Encoder): cos_sim plateaus at ≈0.60 — information ceiling
+- IPP (FlowIPP): train cos=0.93, eval cos=0.017 — catastrophic generalization failure
+- IPP (MLPIPP): just matches CE ceiling, adds nothing
+- Joint CE+IPP: no improvement over CE alone
+- SP (Surprise Predictor): overfits
+
+### Rule
+1. Do NOT use CE, IPP, or SP in new architectures. They are dead code.
+2. For QA answer generation, use autoregressive prediction (ChainGenerator), not encoding/denoising.
+3. The only surviving component is CompositeCritic (Angular + Radial Guard) as a reranker.
+
+## 2026-04-07 - ChainGenerator V1 training analysis: autoregressive collapse after step 2-3
+
+### Pattern
+ChainGenerator (101.8M params, 6-layer decoder) trained for 35 epochs on HotpotQA.
+- System 1 (1 step): tf_cos=0.245, gen_cos=0.195 — genuine learning but low
+- System 2 (3 steps): gen_cos=0.68, tf_cos=0.37 — phase transition at E15!
+- System 2 (5 steps): gen_cos degrades from 0.687 to 0.640, cos_last=0.11
+
+At inference, decoded chain shows collapse:
+```
+Step 1: "The Theoretical theory of relativity..." (coherent)
+Step 2: "Theoretical Theory of Quantum Physics..." (still connected)
+Step 3: "Scientology" (one word)
+Step 4-20: "Theoretical", "Theoretical"... (fixed point loop)
+```
+
+### Root Causes Identified from Attention Analysis
+1. **Cross-attention is trivial**: single KV token (v_query) → softmax always = 1.0 → cross-attn reduces to a fixed linear transform of v_query, identical for every position. No dynamic conditioning.
+2. **Self-attention degenerates**: most heads learn identity (diagonal) or "look at previous only". No long-range patterns. Teacher forcing removes incentive to learn deep chain analysis.
+3. **Error accumulation**: at generation time, error from step 1 feeds into step 2 etc. By step 3-4, model enters attractor basin (fixed point like "Theoretical").
+4. **tf_cos vs gen_cos anomaly explained**: tf_cos = mean cos over ALL chain steps (including hard intermediates). gen_cos = cos of LAST generated step to GT answer. gen_cos >> tf_cos because the final step metric is different from the average.
+
+### Rule
+1. Single-token cross-attention is degenerate. For meaningful conditioning, either:
+   a. Project v_query through multiple "pseudo-tokens" (learned query decomposition)
+   b. Use v_query as additive bias instead of cross-attention
+   c. Inject v_query at multiple points (not just cross-attn)
+2. Teacher forcing alone causes exposure bias in SONAR space. Consider:
+   a. Scheduled sampling (mix GT and predicted inputs during training)
+   b. Add noise to teacher-forced inputs to simulate generation errors
+3. Chain length curriculum must be more conservative. 3 steps was the sweet spot; 4-5 broke the model. Start with 1-3 and stay there until metrics stabilize.
+4. Monitor cos_last (final step quality) as the PRIMARY metric, not cos_sim_mean.
+
+## 2026-04-08 - Free-run objective and memory-bank context are mandatory for autoregressive QA
+
+### Pattern
+Teacher-forced-only chain supervision can look stable in logs but collapses in real rollout (loops/repetition) and gives degenerate best-of-N candidates.
+
+### Root Cause
+- Exposure bias: model never optimized on its own generated trajectories.
+- Cross-attention with a single context token cannot learn useful selection over evidence.
+- Deterministic candidate generation makes reranking ineffective.
+
+### Fix
+- Use composite objective with free-run and in-batch contrastive terms:
+  - `L = lambda_step*L_step_masked + lambda_ans*L_final_answer + lambda_roll*L_free_run + lambda_rank*L_inbatch_contrastive`.
+- Feed a context memory bank (`query + evidence slots`) into cross-attention with proper mask.
+- Make system2 candidate generation stochastic and anti-loop constrained (repeat penalty, repeat-ban, stagnation early-stop).
+
+### Rule
+1. For autoregressive QA, never rely on teacher-forcing loss alone.
+2. If cross-attention key length is 1, do not treat attention plots as evidence of context reasoning.
+3. Reranker quality requires candidate diversity; deterministic best-of-N is a no-op.
+4. Train and inference horizons must be aligned or explicitly capped.

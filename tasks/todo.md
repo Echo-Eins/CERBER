@@ -1,5 +1,306 @@
 # Stage 1.5 Loss Recovery Plan (2026-03-28)
 
+## 2026-04-07 - ChainGenerator/ChainCritic Full Diagnostics (P0/P1) + Stabilization Roadmap
+
+### Objective
+Закрепить полную диагностику текущих проблем в `13_chain_generator` и `14_chain_critic`,
+зафиксировать приоритеты исправлений и сформировать дорожную карту до полноценной
+autoregressive QA модели.
+
+### Critical Errors (P0)
+
+- [x] P0.1 Паддинг-маска в train считается, но не используется в лоссе.
+  - Симптом:
+    - `mask` создается в `experiments/13_chain_generator/train_chain_generator.py:159`.
+    - `compute_loss` вызывается без маски в `experiments/13_chain_generator/train_chain_generator.py:165`.
+    - Лосс усредняется по всем позициям в `cebcm/models/chain_generator.py:460`.
+  - Риск:
+    - модель учится на нулевых padded-векторах как на валидных целях.
+  - Требование фикса:
+    - передавать `mask` в `compute_loss`;
+    - считать masked mean для cosine/MSE;
+    - исключить паддинг из `cos_sim_last`.
+  - Критерий приемки:
+    - при изменении доли паддинга train/val метрики не деградируют искусственно;
+    - masked и unmasked метрики логируются отдельно.
+
+- [x] P0.2 При обрезке длинной цепочки теряется ответ (последний шаг).
+  - Симптом:
+    - `chain = chain[:max_chain_len]` в `experiments/13_chain_generator/train_chain_generator.py:86`.
+    - ответ добавляется в конец в `experiments/13_chain_generator/train_chain_generator.py:80`.
+  - Риск:
+    - финальный answer-token может быть выброшен.
+  - Требование фикса:
+    - обрезка с гарантией сохранения последнего шага-ответа:
+      - либо `keep_last` стратегия;
+      - либо window по reasoning steps + обязательный `v_answer`.
+  - Критерий приемки:
+    - для всех sample `chain[-1] == v_answer` после preprocessing.
+
+- [x] P0.3 `System1=direct answer` не соответствует реальному таргету обучения.
+  - Симптом:
+    - `target_steps=1` помечен как direct answer в `experiments/13_chain_generator/train_chain_generator.py:129`.
+    - фактически берется `chains[:, :effective_len]` в `experiments/13_chain_generator/train_chain_generator.py:156`.
+    - это обычно `v_steps[0]`, а не `v_answer`.
+  - Риск:
+    - System1 обучается не на задачу ответа, а на первый reasoning-step.
+  - Требование фикса:
+    - отдельная target-policy для System1: финальный шаг цепи (`v_answer`).
+  - Критерий приемки:
+    - в логах System1 `target_is_answer_rate=100%`.
+
+- [x] P0.4 Best-of-N reranking в GUI вырожден: кандидаты одинаковые.
+  - Симптом:
+    - кандидаты генерируются детерминированно в цикле `cerber_gui/chain_generator_diagnostics.py:616`.
+    - отсутствуют шум/температура/дискретизация/diverse policy.
+    - в JSON у всех кандидатов одинаковые `energy`.
+  - Риск:
+    - reranking фактически не работает.
+  - Требование фикса:
+    - stochastic candidate generation:
+      - temperature;
+      - latent noise per step;
+      - optional diverse beam / anti-duplicate penalty.
+  - Критерий приемки:
+    - `std(energy)` по кандидатам > 0;
+    - rerank win-rate > random baseline.
+
+### High-Risk Issues (P1)
+
+- [x] P1.1 Mismatch critic train vs inference по контексту.
+  - Симптом:
+    - train с `v_context` в `experiments/14_chain_critic/train_chain_critic.py:136`.
+    - GUI rerank без контекста в `cerber_gui/chain_generator_diagnostics.py:626`.
+  - Риск:
+    - энергия на инференсе не соответствует обученной функции.
+  - Требование фикса:
+    - унифицировать вызов критика с контекстом в train/eval/inference;
+    - fallback-политика контекста явно зафиксирована.
+  - Критерий приемки:
+    - offline eval и GUI online eval дают согласованные ранги.
+
+- [x] P1.2 OOD по горизонту: инференс 20 шагов при train до 5.
+  - Симптом:
+    - `max_chain_steps=5` в train-config;
+    - реальные прогоны `num_steps=20`.
+  - Риск:
+    - циклы, коллапс, повторения.
+  - Требование фикса:
+    - выровнять train horizon с planned inference horizon.
+  - Критерий приемки:
+    - стабильность метрик при `steps in [1..20]` без резкого провала после 5-го.
+
+- [x] P1.3 Валидация teacher-forced без маски паддинга.
+  - Симптом:
+    - `model.compute_loss(v_q, chains)` в `experiments/13_chain_generator/train_chain_generator.py:204`.
+  - Риск:
+    - вал-метрика смещена паддингом и непригодна для раннего стопа.
+  - Требование фикса:
+    - masked validation identical to train masking logic.
+  - Критерий приемки:
+    - `val_tf_*` пересчитаны с маской и отражают качество на реальных токенах.
+
+- [x] P1.4 Негативы critic только случайные (легкие).
+  - Симптом:
+    - random negative sampling в `experiments/14_chain_critic/train_chain_critic.py:81`.
+  - Риск:
+    - высокая `rank_acc` без переносимости на hard candidates генератора.
+  - Требование фикса:
+    - hard-negative mining из текущего генератора;
+    - mixed negatives: random + in-batch hard + model-hard.
+  - Критерий приемки:
+    - рост reranking quality на real candidate pools.
+
+### Attention Diagnostics: What Is Actually Wrong/Right
+
+- [x] A1 Causal mask в self-attention реализован корректно.
+  - `is_causal=True` в `cebcm/models/chain_generator.py:207`.
+  - В diagnostics ручной causal-mask есть в `cerber_gui/chain_generator_diagnostics.py:557`.
+
+- [x] A2 Cross-attention `~1.0` не баг в текущей архитектуре.
+  - Причина:
+    - `context` длины 1 (`[B,1,D]`) в `cebcm/models/chain_generator.py:114`.
+    - softmax по одному ключу всегда равен 1.
+  - Следствие:
+    - текущий график cross-attention в GUI малоинформативен.
+
+- [ ] A3 Диагональные self-head карты интерпретируются как symptom of copying/looping.
+  - Это не доказывает ошибку маски само по себе.
+  - Усиливается из-за:
+    - teacher forcing without free-run correction,
+    - OOD horizon,
+    - target-policy mismatch для System1.
+
+### JSON/Runtime Diagnostics Interpretation (фиксировать как baseline)
+
+- [x] J1 `step_norms ~ 0.2051` — ожидаемо и корректно.
+  - Это следствие sphere projection:
+  - `cebcm/models/chain_generator.py:341`.
+
+- [x] J2 `step_cos_to_target` пустой в text-mode — ожидаемо.
+  - В text-mode нет `v_target`, поэтому cosine к target не считается.
+
+- [x] J3 `rerank_candidates` с одинаковым `energy/cos` — ожидаемо при детерминированном N-best.
+  - Причина:
+    - deterministic candidate generation + `v_target=None`.
+
+- [ ] J4 Повторы вида `Russian/Russian...`, `Saturn/Saturn...` считаются collapse-сигналом.
+  - Вероятные первопричины:
+    - exposure bias teacher forcing,
+    - OOD horizon (20 vs train<=5),
+    - invalid training objective из-за маски/таргета.
+
+### Consolidated Problem Statement
+
+- [x] Главная проблема сейчас не в сломанной causal-mask в attention-слое.
+- [ ] Главная проблема — ошибки постановки обучения/инференса:
+  - неверные таргеты (System1),
+  - потеря ответа при тримминге,
+  - паддинг в лоссе,
+  - OOD по длине,
+  - вырожденный reranking,
+  - контекстный mismatch критика.
+
+### Highest-Impact Upgrades After Bug Fixes
+
+- [ ] U1 Перестроить objective генератора под реальный autoregressive режим:
+  - `L = λ_step*L_step_masked + λ_ans*L_final_answer + λ_roll*L_free_run + λ_rank*L_inbatch_contrastive`
+  - Обоснование:
+    - без `L_free_run` модель остается teacher-forcing-оптимальной и unstable в rollout.
+
+- [ ] U2 Hard-negative mining для critic из текущего генератора.
+  - Не только random negatives.
+  - Собирать top-k сложных кандидатов из реального декодера.
+
+- [ ] U3 Убрать вырожденность кандидатов в System2.
+  - stochastic candidates:
+    - latent noise,
+    - temperature,
+    - diverse beam / diversity penalty,
+    - anti-repeat penalties.
+
+- [ ] U4 Выравнять train horizon и inference horizon.
+  - Если production target = 20 steps, training curriculum должен доходить до 20.
+
+- [ ] U5 Ввести anti-loop контроль генерации.
+  - cosine repeat penalty,
+  - stagnation early-stop (`delta_energy`, `delta_cos`),
+  - latent duplicate suppression.
+
+### Architecture Upgrades (Next Milestone)
+
+- [ ] R1 Cross-attention memory bank вместо single-key контекста.
+  - Сейчас `context=[B,1,D]` делает cross-attn почти нефункциональным.
+  - Требуется `K` контекстных векторов (`query + evidence slots`).
+
+- [ ] R2 Explicit answer-head (повышенный вес финального шага).
+  - Отдельная оптимизация финального answer-step.
+  - Иначе модель перераспределяет емкость в промежуточные шаги.
+
+- [ ] R3 Двухэтапный train pipeline:
+  - Stage A: generator до стабильного free-run;
+  - Stage B: critic на hard negatives;
+  - Stage C: joint fine-tune с малым LR генератора.
+
+### Acceptance Gates (Do Not Promote Without Passing)
+
+- [ ] G1 Masked objective parity:
+  - train/val одинаково masked, паддинг не влияет на метрики.
+- [ ] G2 System1 target integrity:
+  - при `target_steps=1` таргет всегда `v_answer`.
+- [ ] G3 Reranker non-degeneracy:
+  - кандидаты различаются по energy и семантике.
+- [ ] G4 Horizon robustness:
+  - метрики стабильны на шагах до production horizon.
+- [ ] G5 Critic context parity:
+  - единый вызов с контекстом в train/eval/gui inference.
+
+### P0 Implementation Review (2026-04-08)
+- [x] `cebcm/models/chain_generator.py`
+  - added `loss_mask` in `compute_loss`;
+  - masked cosine/MSE aggregation;
+  - final-step metrics now use last valid token.
+- [x] `experiments/13_chain_generator/train_chain_generator.py`
+  - dataset truncation preserves final answer token;
+  - curriculum targets switched to suffix policy ending at answer;
+  - System1 (`target_steps=1`) now trains on `v_answer`;
+  - train/val `compute_loss` now pass valid-token mask.
+- [x] `cerber_gui/chain_generator_diagnostics.py`
+  - added stochastic candidate generation for best-of-N reranking;
+  - candidate #0 deterministic baseline, others noise-perturbed.
+- [x] Validation:
+  - `py -3 -m py_compile cebcm/models/chain_generator.py experiments/13_chain_generator/train_chain_generator.py cerber_gui/chain_generator_diagnostics.py`
+
+### P1 Implementation Review (2026-04-08)
+- [x] `P1.1` Critic context parity (train/eval/inference)
+  - `cerber_gui/chain_generator_diagnostics.py` now passes `v_context` in rerank, per-step energy, critic analysis and landscape.
+  - Added compatibility wrapper for legacy critics that do not accept `v_context`.
+- [x] `P1.2` Horizon OOD guard (train<=5 vs infer=20)
+  - Added runtime cap in GUI diagnostics: `num_steps` is clamped by checkpoint `training.max_chain_steps` and model `max_chain_len`.
+  - Added explicit cap metadata in exported diagnostics JSON/Markdown (`requested_steps`, `step_cap_applied`, `step_cap_reason`).
+  - Updated `configs/chain_generator_config.json` to train with `max_chain_steps=20`.
+- [x] `P1.3` Teacher-forced validation mask
+  - Confirmed masked validation path in `experiments/13_chain_generator/train_chain_generator.py` via `loss_mask`.
+- [x] `P1.4` Hard negatives for critic
+  - Added in-batch hard-negative mining (`top-k` nearest answers by cosine) in `experiments/14_chain_critic/train_chain_critic.py`.
+  - Training now uses mixed negatives: random (dataset) + hard (in-batch injection).
+  - Added optional generator-hard negatives from ChainGenerator checkpoint (filtered by `cos(gen, pos)` threshold).
+  - Added config knobs in `configs/chain_critic_config.json`:
+    - `enable_hard_negatives`
+    - `hard_negatives_top_k`
+    - `enable_generator_hard_negatives`
+    - `generator_hard_checkpoint`
+    - `generator_hard_steps`
+    - `generator_hard_slots`
+    - `generator_hard_max_pos_cos`
+
+
+## 2026-04-06 - ChainGenerator: Autoregressive Transformer Decoder in SONAR Space
+
+### Architecture
+Pure autoregressive Transformer decoder — NOT a denoiser. Direct QA neural network.
+
+```
+Input:  v_query [B, 1024]  (question embedding)
+Output: chain [B, N, 1024]  (reasoning steps + answer, all decodable to text)
+
+ChainGenerator:
+  - Learned [START] token (1024d)
+  - N × Decoder Block (Pre-Norm):
+    a. Causal Self-Attention (RoPE) — chain ordering
+    b. Cross-Attention to v_query — semantic grounding (NO positional enc)
+    c. FFN (SiLU, 1024 → 4096 → 1024)
+  - Output projection → 1024d
+  - Sphere projection: normalize → scale to target_norm (0.2051)
+
+System 1: generate 1 step (direct answer)
+System 2: generate N steps (reasoning chain → answer)
+Each step is a valid SONAR vector — decodable to text at inference
+```
+
+### Key Design Decisions
+- RoPE for self-attention (position-content binding for chain order)
+- Cross-attention to v_query without positional encoding (semantic only)
+- Causal mask (autoregressive: step i sees only steps 1..i)
+- SiLU activation (matches angular critic)
+- Sphere projection enforces SONAR manifold
+- CompositeCritic as optional reranker (NOT navigator)
+- NO CE, IPP, SP — all proven dead ends
+
+### Training
+- Teacher forcing on v_steps + v_answer from HotpotQA data
+- Loss: cosine similarity + MSE per chain step
+- Curriculum: start System 1 (1-step), ramp to System 2 (N-step)
+
+### Tasks
+- [x] Write architecture plan
+- [ ] Implement `cebcm/models/chain_generator.py`
+- [ ] Create `configs/chain_generator_config.json`
+- [ ] Create `experiments/13_chain_generator/train_chain_generator.py`
+- [ ] Update `tasks/lessons.md` with navigation failure lessons
+- [ ] Verify: model forward pass, parameter count, gradient flow
+
+
 ## 2026-04-06 - GUI landscape: backward-compatible checkpoint loading (old/new parametrization keys)
 - [x] Reproduce mismatch source in `cerber_gui/app.py::_load_energy_model_from_checkpoint`
 - [x] Add automatic state_dict migration for `net.*.weight` <-> `net.*.parametrizations.weight.*`
@@ -1808,3 +2109,119 @@ position-content binding for global-token fusion.
 - Validation:
   - `py -3 -m py_compile cebcm/models/context_encoder.py cebcm/training/stage2_utils.py experiments/08_autoregressor/train_stage2.py`
   - `py -3 -c "import json; [json.load(open(p, encoding='utf-8')) for p in ['configs/stage2_config.json','configs/stage2_ce_config.json','configs/stage2_ipp_config.json','configs/stage2_ce_ipp_joint_config.json']]; print('ok')"`
+
+
+## 2026-04-08 - Stage 13 ChainGenerator autoregressive upgrades (implementation)
+
+### Scope
+- [x] Replace objective with composite autoregressive loss:
+  - `L = lambda_step*L_step_masked + lambda_ans*L_final_answer + lambda_roll*L_free_run + lambda_rank*L_inbatch_contrastive`
+- [x] Add free-run rollout loss in training loop (not teacher-forced only).
+- [x] Add in-batch contrastive ranking loss on rollout final answer.
+- [x] Keep System1 semantics answer-aligned via suffix target selection.
+
+### Architecture updates
+- [x] Cross-attention upgraded from single-token context to memory-bank context (`[B, K, D]`) with context masking.
+- [x] Training data pipeline now builds context bank (`query + evidence slots`) and pads it in collate with `context_mask`.
+- [x] Generator forward/loss path now accepts `v_context_bank` and `context_mask`.
+
+### Generation/runtime updates
+- [x] System2 candidate generation is stochastic (temperature + latent/start noise schedules).
+- [x] Added anti-loop controls in generator:
+  - repeat penalty by cosine-to-history,
+  - latent repeat-ban with retry resampling,
+  - stagnation early-stop using delta-energy and delta-cos windows.
+- [x] Best-of-N reranking now receives non-degenerate candidates and exports diversity diagnostics.
+
+### Horizon alignment
+- [x] Training horizon kept at `max_chain_steps=20` (curriculum ramps to configured max).
+- [x] Runtime step cap keeps inference within trained/architectural limits.
+
+### Verification
+- [x] Syntax checks:
+  - `uv run python -m py_compile cebcm/models/chain_generator.py experiments/13_chain_generator/train_chain_generator.py cerber_gui/chain_generator_diagnostics.py`
+
+### Files touched
+- [x] `cebcm/models/chain_generator.py`
+- [x] `experiments/13_chain_generator/train_chain_generator.py`
+- [x] `cerber_gui/chain_generator_diagnostics.py`
+- [x] `configs/chain_generator_config.json`
+
+---
+
+## 2026-04-09 — Generator Fine-tune + Critic Retrain Pipeline
+
+### Context
+Training with all 8 fixes completed through E30+. Results:
+- tf_cos (VAL) = 0.890, roll_cos (VAL) = 0.793, gap = 9.7% at 20 steps
+- Significant improvement over old run (9.7% gap was at 4 steps before)
+- But roll_cos 0.793 is insufficient — SONAR decode gives approximate paraphrases, not faithful answers
+- Target: roll_cos >= 0.90 (ideally 0.93+) for correct factual answers
+
+### Phase 1: Generator Fine-tune (Experiment 13b)
+
+**Goal**: Close tf/roll gap, raise absolute roll_cos above 0.90.
+
+**Key changes from base training:**
+| Parameter | Base (E0-E50) | Fine-tune |
+|-----------|---------------|-----------|
+| lr | 1e-4 | 5e-5 |
+| system1_epochs | 10 | 0 (skip) |
+| system2_start_steps | 2 (ramp) | 20 (immediate) |
+| scheduled_sampling_max | 0.5 | 0.65 |
+| ss_ramp_epochs | 10 | 5 |
+| free_run_noise_std | 0.05 | 0.07 |
+| loss_lambda_roll | 1.0 | 1.5 |
+| num_epochs | 50 | 30 |
+| output_dir | output/ | output_finetune/ |
+
+**How to run:**
+```bash
+python experiments/13_chain_generator/train_chain_generator.py \
+    --config configs/chain_generator_finetune.json \
+    --finetune experiments/13_chain_generator/output/checkpoints/best.pt
+```
+
+**What to watch:**
+- [ ] E0-E2: tf_cos should stay near 0.88+ (no regression from lower lr)
+- [ ] E5+: roll_cos should improve as ss_prob reaches 0.65
+- [ ] VAL gap should shrink below 5% by E10
+- [ ] roll_cos (VAL) target: >= 0.88 by E15, >= 0.90 by E25
+
+### Phase 2: Retrain Critic (Experiment 14)
+
+**Prerequisite:** Phase 1 best checkpoint exists.
+
+**Before running**, update critic config:
+```bash
+# In configs/chain_critic_config.json, update:
+# "generator_hard_checkpoint": "experiments/13_chain_generator/output_finetune/checkpoints/best.pt"
+```
+
+**How to run:**
+```bash
+python experiments/14_chain_critic/train_chain_critic.py \
+    --config configs/chain_critic_config.json
+```
+
+**What to watch:**
+- [ ] val_rank_acc should reach 0.90+ (currently 0.848)
+- [ ] Generator hard negatives should be stronger (higher quality chains)
+
+### Phase 3: Evaluate Pipeline
+
+- [ ] Test inference with fine-tuned generator + retrained critic reranking
+- [ ] Verify "What is the capital of France?" gives "Paris" not "France"
+- [ ] Check multi-step chains produce full sentences, not 1-word outputs
+- [ ] Compare System1 (1-step) vs full chain (20-step) quality
+
+### Phase 4 (if needed): Joint Training or Architecture Changes
+
+Only if Phase 1-3 don't reach 0.90 roll_cos:
+- [ ] Implement generator-critic joint training (generator produces, critic scores, REINFORCE/PPO)
+- [ ] Consider increasing model capacity (8 layers, larger FFN)
+- [ ] Consider data augmentation (richer answer sentences)
+
+### Files created/modified
+- [x] `experiments/13_chain_generator/train_chain_generator.py` — added `--finetune` flag, `system2_start_steps`
+- [x] `configs/chain_generator_finetune.json` — fine-tune config

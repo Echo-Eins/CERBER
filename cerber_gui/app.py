@@ -72,25 +72,27 @@ from cerber_gui.chain_diagnostics import (
     create_overfitting_plot,
     create_energy_scale_plot,
 )
-from cerber_gui.inference_diagnostics import (
-    PRESET_QUESTIONS,
-    DiagnosticsState,
-    InferenceResult,
-    load_pairwise_model as diag_load_pairwise,
-    load_chain_head_model as diag_load_chain,
-    load_sonar as diag_load_sonar,
-    run_inference as diag_run_inference,
-    run_text_inference as diag_run_text_inference,
-    create_energy_trajectory_plot,
-    create_cosine_trajectory_plot,
-    create_attention_animation,
-    create_attention_grid,
-    create_landscape_with_trajectory,
-    create_contour_with_trajectory,
-    format_metrics_markdown,
-    export_metrics_json,
-    export_metrics_csv,
-    get_state as get_diag_state,
+from cerber_gui.chain_generator_diagnostics import (
+    GenerationResult,
+    DiagState as ChainDiagState,
+    load_generator as cg_load_generator,
+    load_critic as cg_load_critic,
+    load_sonar as cg_load_sonar,
+    run_from_data as cg_run_from_data,
+    run_from_text as cg_run_from_text,
+    run_generation as cg_run_generation,
+    analyze_critic_on_chain as cg_analyze_critic,
+    compute_chain_landscape as cg_compute_landscape,
+    create_self_attention_plot as cg_self_attn_plot,
+    create_all_heads_attention_plot as cg_all_heads_plot,
+    create_cross_attention_plot as cg_cross_attn_plot,
+    create_step_metrics_plot as cg_step_metrics_plot,
+    create_energy_landscape_3d as cg_landscape_3d_plot,
+    create_norm_plot as cg_create_norm_plot,
+    format_metrics_markdown as cg_format_md,
+    export_metrics_json as cg_export_json,
+    export_metrics_csv as cg_export_csv,
+    get_state as get_cg_state,
 )
 from cerber_gui.context_encoder_diagnostics import (
     load_ce_models as ce_diag_load_models,
@@ -3082,7 +3084,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     label="Sequence Index",
                 )
                 chain_length = gr.Slider(
-                    minimum=5, maximum=20, value=10, step=1,
+                    minimum=5, maximum=200, value=10, step=1,
                     label="Chain Length",
                 )
                 chain_analyze_btn = gr.Button("Analyze Chain Head", variant="primary")
@@ -3116,135 +3118,154 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 chain_overfit_plot = gr.Plot(label="Train vs Val (Overfitting Detection)")
                 chain_energy_scale_plot = gr.Plot(label="Energy Scale Monitoring")
 
-        # === Tab 6: Inference Diagnostics ===
-        with gr.TabItem("Inference Diagnostics"):
+        # === Tab 6: ChainGenerator Diagnostics ===
+        with gr.TabItem("ChainGenerator QA"):
             gr.Markdown(
                 """
-            ### Comprehensive Inference Diagnostics
+            ### ChainGenerator — Autoregressive QA in SONAR Space
 
-            Load pairwise + chain head checkpoints, run System 1/2 inference with full visibility:
-            attention heatmaps, energy landscape, trajectory tracking, and numerical metrics.
+            Load ChainGenerator + CompositeCritic checkpoints. Run System 1 (direct answer)
+            or System 2 (reasoning chain) generation. Full visibility: attention maps,
+            energy landscape around chain path, per-step metrics, text decode.
             """
             )
 
             # --- Model Loading ---
             gr.Markdown("#### Load Models")
             with gr.Row():
-                diag_pairwise_path = gr.Textbox(
-                    label="Pairwise Checkpoint",
-                    value="experiments/05_stage15_twin/checkpoints/best_model.pt",
+                cg_gen_path = gr.Textbox(
+                    label="ChainGenerator Checkpoint",
+                    value="experiments/13_chain_generator/output/checkpoints/best.pt",
                 )
-                diag_pairwise_load_btn = gr.Button("Load Pairwise", variant="secondary")
-                diag_pairwise_status = gr.Textbox(label="Pairwise Status", lines=3, interactive=False)
+                cg_gen_load_btn = gr.Button("Load Generator", variant="secondary")
+                cg_gen_status = gr.Textbox(label="Generator Status", lines=3, interactive=False)
 
             with gr.Row():
-                diag_chain_path = gr.Textbox(
-                    label="Chain Head Checkpoint",
-                    value="experiments/09_stage3_chain/checkpoints/best_phase_b.pt",
+                cg_critic_path = gr.Textbox(
+                    label="CompositeCritic Checkpoint (optional reranker)",
+                    value="experiments/12_composite_critic/output/checkpoints/best.pt",
                 )
-                diag_chain_load_btn = gr.Button("Load Chain Head", variant="secondary")
-                diag_chain_status = gr.Textbox(label="Chain Head Status", lines=3, interactive=False)
+                cg_critic_load_btn = gr.Button("Load Critic", variant="secondary")
+                cg_critic_status = gr.Textbox(label="Critic Status", lines=3, interactive=False)
 
             with gr.Row():
-                diag_sonar_btn = gr.Button("Load SONAR (for text)", variant="secondary")
-                diag_sonar_status = gr.Textbox(label="SONAR Status", lines=1, interactive=False)
+                cg_sonar_btn = gr.Button("Load SONAR (for text decode)", variant="secondary")
+                cg_sonar_status = gr.Textbox(label="SONAR Status", lines=1, interactive=False)
 
-            # --- Inference Parameters ---
-            gr.Markdown("#### Inference Parameters")
+            # --- Generation Parameters ---
+            gr.Markdown("#### Generation Parameters")
             with gr.Row():
-                diag_mode = gr.Radio(
-                    choices=["system1", "system2", "both"], value="system2",
-                    label="Mode",
+                cg_mode = gr.Radio(
+                    choices=["system1", "system2"], value="system1",
+                    label="Mode (1=direct answer, 2=reasoning chain)",
                 )
-                diag_max_steps = gr.Slider(
-                    minimum=10, maximum=50, value=50, step=1,
-                    label="Max Steps (S1<=10, S2<=50)",
+                cg_num_steps = gr.Slider(
+                    minimum=1, maximum=200, value=1, step=1,
+                    label="Chain Steps (System 2)",
                 )
-                diag_lr = gr.Number(value=0.01, label="Learning Rate")
-                diag_noise_scale = gr.Number(value=0.005, label="Noise Scale")
-
+                cg_num_candidates = gr.Slider(
+                    minimum=1, maximum=16, value=1, step=1,
+                    label="Candidates (step-level N, requires critic)",
+                )
+                cg_beam_width = gr.Slider(
+                    minimum=1, maximum=8, value=1, step=1,
+                    label="Beam Width (requires critic)",
+                )
             with gr.Row():
-                diag_target_norm = gr.Number(value=0.2051, label="Target Norm")
-                diag_chain_eval_every = gr.Slider(
-                    minimum=1, maximum=20, value=5, step=1,
-                    label="Chain Eval Every (S2)",
+                cg_temperature = gr.Slider(
+                    minimum=0.0, maximum=2.0, value=1.0, step=0.05,
+                    label="Temperature",
                 )
-                diag_backtrack_patience = gr.Slider(
-                    minimum=5, maximum=100, value=30, step=5,
-                    label="Backtrack Patience (S2)",
+                cg_noise_std = gr.Slider(
+                    minimum=0.0, maximum=0.2, value=0.01, step=0.005,
+                    label="Noise Std",
                 )
-                diag_max_chain_len = gr.Slider(
-                    minimum=3, maximum=20, value=20, step=1,
-                    label="Max Chain Len (S2)",
+                cg_grid_size = gr.Slider(
+                    minimum=15, maximum=60, value=30, step=5,
+                    label="Landscape Grid Size",
                 )
 
             # --- Data Source ---
-            gr.Markdown("#### Data Source")
+            gr.Markdown("#### Data Source (HotpotQA)")
             with gr.Row():
-                diag_data_path = gr.Textbox(
-                    label="SONAR Data Path",
-                    value="data/squad_sequences.pt",
+                cg_data_path = gr.Textbox(
+                    label="Data Path",
+                    value="data/hotpotqa_sonar.pt",
                 )
-                diag_seq_idx = gr.Slider(
-                    minimum=0, maximum=999, value=0, step=1,
-                    label="Sequence Index",
+                cg_sample_idx = gr.Slider(
+                    minimum=0, maximum=9999, value=0, step=1,
+                    label="Sample Index",
                 )
-                diag_noise_pct = gr.Slider(
-                    minimum=0.1, maximum=20.0, value=5.0, step=0.1,
-                    label="Noise %",
-                )
-                diag_run_data_btn = gr.Button("Run Inference (Data)", variant="primary")
+                cg_run_data_btn = gr.Button("Generate from Data", variant="primary")
 
             # --- Text Input ---
             gr.Markdown("#### Text Input (requires SONAR)")
             with gr.Row():
-                diag_text_input = gr.Textbox(
-                    label="Input Text",
+                cg_text_input = gr.Textbox(
+                    label="Question",
                     lines=2,
-                    placeholder="Enter text to encode with SONAR...",
+                    placeholder="Enter question to answer via ChainGenerator...",
                 )
-                diag_preset_dropdown = gr.Dropdown(
-                    choices=[q["label"] for q in PRESET_QUESTIONS],
+            with gr.Row():
+                cg_preset_dropdown = gr.Dropdown(
+                    choices=[
+                        "What is the capital of France?",
+                        "Who discovered penicillin?",
+                        "What causes rain?",
+                        "How does photosynthesis work?",
+                        "What is the theory of relativity?",
+                        "Why is the sky blue?",
+                        "What are the primary colors?",
+                        "How do computers store data?",
+                    ],
                     label="Preset Questions",
                     interactive=True,
                 )
-            diag_run_text_btn = gr.Button("Run Inference (Text)", variant="primary")
+                cg_run_text_btn = gr.Button("Generate from Text", variant="primary")
 
             # --- Results ---
             gr.Markdown("#### Results")
-            diag_metrics_md = gr.Markdown("Run inference to see results.")
+            cg_metrics_md = gr.Markdown("Load model and run generation to see results.")
 
             with gr.Tabs():
-                with gr.TabItem("Energy Trajectory"):
-                    diag_energy_plot = gr.Plot(label="Energy over Steps")
-                with gr.TabItem("Cosine Trajectory"):
-                    diag_cos_plot = gr.Plot(label="Cosine Similarity to Target")
-                with gr.TabItem("Attention Animation"):
+                with gr.TabItem("Per-Step Metrics"):
+                    cg_step_plot = gr.Plot(label="Cosine to Target + Critic Energy per Step")
+
+                with gr.TabItem("Self-Attention (avg)"):
                     with gr.Row():
-                        diag_attn_layer = gr.Radio(
-                            choices=["0", "1"], value="0", label="Layer",
+                        cg_sa_layer = gr.Slider(
+                            minimum=0, maximum=5, value=0, step=1,
+                            label="Layer",
                         )
-                    diag_attn_anim = gr.Plot(label="Attention Evolution")
-                with gr.TabItem("Attention Grid"):
+                    cg_sa_plot = gr.Plot(label="Self-Attention Heatmap (avg heads)")
+
+                with gr.TabItem("All Heads"):
                     with gr.Row():
-                        diag_attn_grid_step = gr.Slider(
-                            minimum=0, maximum=50, value=0, step=1,
-                            label="Snapshot Index (0 = last)",
+                        cg_ah_layer = gr.Slider(
+                            minimum=0, maximum=5, value=0, step=1,
+                            label="Layer",
                         )
-                        diag_attn_grid_layer = gr.Radio(
-                            choices=["0", "1"], value="0", label="Layer",
+                    cg_ah_plot = gr.Plot(label="All Attention Heads")
+
+                with gr.TabItem("Cross-Attention"):
+                    with gr.Row():
+                        cg_ca_layer = gr.Slider(
+                            minimum=0, maximum=5, value=0, step=1,
+                            label="Layer",
                         )
-                    diag_attn_grid = gr.Plot(label="All Heads at Snapshot")
-                with gr.TabItem("3D Landscape"):
-                    diag_landscape_3d = gr.Plot(label="Energy Surface + Trajectory")
-                with gr.TabItem("2D Contour"):
-                    diag_contour = gr.Plot(label="Contour + Trajectory")
+                    cg_ca_plot = gr.Plot(label="Cross-Attention to Query")
+
+                with gr.TabItem("3D Energy Landscape"):
+                    cg_landscape_plot = gr.Plot(label="Energy Surface Around Chain Path")
+
+                with gr.TabItem("Vector Norms"):
+                    cg_norm_plot = gr.Plot(label="Vector Norms Along Chain")
 
             gr.Markdown("#### Export Metrics")
             with gr.Row():
-                diag_export_btn = gr.Button("Export JSON")
-                diag_export_csv_btn = gr.Button("Export CSV (per-step)")
-                diag_export_output = gr.Textbox(label="Exported Metrics", lines=10, interactive=False)
+                cg_export_json_btn = gr.Button("Export JSON")
+                cg_export_csv_btn = gr.Button("Export CSV (per-step)")
+                cg_export_output = gr.Textbox(label="Exported Metrics", lines=10, interactive=False)
 
         # === Tab 7: Context Encoder Diagnostics ===
         with gr.TabItem("Context Encoder Diagnostics"):
@@ -3613,202 +3634,166 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
         outputs=[chain_overfit_plot, chain_energy_scale_plot],
     )
 
-    # === Inference Diagnostics Handlers ===
+    # === ChainGenerator QA Handlers ===
 
-    # Store last inference result in session state
-    session_state["diag_result"] = None
+    session_state["cg_result"] = None
 
-    def diag_load_pairwise_fn(path):
+    def cg_load_gen_fn(path):
         try:
-            return diag_load_pairwise(path)
+            return cg_load_generator(str(path))
         except Exception as e:
             import traceback
             return f"Error: {e}\n{traceback.format_exc()}"
 
-    def diag_load_chain_fn(path):
+    def cg_load_critic_fn(path):
         try:
-            return diag_load_chain(path)
+            return cg_load_critic(str(path))
         except Exception as e:
             import traceback
             return f"Error: {e}\n{traceback.format_exc()}"
 
-    def diag_load_sonar_fn():
+    def cg_load_sonar_fn():
         try:
-            return diag_load_sonar()
+            return cg_load_sonar()
         except Exception as e:
             return f"Error: {e}"
 
-    def diag_preset_selected(label):
-        for q in PRESET_QUESTIONS:
-            if q["label"] == label:
-                return q["text"]
-        return ""
+    def cg_preset_selected(text):
+        return text if text else ""
 
-    def diag_run_data_fn(
-        data_path, seq_idx, noise_pct, mode, max_steps, lr, noise_scale,
-        target_norm, chain_eval_every, backtrack_patience, max_chain_len,
-        attn_layer_str,
-    ):
+    def _cg_build_outputs(result):
+        """Build all output plots from a GenerationResult."""
+        md = cg_format_md(result)
+        step_fig = cg_step_metrics_plot(result)
+        sa_fig = cg_self_attn_plot(result, layer_idx=0)
+        ah_fig = cg_all_heads_plot(result, layer_idx=0)
+        ca_fig = cg_cross_attn_plot(result, layer_idx=0)
+        landscape_fig = cg_landscape_3d_plot(result)
+        norm_fig = cg_create_norm_plot(result)
+        return md, step_fig, sa_fig, ah_fig, ca_fig, landscape_fig, norm_fig
+
+    def cg_run_data_fn(data_path, sample_idx, mode, num_steps, num_candidates, beam_width, temp, noise, grid_size):
         try:
-            result = diag_run_inference(
-                mode=mode, data_path=data_path, seq_idx=int(seq_idx),
-                noise_pct=noise_pct, max_steps=int(max_steps), lr=lr,
-                noise_scale=noise_scale, target_norm=target_norm,
-                chain_eval_every=int(chain_eval_every),
-                backtrack_patience=int(backtrack_patience),
-                max_chain_len=int(max_chain_len),
+            steps = 1 if mode == "system1" else int(num_steps)
+            result = cg_run_from_data(
+                data_path=str(data_path),
+                sample_idx=int(sample_idx),
+                num_steps=steps,
+                num_candidates=int(num_candidates),
+                beam_width=int(beam_width),
+                temperature=float(temp),
+                noise_std=float(noise),
+                grid_size=int(grid_size),
             )
-            session_state["diag_result"] = result
-            return _diag_build_outputs(result, int(attn_layer_str))
+            session_state["cg_result"] = result
+            return _cg_build_outputs(result)
         except Exception as e:
             import traceback
             err = f"Error: {e}\n```\n{traceback.format_exc()}\n```"
             empty = go.Figure()
             return err, empty, empty, empty, empty, empty, empty
 
-    def diag_run_text_fn(
-        text, mode, max_steps, lr, noise_scale, target_norm, noise_pct,
-        chain_eval_every, backtrack_patience, max_chain_len,
-        attn_layer_str,
-    ):
+    def cg_run_text_fn(text, mode, num_steps, num_candidates, beam_width, temp, noise, grid_size):
         try:
-            result = diag_run_text_inference(
-                text=text, mode=mode, noise_pct=noise_pct,
-                max_steps=int(max_steps), lr=lr,
-                noise_scale=noise_scale, target_norm=target_norm,
-                chain_eval_every=int(chain_eval_every),
-                backtrack_patience=int(backtrack_patience),
-                max_chain_len=int(max_chain_len),
+            steps = 1 if mode == "system1" else int(num_steps)
+            result = cg_run_from_text(
+                text=str(text),
+                num_steps=steps,
+                num_candidates=int(num_candidates),
+                beam_width=int(beam_width),
+                temperature=float(temp),
+                noise_std=float(noise),
+                grid_size=int(grid_size),
             )
-            session_state["diag_result"] = result
-            return _diag_build_outputs(result, int(attn_layer_str))
+            session_state["cg_result"] = result
+            return _cg_build_outputs(result)
         except Exception as e:
             import traceback
             err = f"Error: {e}\n```\n{traceback.format_exc()}\n```"
             empty = go.Figure()
             return err, empty, empty, empty, empty, empty, empty
 
-    def _diag_build_outputs(result, attn_layer):
-        md = format_metrics_markdown(result)
-        energy_fig = create_energy_trajectory_plot(result)
-        cos_fig = create_cosine_trajectory_plot(result)
-        attn_anim = create_attention_animation(result, layer_idx=attn_layer)
-
-        # Attention grid: use last snapshot
-        attn_grid = create_attention_grid(result, snapshot_idx=-1, layer_idx=attn_layer)
-
-        # Landscape plots (can be slow)
-        try:
-            landscape = create_landscape_with_trajectory(result)
-        except Exception:
-            landscape = go.Figure()
-            landscape.update_layout(title="Landscape unavailable")
-
-        try:
-            contour = create_contour_with_trajectory(result)
-        except Exception:
-            contour = go.Figure()
-            contour.update_layout(title="Contour unavailable")
-
-        return md, energy_fig, cos_fig, attn_anim, attn_grid, landscape, contour
-
-    def diag_update_attn_anim(layer_str):
-        result = session_state.get("diag_result")
+    def cg_update_sa(layer_idx):
+        result = session_state.get("cg_result")
         if result is None:
             return go.Figure()
-        return create_attention_animation(result, layer_idx=int(layer_str))
+        return cg_self_attn_plot(result, layer_idx=int(layer_idx))
 
-    def diag_update_attn_grid(step_idx, layer_str):
-        result = session_state.get("diag_result")
+    def cg_update_ah(layer_idx):
+        result = session_state.get("cg_result")
         if result is None:
             return go.Figure()
-        idx = int(step_idx) if int(step_idx) > 0 else -1
-        return create_attention_grid(result, snapshot_idx=idx, layer_idx=int(layer_str))
+        return cg_all_heads_plot(result, layer_idx=int(layer_idx))
 
-    def diag_export_fn():
-        result = session_state.get("diag_result")
+    def cg_update_ca(layer_idx):
+        result = session_state.get("cg_result")
         if result is None:
-            return "No inference result to export."
-        return export_metrics_json(result)
+            return go.Figure()
+        return cg_cross_attn_plot(result, layer_idx=int(layer_idx))
 
-    def diag_export_csv_fn():
-        result = session_state.get("diag_result")
+    def cg_export_json_fn():
+        result = session_state.get("cg_result")
         if result is None:
-            return "No inference result to export."
-        return export_metrics_csv(result)
+            return "No result to export."
+        return cg_export_json(result)
 
-    # Wire up event handlers
-    diag_pairwise_load_btn.click(
-        diag_load_pairwise_fn,
-        inputs=[diag_pairwise_path],
-        outputs=[diag_pairwise_status],
+    def cg_export_csv_fn():
+        result = session_state.get("cg_result")
+        if result is None:
+            return "No result to export."
+        return cg_export_csv(result)
+
+    # Wire up ChainGenerator event handlers
+    cg_gen_load_btn.click(
+        cg_load_gen_fn,
+        inputs=[cg_gen_path],
+        outputs=[cg_gen_status],
     )
-    diag_chain_load_btn.click(
-        diag_load_chain_fn,
-        inputs=[diag_chain_path],
-        outputs=[diag_chain_status],
+    cg_critic_load_btn.click(
+        cg_load_critic_fn,
+        inputs=[cg_critic_path],
+        outputs=[cg_critic_status],
     )
-    diag_sonar_btn.click(
-        diag_load_sonar_fn,
-        outputs=[diag_sonar_status],
+    cg_sonar_btn.click(
+        cg_load_sonar_fn,
+        outputs=[cg_sonar_status],
     )
-    diag_preset_dropdown.change(
-        diag_preset_selected,
-        inputs=[diag_preset_dropdown],
-        outputs=[diag_text_input],
+    cg_preset_dropdown.change(
+        cg_preset_selected,
+        inputs=[cg_preset_dropdown],
+        outputs=[cg_text_input],
     )
 
-    diag_run_data_btn.click(
-        diag_run_data_fn,
+    cg_run_data_btn.click(
+        cg_run_data_fn,
         inputs=[
-            diag_data_path, diag_seq_idx, diag_noise_pct, diag_mode,
-            diag_max_steps, diag_lr, diag_noise_scale, diag_target_norm,
-            diag_chain_eval_every, diag_backtrack_patience, diag_max_chain_len,
-            diag_attn_layer,
+            cg_data_path, cg_sample_idx, cg_mode,
+            cg_num_steps, cg_num_candidates, cg_beam_width, cg_temperature, cg_noise_std, cg_grid_size,
         ],
         outputs=[
-            diag_metrics_md, diag_energy_plot, diag_cos_plot,
-            diag_attn_anim, diag_attn_grid, diag_landscape_3d, diag_contour,
+            cg_metrics_md, cg_step_plot, cg_sa_plot,
+            cg_ah_plot, cg_ca_plot, cg_landscape_plot, cg_norm_plot,
         ],
     )
 
-    diag_run_text_btn.click(
-        diag_run_text_fn,
+    cg_run_text_btn.click(
+        cg_run_text_fn,
         inputs=[
-            diag_text_input, diag_mode, diag_max_steps, diag_lr,
-            diag_noise_scale, diag_target_norm, diag_noise_pct,
-            diag_chain_eval_every, diag_backtrack_patience, diag_max_chain_len,
-            diag_attn_layer,
+            cg_text_input, cg_mode,
+            cg_num_steps, cg_num_candidates, cg_beam_width, cg_temperature, cg_noise_std, cg_grid_size,
         ],
         outputs=[
-            diag_metrics_md, diag_energy_plot, diag_cos_plot,
-            diag_attn_anim, diag_attn_grid, diag_landscape_3d, diag_contour,
+            cg_metrics_md, cg_step_plot, cg_sa_plot,
+            cg_ah_plot, cg_ca_plot, cg_landscape_plot, cg_norm_plot,
         ],
     )
 
-    diag_attn_layer.change(
-        diag_update_attn_anim,
-        inputs=[diag_attn_layer],
-        outputs=[diag_attn_anim],
-    )
-    diag_attn_grid_step.change(
-        diag_update_attn_grid,
-        inputs=[diag_attn_grid_step, diag_attn_grid_layer],
-        outputs=[diag_attn_grid],
-    )
-    diag_attn_grid_layer.change(
-        diag_update_attn_grid,
-        inputs=[diag_attn_grid_step, diag_attn_grid_layer],
-        outputs=[diag_attn_grid],
-    )
-    diag_export_btn.click(
-        diag_export_fn,
-        outputs=[diag_export_output],
-    )
-    diag_export_csv_btn.click(
-        diag_export_csv_fn,
-        outputs=[diag_export_output],
-    )
+    cg_sa_layer.change(cg_update_sa, inputs=[cg_sa_layer], outputs=[cg_sa_plot])
+    cg_ah_layer.change(cg_update_ah, inputs=[cg_ah_layer], outputs=[cg_ah_plot])
+    cg_ca_layer.change(cg_update_ca, inputs=[cg_ca_layer], outputs=[cg_ca_plot])
+
+    cg_export_json_btn.click(cg_export_json_fn, outputs=[cg_export_output])
+    cg_export_csv_btn.click(cg_export_csv_fn, outputs=[cg_export_output])
 
     # === Context Encoder Diagnostics Handlers ===
 

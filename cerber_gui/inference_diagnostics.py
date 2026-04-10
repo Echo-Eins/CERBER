@@ -407,7 +407,7 @@ def run_system2_diagnostics(
     target_norm: float = 0.2051,
     chain_eval_every: int = 5,
     backtrack_patience: int = 30,
-    max_chain_len: int = 20,
+    max_chain_len: int = 200,
 ) -> InferenceResult:
     """Run System 2 (PID + chain-guided gradients) with attention capture."""
     if _state.pairwise_model is None:
@@ -427,7 +427,7 @@ def run_system2_diagnostics(
     t0 = time.time()
 
     steps = min(int(max_steps), 50)
-    chain_cap = min(int(max_chain_len), 20)
+    chain_cap = min(int(max_chain_len), 200)
 
     def _attn_cb(step_id: int, chain_tensor: Tensor) -> list[Tensor]:
         maps = _extract_attention(chain_head, chain_tensor)
@@ -515,7 +515,7 @@ def run_inference(
     target_norm: float = 0.2051,
     chain_eval_every: int = 5,
     backtrack_patience: int = 30,
-    max_chain_len: int = 20,
+    max_chain_len: int = 200,
 ) -> InferenceResult:
     """Run inference on a sample from SONAR data."""
     dev = torch.device(_state.device)
@@ -583,7 +583,7 @@ def run_text_inference(
     target_norm: float = 0.2051,
     chain_eval_every: int = 5,
     backtrack_patience: int = 30,
-    max_chain_len: int = 20,
+    max_chain_len: int = 200,
 ) -> InferenceResult:
     """Encode text with SONAR, run inference, decode output."""
     if _state.sonar is None:

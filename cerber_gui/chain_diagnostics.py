@@ -539,7 +539,7 @@ def load_chain_head_from_checkpoint(
         n_heads=cfg_dict.get("n_heads", 8),
         n_layers=cfg_dict.get("n_layers", 2),
         dim_feedforward=cfg_dict.get("dim_feedforward", 2048),
-        max_chain_len=cfg_dict.get("max_chain_len", 20),
+        max_chain_len=cfg_dict.get("max_chain_len", 200),
         dropout=0.0,
         energy_hidden=cfg_dict.get("energy_hidden", 512),
     )

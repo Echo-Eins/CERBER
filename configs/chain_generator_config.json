@@ -1,0 +1,103 @@
+{
+    "seed": 42,
+
+    "generator": {
+        "d_model": 1024,
+        "n_heads": 8,
+        "n_layers": 6,
+        "dim_feedforward": 4096,
+        "max_chain_len": 20,
+        "dropout": 0.1,
+        "target_norm": 0.2051,
+        "loss_cosine_weight": 1.0,
+        "loss_mse_weight": 0.1
+    },
+
+    "critic": {
+        "angular": {
+            "dim": 1024,
+            "hidden_dims": [2048, 1024, 512],
+            "activation": "silu",
+            "dropout": 0.1,
+            "use_layer_norm": true,
+            "energy_output_clamp": 50.0,
+            "include_context": true,
+            "temperature": 0.07,
+            "focal_gamma": 2.0,
+            "num_negatives": 7
+        },
+        "radial": {
+            "target_norm": 0.2051,
+            "scale": 1.0
+        },
+        "lambda_radial": 5.0
+    },
+
+    "data": {
+        "path": "data/hotpotqa_sonar.pt",
+        "num_workers": 4
+    },
+
+    "training": {
+        "batch_size": 16,
+        "num_epochs": 50,
+        "lr": 1e-4,
+        "weight_decay": 1e-4,
+        "warmup_epochs": 3,
+        "lr_min_factor": 0.01,
+        "clip_grad_norm": 1.0,
+
+        "system1_epochs": 10,
+        "max_chain_steps": 20,
+
+        "scheduled_sampling_max": 0.5,
+        "scheduled_sampling_ramp_epochs": 10,
+
+        "loss_lambda_step": 1.0,
+        "loss_lambda_answer": 1.0,
+        "loss_lambda_roll": 1.0,
+        "loss_lambda_rank": 0.0,
+        "contrastive_temperature": 0.07,
+        "oracle_max_retries": 5,
+
+        "dynamic_step_lr": true,
+        "sadt_ema_alpha": 0.1,
+        "sadt_throttle_factor": 0.5,
+        "sadt_turbo_factor": 1.02,
+        "sadt_min_lr": 1e-6,
+        "sadt_max_lr": 5e-4,
+        "sadt_tolerance": 0.05,
+
+        "free_run_temperature": 1.0,
+        "free_run_noise_std": 0.01,
+        "free_run_noise_std_max": 0.05,
+        "free_run_repeat_penalty": 0.15,
+        "free_run_repeat_cos_threshold": 0.98,
+        "free_run_repeat_ban_threshold": 0.995,
+        "free_run_repeat_ban_retries": 3,
+
+        "context_bank_size": 4,
+        "answer_repeat_pad": 2,
+
+        "log_every": 50,
+        "checkpoint_every": 5,
+        "early_stop_patience": 15
+    },
+
+    "reranking": {
+        "enabled": false,
+        "critic_checkpoint": null,
+        "num_candidates": 4
+    },
+
+    "amp": {
+        "enabled": true,
+        "dtype": "bfloat16"
+    },
+
+    "output": {
+        "output_dir": "experiments/13_chain_generator/output",
+        "checkpoint_dir": "experiments/13_chain_generator/output/checkpoints",
+        "logs_dir": "experiments/13_chain_generator/output/logs"
+    }
+}
