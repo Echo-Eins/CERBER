@@ -1,5 +1,40 @@
 # Lessons
 
+## 2026-04-10 - ChainGenerator NaN collapse at E13 and val roll_cos_last overfitting
+
+### Pattern
+Training collapses to all-NaN at E13 (target_steps=5, ss_prob=0.15) after sporadic NaN first seen at E7. Val roll_cos_last peaks at 0.5991 (E1) then DEGRADES to 0.5063 (E6) despite train tf_cos improving 0.29→0.85.
+
+### Root Causes
+
+**NaN collapse (3 coupled mechanisms):**
+1. **repeat_penalty pushes raw_next toward zero norm**: `raw_next -= penalty * over * repel` subtracts detached historical vectors (norm ~32) from raw logits, driving raw_norm from 0.28→0.15→0. When `F.normalize()` receives near-zero input in bfloat16, gradient through division explodes to NaN.
+2. **Oracle DAgger + repeat_ban compound the issue**: 5 oracle retries + 3 repeat_ban retries = 8 `F.normalize()` calls per step on increasingly corrupted vectors.
+3. **No NaN guard before backward()**: Single NaN in loss → NaN in all gradients → `clip_grad_norm(NaN)=NaN` (IEEE 754) → NaN weights forever.
+
+**SADT amplification**: At System2 transition, metrics naturally drop (harder task). SADT with tolerance=0.05 and OR-gate (`tf OR roll bad`) throttles LR repeatedly (halving by 0.5), masking symptoms without preventing NaN. EMA not reset at transition.
+
+**Val overfitting:**
+1. **Oracle-guided DAgger train/eval mismatch**: Oracle is gated by `self.training`, active during training, absent at eval. Model learns to depend on oracle crutch → val crashes when oracle is removed.
+2. **Weak regularization**: 101M params on ~90k samples with dropout=0.1, weight_decay=1e-4 → severe memorization.
+
+### Fixes
+1. **safe_normalize**: Replace `F.normalize(v)` with `v / v.norm().clamp(min=1e-6)` — prevents gradient explosion on near-zero vectors.
+2. **Disable repeat_penalty in training**: Guard with `not self.training`. It provides zero useful gradient (history detached) but destabilizes raw_next norm.
+3. **NaN guard in train_step**: Check `torch.isfinite(loss)` before backward; check `torch.isfinite(total_norm)` after unscale. Skip step on NaN.
+4. **NaN guard in generate()**: If generated vector is NaN, replace with previous valid vector.
+5. **Oracle probability decay**: New `oracle_prob` param decays from 1.0→0.0 over 20 epochs. Forces model to learn robust generation without oracle dependency.
+6. **SADT cooldown at horizon transition**: Reset EMA and add cooldown period when target_steps changes. Change OR→AND gate for degradation detection.
+7. **Increased regularization**: weight_decay 1e-4→5e-4, sadt_tolerance 0.05→0.10, noise_std_max 0.05→0.03, oracle_max_retries 5→3.
+
+### Rules
+1. **NEVER modify raw logits in-place during training** — repeat_penalty, repulsion, etc. can drive vectors to zero norm, causing F.normalize gradient explosion in low-precision (bf16).
+2. **Any F.normalize in training path must use safe normalization** with `clamp(min=1e-6)`.
+3. **Always guard backward() with NaN check** — a single NaN infects all weights permanently. Skip the step, don't try to clip NaN gradients.
+4. **Train-only mechanisms create eval mismatch** — if oracle/noise/etc. are gated by `self.training`, the model learns a different distribution than what it sees at eval. Decay such mechanisms to zero.
+5. **SADT must reset EMA at curriculum transitions** — metric drops from harder tasks are not degradation.
+6. **Use AND-gate (both metrics bad) for LR throttle, not OR-gate** — single-metric noise causes false throttling.
+
 ## 2026-04-09 - Inference pipeline missing convergence_cos → model never uses trained EOS
 
 ### Pattern

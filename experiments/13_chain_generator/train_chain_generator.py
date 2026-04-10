@@ -258,6 +258,26 @@ def _get_scheduled_sampling_prob(epoch: int, cfg: dict) -> float:
     return ss_max * progress
 
 
+def _get_oracle_prob(epoch: int, cfg: dict) -> float:
+    """Compute oracle guidance probability for the current epoch.
+
+    Oracle guidance creates train/eval distribution mismatch: during training,
+    oracle-guided DAgger helps the model stay close to GT, but at eval the
+    oracle is absent (self.training=False). This causes val roll_cos_last to
+    DEGRADE even as train improves.
+
+    Fix: decay oracle_prob from 1.0 to oracle_prob_min over training,
+    forcing the model to learn robust generation without oracle dependency.
+    """
+    oracle_max = float(cfg.get("oracle_prob_max", 1.0))
+    oracle_min = float(cfg.get("oracle_prob_min", 0.0))
+    oracle_ramp = int(cfg.get("oracle_decay_epochs", 20))
+    if oracle_ramp <= 0:
+        return oracle_min
+    progress = min(1.0, epoch / oracle_ramp)
+    return oracle_max - (oracle_max - oracle_min) * progress
+
+
 def _get_scheduled_noise_std(epoch: int, cfg: dict) -> float:
     """Compute noise std for the current epoch.
 
@@ -287,6 +307,7 @@ def compute_composite_objective(
     cfg: dict,
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
+    oracle_prob: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute full autoregressive objective for one batch."""
     bsz, steps, d_model = chains.shape
@@ -354,6 +375,7 @@ def compute_composite_objective(
         repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 2)),
         oracle_guide=chains,
         oracle_max_retries=int(cfg.get("oracle_max_retries", 4)),
+        oracle_prob=oracle_prob,
         return_info=True,
     )
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
@@ -432,6 +454,7 @@ def train_step(
     target_steps: int,
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
+    oracle_prob: float = 1.0,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
@@ -455,18 +478,36 @@ def train_step(
             cfg,
             scheduled_sampling_prob=scheduled_sampling_prob,
             free_run_noise_std=free_run_noise_std,
+            oracle_prob=oracle_prob,
         )
+
+    # NaN guard: if loss is NaN/Inf, skip this step entirely.
+    # This prevents a single bad batch from permanently corrupting all weights.
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        metrics["nan_skipped"] = 1.0
+        metrics["target_steps"] = float(target_steps)
+        metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
+        return metrics
 
     scaler.scale(loss).backward()
 
     clip_grad = float(cfg.get("clip_grad_norm", 1.0))
     if clip_grad > 0:
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        # Check for NaN/Inf in gradients after unscaling
+        total_norm = nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        if not torch.isfinite(total_norm):
+            optimizer.zero_grad(set_to_none=True)
+            metrics["nan_skipped"] = 1.0
+            metrics["target_steps"] = float(target_steps)
+            metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
+            return metrics
 
     scaler.step(optimizer)
     scaler.update()
 
+    metrics["nan_skipped"] = 0.0
     metrics["target_steps"] = float(target_steps)
     metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
     return metrics
@@ -673,16 +714,34 @@ def main() -> None:
     )
     print("=" * 70)
 
+    prev_target_steps = 1  # Track for SADT cooldown
+
     for epoch in range(start_epoch, num_epochs):
         model.train()
         target_steps = get_chain_steps(epoch, train_cfg)
         ss_prob = _get_scheduled_sampling_prob(epoch, train_cfg)
         noise_std = _get_scheduled_noise_std(epoch, train_cfg)
+        oracle_prob = _get_oracle_prob(epoch, train_cfg)
         epoch_start = time.time()
 
-        phase = "System1" if target_steps == 1 else f"System2({target_steps})"
-        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] ss_prob={ss_prob:.3f} noise_std={noise_std:.4f}")
+        # Reset SADT EMA at System2 transition to prevent false throttling.
+        # When target_steps increases, metrics naturally drop — this is NOT
+        # degradation, it's a harder task. SADT must not punish it.
+        if target_steps != prev_target_steps:
+            sadt_tf_ema = None
+            sadt_roll_ema = None
+            sadt_cooldown = int(train_cfg.get("sadt_cooldown_steps", 200))
+            print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
+                  f"EMA reset, cooldown={sadt_cooldown} steps")
+        else:
+            sadt_cooldown = 0
+        prev_target_steps = target_steps
 
+        phase = "System1" if target_steps == 1 else f"System2({target_steps})"
+        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] "
+              f"ss_prob={ss_prob:.3f} noise_std={noise_std:.4f} oracle_prob={oracle_prob:.3f}")
+
+        nan_count = 0
         for step, batch in enumerate(train_loader):
             metrics = train_step(
                 model,
@@ -696,47 +755,60 @@ def main() -> None:
                 target_steps=target_steps,
                 scheduled_sampling_prob=ss_prob,
                 free_run_noise_std=noise_std,
+                oracle_prob=oracle_prob,
             )
             scheduler.step()
             tracker.update(metrics)
 
+            if metrics.get("nan_skipped", 0.0) > 0:
+                nan_count += 1
+
             # --- SADT Dynamic Throttle Logic ---
-            if train_cfg.get("dynamic_step_lr", False):
+            if train_cfg.get("dynamic_step_lr", False) and sadt_cooldown <= 0:
                 alpha = float(train_cfg.get("sadt_ema_alpha", 0.1))
                 tf_cur = metrics.get("tf_cos_mean", 0.0)
                 roll_cur = metrics.get("roll_cos_mean", 0.0)
-                
-                if sadt_tf_ema is None:
+
+                # Skip NaN-skipped steps in SADT
+                if metrics.get("nan_skipped", 0.0) > 0:
+                    pass  # Don't update EMA or adjust LR on NaN steps
+                elif sadt_tf_ema is None:
                     sadt_tf_ema = tf_cur
                     sadt_roll_ema = roll_cur
                 else:
                     sadt_tf_ema = (1 - alpha) * sadt_tf_ema + alpha * tf_cur
                     sadt_roll_ema = (1 - alpha) * sadt_roll_ema + alpha * roll_cur
-                
-                # Compare current to EMA to detect degradation
-                tolerance = float(train_cfg.get("sadt_tolerance", 0.05))
-                lr_now = optimizer.param_groups[0]["lr"]
-                min_lr = float(train_cfg.get("sadt_min_lr", 1e-6))
-                max_lr = float(train_cfg.get("sadt_max_lr", 5e-4))
-                
-                # Degradation (Throttle)
-                is_bad = tf_cur < (sadt_tf_ema * (1 - tolerance)) or roll_cur < (sadt_roll_ema * (1 - tolerance))
-                if is_bad:
-                    new_lr = max(min_lr, lr_now * float(train_cfg.get("sadt_throttle_factor", 0.5)))
-                    if new_lr < lr_now:
-                        optimizer.param_groups[0]["lr"] = new_lr
-                        sadt_events["throttle"] += 1
-                # Improvement (Turbo) - more conservative
-                elif tf_cur > (sadt_tf_ema * (1 + tolerance/2)) and roll_cur > (sadt_roll_ema * (1 + tolerance/2)):
-                    new_lr = min(max_lr, lr_now * float(train_cfg.get("sadt_turbo_factor", 1.02)))
-                    if new_lr > lr_now:
-                        optimizer.param_groups[0]["lr"] = new_lr
-                        sadt_events["turbo"] += 1
+
+                    # Compare current to EMA to detect degradation
+                    tolerance = float(train_cfg.get("sadt_tolerance", 0.05))
+                    lr_now = optimizer.param_groups[0]["lr"]
+                    min_lr = float(train_cfg.get("sadt_min_lr", 1e-6))
+                    max_lr = float(train_cfg.get("sadt_max_lr", 5e-4))
+
+                    # Degradation (Throttle) — use AND instead of OR to reduce
+                    # false positives from single-metric noise
+                    is_bad = (tf_cur < (sadt_tf_ema * (1 - tolerance))
+                              and roll_cur < (sadt_roll_ema * (1 - tolerance)))
+                    if is_bad:
+                        new_lr = max(min_lr, lr_now * float(train_cfg.get("sadt_throttle_factor", 0.5)))
+                        if new_lr < lr_now:
+                            optimizer.param_groups[0]["lr"] = new_lr
+                            sadt_events["throttle"] += 1
+                    # Improvement (Turbo) - more conservative
+                    elif (tf_cur > (sadt_tf_ema * (1 + tolerance/2))
+                          and roll_cur > (sadt_roll_ema * (1 + tolerance/2))):
+                        new_lr = min(max_lr, lr_now * float(train_cfg.get("sadt_turbo_factor", 1.02)))
+                        if new_lr > lr_now:
+                            optimizer.param_groups[0]["lr"] = new_lr
+                            sadt_events["turbo"] += 1
+            else:
+                sadt_cooldown -= 1
 
             if (step + 1) % log_every == 0:
                 avg = tracker.get()
                 lr_now = optimizer.param_groups[0]["lr"]
                 sadt_info = f" [SADT T:{sadt_events['throttle']} U:{sadt_events['turbo']}]" if train_cfg.get("dynamic_step_lr") else ""
+                nan_info = f" [NaN:{nan_count}]" if nan_count > 0 else ""
                 print(
                     f"  [E{epoch} S{step+1}] "
                     f"loss={avg.get('loss', 0.0):.4f} "
@@ -748,7 +820,7 @@ def main() -> None:
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
                     f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
-                    f"lr={lr_now:.2e}{sadt_info}"
+                    f"lr={lr_now:.2e}{sadt_info}{nan_info}"
                 )
                 tracker.reset()
                 sadt_events = {"throttle": 0, "turbo": 0}

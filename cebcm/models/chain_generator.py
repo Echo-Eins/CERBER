@@ -233,8 +233,18 @@ class ChainGenerator(nn.Module):
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
 
+    def _safe_normalize(self, v: Tensor, dim: int = -1, eps: float = 1e-6) -> Tensor:
+        """Numerically safe normalization that prevents NaN gradients.
+
+        F.normalize with default eps=1e-12 can produce exploding gradients
+        when input norm approaches zero (especially in bfloat16). We use a
+        larger eps and clamp the norm to prevent this.
+        """
+        norms = v.norm(dim=dim, keepdim=True).clamp(min=eps)
+        return v / norms
+
     def _sphere_project(self, v: Tensor) -> Tensor:
-        return F.normalize(v, dim=-1) * self.cfg.target_norm
+        return self._safe_normalize(v, dim=-1) * self.cfg.target_norm
 
     def _to_residual_space(self, sonar_vectors: Tensor) -> Tensor:
         """
@@ -374,6 +384,7 @@ class ChainGenerator(nn.Module):
         num_candidates: int = 1,
         oracle_guide: Tensor | None = None,
         oracle_max_retries: int = 0,
+        oracle_prob: float = 1.0,
     ) -> Tensor | tuple[Tensor, dict[str, float | int | bool]]:
         """
         Autoregressive generation with adaptive stopping and resume support.
@@ -452,10 +463,12 @@ class ChainGenerator(nn.Module):
 
             raw_norms.append(float(raw_next.detach().norm(dim=-1).mean().item()))
 
-            if generated and repeat_penalty > 0.0:
-                # DETACH hist! We only want to push the CURRENT raw_next away from past tokens.
-                # If we don't detach, F.cosine_similarity backpropagates across time steps,
-                # and when vectors are nearly parallel (cos~1.0), the gradient explodes to NaN!
+            # Repeat penalty: ONLY at inference. During training, this pushes
+            # raw_next toward zero norm, causing F.normalize gradient explosion
+            # in bfloat16 (the primary NaN collapse trigger at E13+).
+            # The penalty provides no useful gradient (history is detached), and
+            # the oracle-guided DAgger already handles diversity.
+            if generated and repeat_penalty > 0.0 and not self.training:
                 hist = torch.cat(generated, dim=1).detach()
                 cos_hist_tensor = F.cosine_similarity(
                     raw_next.expand(-1, hist.shape[1], -1),
@@ -473,25 +486,37 @@ class ChainGenerator(nn.Module):
 
             clean_next_vec = self._sphere_project(raw_next)
 
-            if oracle_guide is not None and oracle_max_retries > 0 and self.training and noise_std > 0.0:
-                # Oracle-Guided DAgger: Search for a candidate that maximizes similarity to GT token
+            # Oracle-guided DAgger with probability decay.
+            # oracle_prob < 1.0 means some samples skip oracle guidance entirely,
+            # forcing the model to learn robust generation without oracle dependency.
+            # This prevents val roll_cos_last degradation caused by train-only
+            # oracle reliance (oracle is disabled at eval since self.training=False).
+            import random as _random
+            use_oracle = (
+                oracle_guide is not None
+                and oracle_max_retries > 0
+                and self.training
+                and noise_std > 0.0
+                and _random.random() < oracle_prob
+            )
+            if use_oracle:
                 t_idx = min(step_idx, oracle_guide.shape[1] - 1)
                 t_step = oracle_guide[:, t_idx, :]  # [B, D]
-                
+
                 best_cand = clean_next_vec.clone()
                 best_cos = F.cosine_similarity(best_cand.squeeze(1), t_step, dim=-1)
                 jitter_std = max(noise_std, 0.01)
-                
+
                 for _ in range(oracle_max_retries):
                     cand_noisy = raw_next + jitter_std * torch.randn_like(raw_next)
                     cand_proj = self._sphere_project(cand_noisy)
                     cand_cos = F.cosine_similarity(cand_proj.squeeze(1), t_step, dim=-1)
-                    
+
                     improved = cand_cos > best_cos
                     if improved.any():
                         best_cos = torch.where(improved, cand_cos, best_cos)
                         best_cand = torch.where(improved.view(bsz, 1, 1), cand_proj, best_cand)
-                
+
                 next_vec_for_chain = best_cand
 
             elif num_candidates > 1 and energy_fn is not None and noise_std > 0.0:
@@ -553,6 +578,23 @@ class ChainGenerator(nn.Module):
             else:
                 # Inference: track the ACTUAL vector chosen by the Critic/Repeat-Ban!
                 generated.append(next_vec_for_chain)
+
+            # NaN guard: if generated vector contains NaN, replace with the
+            # previous valid vector (or start_token projection). This prevents
+            # a single NaN from cascading through the entire chain.
+            if torch.isnan(next_vec_for_chain).any():
+                if len(generated) >= 2:
+                    next_vec_for_chain = generated[-2].detach().clone()
+                    next_vec_for_chain = self._sphere_project(next_vec_for_chain)
+                else:
+                    next_vec_for_chain = self._sphere_project(
+                        torch.randn(bsz, 1, self.cfg.d_model, device=v_query.device)
+                    )
+                # Also fix the recorded generated vector
+                if self.training:
+                    generated[-1] = next_vec_for_chain / self.cfg.target_norm  # undo sphere project for raw logit scale
+                else:
+                    generated[-1] = next_vec_for_chain
 
             # Fix #3: Detach before appending so backward() through L_roll
             # only goes one step deep, not through the entire autoregressive chain.
