@@ -617,6 +617,7 @@ def _generate_stochastic_chain(
     stagnation_delta_cos: float = 1e-4,
     convergence_cos: float = 0.0,
     convergence_window: int = 2,
+    num_candidates: int = 1,
 ) -> tuple[Tensor, dict]:
     """Generate one candidate chain with stochastic + anti-loop controls."""
     chain, info = model.generate(
@@ -639,6 +640,7 @@ def _generate_stochastic_chain(
         convergence_cos=convergence_cos,
         convergence_window=convergence_window,
         return_info=True,
+        num_candidates=num_candidates,
     )
     return chain, info
 
@@ -695,21 +697,15 @@ def run_generation(
     num_steps: int = 1,
     v_target: Tensor | None = None,
     num_candidates: int = 1,
+    beam_width: int = 1,
+    temperature: float = 1.0,
+    noise_std: float = 0.01,
     v_context: Tensor | None = None,
     v_context_bank: Tensor | None = None,
     context_labels: list[str] | None = None,
 ) -> GenerationResult:
     """
-    Run ChainGenerator with full diagnostics.
-
-    Args:
-        v_query: [D] question embedding
-        num_steps: chain length
-        v_target: optional [D] answer embedding for diagnostics
-        num_candidates: best-of-N candidates for system2 reranking
-        v_context: optional [D] critic context (if None, fallback to query)
-        v_context_bank: optional [K, D] memory bank for generator cross-attention
-        context_labels: labels for context memory slots
+    Run ChainGenerator with full diagnostics using Active Inference.
     """
     if _state.generator is None:
         raise RuntimeError("ChainGenerator not loaded. Load checkpoint first.")
@@ -718,7 +714,7 @@ def run_generation(
     device = torch.device(_state.device)
     t0 = time.time()
 
-    effective_steps, step_cap_applied, step_cap_reason = _resolve_num_steps(num_steps)
+    effective_steps, _, _ = _resolve_num_steps(num_steps)
 
     v_q = v_query.unsqueeze(0).to(device)  # [1, D]
     v_ctx = v_q if v_context is None else v_context.unsqueeze(0).to(device)
@@ -732,10 +728,7 @@ def run_generation(
         if gen_ctx.dim() == 2:
             gen_ctx = gen_ctx.unsqueeze(0)
         gen_ctx_mask = torch.ones((gen_ctx.shape[0], gen_ctx.shape[1]), device=device, dtype=torch.bool)
-        if context_labels is None:
-            labels = [f"ctx_{i}" for i in range(gen_ctx.shape[1])]
-        else:
-            labels = context_labels[: gen_ctx.shape[1]]
+        labels = context_labels[: gen_ctx.shape[1]] if context_labels else [f"ctx_{i}" for i in range(gen_ctx.shape[1])]
 
     def _energy_fn(q_batch: Tensor, c_batch: Tensor) -> Tensor:
         if _state.critic is None:
@@ -744,35 +737,39 @@ def run_generation(
 
     target_for_stop = None if v_target is None else v_target.to(device).unsqueeze(0)
 
-    candidates: list[Tensor] = []
-    candidate_infos: list[dict] = []
+    latent_noise_std = noise_std
+    start_noise_std = noise_std * 0.5
+    repeat_penalty = 0.2 if effective_steps > 1 else 0.0
+    repeat_cos_thr = 0.985
+    repeat_ban_thr = 0.997
+    repeat_ban_retries = 3
 
-    use_stochastic = (num_candidates > 1)
-    n_candidates = max(1, int(num_candidates))
+    stagnation_patience = 4 if effective_steps > 1 else 0
+    stagnation_delta_energy = 5e-4
+    stagnation_delta_cos = 5e-4
+    convergence_cos = 0.995 if effective_steps > 1 else 0.0
+    convergence_window = 2
 
-    for cand_idx in range(n_candidates):
-        if not use_stochastic or cand_idx == 0:
-            temperature = 1.0
-            latent_noise_std = 0.0
-            start_noise_std = 0.0
-        else:
-            temperature = 1.0 + 0.15 * ((cand_idx - 1) % 4)
-            latent_noise_std = 0.006 + 0.004 * ((cand_idx - 1) % 3)
-            start_noise_std = 0.003 + 0.002 * ((cand_idx - 1) % 2)
-
-        repeat_penalty = 0.2 if effective_steps > 1 else 0.0
-        repeat_cos_thr = 0.985
-        repeat_ban_thr = 0.997
-        repeat_ban_retries = 3
-
-        stagnation_patience = 4 if effective_steps > 1 else 0
-        stagnation_delta_energy = 5e-4
-        stagnation_delta_cos = 5e-4
-
-        # Convergence stopping: SONAR-space EOS trained via answer-repeat padding.
-        convergence_cos = 0.995 if effective_steps > 1 else 0.0
-        convergence_window = 2
-
+    if beam_width > 1:
+        chain = model.beam_generate(
+            v_query=v_q,
+            num_steps=effective_steps,
+            beam_width=int(beam_width),
+            num_candidates=int(num_candidates),
+            v_context_bank=gen_ctx,
+            context_mask=gen_ctx_mask,
+            temperature=temperature,
+            noise_std=noise_std,
+            energy_fn=_energy_fn if _state.critic is not None else None,
+        )
+        info = {
+            "steps_generated": chain.shape[1] - 1,
+            "early_stop": False,
+            "early_stop_reason": "",
+            "mode": "beam_search",
+            "repeat_resamples": 0,
+        }
+    else:
         chain, info = _generate_stochastic_chain(
             model,
             v_q,
@@ -793,61 +790,24 @@ def run_generation(
             stagnation_delta_cos=stagnation_delta_cos,
             convergence_cos=convergence_cos,
             convergence_window=convergence_window,
+            num_candidates=num_candidates,
         )
 
-        # Diversity guard: if final state is almost identical to previous candidates,
-        # re-sample once with stronger noise.
-        if use_stochastic and candidates:
-            final_vec = chain[0, -1]
-            prev_finals = torch.stack([c[-1] for c in candidates], dim=0)
-            sim_prev = F.cosine_similarity(final_vec.unsqueeze(0), prev_finals, dim=-1)
-            if float(sim_prev.max().item()) > 0.997:
-                chain, info = _generate_stochastic_chain(
-                    model,
-                    v_q,
-                    num_steps=effective_steps,
-                    v_context_bank=gen_ctx,
-                    context_mask=gen_ctx_mask,
-                    temperature=max(temperature, 1.15),
-                    latent_noise_std=max(latent_noise_std, 0.012),
-                    start_noise_std=max(start_noise_std, 0.006),
-                    repeat_penalty=repeat_penalty,
-                    repeat_cos_threshold=repeat_cos_thr,
-                    repeat_ban_threshold=repeat_ban_thr,
-                    repeat_ban_retries=repeat_ban_retries,
-                    energy_fn=_energy_fn if _state.critic is not None else None,
-                    target_vec=target_for_stop,
-                    stagnation_patience=stagnation_patience,
-                    stagnation_delta_energy=stagnation_delta_energy,
-                    stagnation_delta_cos=stagnation_delta_cos,
-                    convergence_cos=convergence_cos,
-                    convergence_window=convergence_window,
-                )
+    candidates = [chain[0]]
+    candidate_infos = [
+        {
+            "idx": 0,
+            "temperature": float(temperature),
+            "latent_noise_std": float(latent_noise_std),
+            "start_noise_std": float(start_noise_std),
+            "early_stop": bool(info.get("early_stop", False)),
+            "early_stop_reason": str(info.get("early_stop_reason", "")),
+            "steps_generated": int(info.get("steps_generated", chain.shape[1] - 1)),
+            "repeat_resamples": int(info.get("repeat_resamples", 0)),
+        }
+    ]
 
-        candidates.append(chain[0])
-        candidate_infos.append(
-            {
-                "idx": cand_idx,
-                "temperature": float(temperature),
-                "latent_noise_std": float(latent_noise_std),
-                "start_noise_std": float(start_noise_std),
-                "early_stop": bool(info.get("early_stop", False)),
-                "early_stop_reason": str(info.get("early_stop_reason", "")),
-                "steps_generated": int(info.get("steps_generated", chain.shape[1])),
-                "repeat_resamples": int(info.get("repeat_resamples", 0)),
-            }
-        )
-
-    # Diversity metric over candidate finals.
     diversity_cos_mean = None
-    if len(candidates) > 1:
-        finals = torch.stack([c[-1] for c in candidates], dim=0)
-        sims = []
-        for i in range(finals.shape[0]):
-            for j in range(i + 1, finals.shape[0]):
-                sims.append(float(F.cosine_similarity(finals[i:i+1], finals[j:j+1], dim=-1).item()))
-        if sims:
-            diversity_cos_mean = sum(sims) / len(sims)
 
     # Rerank by critic energy on final step when critic is available.
     cand_info: list[dict] | None = None

@@ -346,6 +346,7 @@ class ChainGenerator(nn.Module):
         convergence_window: int = 2,
         chain_prefix: Tensor | None = None,
         return_info: bool = False,
+        num_candidates: int = 1,
     ) -> Tensor | tuple[Tensor, dict[str, float | int | bool]]:
         """
         Autoregressive generation with adaptive stopping and resume support.
@@ -442,7 +443,23 @@ class ChainGenerator(nn.Module):
 
             clean_next_vec = self._sphere_project(raw_next)
 
-            if noise_std > 0.0:
+            if num_candidates > 1 and energy_fn is not None and not self.training and noise_std > 0.0:
+                best_noisy_vecs = []
+                for b in range(bsz):
+                    raw_b = raw_next[b : b + 1]  # [1, 1, D]
+                    raw_k = raw_b.expand(int(num_candidates), -1, -1).clone()
+                    raw_k_noisy = raw_k + noise_std * torch.randn_like(raw_k)
+                    cand_vecs = self._sphere_project(raw_k_noisy)  # [K, 1, D]
+                    
+                    q_b = v_query[b : b + 1].expand(int(num_candidates), -1)  # [K, D]
+                    with torch.no_grad():
+                        e_vals = energy_fn(q_b, cand_vecs.squeeze(1))  # [K]
+                    
+                    best_idx = e_vals.argmin()
+                    best_noisy_vecs.append(cand_vecs[best_idx : best_idx + 1])
+                
+                next_vec_for_chain = torch.cat(best_noisy_vecs, dim=0)
+            elif noise_std > 0.0:
                 raw_next_noisy = raw_next + noise_std * torch.randn_like(raw_next)
                 next_vec_for_chain = self._sphere_project(raw_next_noisy)
             else:
@@ -567,6 +584,100 @@ class ChainGenerator(nn.Module):
             info["cos_final"] = float(cos_hist[-1])
 
         return chain_out, info
+
+    def beam_generate(
+        self,
+        v_query: Tensor,
+        num_steps: int = 1,
+        beam_width: int = 4,
+        num_candidates: int = 4,
+        v_context_bank: Tensor | None = None,
+        context_mask: Tensor | None = None,
+        temperature: float = 1.0,
+        noise_std: float = 0.05,
+        energy_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
+    ) -> Tensor:
+        """
+        Energy-Guided Beam Search for Autoregressive Generation.
+
+        Maintains `beam_width` active reasoning trajectories. At each step, expands
+        each trajectory with `num_candidates` noisy extensions, evaluates them
+        using `energy_fn`, and prunes back to `beam_width` by cumulative energy.
+        """
+        bsz, _ = v_query.shape
+        if energy_fn is None:
+            raise ValueError("beam_generate requires energy_fn to score paths")
+
+        context, ctx_mask = self._prepare_context(v_query, v_context_bank, context_mask)
+        temp = max(float(temperature), 1e-4)
+        n_std = max(float(noise_std) * temp, 0.0)
+
+        # active_chains: [B, W, t, D]. Starts at t=1 (start_token only)
+        active_chains = self.start_token.expand(bsz, 1, 1, -1)  # [B, 1, 1, D]
+        active_energies = torch.zeros(bsz, 1, device=v_query.device)  # [B, 1]
+        
+        W = 1
+        steps = max(1, int(num_steps))
+        K = max(1, int(num_candidates))
+        
+        for step_idx in range(steps):
+            B_W = bsz * W
+            flat_chains = active_chains.reshape(B_W, -1, self.cfg.d_model)
+            
+            flat_context = context.repeat_interleave(W, dim=0)
+            flat_ctx_mask = ctx_mask.repeat_interleave(W, dim=0)
+
+            x = flat_chains
+            for layer in self.layers:
+                x = layer(x, flat_context, context_mask=flat_ctx_mask)
+
+            x = self.final_norm(x)
+            raw_next = self.output_proj(x[:, -1:, :])  # [B*W, 1, D]
+
+            new_W = W * K
+            raw_k = raw_next.reshape(bsz, W, 1, self.cfg.d_model).unsqueeze(2).expand(-1, -1, K, -1, -1).clone()
+            
+            if n_std > 0.0:
+                raw_k_noisy = raw_k + n_std * torch.randn_like(raw_k)
+            else:
+                raw_k_noisy = raw_k
+                
+            cand_vecs = self._sphere_project(raw_k_noisy)  # [B, W, K, 1, D]
+
+            flat_cands = cand_vecs.reshape(bsz * new_W, self.cfg.d_model)
+            flat_qs = v_query.repeat_interleave(new_W, dim=0)
+            
+            with torch.no_grad():
+                step_energies = energy_fn(flat_qs, flat_cands)  # [B*W*K]
+            
+            step_energies = step_energies.reshape(bsz, W, K)
+            
+            # Cumulative energy over the chain path
+            cum_energies = active_energies.unsqueeze(2) + step_energies  # [B, W, K]
+            cum_energies_flat = cum_energies.reshape(bsz, new_W)
+            
+            next_W = min(int(beam_width), new_W)
+            top_energies, top_indices = torch.topk(cum_energies_flat, next_W, dim=1, largest=False)  # [B, next_W]
+            
+            reconstructed_cands = cand_vecs.reshape(bsz, new_W, 1, self.cfg.d_model)
+            t = active_chains.shape[2]
+            history = active_chains.unsqueeze(2).expand(-1, -1, K, -1, -1).reshape(bsz, new_W, t, self.cfg.d_model)
+            
+            next_chains = []
+            for b in range(bsz):
+                idx = top_indices[b]
+                b_hist = history[b, idx]  # [next_W, t, D]
+                b_cand = reconstructed_cands[b, idx]  # [next_W, 1, D]
+                b_new = torch.cat([b_hist, b_cand], dim=1)  # [next_W, t+1, D]
+                next_chains.append(b_new)
+                
+            active_chains = torch.stack(next_chains, dim=0)  # [B, next_W, t+1, D]
+            active_energies = top_energies
+            W = next_W
+            
+        # Return best chain per batch item (idx 0), excluding start_token (pos 0)
+        best_chains = active_chains[:, 0, 1:, :]  # [B, num_steps, D]
+        return best_chains
 
     def compute_loss(
         self,

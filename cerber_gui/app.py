@@ -3165,7 +3165,20 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 )
                 cg_num_candidates = gr.Slider(
                     minimum=1, maximum=16, value=1, step=1,
-                    label="Candidates (best-of-N, requires critic)",
+                    label="Candidates (step-level N, requires critic)",
+                )
+                cg_beam_width = gr.Slider(
+                    minimum=1, maximum=8, value=1, step=1,
+                    label="Beam Width (requires critic)",
+                )
+            with gr.Row():
+                cg_temperature = gr.Slider(
+                    minimum=0.0, maximum=2.0, value=1.0, step=0.05,
+                    label="Temperature",
+                )
+                cg_noise_std = gr.Slider(
+                    minimum=0.0, maximum=0.2, value=0.01, step=0.005,
+                    label="Noise Std",
                 )
                 cg_grid_size = gr.Slider(
                     minimum=15, maximum=60, value=30, step=5,
@@ -3659,7 +3672,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
         norm_fig = cg_create_norm_plot(result)
         return md, step_fig, sa_fig, ah_fig, ca_fig, landscape_fig, norm_fig
 
-    def cg_run_data_fn(data_path, sample_idx, mode, num_steps, num_candidates, grid_size):
+    def cg_run_data_fn(data_path, sample_idx, mode, num_steps, num_candidates, beam_width, temp, noise, grid_size):
         try:
             steps = 1 if mode == "system1" else int(num_steps)
             result = cg_run_from_data(
@@ -3667,6 +3680,9 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 sample_idx=int(sample_idx),
                 num_steps=steps,
                 num_candidates=int(num_candidates),
+                beam_width=int(beam_width),
+                temperature=float(temp),
+                noise_std=float(noise),
                 grid_size=int(grid_size),
             )
             session_state["cg_result"] = result
@@ -3677,13 +3693,16 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             empty = go.Figure()
             return err, empty, empty, empty, empty, empty, empty
 
-    def cg_run_text_fn(text, mode, num_steps, num_candidates, grid_size):
+    def cg_run_text_fn(text, mode, num_steps, num_candidates, beam_width, temp, noise, grid_size):
         try:
             steps = 1 if mode == "system1" else int(num_steps)
             result = cg_run_from_text(
                 text=str(text),
                 num_steps=steps,
                 num_candidates=int(num_candidates),
+                beam_width=int(beam_width),
+                temperature=float(temp),
+                noise_std=float(noise),
                 grid_size=int(grid_size),
             )
             session_state["cg_result"] = result
@@ -3749,7 +3768,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
         cg_run_data_fn,
         inputs=[
             cg_data_path, cg_sample_idx, cg_mode,
-            cg_num_steps, cg_num_candidates, cg_grid_size,
+            cg_num_steps, cg_num_candidates, cg_beam_width, cg_temperature, cg_noise_std, cg_grid_size,
         ],
         outputs=[
             cg_metrics_md, cg_step_plot, cg_sa_plot,
@@ -3761,7 +3780,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
         cg_run_text_fn,
         inputs=[
             cg_text_input, cg_mode,
-            cg_num_steps, cg_num_candidates, cg_grid_size,
+            cg_num_steps, cg_num_candidates, cg_beam_width, cg_temperature, cg_noise_std, cg_grid_size,
         ],
         outputs=[
             cg_metrics_md, cg_step_plot, cg_sa_plot,

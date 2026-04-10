@@ -60,7 +60,8 @@
         "contrastive_temperature": 0.07,
 
         "free_run_temperature": 1.05,
-        "free_run_noise_std": 0.05,
+        "free_run_noise_std": 0.01,
+        "free_run_noise_std_max": 0.05,
         "free_run_repeat_penalty": 0.15,
         "free_run_repeat_cos_threshold": 0.98,
         "free_run_repeat_ban_threshold": 0.995,
