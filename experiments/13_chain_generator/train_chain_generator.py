@@ -352,7 +352,7 @@ def compute_composite_objective(
         repeat_cos_threshold=float(cfg.get("free_run_repeat_cos_threshold", 0.98)),
         repeat_ban_threshold=float(cfg.get("free_run_repeat_ban_threshold", 0.995)),
         repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 2)),
-        oracle_guide=chains_trunc,
+        oracle_guide=chains,
         oracle_max_retries=int(cfg.get("oracle_max_retries", 4)),
         return_info=True,
     )
