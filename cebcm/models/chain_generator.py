@@ -715,8 +715,8 @@ class ChainGenerator(nn.Module):
         cos_sim = F.cosine_similarity(v_pred, v_target_chain, dim=-1)
         cos_loss = ((1.0 - cos_sim) * mask).sum() / mask_sum
 
-        mse_per_step = (v_pred - v_target_chain).pow(2).mean(dim=-1)
-        mse_loss = (mse_per_step * mask).sum() / mask_sum  # .mean(-1) already averages over D
+        mse_per_step = (v_pred - v_target_chain).pow(2).sum(dim=-1)
+        mse_loss = (mse_per_step * mask).sum() / mask_sum
 
         loss = self.cfg.loss_cosine_weight * cos_loss + self.cfg.loss_mse_weight * mse_loss
 

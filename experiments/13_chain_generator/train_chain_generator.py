@@ -198,7 +198,7 @@ def _masked_step_losses(
     cos_sim = F.cosine_similarity(pred, target, dim=-1)
     cos_loss = ((1.0 - cos_sim) * maskf).sum() / mask_sum
 
-    mse_per = (pred - target).pow(2).mean(dim=-1)  # already averaged over D
+    mse_per = (pred - target).pow(2).sum(dim=-1)
     mse_loss = (mse_per * maskf).sum() / mask_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
@@ -333,7 +333,7 @@ def compute_composite_objective(
     
     if has_answer.any():
         ans_cos = (1.0 - F.cosine_similarity(tf_final[has_answer], tgt_final[has_answer], dim=-1)).mean()
-        ans_mse = (tf_final[has_answer] - tgt_final[has_answer]).pow(2).mean(dim=-1).mean()
+        ans_mse = (tf_final[has_answer] - tgt_final[has_answer]).pow(2).sum(dim=-1).mean()
         l_ans = w_cos * ans_cos + w_mse * ans_mse
     else:
         # System2: No sample reached the answer in this window.
