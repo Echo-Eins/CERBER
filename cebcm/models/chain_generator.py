@@ -340,7 +340,9 @@ class ChainGenerator(nn.Module):
                 
                 # Context sequence must hold residual-scaled vectors
                 scaled_gt = self._to_residual_space(v_target_chain[:, t : t + 1, :])
-                scaled_noisy_pred = self._to_residual_space(pred_t)
+                # DETACH the prediction being used as context to prevent recursive BPTT
+                # across Transformer layers!
+                scaled_noisy_pred = self._to_residual_space(pred_t).detach()
                 next_vec = torch.where(use_pred, scaled_noisy_pred, scaled_gt)
                 
                 seq = torch.cat([seq, next_vec], dim=1)
@@ -370,6 +372,8 @@ class ChainGenerator(nn.Module):
         chain_prefix: Tensor | None = None,
         return_info: bool = False,
         num_candidates: int = 1,
+        oracle_guide: Tensor | None = None,
+        oracle_max_retries: int = 0,
     ) -> Tensor | tuple[Tensor, dict[str, float | int | bool]]:
         """
         Autoregressive generation with adaptive stopping and resume support.
@@ -449,7 +453,10 @@ class ChainGenerator(nn.Module):
             raw_norms.append(float(raw_next.detach().norm(dim=-1).mean().item()))
 
             if generated and repeat_penalty > 0.0:
-                hist = torch.cat(generated, dim=1)
+                # DETACH hist! We only want to push the CURRENT raw_next away from past tokens.
+                # If we don't detach, F.cosine_similarity backpropagates across time steps,
+                # and when vectors are nearly parallel (cos~1.0), the gradient explodes to NaN!
+                hist = torch.cat(generated, dim=1).detach()
                 cos_hist_tensor = F.cosine_similarity(
                     raw_next.expand(-1, hist.shape[1], -1),
                     hist,
@@ -466,7 +473,28 @@ class ChainGenerator(nn.Module):
 
             clean_next_vec = self._sphere_project(raw_next)
 
-            if num_candidates > 1 and energy_fn is not None and not self.training and noise_std > 0.0:
+            if oracle_guide is not None and oracle_max_retries > 0 and self.training and noise_std > 0.0:
+                # Oracle-Guided DAgger: Search for a candidate that maximizes similarity to GT token
+                t_idx = min(step_idx, oracle_guide.shape[1] - 1)
+                t_step = oracle_guide[:, t_idx, :]  # [B, D]
+                
+                best_cand = clean_next_vec.clone()
+                best_cos = F.cosine_similarity(best_cand.squeeze(1), t_step, dim=-1)
+                jitter_std = max(noise_std, 0.01)
+                
+                for _ in range(oracle_max_retries):
+                    cand_noisy = raw_next + jitter_std * torch.randn_like(raw_next)
+                    cand_proj = self._sphere_project(cand_noisy)
+                    cand_cos = F.cosine_similarity(cand_proj.squeeze(1), t_step, dim=-1)
+                    
+                    improved = cand_cos > best_cos
+                    if improved.any():
+                        best_cos = torch.where(improved, cand_cos, best_cos)
+                        best_cand = torch.where(improved.view(bsz, 1, 1), cand_proj, best_cand)
+                
+                next_vec_for_chain = best_cand
+
+            elif num_candidates > 1 and energy_fn is not None and noise_std > 0.0:
                 best_noisy_vecs = []
                 for b in range(bsz):
                     raw_b = raw_next[b : b + 1]  # [1, 1, D]
@@ -488,11 +516,10 @@ class ChainGenerator(nn.Module):
             else:
                 next_vec_for_chain = clean_next_vec
 
-            # Fix #5: Skip repeat_ban during training — torch.where with
-            # a second randn introduces piecewise gradient discontinuities.
+            # DAgger Fix: Allow repeat_ban during training since chain vectors 
+            # are now securely .detach()-ed, preserving clean state tracking.
             if (
-                not self.training
-                and generated
+                generated
                 and repeat_ban_threshold < 1.0
                 and repeat_ban_max_retries > 0
             ):
@@ -517,16 +544,15 @@ class ChainGenerator(nn.Module):
 
             # Mathematical Fix: The model's TRUE prediction is the clean vector.
             # We must evaluate the loss (and report metrics) on the clean vector.
-            # In contrast, the context chain gets the NOISY vector to train the
-            # model to recover from exposure bias.
-            # If we evaluated the noisy vector, we'd penalize the model for random
-            # noise it couldn't predict, capping the max possible validation cosine.
-            # Furthermore, we must evaluate on the RAW UNPROJECTED vector during training
-            # so the MSE loss provides gradients to constrain the logit magnitudes.
+            # In contrast, the context chain gets the NOISY / RE-ROLLED vector.
+            # If we evaluated the noisy vector during training, we'd penalize random
+            # noise it couldn't predict.
             if self.training:
+                # Training: track the raw unprojected logit to compute MSE gradients.
                 generated.append(raw_next)
             else:
-                generated.append(clean_next_vec)
+                # Inference: track the ACTUAL vector chosen by the Critic/Repeat-Ban!
+                generated.append(next_vec_for_chain)
 
             # Fix #3: Detach before appending so backward() through L_roll
             # only goes one step deep, not through the entire autoregressive chain.
