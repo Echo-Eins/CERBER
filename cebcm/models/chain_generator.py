@@ -199,7 +199,9 @@ class ChainGenerator(nn.Module):
         super().__init__()
         self.cfg = cfg if cfg is not None else ChainGeneratorConfig()
 
-        self.start_token = nn.Parameter(torch.randn(1, 1, self.cfg.d_model) * 0.02)
+        # Initialize start_token to have standard normal variance (norm ≈ sqrt(D) ≈ 32)
+        # to correctly match the scaled residual stream magnitude.
+        self.start_token = nn.Parameter(torch.randn(1, 1, self.cfg.d_model))
 
         max_seq = self.cfg.max_chain_len + 1
         self.layers = nn.ModuleList(
@@ -234,6 +236,17 @@ class ChainGenerator(nn.Module):
     def _sphere_project(self, v: Tensor) -> Tensor:
         return F.normalize(v, dim=-1) * self.cfg.target_norm
 
+    def _to_residual_space(self, sonar_vectors: Tensor) -> Tensor:
+        """
+        SONAR embeddings have norm ~0.2 (variance ~4e-5). If fed directly into 
+        the residual stream or cross-attn, they are completely obliterated by 
+        LayerNorm-scaled self-attention updates (norm ~32, variance ~1.0).
+        This scales them up to naturally match standard Transformer variance.
+        """
+        import math
+        scale = math.sqrt(self.cfg.d_model) / self.cfg.target_norm
+        return sonar_vectors * scale
+
     def _prepare_context(
         self,
         v_query: Tensor,
@@ -244,10 +257,12 @@ class ChainGenerator(nn.Module):
 
         if v_context_bank is None:
             context = v_query.unsqueeze(1)
+            context = self._to_residual_space(context)
             mask = torch.ones((bsz, 1), device=v_query.device, dtype=torch.bool)
             return context, mask
 
         context = v_context_bank
+        context = self._to_residual_space(context)
         if context.dim() == 2:
             context = context.unsqueeze(1)
         if context.dim() != 3:
@@ -292,7 +307,8 @@ class ChainGenerator(nn.Module):
         if not use_ss:
             # Pure teacher forcing (original path).
             start = self.start_token.expand(bsz, -1, -1)
-            decoder_input = torch.cat([start, v_target_chain[:, :-1, :]], dim=1)
+            scaled_target = self._to_residual_space(v_target_chain)
+            decoder_input = torch.cat([start, scaled_target[:, :-1, :]], dim=1)
 
             x = decoder_input
             for layer in self.layers:
@@ -318,9 +334,16 @@ class ChainGenerator(nn.Module):
 
             if t < num_steps - 1:
                 # Decide per-sample: use own prediction or ground truth.
-                use_pred = torch.rand(bsz, 1, 1, device=v_query.device) < ss_prob
-                next_input = torch.where(use_pred, pred_t, v_target_chain[:, t:t+1, :])
-                seq = torch.cat([seq, next_input], dim=1)
+                # Generate random threshold for each sample in batch.
+                rand_vals = torch.rand(bsz, 1, 1, device=x.device)
+                use_pred = rand_vals < ss_prob
+                
+                # Context sequence must hold residual-scaled vectors
+                scaled_gt = self._to_residual_space(v_target_chain[:, t : t + 1, :])
+                scaled_noisy_pred = self._to_residual_space(pred_t)
+                next_vec = torch.where(use_pred, scaled_noisy_pred, scaled_gt)
+                
+                seq = torch.cat([seq, next_vec], dim=1)
 
         return torch.cat(preds, dim=1)
 
@@ -507,7 +530,9 @@ class ChainGenerator(nn.Module):
 
             # Fix #3: Detach before appending so backward() through L_roll
             # only goes one step deep, not through the entire autoregressive chain.
-            chain = torch.cat([chain, next_vec_for_chain.detach()], dim=1)
+            # Scale the next_vec_for_chain UP to residual space before appending!
+            scaled_next = self._to_residual_space(next_vec_for_chain)
+            chain = torch.cat([chain, scaled_next.detach()], dim=1)
 
             # ── Convergence check (SONAR-space EOS) ──
             # If the last W outputs are all mutually similar (cos > threshold),
