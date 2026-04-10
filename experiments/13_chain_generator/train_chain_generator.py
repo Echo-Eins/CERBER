@@ -648,6 +648,11 @@ def main() -> None:
     no_improve = 0
 
     tracker = MetricTracker()
+    
+    # Initialize SADT (Step-wise Adaptive DAgger-Throttling) state
+    sadt_tf_ema = None
+    sadt_roll_ema = None
+    sadt_events = {"throttle": 0, "turbo": 0}
 
     print("\nTraining settings")
     print(f"  epochs={num_epochs}, batch={batch_size}, lr={lr:.2e}")
@@ -695,9 +700,43 @@ def main() -> None:
             scheduler.step()
             tracker.update(metrics)
 
+            # --- SADT Dynamic Throttle Logic ---
+            if train_cfg.get("dynamic_step_lr", False):
+                alpha = float(train_cfg.get("sadt_ema_alpha", 0.1))
+                tf_cur = metrics.get("tf_cos_mean", 0.0)
+                roll_cur = metrics.get("roll_cos_mean", 0.0)
+                
+                if sadt_tf_ema is None:
+                    sadt_tf_ema = tf_cur
+                    sadt_roll_ema = roll_cur
+                else:
+                    sadt_tf_ema = (1 - alpha) * sadt_tf_ema + alpha * tf_cur
+                    sadt_roll_ema = (1 - alpha) * sadt_roll_ema + alpha * roll_cur
+                
+                # Compare current to EMA to detect degradation
+                tolerance = float(train_cfg.get("sadt_tolerance", 0.05))
+                lr_now = optimizer.param_groups[0]["lr"]
+                min_lr = float(train_cfg.get("sadt_min_lr", 1e-6))
+                max_lr = float(train_cfg.get("sadt_max_lr", 5e-4))
+                
+                # Degradation (Throttle)
+                is_bad = tf_cur < (sadt_tf_ema * (1 - tolerance)) or roll_cur < (sadt_roll_ema * (1 - tolerance))
+                if is_bad:
+                    new_lr = max(min_lr, lr_now * float(train_cfg.get("sadt_throttle_factor", 0.5)))
+                    if new_lr < lr_now:
+                        optimizer.param_groups[0]["lr"] = new_lr
+                        sadt_events["throttle"] += 1
+                # Improvement (Turbo) - more conservative
+                elif tf_cur > (sadt_tf_ema * (1 + tolerance/2)) and roll_cur > (sadt_roll_ema * (1 + tolerance/2)):
+                    new_lr = min(max_lr, lr_now * float(train_cfg.get("sadt_turbo_factor", 1.02)))
+                    if new_lr > lr_now:
+                        optimizer.param_groups[0]["lr"] = new_lr
+                        sadt_events["turbo"] += 1
+
             if (step + 1) % log_every == 0:
                 avg = tracker.get()
                 lr_now = optimizer.param_groups[0]["lr"]
+                sadt_info = f" [SADT T:{sadt_events['throttle']} U:{sadt_events['turbo']}]" if train_cfg.get("dynamic_step_lr") else ""
                 print(
                     f"  [E{epoch} S{step+1}] "
                     f"loss={avg.get('loss', 0.0):.4f} "
@@ -709,9 +748,10 @@ def main() -> None:
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
                     f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
-                    f"lr={lr_now:.2e}"
+                    f"lr={lr_now:.2e}{sadt_info}"
                 )
                 tracker.reset()
+                sadt_events = {"throttle": 0, "turbo": 0}
 
         model.eval()
         val_tracker = MetricTracker()

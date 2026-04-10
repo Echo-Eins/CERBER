@@ -60,6 +60,14 @@
         "contrastive_temperature": 0.07,
         "oracle_max_retries": 5,
 
+        "dynamic_step_lr": true,
+        "sadt_ema_alpha": 0.1,
+        "sadt_throttle_factor": 0.5,
+        "sadt_turbo_factor": 1.02,
+        "sadt_min_lr": 1e-6,
+        "sadt_max_lr": 5e-4,
+        "sadt_tolerance": 0.05,
+
         "free_run_temperature": 1.0,
         "free_run_noise_std": 0.01,
         "free_run_noise_std_max": 0.05,
