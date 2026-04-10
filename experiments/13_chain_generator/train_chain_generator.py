@@ -352,6 +352,8 @@ def compute_composite_objective(
         repeat_cos_threshold=float(cfg.get("free_run_repeat_cos_threshold", 0.98)),
         repeat_ban_threshold=float(cfg.get("free_run_repeat_ban_threshold", 0.995)),
         repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 2)),
+        oracle_guide=chains_trunc,
+        oracle_max_retries=int(cfg.get("oracle_max_retries", 4)),
         return_info=True,
     )
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
