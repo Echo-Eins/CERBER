@@ -300,7 +300,7 @@ class ChainGenerator(nn.Module):
 
             x = self.final_norm(x)
             v_pred = self.output_proj(x)
-            return self._sphere_project(v_pred)
+            return v_pred
 
         # ── Scheduled sampling: step-by-step with token mixing ──
         seq = self.start_token.expand(bsz, -1, -1)  # [B, 1, D]
@@ -314,7 +314,7 @@ class ChainGenerator(nn.Module):
             x = self.final_norm(x)
             raw = self.output_proj(x[:, -1:, :])  # [B, 1, D]
             pred_t = self._sphere_project(raw)
-            preds.append(pred_t)
+            preds.append(raw)
 
             if t < num_steps - 1:
                 # Decide per-sample: use own prediction or ground truth.
@@ -498,7 +498,12 @@ class ChainGenerator(nn.Module):
             # model to recover from exposure bias.
             # If we evaluated the noisy vector, we'd penalize the model for random
             # noise it couldn't predict, capping the max possible validation cosine.
-            generated.append(clean_next_vec)
+            # Furthermore, we must evaluate on the RAW UNPROJECTED vector during training
+            # so the MSE loss provides gradients to constrain the logit magnitudes.
+            if self.training:
+                generated.append(raw_next)
+            else:
+                generated.append(clean_next_vec)
 
             # Fix #3: Detach before appending so backward() through L_roll
             # only goes one step deep, not through the entire autoregressive chain.
