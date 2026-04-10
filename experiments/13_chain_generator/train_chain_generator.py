@@ -492,13 +492,17 @@ def train_step(
 
     scaler.scale(loss).backward()
 
+    # Unscale once, then clip + check for NaN gradients.
+    scaler.unscale_(optimizer)
+
     clip_grad = float(cfg.get("clip_grad_norm", 1.0))
     if clip_grad > 0:
-        scaler.unscale_(optimizer)
-        # Check for NaN/Inf in gradients after unscaling
         total_norm = nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         if not torch.isfinite(total_norm):
+            # NaN/Inf in gradients — must still call scaler.update() to
+            # keep its internal state consistent, then skip optimizer.step().
             optimizer.zero_grad(set_to_none=True)
+            scaler.update()
             metrics["nan_skipped"] = 1.0
             metrics["target_steps"] = float(target_steps)
             metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
