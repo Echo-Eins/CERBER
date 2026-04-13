@@ -75,9 +75,12 @@
         "sadt_cooldown_steps": 200,
 
         "free_run_temperature": 1.0,
-        "free_run_noise_std": 0.01,
-        "free_run_noise_std_max": 0.03,
+        "free_run_noise_std": 0.0,
+        "free_run_noise_std_max": 0.0,
         "eval_free_run_noise_std": 0.0,
+
+        "tf_noise_std_max": 0.005,
+        "tf_noise_ramp_epochs": 5,
         "free_run_repeat_penalty": 0.15,
         "free_run_repeat_cos_threshold": 0.98,
         "free_run_repeat_ban_threshold": 0.995,

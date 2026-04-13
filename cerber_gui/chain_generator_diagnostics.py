@@ -1476,6 +1476,9 @@ def run_from_data(
     sample_idx: int = 0,
     num_steps: int = 1,
     num_candidates: int = 1,
+    beam_width: int = 1,
+    temperature: float = 1.0,
+    noise_std: float = 0.01,
     grid_size: int = 30,
 ) -> GenerationResult:
     """
@@ -1505,6 +1508,9 @@ def run_from_data(
         num_steps=num_steps,
         v_target=v_answer,
         num_candidates=num_candidates,
+        beam_width=beam_width,
+        temperature=temperature,
+        noise_std=noise_std,
         v_context=v_context,
         v_context_bank=v_context_bank,
         context_labels=context_labels,
@@ -1530,6 +1536,9 @@ def run_from_text(
     text: str,
     num_steps: int = 1,
     num_candidates: int = 1,
+    beam_width: int = 1,
+    temperature: float = 1.0,
+    noise_std: float = 0.01,
     grid_size: int = 30,
 ) -> GenerationResult:
     """
@@ -1553,6 +1562,9 @@ def run_from_text(
         v_query,
         num_steps=num_steps,
         num_candidates=num_candidates,
+        beam_width=beam_width,
+        temperature=temperature,
+        noise_std=noise_std,
         v_context=v_query,
         v_context_bank=v_context_bank,
         context_labels=context_labels,

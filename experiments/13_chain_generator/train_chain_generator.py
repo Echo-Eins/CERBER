@@ -391,6 +391,28 @@ def _get_scheduled_noise_std(epoch: int, cfg: dict) -> float:
     return base_noise + (max_noise - base_noise) * progress
 
 
+def _get_tf_noise_std(epoch: int, cfg: dict) -> float:
+    """Compute noisy teacher-forcing noise std for the current epoch.
+
+    Diffusion-inspired: add noise to the teacher-forced prefix so the model
+    learns to predict from imperfect contexts.  Noise is in SONAR space
+    (pre-residual-scaling), so values are relative to target_norm≈0.2051.
+
+    Returns 0.0 if tf_noise_std_max is 0 or absent (disabled by default).
+    Ramps linearly from 0 to tf_noise_std_max over tf_noise_ramp_epochs,
+    then stays at max.  Starting from 0 ensures early training focuses on
+    learning the clean mapping before introducing perturbation.
+    """
+    max_noise = float(cfg.get("tf_noise_std_max", 0.0))
+    if max_noise <= 0.0:
+        return 0.0
+    ramp_epochs = int(cfg.get("tf_noise_ramp_epochs", 5))
+    if ramp_epochs <= 0:
+        return max_noise
+    progress = min(1.0, epoch / ramp_epochs)
+    return max_noise * progress
+
+
 def compute_composite_objective(
     model: ChainGenerator,
     v_q: torch.Tensor,
@@ -403,6 +425,7 @@ def compute_composite_objective(
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
     oracle_prob: float = 0.0,
+    tf_noise_std: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute full autoregressive objective for one batch."""
     bsz, steps, d_model = chains.shape
@@ -427,12 +450,15 @@ def compute_composite_objective(
     has_answer = (chain_lens <= steps) | (steps == 1)
 
     # 1) Teacher-forced masked step loss (with optional scheduled sampling).
+    # Noisy TF: inject noise into the teacher-forced prefix so the model
+    # learns to predict from imperfect contexts (diffusion-inspired).
     v_tf = model.forward(
         v_q,
         chains,
         v_context_bank=context_banks,
         context_mask=context_mask,
         scheduled_sampling_prob=scheduled_sampling_prob,
+        tf_noise_std=tf_noise_std,
     )
 
     # Fix #7: Only exclude last position from L_step when L_ans is active
@@ -570,6 +596,7 @@ def compute_composite_objective(
             "lambda_rank": lambda_rank,
             "ss_prob": float(scheduled_sampling_prob),
             "free_run_noise_std": float(free_run_noise_std),
+            "tf_noise_std": float(tf_noise_std),
             "oracle_enabled": 1.0 if oracle_enabled else 0.0,
             "oracle_prob": float(effective_oracle_prob),
             "answer_coverage": float(has_answer.float().mean().item()),
@@ -598,6 +625,7 @@ def train_step(
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
     oracle_prob: float = 0.0,
+    tf_noise_std: float = 0.0,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
@@ -622,6 +650,7 @@ def train_step(
             scheduled_sampling_prob=scheduled_sampling_prob,
             free_run_noise_std=free_run_noise_std,
             oracle_prob=oracle_prob,
+            tf_noise_std=tf_noise_std,
         )
 
     # NaN guard: if loss is NaN/Inf, skip this step entirely.
@@ -904,6 +933,7 @@ def main() -> None:
         ss_prob = _get_scheduled_sampling_prob(epoch, train_cfg)
         noise_std = _get_scheduled_noise_std(epoch, train_cfg)
         oracle_prob = _get_oracle_prob(epoch, train_cfg)
+        tf_noise = _get_tf_noise_std(epoch, train_cfg)
         epoch_start = time.time()
 
         # Reset SADT EMA at System2 transition to prevent false throttling.
@@ -920,8 +950,10 @@ def main() -> None:
         prev_target_steps = target_steps
 
         phase = "System1" if target_steps == 1 else f"System2({target_steps})"
+        tf_noise_info = f" tf_noise={tf_noise:.4f}" if tf_noise > 0 else ""
         print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] "
-              f"ss_prob={ss_prob:.3f} noise_std={noise_std:.4f} oracle_prob={oracle_prob:.3f}")
+              f"ss_prob={ss_prob:.3f} noise_std={noise_std:.4f} oracle_prob={oracle_prob:.3f}"
+              f"{tf_noise_info}")
 
         nan_count = 0
         for step, batch in enumerate(train_loader):
@@ -938,6 +970,7 @@ def main() -> None:
                 scheduled_sampling_prob=ss_prob,
                 free_run_noise_std=noise_std,
                 oracle_prob=oracle_prob,
+                tf_noise_std=tf_noise,
             )
             if metrics.get("optimizer_stepped", 0.0) > 0.0:
                 scheduler.step()

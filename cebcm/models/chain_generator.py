@@ -301,6 +301,7 @@ class ChainGenerator(nn.Module):
         v_context_bank: Tensor | None = None,
         context_mask: Tensor | None = None,
         scheduled_sampling_prob: float = 0.0,
+        tf_noise_std: float = 0.0,
     ) -> Tensor:
         """Teacher-forced forward pass with optional scheduled sampling.
 
@@ -308,6 +309,15 @@ class ChainGenerator(nn.Module):
         the first) independently uses the model's own prediction instead of
         ground truth with probability ``scheduled_sampling_prob``.
         This bridges the teacher-forcing / free-run distribution gap.
+
+        Noisy teacher forcing (tf_noise_std > 0, training only):
+        Adds Gaussian noise to the teacher-forced prefix, scaled per-sample
+        from U[0, tf_noise_std]. This is the continuous-space analogue of
+        training a diffusion model at multiple noise levels — the model
+        learns to predict correctly from imperfect contexts, reducing
+        autoregressive error accumulation at eval.  The noise is in SONAR
+        space (pre-residual-scaling), so tf_noise_std=0.01 corresponds to
+        perturbation relative to target_norm≈0.2051 (~5% relative).
         """
         bsz, num_steps, _ = v_target_chain.shape
         context, ctx_mask = self._prepare_context(v_query, v_context_bank, context_mask)
@@ -319,7 +329,22 @@ class ChainGenerator(nn.Module):
             # Pure teacher forcing (original path).
             start = self.start_token.expand(bsz, -1, -1)
             scaled_target = self._to_residual_space(v_target_chain)
-            decoder_input = torch.cat([start, scaled_target[:, :-1, :]], dim=1)
+
+            # Noisy teacher forcing: add per-sample scaled noise to the
+            # prefix context.  Noise is added in SONAR space before residual
+            # scaling so that tf_noise_std is interpretable relative to
+            # target_norm.  Each sample gets a uniformly random noise level
+            # in [0, tf_noise_std], simulating diffusion-style multi-level
+            # training.
+            if self.training and tf_noise_std > 0.0 and num_steps > 1:
+                prefix_sonar = v_target_chain[:, :-1, :]  # [B, T-1, D]
+                # Per-sample noise level ~ U[0, tf_noise_std]
+                sigma = torch.rand(bsz, 1, 1, device=prefix_sonar.device) * tf_noise_std
+                noisy_prefix = prefix_sonar + sigma * torch.randn_like(prefix_sonar)
+                scaled_prefix = self._to_residual_space(noisy_prefix)
+                decoder_input = torch.cat([start, scaled_prefix], dim=1)
+            else:
+                decoder_input = torch.cat([start, scaled_target[:, :-1, :]], dim=1)
 
             x = decoder_input
             for layer in self.layers:
@@ -332,6 +357,7 @@ class ChainGenerator(nn.Module):
         # ── Scheduled sampling: step-by-step with token mixing ──
         seq = self.start_token.expand(bsz, -1, -1)  # [B, 1, D]
         preds: list[Tensor] = []
+        use_tf_noise = self.training and tf_noise_std > 0.0
 
         for t in range(num_steps):
             x = seq
@@ -345,17 +371,20 @@ class ChainGenerator(nn.Module):
 
             if t < num_steps - 1:
                 # Decide per-sample: use own prediction or ground truth.
-                # Generate random threshold for each sample in batch.
                 rand_vals = torch.rand(bsz, 1, 1, device=x.device)
                 use_pred = rand_vals < ss_prob
-                
-                # Context sequence must hold residual-scaled vectors
-                scaled_gt = self._to_residual_space(v_target_chain[:, t : t + 1, :])
+
+                # GT token — optionally noised (diffusion-inspired).
+                gt_sonar = v_target_chain[:, t : t + 1, :]
+                if use_tf_noise:
+                    sigma = torch.rand(bsz, 1, 1, device=x.device) * tf_noise_std
+                    gt_sonar = gt_sonar + sigma * torch.randn_like(gt_sonar)
+                scaled_gt = self._to_residual_space(gt_sonar)
                 # DETACH the prediction being used as context to prevent recursive BPTT
                 # across Transformer layers!
                 scaled_noisy_pred = self._to_residual_space(pred_t).detach()
                 next_vec = torch.where(use_pred, scaled_noisy_pred, scaled_gt)
-                
+
                 seq = torch.cat([seq, next_vec], dim=1)
 
         return torch.cat(preds, dim=1)

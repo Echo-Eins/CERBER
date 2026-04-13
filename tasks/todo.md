@@ -2228,6 +2228,36 @@ Only if Phase 1-3 don't reach 0.90 roll_cos:
 
 
 ---
+## 2026-04-13 - Diffusion-Inspired Exposure Bias Fix + GUI Repair
+
+### Objective
+Fix the root cause of val_roll_cos_last ceiling at 0.60: the model never sees imperfect contexts during teacher forcing. Implement noisy teacher forcing (diffusion-inspired multi-noise-level training). Fix GUI inference crash. Remove pointless train generate() noise.
+
+### Analysis Validated
+- [x] Training log confirms user's analysis: oracle inflated train_roll_cos, noise destroyed eval_roll_cos
+- [x] Root cause of 0.16 gap at steps=1: eval noise_std=0.01 in d=1024 → noise_norm=0.32 vs signal=0.4 (SNR=1.25)
+- [x] NaN:3 per epoch is cumulative, not per-batch-window; happens at initialization
+- [x] val_tf_cos=0.87 proves model capacity is sufficient; problem is training distribution
+
+### Changes
+- [x] Fix GUI `run_from_text`/`run_from_data` — add missing `beam_width`, `temperature`, `noise_std` params
+- [x] Remove train generate() noise: `free_run_noise_std=0.0` (noise was only useful for oracle candidate selection, now disabled)
+- [x] Implement Noisy Teacher Forcing in `forward()`:
+  - Per-sample noise level σ ~ U[0, tf_noise_std]
+  - Applied to GT prefix in SONAR space before residual scaling
+  - Calibrated: tf_noise_std_max=0.005 → angular perturbation ≈ 38° at max
+  - Active in both pure TF and scheduled sampling paths
+- [x] Add `_get_tf_noise_std()` scheduler: ramps 0→tf_noise_std_max over tf_noise_ramp_epochs
+- [x] Thread tf_noise_std through train_step → compute_composite_objective → model.forward()
+- [x] Log tf_noise_std in metrics
+- [x] Update lessons.md with noise calibration rules
+
+### Next Steps (Priority Order)
+- [ ] Run clean training from scratch — establish honest baseline with oracle disabled + noisy TF
+- [ ] If val_roll_cos_last plateaus < 0.65: implement self-conditioning (second forward pass with preliminary prediction as conditioning)
+- [ ] If val_roll_cos_last plateaus < 0.80: implement iterative refinement per autoregressive step (K=2-4 refinement passes)
+- [ ] Consider Diffusion Forcing for hybrid autoregressive-diffusion architecture (major effort)
+
 ## 2026-04-11 - Disable Oracle/DAger and Fix ChainGenerator NaNs
 
 ### Objective

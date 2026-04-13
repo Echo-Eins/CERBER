@@ -1,5 +1,31 @@
 # Lessons
 
+## 2026-04-13 - Noise calibration in high-dim continuous space and diffusion-inspired exposure bias fix
+
+### Pattern
+Training log analysis revealed TWO compounding causes for the val_roll_cos_last ceiling at 0.60:
+1. Oracle-assisted rollout inflated train_roll_cos (fixed in 5cced91)
+2. Eval generate() received `noise_std=0.01` which in d=1024 produces noise norm ≈ sqrt(1024)*0.01 ≈ 0.32, comparable to raw_next norm ≈ 0.4 (SNR=1.25). This destroyed eval cosine by ~0.16.
+
+Additionally, model has val_tf_cos=0.87 (single-step accuracy) but val_roll_cos=0.47 (multi-step accuracy) — classic exposure bias where the model never sees its own imperfect outputs during training.
+
+### Root Causes
+1. **Noise uncalibrated for dimensionality**: `noise_std` is per-dimension, but total noise norm scales as `sqrt(d) * std`. In d=1024, even small per-dim std=0.01 creates devastating total perturbation.
+2. **No noise robustness in teacher forcing**: forward() gives the model perfect GT prefix. At eval, generate() feeds back model's own errors, causing error accumulation over multi-step rollout.
+3. **Train generate() noise was pointless with oracle disabled**: Without oracle to select from noisy candidates, noise only degrades training quality and creates train/eval mismatch.
+
+### Fixes
+1. Set `free_run_noise_std=0.0` in both train and eval (no more noise in generate())
+2. Added **Noisy Teacher Forcing** (diffusion-inspired): forward() adds per-sample noise from U[0, tf_noise_std] to GT prefix during training. Model learns to predict from imperfect contexts.
+3. Noise calibration: tf_noise_std_max=0.005 in SONAR space (target_norm=0.2051). At max: noise_norm ≈ sqrt(1024)*0.005 ≈ 0.16, ratio=0.78, angular perturbation ≈ 38° — matches model's late-training error of arccos(0.87) ≈ 30°.
+4. Noisy TF also applies inside scheduled sampling (GT tokens get noised too).
+
+### Rules
+1. **ALWAYS scale noise by sqrt(d)** to understand its real magnitude. noise_std=0.01 in d=1024 is NOT "small noise".
+2. **If a noise mechanism exists only for a disabled feature (oracle), remove the noise too.**
+3. **Exposure bias in continuous AR = diffusion at noise level 0 only.** Fix by training at multiple noise levels (noisy teacher forcing = multi-level denoising training).
+4. **Calibrate noise to model error level**: tf_noise_std should produce angular perturbation ≈ arccos(current_tf_cos). Use tf_noise_std ≈ target_norm * tan(arccos(tf_cos)) / sqrt(d).
+
 ## 2026-04-11 - Oracle/DAger can fake rollout quality and disabled rank loss can still create NaNs
 
 ### Pattern
