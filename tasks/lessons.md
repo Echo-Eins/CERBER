@@ -1,5 +1,24 @@
 # Lessons
 
+## 2026-04-13 - Diffusion Forcing audit: Min-SNR weight formula inversion and grad_norm logging gap
+
+### Pattern
+Full code review of Diffusion Forcing implementation (1760 lines added across 8 files) found one mathematical bug and one monitoring gap.
+
+### Root Causes
+1. **Min-SNR weight formula inverted for x₀-prediction**: Code had `min(SNR, γ) / γ` which gives weight ~1 for clean tokens (high SNR) and ~0 for noisy tokens. For x₀-prediction, correct formula is `min(SNR, γ) / SNR` which downweights the trivially easy clean regime. Bug was latent (γ=0 = disabled by default).
+2. **grad_norm not logged**: Training dashboard couldn't show gradient norm over time, essential for diagnosing training instability.
+
+### Fixes
+1. Changed Min-SNR weights from `min(SNR, γ) / γ` to `min(SNR, γ) / SNR` in `_diffusion_forcing_weights`.
+2. Added `grad_norm` to train_step metrics, console output, JSONL log, and GUI dashboard.
+3. Fixed BOM (U+FEFF) in training_geometry.py.
+
+### Rules
+1. **For x₀-prediction diffusion, Min-SNR-γ weight = min(SNR, γ) / SNR**. For ε-prediction it's the same formula. The form `min(SNR, γ) / γ` is WRONG — it inverts the weighting.
+2. **Always log grad_norm** — it's the earliest indicator of training instability before loss NaN appears.
+3. **When reviewing latent bugs behind disabled features**: even if a flag is off, fix the underlying code. Someone will enable it later and get silent corruption.
+
 ## 2026-04-13 - Noise calibration in high-dim continuous space and diffusion-inspired exposure bias fix
 
 ### Pattern

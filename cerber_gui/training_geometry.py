@@ -1,4 +1,4 @@
-﻿"""Training geometry visualization for ChainGenerator probes.
+"""Training geometry visualization for ChainGenerator probes.
 
 The training script writes compact fixed-probe snapshots. This module keeps the
 GUI side read-only: it loads JSONL scalar events and per-step .pt artifacts, then
@@ -209,6 +209,9 @@ def format_geometry_summary(run: dict[str, Any] | None, snapshot: dict[str, Any]
     latest_train = _latest_value(df, "train_step", "train_roll_cos_answer")
     latest_roll = _latest_value(df, "train_step", "train_roll_cos_mean")
     latest_df = _latest_value(df, "train_step", "train_df_cos")
+    latest_grad = _latest_value(df, "train_step", "train_grad_norm")
+    latest_lr = _latest_value(df, "train_step", "lr")
+    latest_nan = _latest_value(df, "train_step", "nan_count_epoch")
     latest_val = _latest_value(df, "val_epoch", "val_roll_cos_answer")
     latest_val_last = _latest_value(df, "val_epoch", "val_roll_cos_last")
     if latest_train is not None or latest_val is not None:
@@ -220,6 +223,12 @@ def format_geometry_summary(run: dict[str, Any] | None, snapshot: dict[str, Any]
             lines.append(f"- train roll_cos_answer: {float(latest_train):.4f}")
         if latest_df is not None:
             lines.append(f"- train df_cos: {float(latest_df):.4f}")
+        if latest_grad is not None:
+            lines.append(f"- grad_norm: {float(latest_grad):.4f}")
+        if latest_lr is not None:
+            lines.append(f"- lr: {float(latest_lr):.2e}")
+        if latest_nan is not None and float(latest_nan) > 0:
+            lines.append(f"- nan_skipped (epoch total): {int(latest_nan)}")
         if latest_val is not None:
             lines.append(f"- val roll_cos_answer: {float(latest_val):.4f}")
         if latest_val_last is not None:
@@ -273,12 +282,19 @@ def create_step_metrics_figure(run: dict[str, Any] | None) -> go.Figure:
         return _empty_fig("Step-Level Training Metrics", "No scalar JSONL events found yet")
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # Primary y: losses
     _add_line_if_present(fig, df, "train_step", "train_loss", "train loss", "#ff8787", secondary_y=False)
+    _add_line_if_present(fig, df, "train_step", "train_loss_df", "train DF loss", "#74c0fc", secondary_y=False)
+    _add_line_if_present(fig, df, "train_step", "train_grad_norm", "grad norm", "#e599f7", secondary_y=False)
+    # Secondary y: cosine metrics
     _add_line_if_present(fig, df, "train_step", "train_roll_cos_mean", "train rollout cos", "#b197fc", secondary_y=True)
     _add_line_if_present(fig, df, "train_step", "train_roll_cos_answer", "train answer cos", "#50fa7b", secondary_y=True)
     _add_line_if_present(fig, df, "train_step", "train_df_cos", "train DF cos", "#4dabf7", secondary_y=True)
+    _add_line_if_present(fig, df, "train_step", "train_tf_cos_answer", "train TF answer cos", "#ffc078", secondary_y=True)
+    _add_line_if_present(fig, df, "train_step", "train_rank_acc", "train rank acc", "#69db7c", secondary_y=True)
     _add_line_if_present(fig, df, "val_epoch", "val_roll_cos", "val rollout cos", "#ffd43b", secondary_y=True)
-    _add_line_if_present(fig, df, "val_epoch", "val_roll_cos_answer", "val answer cos", "#69db7c", secondary_y=True)
+    _add_line_if_present(fig, df, "val_epoch", "val_roll_cos_answer", "val answer cos", "#a9e34b", secondary_y=True)
+    _add_line_if_present(fig, df, "val_epoch", "val_df_cos", "val DF cos", "#63e6be", secondary_y=True)
     _add_line_if_present(fig, df, "probe_snapshot", "probe_roll_cos_mean", "probe rollout cos", "#da77f2", secondary_y=True)
     _add_line_if_present(fig, df, "probe_snapshot", "probe_df_cos_mean", "probe DF cos", "#74c0fc", secondary_y=True)
     fig.update_layout(
@@ -291,8 +307,8 @@ def create_step_metrics_figure(run: dict[str, Any] | None) -> go.Figure:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
     )
     fig.update_xaxes(title_text="global_step", gridcolor="rgba(180,195,255,0.14)")
-    fig.update_yaxes(title_text="loss", secondary_y=False, gridcolor="rgba(180,195,255,0.14)")
-    fig.update_yaxes(title_text="cosine", secondary_y=True, range=[-0.05, 1.02], gridcolor="rgba(180,195,255,0.05)")
+    fig.update_yaxes(title_text="loss / grad_norm", secondary_y=False, gridcolor="rgba(180,195,255,0.14)")
+    fig.update_yaxes(title_text="cosine / accuracy", secondary_y=True, range=[-0.05, 1.02], gridcolor="rgba(180,195,255,0.05)")
     return fig
 
 

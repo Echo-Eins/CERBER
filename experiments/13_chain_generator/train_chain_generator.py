@@ -501,13 +501,13 @@ def _diffusion_forcing_weights(
     cfg: dict,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Optional Min-SNR-style weights for DF loss.
+    """Optional Min-SNR-γ weights for DF loss (Hang et al. 2023).
 
     Default is uniform because SONAR pred-x0 cosine loss is already stable;
-    set df_min_snr_gamma > 0 only for ablations.  This path predicts clean
-    x0, not epsilon, so the Min-SNR form is clipped_snr/gamma.  Using
-    clipped_snr/snr would be the pred-noise weighting and would suppress
-    clean/low-noise positions incorrectly.
+    set df_min_snr_gamma > 0 only for ablations.  For x0-prediction the
+    weight is min(SNR, γ) / SNR — this downweights clean (high-SNR) tokens
+    where the prediction task is trivial, focusing training on the harder
+    noisy regime.
     """
     gamma = float(cfg.get("df_min_snr_gamma", 0.0))
     if gamma <= 0.0:
@@ -515,7 +515,7 @@ def _diffusion_forcing_weights(
 
     snr = model.diffusion_snr(noise_levels).to(device=noise_levels.device).float().clamp(min=1e-8)
     gamma_t = torch.full_like(snr, gamma)
-    weights = torch.minimum(snr, gamma_t) / gamma_t.clamp(min=1e-8)
+    weights = torch.minimum(snr, gamma_t) / snr
     return torch.where(mask.to(dtype=torch.bool), weights, torch.zeros_like(weights))
 
 
@@ -964,6 +964,7 @@ def train_step(
     metrics["nan_loss_skipped"] = 0.0
     metrics["nan_grad_skipped"] = 0.0
     metrics["optimizer_stepped"] = 1.0
+    metrics["grad_norm"] = float(total_norm.item()) if clip_grad > 0 else 0.0
     metrics["target_steps"] = float(target_steps)
     metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
     return metrics
@@ -1657,6 +1658,7 @@ def main() -> None:
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
                     f"ans_cov={avg.get('answer_coverage', 0.0):.2f} "
                     f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
+                    f"grad={avg.get('grad_norm', 0.0):.4f} "
                     f"lr={lr_now:.2e}{sadt_info}{nan_info}"
                 )
                 _append_jsonl(
