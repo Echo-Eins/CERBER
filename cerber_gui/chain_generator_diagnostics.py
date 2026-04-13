@@ -714,7 +714,7 @@ def run_generation(
     device = torch.device(_state.device)
     t0 = time.time()
 
-    effective_steps, _, _ = _resolve_num_steps(num_steps)
+    effective_steps, step_cap_applied, step_cap_reason = _resolve_num_steps(num_steps)
 
     v_q = v_query.unsqueeze(0).to(device)  # [1, D]
     v_ctx = v_q if v_context is None else v_context.unsqueeze(0).to(device)
