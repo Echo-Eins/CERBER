@@ -58,9 +58,10 @@
         "loss_lambda_roll": 1.0,
         "loss_lambda_rank": 0.0,
         "contrastive_temperature": 0.07,
-        "oracle_max_retries": 3,
+        "enable_oracle_dagger": false,
+        "oracle_max_retries": 0,
 
-        "oracle_prob_max": 1.0,
+        "oracle_prob_max": 0.0,
         "oracle_prob_min": 0.0,
         "oracle_decay_epochs": 20,
 
@@ -76,6 +77,7 @@
         "free_run_temperature": 1.0,
         "free_run_noise_std": 0.01,
         "free_run_noise_std_max": 0.03,
+        "eval_free_run_noise_std": 0.0,
         "free_run_repeat_penalty": 0.15,
         "free_run_repeat_cos_threshold": 0.98,
         "free_run_repeat_ban_threshold": 0.995,

@@ -1,5 +1,37 @@
 # Lessons
 
+## 2026-04-11 - Oracle/DAger can fake rollout quality and disabled rank loss can still create NaNs
+
+### Pattern
+Latest ChainGenerator run (`Arch(11-04-26) training log.txt`) reached train `tf_cos≈0.89` and train `roll_cos≈0.87`, while eval stayed near `roll_cos≈0.50` and `roll_cos_last≈0.47`. The best eval point remained early System1 (`val_roll_cos_last≈0.5993`). NaN-skipped batches also appeared across most epochs even after earlier guards.
+
+### Root Causes
+1. **Oracle-guided DAger train/eval mismatch**: train rollout used `oracle_guide=chains` with nonzero `oracle_prob`; eval had no oracle because `self.training=False`. Train rollout therefore measured an oracle-assisted trajectory, not the actual model policy.
+2. **Disabled rank loss was still computed**: `loss_lambda_rank=0.0`, but in-batch contrastive rank still ran through normalization. If it produced NaN, `0.0 * NaN` contaminated total loss.
+3. **Unsafe normalization in rank path**: rank loss used `F.normalize` default epsilon instead of the project safe-normalize rule.
+4. **Masked loss used multiplication by zero**: `NaN * 0` can stay NaN; masked losses must use `torch.where(mask, value, 0)` before reduction.
+5. **Repeat-ban in training reintroduced stochastic rollout mismatch**: repeat-ban is an inference safety mechanism and must not perturb the training prefix.
+6. **Scheduler advanced on skipped optimizer steps**: when NaN/Inf skipped a step, the LR scheduler still stepped, causing schedule drift and PyTorch warnings.
+
+### Fixes
+- Disable oracle/DAger by default with explicit `enable_oracle_dagger=false`, `oracle_max_retries=0`, `oracle_prob_max=0.0`.
+- Gate `oracle_guide` in the train objective; only pass it when explicitly enabled for ablations.
+- Compute rank loss lazily: if `loss_lambda_rank==0`, do not include it in the graph and never multiply zero by a possibly non-finite tensor.
+- Replace contrastive rank normalization with safe normalization.
+- Replace latent-vector cosine checks in generation with the same safe-normalize rule.
+- Compute masked cosine/MSE reductions with `torch.where`, not value-by-mask multiplication.
+- Disable repeat-ban during training.
+- Return `optimizer_stepped` from `train_step` and only advance the scheduler after a real optimizer step.
+- Add dataset/horizon diagnostics and explicit `ans_cov` / `roll_ans` metrics so `roll_cos_last` is not mistaken for answer quality when the current horizon has not reached the answer.
+
+### Rules
+1. If train rollout uses an expert/oracle and eval rollout does not, train rollout metrics are not valid quality metrics.
+2. Disabled loss terms must not execute unstable graph code; never rely on `0.0 * loss`.
+3. Masked losses must avoid `NaN * 0`; use `torch.where(mask, term, 0)`.
+4. Inference anti-loop mechanisms (`repeat_ban`, repeat penalty, stochastic rerolling) must be guarded out of training unless the same mechanism is explicitly part of the train objective and metric.
+5. LR schedulers should step only when the optimizer actually stepped.
+6. Always log answer coverage for curriculum horizons; `roll_cos_last` is only an answer metric when the answer is inside the selected training window.
+
 ## 2026-04-10 - ChainGenerator NaN collapse at E13 and val roll_cos_last overfitting
 
 ### Pattern

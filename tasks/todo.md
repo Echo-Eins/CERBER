@@ -2225,3 +2225,28 @@ Only if Phase 1-3 don't reach 0.90 roll_cos:
 ### Files created/modified
 - [x] `experiments/13_chain_generator/train_chain_generator.py` — added `--finetune` flag, `system2_start_steps`
 - [x] `configs/chain_generator_finetune.json` — fine-tune config
+
+
+---
+## 2026-04-11 - Disable Oracle/DAger and Fix ChainGenerator NaNs
+
+### Objective
+Disable oracle-guided DAger by default, remove train/eval oracle leakage, fix NaN sources in the ChainGenerator objective, and add dataset/training diagnostics that explain the current 0.90 train vs ~0.49 eval gap.
+
+### Checklist
+- [x] Gate oracle/DAger behind `enable_oracle_dagger=false` and default oracle probability/retries to zero.
+- [x] Stop passing oracle guidance into free-run rollout unless explicitly enabled.
+- [x] Fix disabled-rank-loss NaN contamination by skipping rank loss computation when `loss_lambda_rank=0`.
+- [x] Replace unsafe normalize paths with fp32 safe normalization for tiny SONAR-sphere vectors.
+- [x] Replace latent-vector cosine checks in generation with safe-normalize cosine.
+- [x] Replace masked `loss * mask` with `torch.where(mask, loss, 0)` to avoid `NaN * 0`.
+- [x] Disable repeat-ban during training rollouts so the training objective stays differentiable and stable.
+- [x] Skip scheduler stepping when the optimizer step is skipped due non-finite loss or gradients.
+- [x] Add train/val dataset diagnostics: chain length, truncation, answer coverage, norms, answer text length, context length.
+- [x] Add answer-specific metrics: teacher-forced answer cosine, rollout answer cosine, answer coverage.
+- [x] Re-run static verification: Python compile, JSON parse, and git whitespace checks.
+
+### Review
+- Oracle-guided DAger is now opt-in only. Default training/eval measures real free-run quality instead of oracle-assisted rollout.
+- Primary NaN root causes were disabled rank loss still producing NaNs, unsafe normalization on tiny vectors, masked multiplication by zero, and scheduler advancement after skipped steps.
+- The next full training run should be started from a clean checkpoint or explicitly treated as fine-tuning from an oracle-contaminated checkpoint.

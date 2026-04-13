@@ -240,8 +240,9 @@ class ChainGenerator(nn.Module):
         when input norm approaches zero (especially in bfloat16). We use a
         larger eps and clamp the norm to prevent this.
         """
-        norms = v.norm(dim=dim, keepdim=True).clamp(min=eps)
-        return v / norms
+        v_float = v.float()
+        norms = v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
+        return (v_float / norms).to(dtype=v.dtype)
 
     def _sphere_project(self, v: Tensor) -> Tensor:
         return self._safe_normalize(v, dim=-1) * self.cfg.target_norm
@@ -384,7 +385,7 @@ class ChainGenerator(nn.Module):
         num_candidates: int = 1,
         oracle_guide: Tensor | None = None,
         oracle_max_retries: int = 0,
-        oracle_prob: float = 1.0,
+        oracle_prob: float = 0.0,
     ) -> Tensor | tuple[Tensor, dict[str, float | int | bool]]:
         """
         Autoregressive generation with adaptive stopping and resume support.
@@ -467,14 +468,13 @@ class ChainGenerator(nn.Module):
             # raw_next toward zero norm, causing F.normalize gradient explosion
             # in bfloat16 (the primary NaN collapse trigger at E13+).
             # The penalty provides no useful gradient (history is detached), and
-            # the oracle-guided DAgger already handles diversity.
+            # Diversity must be handled by scheduled sampling/noise in training.
             if generated and repeat_penalty > 0.0 and not self.training:
                 hist = torch.cat(generated, dim=1).detach()
-                cos_hist_tensor = F.cosine_similarity(
-                    raw_next.expand(-1, hist.shape[1], -1),
-                    hist,
-                    dim=-1,
-                )
+                cos_hist_tensor = (
+                    self._safe_normalize(raw_next.expand(-1, hist.shape[1], -1), dim=-1)
+                    * self._safe_normalize(hist, dim=-1)
+                ).sum(dim=-1)
                 max_cos, max_idx = cos_hist_tensor.max(dim=1)
                 over = (max_cos - repeat_cos_threshold).clamp(min=0.0)
                 if torch.any(over > 0):
@@ -504,13 +504,19 @@ class ChainGenerator(nn.Module):
                 t_step = oracle_guide[:, t_idx, :]  # [B, D]
 
                 best_cand = clean_next_vec.clone()
-                best_cos = F.cosine_similarity(best_cand.squeeze(1), t_step, dim=-1)
+                best_cos = (
+                    self._safe_normalize(best_cand.squeeze(1), dim=-1)
+                    * self._safe_normalize(t_step, dim=-1)
+                ).sum(dim=-1)
                 jitter_std = max(noise_std, 0.01)
 
                 for _ in range(oracle_max_retries):
                     cand_noisy = raw_next + jitter_std * torch.randn_like(raw_next)
                     cand_proj = self._sphere_project(cand_noisy)
-                    cand_cos = F.cosine_similarity(cand_proj.squeeze(1), t_step, dim=-1)
+                    cand_cos = (
+                        self._safe_normalize(cand_proj.squeeze(1), dim=-1)
+                        * self._safe_normalize(t_step, dim=-1)
+                    ).sum(dim=-1)
 
                     improved = cand_cos > best_cos
                     if improved.any():
@@ -541,21 +547,22 @@ class ChainGenerator(nn.Module):
             else:
                 next_vec_for_chain = clean_next_vec
 
-            # DAgger Fix: Allow repeat_ban during training since chain vectors 
-            # are now securely .detach()-ed, preserving clean state tracking.
+            # Repeat-ban is inference-only. In training it creates a second
+            # train/eval mismatch and adds stochastic resampling to the rollout
+            # context while the loss still supervises the clean raw prediction.
             if (
                 generated
                 and repeat_ban_threshold < 1.0
                 and repeat_ban_max_retries > 0
+                and not self.training
             ):
                 hist = torch.cat(generated, dim=1)
                 jitter_std = max(noise_std, 0.01)
                 for _ in range(repeat_ban_max_retries):
-                    cos_to_hist = F.cosine_similarity(
-                        next_vec_for_chain.expand(-1, hist.shape[1], -1),
-                        hist,
-                        dim=-1,
-                    )
+                    cos_to_hist = (
+                        self._safe_normalize(next_vec_for_chain.expand(-1, hist.shape[1], -1), dim=-1)
+                        * self._safe_normalize(hist, dim=-1)
+                    ).sum(dim=-1)
                     max_cos = cos_to_hist.max(dim=1).values
                     repeat_mask = max_cos > repeat_ban_threshold
                     if not torch.any(repeat_mask):
@@ -611,7 +618,7 @@ class ChainGenerator(nn.Module):
                 # Check all consecutive pairs in window.
                 w1 = window[:, :-1, :]   # [B, W-1, D]
                 w2 = window[:, 1:, :]    # [B, W-1, D]
-                pair_cos = F.cosine_similarity(w1, w2, dim=-1)  # [B, W-1]
+                pair_cos = (self._safe_normalize(w1, dim=-1) * self._safe_normalize(w2, dim=-1)).sum(dim=-1)
                 # Converged if ALL pairs exceed threshold (mean across batch).
                 min_pair_cos = pair_cos.min(dim=1).values.mean().item()
                 if min_pair_cos > convergence_cos:
@@ -633,7 +640,10 @@ class ChainGenerator(nn.Module):
                         warnings.warn(f"energy_fn failed at step 0: {exc}", stacklevel=2)
 
             if t_target is not None:
-                cos_val = F.cosine_similarity(clean_next_vec.squeeze(1), t_target, dim=-1)
+                cos_val = (
+                    self._safe_normalize(clean_next_vec.squeeze(1), dim=-1)
+                    * self._safe_normalize(t_target, dim=-1)
+                ).sum(dim=-1)
                 cos_hist.append(float(cos_val.mean().item()))
 
             if stagnation_patience > 0 and step_idx + 1 >= (stagnation_patience + 1):
@@ -803,13 +813,21 @@ class ChainGenerator(nn.Module):
                     f"loss_mask shape {tuple(mask.shape)} does not match (B,N)=({bsz},{num_steps})"
                 )
 
+        mask_bool = mask > 0
         mask_sum = mask.sum().clamp(min=1.0)
 
-        cos_sim = F.cosine_similarity(v_pred, v_target_chain, dim=-1)
-        cos_loss = ((1.0 - cos_sim) * mask).sum() / mask_sum
+        v_pred_f = v_pred.float()
+        v_target_f = v_target_chain.float()
+        cos_sim = (
+            self._safe_normalize(v_pred_f, dim=-1)
+            * self._safe_normalize(v_target_f, dim=-1)
+        ).sum(dim=-1)
+        cos_term = torch.where(mask_bool, 1.0 - cos_sim, torch.zeros_like(cos_sim))
+        cos_loss = cos_term.sum() / mask_sum
 
-        mse_per_step = (v_pred - v_target_chain).pow(2).sum(dim=-1)
-        mse_loss = (mse_per_step * mask).sum() / mask_sum
+        mse_per_step = (v_pred_f - v_target_f).pow(2).sum(dim=-1)
+        mse_term = torch.where(mask_bool, mse_per_step, torch.zeros_like(mse_per_step))
+        mse_loss = mse_term.sum() / mask_sum
 
         loss = self.cfg.loss_cosine_weight * cos_loss + self.cfg.loss_mse_weight * mse_loss
 
@@ -817,6 +835,9 @@ class ChainGenerator(nn.Module):
             valid_per_step = mask.sum(dim=0).clamp(min=1.0)
             sample_valid_counts = mask.sum(dim=1).long().clamp(min=1)
             last_idx = (sample_valid_counts - 1).clamp(min=0)
+            cos_masked = torch.where(mask_bool, cos_sim, torch.zeros_like(cos_sim))
+            pred_norm = v_pred.norm(dim=-1)
+            pred_norm_masked = torch.where(mask_bool, pred_norm, torch.zeros_like(pred_norm))
             cos_last = cos_sim.gather(1, last_idx.unsqueeze(1)).squeeze(1).mean().item()
             cos_first = cos_sim[:, 0].mean().item()
 
@@ -824,15 +845,18 @@ class ChainGenerator(nn.Module):
                 "loss": float(loss.item()),
                 "cos_loss": float(cos_loss.item()),
                 "mse_loss": float(mse_loss.item()),
-                "cos_sim_mean": float(((cos_sim * mask).sum() / mask_sum).item()),
+                "cos_sim_mean": float((cos_masked.sum() / mask_sum).item()),
                 "cos_sim_last": float(cos_last),
                 "cos_sim_first": float(cos_first),
-                "pred_norm_mean": float(((v_pred.norm(dim=-1) * mask).sum() / mask_sum).item()),
+                "pred_norm_mean": float((pred_norm_masked.sum() / mask_sum).item()),
                 "valid_tokens": float(mask_sum.item()),
                 "valid_tokens_per_sample": float(sample_valid_counts.float().mean().item()),
-                "cos_step0": float(((cos_sim[:, 0] * mask[:, 0]).sum() / mask[:, 0].sum().clamp(min=1.0)).item()),
+                "cos_step0": float((
+                    torch.where(mask_bool[:, 0], cos_sim[:, 0], torch.zeros_like(cos_sim[:, 0])).sum()
+                    / mask[:, 0].sum().clamp(min=1.0)
+                ).item()),
                 "cos_step_last_masked": float(cos_last),
-                "cos_step_mean_masked": float(((cos_sim * mask).sum() / mask_sum).item()),
+                "cos_step_mean_masked": float((cos_masked.sum() / mask_sum).item()),
                 "valid_steps": float(mask_sum.item()),
                 "valid_steps_per_sample": float(sample_valid_counts.float().mean().item()),
             }

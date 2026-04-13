@@ -133,6 +133,89 @@ def collate_chains(batch: list[dict]) -> dict:
     }
 
 
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    idx = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * q))))
+    return float(vals[idx])
+
+
+def _mean(values: list[float]) -> float:
+    return float(sum(values) / max(len(values), 1))
+
+
+def summarize_chain_dataset(
+    samples: list[dict],
+    label: str,
+    max_chain_len: int,
+    max_chain_steps: int,
+    answer_repeat_pad: int,
+    context_bank_size: int,
+) -> dict[str, float]:
+    """Print cheap dataset diagnostics before spending GPU time."""
+    step_lens: list[float] = []
+    chain_lens: list[float] = []
+    ctx_lens: list[float] = []
+    q_norms: list[float] = []
+    a_norms: list[float] = []
+    step_norms: list[float] = []
+    answer_word_lens: list[float] = []
+    truncated = 0
+
+    for s in samples:
+        v_steps = s["v_steps"]
+        n_steps = int(v_steps.shape[0])
+        raw_chain_len = n_steps + 1 + max(0, int(answer_repeat_pad))
+        final_chain_len = min(raw_chain_len, int(max_chain_len))
+
+        step_lens.append(float(n_steps))
+        chain_lens.append(float(final_chain_len))
+        ctx_lens.append(float(min(1 + n_steps, max(1, int(context_bank_size)))))
+        q_norms.append(float(s["v_question"].norm().item()))
+        a_norms.append(float(s["v_answer"].norm().item()))
+        if n_steps > 0:
+            step_norms.append(float(v_steps.norm(dim=-1).mean().item()))
+        answer_text = s.get("answer")
+        if isinstance(answer_text, str):
+            answer_word_lens.append(float(len(answer_text.split())))
+        if raw_chain_len > max_chain_len:
+            truncated += 1
+
+    n = max(len(samples), 1)
+    coverage = sum(1 for x in chain_lens if x <= max_chain_steps) / n
+    stats = {
+        "n": float(len(samples)),
+        "steps_mean": _mean(step_lens),
+        "steps_p50": _percentile(step_lens, 0.50),
+        "steps_p95": _percentile(step_lens, 0.95),
+        "steps_max": max(step_lens) if step_lens else 0.0,
+        "chain_mean": _mean(chain_lens),
+        "chain_p50": _percentile(chain_lens, 0.50),
+        "chain_p95": _percentile(chain_lens, 0.95),
+        "chain_max": max(chain_lens) if chain_lens else 0.0,
+        "truncated_pct": 100.0 * truncated / n,
+        "answer_coverage_at_max_steps_pct": 100.0 * coverage,
+        "context_len_mean": _mean(ctx_lens),
+        "q_norm_mean": _mean(q_norms),
+        "a_norm_mean": _mean(a_norms),
+        "step_norm_mean": _mean(step_norms),
+        "answer_words_mean": _mean(answer_word_lens),
+        "answer_words_p95": _percentile(answer_word_lens, 0.95),
+    }
+    print(
+        f"  [{label}] chain_len mean/p50/p95/max="
+        f"{stats['chain_mean']:.1f}/{stats['chain_p50']:.0f}/{stats['chain_p95']:.0f}/{stats['chain_max']:.0f}; "
+        f"steps mean/p95={stats['steps_mean']:.1f}/{stats['steps_p95']:.0f}; "
+        f"truncated={stats['truncated_pct']:.1f}%; "
+        f"answer_coverage@max_steps={stats['answer_coverage_at_max_steps_pct']:.1f}%; "
+        f"answer_words mean/p95={stats['answer_words_mean']:.1f}/{stats['answer_words_p95']:.0f}; "
+        f"norm q/a/step={stats['q_norm_mean']:.4f}/{stats['a_norm_mean']:.4f}/{stats['step_norm_mean']:.4f}; "
+        f"context_len_mean={stats['context_len_mean']:.1f}"
+    )
+    return stats
+
+
 def get_chain_steps(epoch: int, cfg: dict) -> int:
     """Curriculum for chain horizon growth.
 
@@ -192,14 +275,19 @@ def _masked_step_losses(
     cosine_weight: float,
     mse_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    maskf = mask.to(dtype=pred.dtype)
+    pred = pred.float()
+    target = target.float()
+    mask_bool = mask.to(device=pred.device, dtype=torch.bool)
+    maskf = mask_bool.to(dtype=pred.dtype)
     mask_sum = maskf.sum().clamp(min=1.0)
 
-    cos_sim = F.cosine_similarity(pred, target, dim=-1)
-    cos_loss = ((1.0 - cos_sim) * maskf).sum() / mask_sum
+    cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+    cos_term = torch.where(mask_bool, 1.0 - cos_sim, torch.zeros_like(cos_sim))
+    cos_loss = cos_term.sum() / mask_sum
 
     mse_per = (pred - target).pow(2).sum(dim=-1)
-    mse_loss = (mse_per * maskf).sum() / mask_sum
+    mse_term = torch.where(mask_bool, mse_per, torch.zeros_like(mse_per))
+    mse_loss = mse_term.sum() / mask_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
     return loss, {
@@ -215,6 +303,11 @@ def _gather_last_valid(x: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tenso
     return x[torch.arange(x.shape[0], device=x.device), idx]
 
 
+def _safe_normalize(v: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    v_float = v.float()
+    return v_float / v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
+
+
 def _inbatch_contrastive_loss(
     pred_final: torch.Tensor,
     tgt_final: torch.Tensor,
@@ -227,8 +320,8 @@ def _inbatch_contrastive_loss(
         return zero, one
 
     temp = max(float(temperature), 1e-4)
-    p = F.normalize(pred_final, dim=-1)
-    t = F.normalize(tgt_final, dim=-1)
+    p = _safe_normalize(pred_final.float(), dim=-1)
+    t = _safe_normalize(tgt_final.float(), dim=-1)
 
     logits = (p @ t.t()) / temp
     labels = torch.arange(bsz, device=pred_final.device)
@@ -261,15 +354,17 @@ def _get_scheduled_sampling_prob(epoch: int, cfg: dict) -> float:
 def _get_oracle_prob(epoch: int, cfg: dict) -> float:
     """Compute oracle guidance probability for the current epoch.
 
-    Oracle guidance creates train/eval distribution mismatch: during training,
-    oracle-guided DAgger helps the model stay close to GT, but at eval the
-    oracle is absent (self.training=False). This causes val roll_cos_last to
-    DEGRADE even as train improves.
+    Oracle guidance is disabled by default because it creates a train/eval
+    distribution mismatch: during training it helps the model stay close to
+    GT, but at eval the oracle is absent (self.training=False). That makes
+    train rollouts look much better than real rollouts.
 
-    Fix: decay oracle_prob from 1.0 to oracle_prob_min over training,
-    forcing the model to learn robust generation without oracle dependency.
+    If explicitly re-enabled for an ablation, decay oracle_prob over training.
     """
-    oracle_max = float(cfg.get("oracle_prob_max", 1.0))
+    if not bool(cfg.get("enable_oracle_dagger", False)):
+        return 0.0
+
+    oracle_max = float(cfg.get("oracle_prob_max", 0.0))
     oracle_min = float(cfg.get("oracle_prob_min", 0.0))
     oracle_ramp = int(cfg.get("oracle_decay_epochs", 20))
     if oracle_ramp <= 0:
@@ -307,7 +402,7 @@ def compute_composite_objective(
     cfg: dict,
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
-    oracle_prob: float = 1.0,
+    oracle_prob: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute full autoregressive objective for one batch."""
     bsz, steps, d_model = chains.shape
@@ -318,6 +413,9 @@ def compute_composite_objective(
     lambda_ans = float(cfg.get("loss_lambda_answer", 1.0))
     lambda_roll = float(cfg.get("loss_lambda_roll", 1.0))
     lambda_rank = float(cfg.get("loss_lambda_rank", 0.1))
+    rank_enabled = lambda_rank > 0.0
+    oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
+    effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
 
     # Base cosine/MSE weights from model config.
     w_cos = float(model.cfg.loss_cosine_weight)
@@ -353,8 +451,11 @@ def compute_composite_objective(
     tgt_final = _gather_last_valid(chains, valid_lens)
     
     if has_answer.any():
-        ans_cos = (1.0 - F.cosine_similarity(tf_final[has_answer], tgt_final[has_answer], dim=-1)).mean()
-        ans_mse = (tf_final[has_answer] - tgt_final[has_answer]).pow(2).sum(dim=-1).mean()
+        tf_ans = tf_final[has_answer].float()
+        tgt_ans = tgt_final[has_answer].float()
+        ans_cos_sim = (_safe_normalize(tf_ans, dim=-1) * _safe_normalize(tgt_ans, dim=-1)).sum(dim=-1)
+        ans_cos = (1.0 - ans_cos_sim).mean()
+        ans_mse = (tf_ans - tgt_ans).pow(2).sum(dim=-1).mean()
         l_ans = w_cos * ans_cos + w_mse * ans_mse
     else:
         # System2: No sample reached the answer in this window.
@@ -373,35 +474,72 @@ def compute_composite_objective(
         repeat_cos_threshold=float(cfg.get("free_run_repeat_cos_threshold", 0.98)),
         repeat_ban_threshold=float(cfg.get("free_run_repeat_ban_threshold", 0.995)),
         repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 2)),
-        oracle_guide=chains,
-        oracle_max_retries=int(cfg.get("oracle_max_retries", 4)),
-        oracle_prob=oracle_prob,
+        oracle_guide=chains if oracle_enabled else None,
+        oracle_max_retries=int(cfg.get("oracle_max_retries", 0)) if oracle_enabled else 0,
+        oracle_prob=effective_oracle_prob,
         return_info=True,
     )
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
 
     # 4) In-batch contrastive ranking on final rollout answer.
     roll_final = _gather_last_valid(v_roll, valid_lens)
-    l_rank, rank_acc = _inbatch_contrastive_loss(
-        roll_final,
-        tgt_final,
-        temperature=float(cfg.get("contrastive_temperature", 0.07)),
-    )
+    if rank_enabled:
+        l_rank, rank_acc = _inbatch_contrastive_loss(
+            roll_final,
+            tgt_final,
+            temperature=float(cfg.get("contrastive_temperature", 0.07)),
+        )
+    else:
+        l_rank = chains.new_zeros(())
+        with torch.no_grad():
+            _, rank_acc = _inbatch_contrastive_loss(
+                roll_final.detach(),
+                tgt_final.detach(),
+                temperature=float(cfg.get("contrastive_temperature", 0.07)),
+            )
+            if not torch.isfinite(rank_acc):
+                rank_acc = chains.new_zeros(())
 
-    loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll + lambda_rank * l_rank
+    loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll
+    if rank_enabled:
+        loss = loss + lambda_rank * l_rank
 
     with torch.no_grad():
         # Use FULL mask (incl. answer) for reporting metrics.
-        tf_cos = F.cosine_similarity(v_tf, chains, dim=-1)
-        roll_cos = F.cosine_similarity(v_roll, chains, dim=-1)
+        tf_cos = (_safe_normalize(v_tf.float(), dim=-1) * _safe_normalize(chains.float(), dim=-1)).sum(dim=-1)
+        roll_cos = (_safe_normalize(v_roll.float(), dim=-1) * _safe_normalize(chains.float(), dim=-1)).sum(dim=-1)
+        tf_cos_masked = torch.where(chain_mask, tf_cos, torch.zeros_like(tf_cos))
+        roll_cos_masked = torch.where(chain_mask, roll_cos, torch.zeros_like(roll_cos))
+        tf_norm = v_tf.norm(dim=-1)
+        roll_norm = v_roll.norm(dim=-1)
+        tf_norm_masked = torch.where(chain_mask, tf_norm, torch.zeros_like(tf_norm))
+        roll_norm_masked = torch.where(chain_mask, roll_norm, torch.zeros_like(roll_norm))
         maskf = chain_mask.to(dtype=chains.dtype)
         valid = maskf.sum().clamp(min=1.0)
 
-        tf_cos_mean = ((tf_cos * maskf).sum() / valid).item()
-        roll_cos_mean = ((roll_cos * maskf).sum() / valid).item()
+        tf_cos_mean = (tf_cos_masked.sum() / valid).item()
+        roll_cos_mean = (roll_cos_masked.sum() / valid).item()
 
-        tf_cos_last = F.cosine_similarity(tf_final, tgt_final, dim=-1).mean().item()
-        roll_cos_last = F.cosine_similarity(roll_final, tgt_final, dim=-1).mean().item()
+        tf_cos_last = (
+            _safe_normalize(tf_final.float(), dim=-1)
+            * _safe_normalize(tgt_final.float(), dim=-1)
+        ).sum(dim=-1).mean().item()
+        roll_cos_last = (
+            _safe_normalize(roll_final.float(), dim=-1)
+            * _safe_normalize(tgt_final.float(), dim=-1)
+        ).sum(dim=-1).mean().item()
+        if has_answer.any():
+            roll_answer_cos = (
+                _safe_normalize(roll_final[has_answer].float(), dim=-1)
+                * _safe_normalize(tgt_final[has_answer].float(), dim=-1)
+            ).sum(dim=-1).mean().item()
+            tf_answer_cos = (
+                _safe_normalize(tf_final[has_answer].float(), dim=-1)
+                * _safe_normalize(tgt_final[has_answer].float(), dim=-1)
+            ).sum(dim=-1).mean().item()
+        else:
+            roll_answer_cos = 0.0
+            tf_answer_cos = 0.0
 
         # Fix #1: Per-step cosine diagnostics.
         tf_cos_first = float(tf_cos[:, 0].mean().item()) if steps >= 1 else 0.0
@@ -415,13 +553,15 @@ def compute_composite_objective(
             "loss_rank": float(l_rank.item()),
             "tf_cos_mean": float(tf_cos_mean),
             "tf_cos_last": float(tf_cos_last),
+            "tf_cos_answer": float(tf_answer_cos),
             "tf_cos_first": float(tf_cos_first),
             "roll_cos_mean": float(roll_cos_mean),
             "roll_cos_last": float(roll_cos_last),
+            "roll_cos_answer": float(roll_answer_cos),
             "roll_cos_first": float(roll_cos_first),
             "rank_acc": float(rank_acc.item()),
-            "pred_norm_mean_tf": float((v_tf.norm(dim=-1) * maskf).sum().item() / valid.item()),
-            "pred_norm_mean_roll": float((v_roll.norm(dim=-1) * maskf).sum().item() / valid.item()),
+            "pred_norm_mean_tf": float(tf_norm_masked.sum().item() / valid.item()),
+            "pred_norm_mean_roll": float(roll_norm_masked.sum().item() / valid.item()),
             "valid_tokens": float(valid.item()),
             "valid_tokens_per_sample": float(valid_lens.float().mean().item()),
             "lambda_step": lambda_step,
@@ -430,6 +570,9 @@ def compute_composite_objective(
             "lambda_rank": lambda_rank,
             "ss_prob": float(scheduled_sampling_prob),
             "free_run_noise_std": float(free_run_noise_std),
+            "oracle_enabled": 1.0 if oracle_enabled else 0.0,
+            "oracle_prob": float(effective_oracle_prob),
+            "answer_coverage": float(has_answer.float().mean().item()),
             "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
         }
 
@@ -454,7 +597,7 @@ def train_step(
     target_steps: int,
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
-    oracle_prob: float = 1.0,
+    oracle_prob: float = 0.0,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
@@ -486,6 +629,9 @@ def train_step(
     if not torch.isfinite(loss):
         optimizer.zero_grad(set_to_none=True)
         metrics["nan_skipped"] = 1.0
+        metrics["nan_loss_skipped"] = 1.0
+        metrics["nan_grad_skipped"] = 0.0
+        metrics["optimizer_stepped"] = 0.0
         metrics["target_steps"] = float(target_steps)
         metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
         return metrics
@@ -504,6 +650,9 @@ def train_step(
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
             metrics["nan_skipped"] = 1.0
+            metrics["nan_loss_skipped"] = 0.0
+            metrics["nan_grad_skipped"] = 1.0
+            metrics["optimizer_stepped"] = 0.0
             metrics["target_steps"] = float(target_steps)
             metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
             return metrics
@@ -512,6 +661,9 @@ def train_step(
     scaler.update()
 
     metrics["nan_skipped"] = 0.0
+    metrics["nan_loss_skipped"] = 0.0
+    metrics["nan_grad_skipped"] = 0.0
+    metrics["optimizer_stepped"] = 1.0
     metrics["target_steps"] = float(target_steps)
     metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
     return metrics
@@ -545,7 +697,7 @@ def eval_step(
             context_banks,
             context_mask,
             cfg,
-            free_run_noise_std=float(cfg.get("free_run_noise_std", 0.0)),
+            free_run_noise_std=float(cfg.get("eval_free_run_noise_std", 0.0)),
         )
 
     return {
@@ -556,11 +708,14 @@ def eval_step(
         "val_loss_rank": metrics["loss_rank"],
         "val_tf_cos": metrics["tf_cos_mean"],
         "val_tf_cos_last": metrics["tf_cos_last"],
+        "val_tf_cos_answer": metrics["tf_cos_answer"],
         "val_roll_cos": metrics["roll_cos_mean"],
         "val_roll_cos_last": metrics["roll_cos_last"],
+        "val_roll_cos_answer": metrics["roll_cos_answer"],
         "val_rank_acc": metrics["rank_acc"],
         "val_norm_tf": metrics["pred_norm_mean_tf"],
         "val_norm_roll": metrics["pred_norm_mean_roll"],
+        "val_answer_coverage": metrics["answer_coverage"],
     }
 
 
@@ -628,6 +783,23 @@ def main() -> None:
 
     print(f"Data: train={len(train_ds)}, val={len(val_ds)}, "
           f"context_bank_size={context_bank_size}, answer_repeat_pad={answer_repeat_pad}")
+    print("Dataset diagnostics:")
+    summarize_chain_dataset(
+        data["train"],
+        "train",
+        max_chain_len=gen_cfg.max_chain_len,
+        max_chain_steps=max_chain_steps,
+        answer_repeat_pad=answer_repeat_pad,
+        context_bank_size=context_bank_size,
+    )
+    summarize_chain_dataset(
+        data["val"],
+        "val",
+        max_chain_len=gen_cfg.max_chain_len,
+        max_chain_steps=max_chain_steps,
+        answer_repeat_pad=answer_repeat_pad,
+        context_bank_size=context_bank_size,
+    )
 
     batch_size = int(train_cfg.get("batch_size", 16))
     num_workers = int(data_cfg.get("num_workers", 4))
@@ -694,7 +866,8 @@ def main() -> None:
 
     tracker = MetricTracker()
     
-    # Initialize SADT (Step-wise Adaptive DAgger-Throttling) state
+    # Initialize SADT (Step-wise Adaptive Dynamic Throttling) state.
+    # It changes LR only; oracle/DAger is disabled by default and not tied to SADT.
     sadt_tf_ema = None
     sadt_roll_ema = None
     sadt_events = {"throttle": 0, "turbo": 0}
@@ -715,6 +888,11 @@ def main() -> None:
     print(
         f"  scheduled_sampling: max={train_cfg.get('scheduled_sampling_max', 0.5)}, "
         f"ramp_epochs={train_cfg.get('scheduled_sampling_ramp_epochs', 10)}"
+    )
+    print(
+        f"  oracle_dagger: enabled={bool(train_cfg.get('enable_oracle_dagger', False))}, "
+        f"max_retries={train_cfg.get('oracle_max_retries', 0)}, "
+        f"prob_max={train_cfg.get('oracle_prob_max', 0.0)}"
     )
     print("=" * 70)
 
@@ -761,7 +939,8 @@ def main() -> None:
                 free_run_noise_std=noise_std,
                 oracle_prob=oracle_prob,
             )
-            scheduler.step()
+            if metrics.get("optimizer_stepped", 0.0) > 0.0:
+                scheduler.step()
             tracker.update(metrics)
 
             if metrics.get("nan_skipped", 0.0) > 0:
@@ -822,7 +1001,9 @@ def main() -> None:
                     f"rank={avg.get('loss_rank', 0.0):.4f} "
                     f"tf_cos={avg.get('tf_cos_mean', 0.0):.4f} "
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
+                    f"roll_ans={avg.get('roll_cos_answer', 0.0):.4f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
+                    f"ans_cov={avg.get('answer_coverage', 0.0):.2f} "
                     f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
                     f"lr={lr_now:.2e}{sadt_info}{nan_info}"
                 )
@@ -856,7 +1037,9 @@ def main() -> None:
             f"tf_cos={val.get('val_tf_cos', 0.0):.4f} "
             f"roll_cos={val.get('val_roll_cos', 0.0):.4f} "
             f"roll_cos_last={val.get('val_roll_cos_last', 0.0):.4f} "
+            f"roll_ans={val.get('val_roll_cos_answer', 0.0):.4f} "
             f"rank_acc={val.get('val_rank_acc', 0.0):.3f} "
+            f"ans_cov={val.get('val_answer_coverage', 0.0):.2f} "
             f"norm_roll={val.get('val_norm_roll', 0.0):.4f} "
             f"({epoch_time:.1f}s)"
         )
