@@ -1,5 +1,46 @@
 # Lessons
 
+## 2026-04-14 - ChainGenerator NaN collapse (E3→E4): NaN×0 trap recurrence, Min-SNR x₀/ε swap, defense-in-depth
+
+### Pattern
+Training log `Arch 14_01_26 full training log.txt` showed healthy convergence through E3 (val_roll_cos_last=0.7554), then a single NaN in `loss_df` at the end of E3, complete loss collapse from E4 (grad_norm=0.0000 for 20 consecutive epochs), plus a secondary `ans_coverage→0` collapse at System1→System2 transition (E10+). Early-stopped at E24 vs planned E50.
+
+### Root Causes
+1. **NaN × 0 = NaN recurrence in `_masked_weighted_step_losses`**. The lessons entry from the original NaN bug (L57 pattern) says "masked losses must use `torch.where(mask, term, 0)`, never multiplication by mask". When the positionally-weighted variant was added for Diffusion Forcing, it reintroduced the exact same bug: `cos_loss = ((1 - cos) * weights * mask).sum() / denom`. Any single token with NaN in `cos_sim`/`mse_per` (e.g. `target=0` row) poisoned the entire batch loss and every downstream gradient.
+2. **Min-SNR x₀/ε formulas were swapped** in `_diffusion_forcing_weights`. Correct derivations:
+   - x₀-prediction: `w = clipped` (NOT `clipped/snr` — that double-counts the 1/SNR already in the loss)
+   - ε-prediction: `w = clipped/snr`
+   - v-prediction: `w = clipped/(snr+1)`
+   Code had x₀ and ε inverted. Latent because v-prediction is the default, but a footgun for anyone switching.
+3. **`_safe_normalize` divergence**: train-side helper used unguarded `v/v.norm().clamp(1e-6)` without first scrubbing inf/NaN. A single inf-slot propagated through every downstream normalization.
+4. **No nan_to_num at forward-pass boundaries** (`v_tf`, `v_roll`, `model_out`, `target`, `weights`). Bfloat16 + high-SNR regime at `t≈0` occasionally produced inf SNR and NaN model outputs that were not caught until they had already been masked-multiplied into the loss.
+5. **DF lambda=0.5 applied from step 0** against an un-warmed backbone, combined with `df_noise_level_min=0` allowing trivially-clean samples where SNR→∞.
+6. **System1 phase too short**: with `system1_epochs=10`, the model did not see enough single-step coverage before the much harder System2 phase, and positional weights amplified the answer-slot loss past the backbone's ability to keep up, collapsing `ans_coverage` to zero.
+
+### Fixes (applied in this session)
+- **Defense-in-depth `nan_to_num` scrub** at every boundary: `_safe_normalize` input, `cos_sim`, `mse_per`, `weights`, `v_tf`, `v_roll`, `model_out`, `target`, SNR clamp `max=1e4`.
+- **`_masked_weighted_step_losses` rewritten** to use `torch.where(mask_bool, term, zeros)` for both cosine and MSE terms — no more `* mask` multiplication on potentially-NaN tensors.
+- **Min-SNR x₀/ε formulas corrected** in `_diffusion_forcing_weights` per derivation above; `pt="v"` branch unchanged.
+- **DF lambda warm-up ramp**: added `df_warmup_epochs=3` config + training-loop logic that scales `loss_lambda_diffusion` from `0 → base` over the first N epochs. Base lowered from `0.5 → 0.25`.
+- **`df_noise_level_min: 0 → 2`** — skip the near-clean regime where SNR is numerically unstable and the objective is trivial.
+- **`system1_epochs: 10 → 15`** — longer single-step phase so the backbone stabilizes before the System1→System2 transition.
+- **Rolling `ans_coverage` warning** log: prints an explicit `[WARN]` when `val_answer_coverage` rolling-mean over last N epochs drops below threshold — early signal of the collapse pattern.
+- **`df_lam` added to per-step training log** so the warm-up is visible in logs.
+
+### Rules (carry forward)
+1. **NaN × 0 = NaN is recurrent**. Every time a new masked/weighted loss is added, grep for `* mask` / `* weights` patterns and force them through `torch.where`. Add this to the PR checklist.
+2. **Min-SNR-γ cheat sheet** (for the ChainGenerator DF loss formulation):
+   - x₀ → `w = clip(snr, γ)`
+   - ε  → `w = clip(snr, γ) / snr`
+   - v  → `w = clip(snr, γ) / (snr + 1)`
+   Do NOT memorise from papers written against a different parameterisation; re-derive against OUR loss every time.
+3. **Always `nan_to_num` at forward-pass boundaries** when training in bfloat16 with a diffusion objective. SNR blow-ups at `t≈0` are a known failure mode; the cost of defensive sanitization is < 0.1% of step time.
+4. **Never jam two new regimes at once**. Launching `System1→System2` AND full-strength DF loss simultaneously at E10 caused a double-shock. Use warm-up ramps for any auxiliary loss that can reach >10% of the primary loss magnitude.
+5. **Log whatever you will want to investigate**. `df_lam`, `ans_coverage`, and grad_norm must all be in per-step logs; otherwise the post-mortem needs guesses instead of evidence.
+6. **`safe_normalize` is a public API** — both the model and the training script must use the SAME implementation. Duplicate helpers drift; consolidate.
+
+---
+
 ## 2026-04-13 - Diffusion Forcing audit: Min-SNR weight formula inversion and grad_norm logging gap
 
 ### Pattern

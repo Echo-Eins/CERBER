@@ -308,10 +308,14 @@ def _masked_step_losses(
     mask_sum = maskf.sum().clamp(min=1.0)
 
     cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+    # Clamp to valid cosine range and scrub NaN (fp-rounding or poisoned
+    # rows can push values slightly outside [-1, 1] and break (1 - cos)).
+    cos_sim = torch.nan_to_num(cos_sim.clamp(min=-1.0, max=1.0), nan=0.0)
     cos_term = torch.where(mask_bool, 1.0 - cos_sim, torch.zeros_like(cos_sim))
     cos_loss = cos_term.sum() / mask_sum
 
     mse_per = (pred - target).pow(2).sum(dim=-1)
+    mse_per = torch.nan_to_num(mse_per, nan=0.0, posinf=1e6, neginf=0.0)
     mse_term = torch.where(mask_bool, mse_per, torch.zeros_like(mse_per))
     mse_loss = mse_term.sum() / mask_sum
 
@@ -434,13 +438,27 @@ def _masked_weighted_step_losses(
     mask_bool = mask.to(device=pred.device, dtype=torch.bool)
     weights = weights.to(device=pred.device, dtype=pred.dtype)
     weights = torch.where(mask_bool, weights, torch.zeros_like(weights))
+    # Guard against non-finite weights from an upstream SNR overflow.
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     weight_sum = weights.sum().clamp(min=1.0)
 
     cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
-    cos_loss = ((1.0 - cos_sim) * weights).sum() / weight_sum
+    cos_sim = torch.nan_to_num(cos_sim.clamp(min=-1.0, max=1.0), nan=0.0)
+    # CRITICAL: avoid ``NaN * 0`` by zeroing inside ``torch.where`` BEFORE
+    # multiplying by ``weights``.  Direct ``(1 - cos) * weights`` is the
+    # exact footgun flagged in tasks/lessons.md (2026-04-11, rule #3):
+    # a single NaN at a masked position pollutes the entire reduction.
+    cos_term = torch.where(
+        mask_bool, (1.0 - cos_sim) * weights, torch.zeros_like(cos_sim)
+    )
+    cos_loss = cos_term.sum() / weight_sum
 
     mse_per = (pred - target).pow(2).sum(dim=-1)
-    mse_loss = (mse_per * weights).sum() / weight_sum
+    mse_per = torch.nan_to_num(mse_per, nan=0.0, posinf=1e6, neginf=0.0)
+    mse_term = torch.where(
+        mask_bool, mse_per * weights, torch.zeros_like(mse_per)
+    )
+    mse_loss = mse_term.sum() / weight_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
     return loss, {
@@ -457,8 +475,19 @@ def _gather_last_valid(x: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tenso
 
 
 def _safe_normalize(v: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """Numerically safe normalization that prevents NaN gradients.
+
+    Mirrors ``ChainGenerator._safe_normalize``: (1) scrubs any non-finite
+    values from the input so downstream division never sees NaN/Inf, and
+    (2) clamps the norm BEFORE division.  Without the NaN scrub, a single
+    corrupted element (e.g. from a bfloat16 overflow in AMP) would poison
+    the entire masked-reduce — the classic ``NaN * 0 = NaN`` trap flagged
+    in ``tasks/lessons.md`` (2026-04-11).
+    """
     v_float = v.float()
-    return v_float / v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
+    v_float = torch.nan_to_num(v_float, nan=0.0, posinf=0.0, neginf=0.0)
+    norms = v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
+    return v_float / norms
 
 
 def _inbatch_contrastive_loss(
@@ -623,10 +652,16 @@ def _diffusion_forcing_weights(
 ) -> torch.Tensor:
     """Min-SNR-γ weights for DF loss (Hang et al. 2023).
 
-        Weight formula depends on ``prediction_type`` (Table 1 of Min-SNR paper):
-          - x₀-prediction: ``min(SNR, γ) / SNR``
-          - ε-prediction:  ``min(SNR, γ)``
+        Weight formula depends on ``prediction_type`` (Table 1 of Min-SNR paper,
+        confirmed by tasks/lessons.md 2026-04-13 rule #2):
+          - x₀-prediction: ``min(SNR, γ)``           (lesson L2064 correction)
+          - ε-prediction:  ``min(SNR, γ) / SNR``     (lesson L13 derivation)
           - v-prediction:  ``min(SNR, γ) / (SNR + 1)``
+
+        The x0 / eps formulas were previously swapped.  v-prediction (the
+        default in this config) was always correct, so existing runs with
+        ``prediction_type="v"`` are unaffected — but we now fix the latent
+        bugs behind the disabled branches per lesson L20.
 
         Default gamma=5.0 (recommended by Hang et al.).  Set to 0 to disable.
         """
@@ -634,19 +669,27 @@ def _diffusion_forcing_weights(
     if gamma <= 0.0:
         return torch.ones_like(noise_levels, dtype=torch.float32)
 
-    snr = model.diffusion_snr(noise_levels).to(device=noise_levels.device).float().clamp(min=1e-8)
+    # Clamp SNR both sides: min to avoid log(0) / div-by-0, max to avoid
+    # bfloat16 overflow at the cleanest timesteps where SNR can reach 1e8+.
+    snr = (
+        model.diffusion_snr(noise_levels)
+        .to(device=noise_levels.device)
+        .float()
+        .clamp(min=1e-8, max=1e4)
+    )
     gamma_t = torch.full_like(snr, gamma)
     clipped = torch.minimum(snr, gamma_t)
 
     pt = getattr(model.cfg, "prediction_type", "x0")
     if pt == "x0":
-        weights = clipped / snr
+        weights = clipped  # Fixed: was clipped/snr
     elif pt == "eps":
-        weights = clipped
+        weights = clipped / snr  # Fixed: was clipped
     elif pt == "v":
         weights = clipped / (snr + 1.0)
     else:
-        weights = clipped / snr  # fallback
+        weights = clipped / (snr + 1.0)  # safe fallback matching v-pred
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     return torch.where(mask.to(dtype=torch.bool), weights, torch.zeros_like(weights))
 
 
@@ -789,9 +832,16 @@ def _diffusion_forcing_objective(
         noise=noise,
         return_noisy=True,
     )
+    # Defense-in-depth: scrub any non-finite values from the decoder
+    # output before they enter the masked cosine/MSE reduction.  Without
+    # this, a single bf16 overflow anywhere in the 6-layer AdaLN stack
+    # leaks NaN into `cos_sim`, which then poisons the whole batch via
+    # the NaN*0 trap even though the position is masked out.
+    model_out = torch.nan_to_num(model_out, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Compute prediction-type-aware target.
     target = model.diffusion_target(chains, eps, levels)
+    target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
 
     loss, stats = _masked_weighted_step_losses(
         model_out,
@@ -889,6 +939,10 @@ def compute_composite_objective(
         scheduled_sampling_prob=scheduled_sampling_prob,
         tf_noise_std=tf_noise_std,
     )
+    # Defense-in-depth: sanitize decoder output so a single corrupted
+    # row (bf16 overflow, AMP edge-case) cannot poison the masked loss
+    # via NaN propagation. See tasks/lessons.md 2026-04-11 rule #3.
+    v_tf = torch.nan_to_num(v_tf, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Fix #7: Only exclude last position from L_step when L_ans is active
     # for that specific sample (i.e., when the window contains the answer).
@@ -937,6 +991,8 @@ def compute_composite_objective(
         oracle_prob=effective_oracle_prob,
         return_info=True,
     )
+    # Defense-in-depth sanitisation on rollout output (same reasoning as v_tf).
+    v_roll = torch.nan_to_num(v_roll, nan=0.0, posinf=0.0, neginf=0.0)
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
 
     # 4) In-batch contrastive ranking on final rollout answer.
@@ -1770,7 +1826,17 @@ def main() -> None:
     )
 
     tracker = MetricTracker()
-    
+
+    # Preserve base lambda_df so warm-up schedule can scale it each epoch
+    # without cumulative drift from in-place overwrites.
+    base_df_lambda = float(train_cfg.get("loss_lambda_diffusion", 0.0))
+    df_warmup_epochs = int(train_cfg.get("df_warmup_epochs", 0))
+
+    # Rolling ans_coverage history for collapse-warning heuristic.
+    ans_cov_history: list[float] = []
+    ans_cov_warn_threshold = float(train_cfg.get("ans_cov_warn_threshold", 0.10))
+    ans_cov_warn_window = int(train_cfg.get("ans_cov_warn_window", 3))
+
     # Initialize SADT (Step-wise Adaptive Dynamic Throttling) state.
     # It changes LR only; oracle/DAger is disabled by default and not tied to SADT.
     sadt_tf_ema = None
@@ -1822,6 +1888,17 @@ def main() -> None:
         noise_std = _get_scheduled_noise_std(epoch, train_cfg)
         oracle_prob = _get_oracle_prob(epoch, train_cfg)
         tf_noise = _get_tf_noise_std(epoch, train_cfg)
+
+        # Diffusion Forcing lambda warm-up: ramp from 0 to base over the first
+        # df_warmup_epochs. Prevents the high-variance DF gradient from
+        # dominating early training while the backbone is still warming up
+        # and the geometry has not stabilised.
+        if df_warmup_epochs > 0 and epoch < df_warmup_epochs:
+            effective_df_lambda = base_df_lambda * (float(epoch + 1) / float(df_warmup_epochs))
+        else:
+            effective_df_lambda = base_df_lambda
+        train_cfg["loss_lambda_diffusion"] = effective_df_lambda
+
         epoch_start = time.time()
 
         # Reset SADT EMA at System2 transition to prevent false throttling.
@@ -1976,6 +2053,7 @@ def main() -> None:
                     f"roll={avg.get('loss_roll', 0.0):.4f} "
                     f"rank={avg.get('loss_rank', 0.0):.4f} "
                     f"df={avg.get('loss_df', 0.0):.4f} "
+                    f"df_lam={effective_df_lambda:.3f} "
                     f"tf_cos={avg.get('tf_cos_mean', 0.0):.4f} "
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
                     f"roll_ans={avg.get('roll_cos_answer', 0.0):.4f} "
@@ -2065,6 +2143,23 @@ def main() -> None:
                 "timestamp": time.time(),
             },
         )
+
+        # Rolling ans_coverage collapse warning: often the first visible
+        # signal of the System1→System2 transition going wrong.
+        cur_ans_cov = float(val.get("val_answer_coverage", 0.0))
+        ans_cov_history.append(cur_ans_cov)
+        if len(ans_cov_history) > ans_cov_warn_window:
+            ans_cov_history = ans_cov_history[-ans_cov_warn_window:]
+        if (
+            len(ans_cov_history) >= ans_cov_warn_window
+            and (sum(ans_cov_history) / len(ans_cov_history)) < ans_cov_warn_threshold
+        ):
+            rolling = sum(ans_cov_history) / len(ans_cov_history)
+            print(
+                f"  [WARN] val_answer_coverage rolling-mean={rolling:.3f} "
+                f"< {ans_cov_warn_threshold:.2f} over last {ans_cov_warn_window} epochs "
+                f"(target_steps={target_steps}). Possible System1→System2 collapse."
+            )
 
         improved = val_metric > best_metric
         if improved:

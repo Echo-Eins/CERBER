@@ -579,9 +579,13 @@ class ChainGenerator(nn.Module):
 
         F.normalize with default eps=1e-12 can produce exploding gradients
         when input norm approaches zero (especially in bfloat16). We use a
-        larger eps and clamp the norm to prevent this.
+        larger eps and clamp the norm to prevent this.  We also scrub any
+        non-finite values from the input so a poisoned row cannot leak NaN
+        through the downstream division (see tasks/lessons.md 2026-04-11
+        rule #3 for the NaN*0 propagation trap).
         """
         v_float = v.float()
+        v_float = torch.nan_to_num(v_float, nan=0.0, posinf=0.0, neginf=0.0)
         norms = v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
         return (v_float / norms).to(dtype=v.dtype)
 

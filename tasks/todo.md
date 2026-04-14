@@ -2357,3 +2357,40 @@ Add a mathematically honest and visually useful Web GUI diagnostics path for ste
 - Manual math review fixed PCA explained variance normalization: numerator and denominator now use the same variance units instead of mixing variance with total sum-of-squares.
 - Verification passed: `uv run python -m py_compile experiments/13_chain_generator/train_chain_generator.py cerber_gui/app.py cerber_gui/training_geometry.py`, `uv run python -m json.tool configs/chain_generator_config.json`, `git diff --check`, and manual trailing-whitespace check for the new GUI module.
 - Runtime import smoke is blocked in this Windows `uv` environment because `torch` is not installed and `cerber_gui.__init__` imports torch-dependent modules. Use the project `.venv` training environment for live GUI smoke.
+
+## 2026-04-14 - ChainGenerator NaN collapse fix (`Arch 14_01_26` run post-mortem)
+
+### Context
+Run `Arch 14_01_26 full training log.txt` converged to `val_roll_cos_last=0.7554` at E3, then NaN in `loss_df` at end of E3, grad_norm collapsed to 0.0000 from E4 onward and never recovered. Secondary symptom: `val_answer_coverage→0.00` at System1→System2 transition (E10). Early-stopped at E24 instead of E50. Root-cause analysis in `tasks/lessons.md` entry dated 2026-04-14.
+
+### Tasks
+- [x] Locate the reintroduced `NaN × 0` trap.
+- [x] Harden `_masked_weighted_step_losses` with `torch.where` + `nan_to_num`.
+- [x] Audit and fix Min-SNR-γ x₀/ε formula swap in `_diffusion_forcing_weights`.
+- [x] Reconcile `_safe_normalize` between model and training script; add inf/NaN scrub.
+- [x] Add `nan_to_num` defense-in-depth on `v_tf`, `v_roll`, `model_out`, `target`, `weights`.
+- [x] Clamp SNR with `max=1e4` to stop bfloat16 overflow at `t≈0`.
+- [x] Add DF lambda warm-up ramp (`df_warmup_epochs=3`) and lower base lambda `0.5 → 0.25`.
+- [x] Raise `df_noise_level_min: 0 → 2` to skip unstable near-clean regime.
+- [x] Extend `system1_epochs: 10 → 15`.
+- [x] Add `df_lam` to per-step training log.
+- [x] Add rolling `val_answer_coverage` `[WARN]` log when below threshold.
+- [x] Static verification: `py_compile` on `train_chain_generator.py` + `chain_generator.py`, `json.load` on `chain_generator_config.json`.
+- [x] Update `tasks/lessons.md` with full post-mortem + carry-forward rules.
+
+### Files Touched
+- `experiments/13_chain_generator/train_chain_generator.py` — `_safe_normalize`, `_masked_step_losses`, `_masked_weighted_step_losses`, `_diffusion_forcing_weights`, `_diffusion_forcing_objective`, `compute_composite_objective`, epoch loop (DF warm-up + ans_cov rolling warning + `df_lam` log).
+- `cebcm/models/chain_generator.py` — `_safe_normalize` input sanitization.
+- `configs/chain_generator_config.json` — `system1_epochs 15`, `loss_lambda_diffusion 0.25`, `df_warmup_epochs 3`, `df_noise_level_min 2`.
+- `tasks/lessons.md` — 2026-04-14 entry with NaN×0 trap recurrence, Min-SNR swap, defense-in-depth pattern.
+
+### Review
+- **NaN×0 trap was reintroduced** exactly where the lessons file warns against it — in a new positionally-weighted loss variant added for Diffusion Forcing. Fix: `torch.where(mask_bool, term, zeros_like)` for both cosine and MSE branches, plus explicit `nan_to_num` on `cos_sim`, `mse_per`, `weights` before multiplication.
+- **Min-SNR-γ x₀ and ε were swapped** in `_diffusion_forcing_weights`. Corrected against derivation — kept v-prediction (the active `prediction_type`) unchanged but fixed the latent footgun for the other two.
+- **`_safe_normalize` divergence** between `cebcm/models/chain_generator.py` and `experiments/13_chain_generator/train_chain_generator.py` was resolved by adding `nan_to_num` scrub to both; they now behave identically.
+- **Defense-in-depth `nan_to_num`** on all forward-pass tensor boundaries is the cheapest insurance against bfloat16 + diffusion + high-dim SONAR geometry edge cases. ~zero runtime cost.
+- **DF lambda warm-up** (`df_warmup_epochs=3`) prevents the high-variance diffusion gradient from dominating before the backbone has stabilised; base lambda also lowered `0.5 → 0.25`.
+- **`system1_epochs 10→15`** plus `df_noise_level_min 0→2` removes two compounding sources of instability at the System1→System2 transition where `ans_coverage` collapsed.
+- **Observability improvements**: `df_lam` is now in per-step training logs; `val_answer_coverage` gets a rolling `[WARN]` below `0.10` so the collapse pattern is caught early instead of at early-stop.
+- **Static verification passed**: `python -m py_compile experiments/13_chain_generator/train_chain_generator.py cebcm/models/chain_generator.py` and `json.load` on `configs/chain_generator_config.json` both clean.
+- **Not verified**: live training run with a few epochs on real data. This is a code-level fix; empirical validation requires GPU time and is the next action for the training engineer.
