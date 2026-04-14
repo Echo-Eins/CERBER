@@ -1098,6 +1098,90 @@ def _masked_probe_points(*vectors: torch.Tensor, mask: torch.Tensor) -> torch.Te
 
 
 @torch.no_grad()
+def _extract_probe_attention(
+    model: ChainGenerator,
+    x_input: torch.Tensor,
+    context: torch.Tensor,
+    context_mask: torch.Tensor | None,
+) -> list[dict[str, torch.Tensor]]:
+    """Extract self- and cross-attention maps from all decoder layers.
+
+    Uses forward hooks on q/k projections to reconstruct attention scores
+    without modifying the model's forward pass or using the slower
+    non-fused attention path.  Returns one dict per layer with keys
+    ``self_attn`` [H, L, L] and ``cross_attn`` [H, L, K].
+    """
+    from cebcm.models.chain_head import _apply_rope
+
+    hooks: list[torch.utils.hooks.RemovableHook] = []
+    captured: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
+
+    for layer_idx, layer in enumerate(model.layers):
+        sa = layer.self_attn
+        ca = layer.cross_attn
+        self_cap: dict[str, torch.Tensor] = {}
+        cross_cap: dict[str, torch.Tensor] = {}
+
+        def _make_hook(storage: dict[str, torch.Tensor], key: str):
+            def _hook(_mod, _inp, out):
+                storage[key] = out.detach()
+            return _hook
+
+        hooks.append(sa.q_proj.register_forward_hook(_make_hook(self_cap, "q")))
+        hooks.append(sa.k_proj.register_forward_hook(_make_hook(self_cap, "k")))
+        hooks.append(ca.q_proj.register_forward_hook(_make_hook(cross_cap, "q")))
+        hooks.append(ca.k_proj.register_forward_hook(_make_hook(cross_cap, "k")))
+        captured[layer_idx] = {"self": self_cap, "cross": cross_cap}
+
+    # Run the actual forward — hooks capture projections.
+    x = x_input
+    for layer in model.layers:
+        x = layer(x, context, context_mask=context_mask)
+
+    # Remove hooks immediately.
+    for h in hooks:
+        h.remove()
+
+    attention_maps: list[dict[str, torch.Tensor]] = []
+    for layer_idx in range(len(model.layers)):
+        sa = model.layers[layer_idx].self_attn
+        ca = model.layers[layer_idx].cross_attn
+        sc = captured[layer_idx]["self"]
+        cc = captured[layer_idx]["cross"]
+        layer_map: dict[str, torch.Tensor] = {}
+
+        if "q" in sc and "k" in sc:
+            n_h, h_d = sa.n_heads, sa.head_dim
+            q = sc["q"].view(-1, sc["q"].shape[1], n_h, h_d).transpose(1, 2)
+            k = sc["k"].view(-1, sc["k"].shape[1], n_h, h_d).transpose(1, 2)
+            rope = sa._get_rope(q.shape[2], q.device)
+            q = _apply_rope(q, rope)
+            k = _apply_rope(k, rope)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (h_d ** -0.5)
+            seq_len = scores.shape[-1]
+            causal = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            )
+            scores = scores + causal
+            layer_map["self_attn"] = F.softmax(scores, dim=-1).cpu()  # [B, H, L, L]
+
+        if "q" in cc and "k" in cc:
+            n_h, h_d = ca.n_heads, ca.head_dim
+            q = cc["q"].view(-1, cc["q"].shape[1], n_h, h_d).transpose(1, 2)
+            k = cc["k"].view(-1, cc["k"].shape[1], n_h, h_d).transpose(1, 2)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (h_d ** -0.5)
+            if context_mask is not None:
+                invalid = ~context_mask.to(dtype=torch.bool, device=scores.device)
+                scores = scores.masked_fill(invalid[:, None, None, :], float("-inf"))
+            layer_map["cross_attn"] = F.softmax(scores, dim=-1).cpu()  # [B, H, L, K]
+
+        attention_maps.append(layer_map)
+
+    return attention_maps
+
+
+@torch.no_grad()
 def write_training_probe_snapshot(
     *,
     model: ChainGenerator,
@@ -1171,6 +1255,15 @@ def write_training_probe_snapshot(
             return_info=True,
         )
 
+        # Extract attention maps on the DF (noised) input for overlay visualization.
+        df_context, df_ctx_mask = model._prepare_context(v_q, context_banks, context_mask)
+        df_input = model._to_residual_space(v_noisy)
+        t_emb = model._diffusion_timestep_embedding(levels).to(device=df_input.device, dtype=df_input.dtype)
+        df_input_conditioned = df_input + t_emb
+        attention_maps = _extract_probe_attention(
+            model, df_input_conditioned, df_context, df_ctx_mask,
+        )
+
         if projection_state is None:
             points = _masked_probe_points(chains_trunc, v_noisy, v_df, v_roll, v_tf, mask=chain_mask)
             mean, basis, explained = _fit_probe_projection_basis(points)
@@ -1238,6 +1331,24 @@ def write_training_probe_snapshot(
                 "noise_level_max": float(levels[mask].float().max().item()) if mask.any() else 0.0,
                 "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
             },
+        }
+
+        # Save attention maps: compact representation per layer.
+        # Each layer has self_attn [B, H, L, L] and cross_attn [B, H, L, K].
+        # We save only the first probe sample to limit file size.
+        attn_data: list[dict[str, torch.Tensor]] = []
+        for lm in attention_maps:
+            layer_out: dict[str, torch.Tensor] = {}
+            if "self_attn" in lm and lm["self_attn"].shape[0] > 0:
+                layer_out["self_attn"] = lm["self_attn"][0].cpu()    # [H, L, L]
+            if "cross_attn" in lm and lm["cross_attn"].shape[0] > 0:
+                layer_out["cross_attn"] = lm["cross_attn"][0].cpu()  # [H, L, K]
+            attn_data.append(layer_out)
+        snapshot["attention"] = attn_data
+        snapshot["attention_meta"] = {
+            "n_layers": len(attn_data),
+            "n_heads": int(model.cfg.n_heads),
+            "context_len": int(context_mask.shape[1]) if context_mask is not None else 1,
         }
 
         if bool(cfg.get("probe_save_raw_vectors", False)):

@@ -60,6 +60,9 @@ from cerber_gui.training_geometry import (
     create_rollout_geometry_3d,
     create_noise_heatmap,
     create_token_metrics_figure,
+    create_attention_noise_3d,
+    create_attention_heads_heatmap,
+    create_noise_denoising_3d,
 )
 from cerber_gui.sota_eval import (
     SOTAEvalConfig,
@@ -3011,6 +3014,16 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                     tg_noise_heatmap = gr.Plot(label="Noise / Cosine / L2 by Position")
                 with gr.TabItem("Token Metrics"):
                     tg_token_metrics = gr.Plot(label="Per-Token Probe Metrics")
+                with gr.TabItem("Attention + Noise 3D"):
+                    with gr.Row():
+                        tg_attn_layer = gr.Slider(
+                            minimum=0, maximum=5, value=0, step=1,
+                            label="Decoder Layer", scale=1,
+                        )
+                    tg_attn_3d = gr.Plot(label="Self-Attention + Noise 3D Surface")
+                    tg_attn_heads = gr.Plot(label="All Heads + Noise Overlay")
+                with gr.TabItem("Noise Field 3D"):
+                    tg_noise_3d = gr.Plot(label="Noise / Denoising Multi-Ribbon 3D")
 
         # === Tab 4: Live Monitor ===
         with gr.TabItem("Live Monitor"):
@@ -3572,12 +3585,12 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
     # Live ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¼ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¾ÃƒÆ’Ã¢â‚¬ËœÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â¸ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â½ÃƒÆ’Ã‚ÂÃƒâ€šÃ‚Â³
     # === ChainGenerator Training Geometry Handlers ===
 
-    def _tg_empty_plots(title: str = "No training geometry loaded"):
+    def _tg_empty_fig(title: str = "No training geometry loaded"):
         fig = go.Figure()
         fig.update_layout(template="plotly_dark", title=title)
-        return fig, fig, fig, fig, fig
+        return fig
 
-    def tg_load_run_fn(path, sample_idx):
+    def tg_load_run_fn(path, sample_idx, attn_layer):
         try:
             run = load_training_geometry_run(str(path))
             session_state["training_geometry_run"] = run
@@ -3586,6 +3599,7 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
             snapshot = load_probe_snapshot(run, selected)
             session_state["training_geometry_snapshot"] = snapshot
             sample = int(sample_idx)
+            layer = int(attn_layer)
             summary = format_geometry_summary(run, snapshot)
             step_fig = create_step_metrics_figure(run)
             return (
@@ -3596,21 +3610,25 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 create_rollout_geometry_3d(snapshot, sample),
                 create_noise_heatmap(snapshot, sample),
                 create_token_metrics_figure(snapshot, sample),
+                create_attention_noise_3d(snapshot, sample, layer),
+                create_attention_heads_heatmap(snapshot, sample, layer),
+                create_noise_denoising_3d(snapshot, sample),
             )
         except Exception as e:
             import traceback
             session_state["training_geometry_run"] = None
             session_state["training_geometry_snapshot"] = None
             err = f"Error: {e}\n\n```\n{traceback.format_exc()}\n```"
-            empty, empty2, empty3, empty4, empty5 = _tg_empty_plots("Training geometry load failed")
-            return gr.update(choices=[], value=None), err, empty, empty2, empty3, empty4, empty5
+            ef = _tg_empty_fig("Training geometry load failed")
+            return gr.update(choices=[], value=None), err, ef, ef, ef, ef, ef, ef, ef, ef
 
-    def tg_update_snapshot_fn(selected, sample_idx):
+    def tg_update_snapshot_fn(selected, sample_idx, attn_layer):
         try:
             run = session_state.get("training_geometry_run")
             snapshot = load_probe_snapshot(run, selected)
             session_state["training_geometry_snapshot"] = snapshot
             sample = int(sample_idx)
+            layer = int(attn_layer)
             summary = format_geometry_summary(run, snapshot)
             return (
                 summary,
@@ -3618,48 +3636,84 @@ with gr.Blocks(title="CERBER Model Monitor") as demo:
                 create_rollout_geometry_3d(snapshot, sample),
                 create_noise_heatmap(snapshot, sample),
                 create_token_metrics_figure(snapshot, sample),
+                create_attention_noise_3d(snapshot, sample, layer),
+                create_attention_heads_heatmap(snapshot, sample, layer),
+                create_noise_denoising_3d(snapshot, sample),
             )
         except Exception as e:
             import traceback
             err = f"Error: {e}\n\n```\n{traceback.format_exc()}\n```"
-            empty, empty2, empty3, empty4, _ = _tg_empty_plots("Training geometry update failed")
-            return err, empty, empty2, empty3, empty4
+            ef = _tg_empty_fig("Training geometry update failed")
+            return err, ef, ef, ef, ef, ef, ef, ef
+
+    def tg_update_attention_fn(selected, sample_idx, attn_layer):
+        """Fast update for attention-only controls (layer slider)."""
+        try:
+            snapshot = session_state.get("training_geometry_snapshot")
+            if snapshot is None:
+                snapshot = load_probe_snapshot(
+                    session_state.get("training_geometry_run"), selected,
+                )
+                session_state["training_geometry_snapshot"] = snapshot
+            sample = int(sample_idx)
+            layer = int(attn_layer)
+            return (
+                create_attention_noise_3d(snapshot, sample, layer),
+                create_attention_heads_heatmap(snapshot, sample, layer),
+            )
+        except Exception:
+            ef = _tg_empty_fig("Attention update failed")
+            return ef, ef
+
+    _tg_all_outputs = [
+        tg_probe_dropdown,
+        tg_summary,
+        tg_step_metrics_plot,
+        tg_diffusion_3d,
+        tg_rollout_3d,
+        tg_noise_heatmap,
+        tg_token_metrics,
+        tg_attn_3d,
+        tg_attn_heads,
+        tg_noise_3d,
+    ]
+    _tg_load_inputs = [tg_path_input, tg_sample_idx, tg_attn_layer]
+    _tg_snapshot_inputs = [tg_probe_dropdown, tg_sample_idx, tg_attn_layer]
+    _tg_snapshot_outputs = [
+        tg_summary,
+        tg_diffusion_3d,
+        tg_rollout_3d,
+        tg_noise_heatmap,
+        tg_token_metrics,
+        tg_attn_3d,
+        tg_attn_heads,
+        tg_noise_3d,
+    ]
 
     tg_load_btn.click(
         tg_load_run_fn,
-        inputs=[tg_path_input, tg_sample_idx],
-        outputs=[
-            tg_probe_dropdown,
-            tg_summary,
-            tg_step_metrics_plot,
-            tg_diffusion_3d,
-            tg_rollout_3d,
-            tg_noise_heatmap,
-            tg_token_metrics,
-        ],
+        inputs=_tg_load_inputs,
+        outputs=_tg_all_outputs,
     )
     tg_path_input.submit(
         tg_load_run_fn,
-        inputs=[tg_path_input, tg_sample_idx],
-        outputs=[
-            tg_probe_dropdown,
-            tg_summary,
-            tg_step_metrics_plot,
-            tg_diffusion_3d,
-            tg_rollout_3d,
-            tg_noise_heatmap,
-            tg_token_metrics,
-        ],
+        inputs=_tg_load_inputs,
+        outputs=_tg_all_outputs,
     )
     tg_probe_dropdown.change(
         tg_update_snapshot_fn,
-        inputs=[tg_probe_dropdown, tg_sample_idx],
-        outputs=[tg_summary, tg_diffusion_3d, tg_rollout_3d, tg_noise_heatmap, tg_token_metrics],
+        inputs=_tg_snapshot_inputs,
+        outputs=_tg_snapshot_outputs,
     )
     tg_sample_idx.change(
         tg_update_snapshot_fn,
-        inputs=[tg_probe_dropdown, tg_sample_idx],
-        outputs=[tg_summary, tg_diffusion_3d, tg_rollout_3d, tg_noise_heatmap, tg_token_metrics],
+        inputs=_tg_snapshot_inputs,
+        outputs=_tg_snapshot_outputs,
+    )
+    tg_attn_layer.change(
+        tg_update_attention_fn,
+        inputs=[tg_probe_dropdown, tg_sample_idx, tg_attn_layer],
+        outputs=[tg_attn_3d, tg_attn_heads],
     )
 
     start_live_btn.click(

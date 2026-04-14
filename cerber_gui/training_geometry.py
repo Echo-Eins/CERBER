@@ -601,3 +601,410 @@ def create_token_metrics_figure(snapshot: dict[str, Any] | None, sample_idx: int
     fig.update_yaxes(title_text="cosine", secondary_y=False, range=[-0.05, 1.02], gridcolor="rgba(180,195,255,0.14)")
     fig.update_yaxes(title_text="noise level", secondary_y=True, gridcolor="rgba(180,195,255,0.05)")
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Attention + Noise Overlay
+# ---------------------------------------------------------------------------
+
+def _get_attention_layer(
+    snapshot: dict[str, Any],
+    layer_idx: int,
+    attn_type: str = "self_attn",
+) -> np.ndarray | None:
+    """Return attention map [H, L, L|K] for a given layer, or None."""
+    attn_list = snapshot.get("attention")
+    if not attn_list or layer_idx >= len(attn_list):
+        return None
+    layer = attn_list[layer_idx]
+    data = layer.get(attn_type)
+    return _to_numpy(data) if data is not None else None
+
+
+def create_attention_noise_3d(
+    snapshot: dict[str, Any] | None,
+    sample_idx: int = 0,
+    layer_idx: int = 0,
+) -> go.Figure:
+    """3D self-attention surface with noise level as the Z-height field.
+
+    X = query position (attending token), Y = key position (attended token),
+    Z = noise level of the query token.  The surface color encodes
+    attention weight — bright regions show where each noisy token attends.
+
+    This reveals whether high-noise tokens attend broadly (diffusion) or
+    narrowly (collapse), and whether the causal structure is preserved.
+    """
+    if snapshot is None:
+        return _empty_fig("Attention + Noise 3D Overlay")
+
+    attn = _get_attention_layer(snapshot, layer_idx, "self_attn")
+    if attn is None or attn.ndim < 3:
+        return _empty_fig(
+            "Attention + Noise 3D Overlay",
+            f"No self-attention data for layer {layer_idx}",
+        )
+
+    idx = _valid_positions(snapshot, sample_idx)
+    if idx.size == 0:
+        return _empty_fig("Attention + Noise 3D Overlay", "No valid positions")
+
+    noise = _array_data(snapshot, "noise_levels", sample_idx)
+    n_heads = attn.shape[0]
+    seq_len = attn.shape[1]
+
+    # Average attention across all heads for the 3D surface.
+    attn_avg = attn.mean(axis=0)  # [L, L]
+
+    # Crop to valid positions.
+    attn_valid = attn_avg[np.ix_(idx, idx)]  # [V, V]
+    noise_valid = noise[idx] if noise.size else np.zeros(len(idx))
+    n_valid = len(idx)
+
+    # Build 3D surface: X=query, Y=key, Z=noise[query], color=attention.
+    query_grid, key_grid = np.meshgrid(idx, idx, indexing="ij")
+    noise_z = np.tile(noise_valid.reshape(-1, 1), (1, n_valid))
+
+    fig = go.Figure()
+
+    # 3D attention surface.
+    fig.add_trace(go.Surface(
+        x=query_grid,
+        y=key_grid,
+        z=noise_z,
+        surfacecolor=attn_valid,
+        colorscale="Turbo",
+        colorbar=dict(title="attn weight", x=1.05, len=0.75),
+        opacity=0.88,
+        name="self-attention surface",
+        hovertemplate=(
+            "query pos=%{x}<br>"
+            "key pos=%{y}<br>"
+            "noise level=%{z:.0f}<br>"
+            "attention=%{surfacecolor:.4f}<extra></extra>"
+        ),
+    ))
+
+    # Mark the causal diagonal.
+    diag_x = idx.astype(float)
+    diag_y = idx.astype(float)
+    diag_z = noise_valid.astype(float) + 0.5
+    fig.add_trace(go.Scatter3d(
+        x=diag_x, y=diag_y, z=diag_z,
+        mode="lines+markers",
+        name="causal diagonal",
+        line=dict(color="#ffffff", width=4),
+        marker=dict(size=3, color="#ffffff"),
+    ))
+
+    # Mark answer position.
+    answer_pos = _answer_pos(snapshot, sample_idx)
+    if answer_pos is not None and answer_pos in set(idx.tolist()):
+        a_idx_local = np.where(idx == answer_pos)[0][0]
+        a_noise = noise_valid[a_idx_local]
+        fig.add_trace(go.Scatter3d(
+            x=[answer_pos], y=[answer_pos], z=[a_noise + 1.0],
+            mode="markers",
+            name="answer token",
+            marker=dict(size=8, color=COLORS["answer"], symbol="diamond",
+                        line=dict(color="#000000", width=1.5)),
+        ))
+
+    meta = snapshot.get("attention_meta", {})
+    ctx_len = meta.get("context_len", 0)
+    title_extra = ""
+    if ctx_len == 1:
+        title_extra = " | cross-attn trivial (ctx=1)"
+
+    fig.update_layout(
+        template=PLOT_TEMPLATE,
+        title=(
+            f"Self-Attention + Noise 3D | layer {layer_idx} | "
+            f"{n_heads}H avg | step {snapshot.get('global_step')}"
+            f"{title_extra}"
+        ),
+        paper_bgcolor="#0b111d",
+        scene=dict(
+            xaxis_title="query position",
+            yaxis_title="key position",
+            zaxis_title="noise level",
+            bgcolor="#0f1724",
+            xaxis=dict(gridcolor="rgba(180,195,255,0.16)"),
+            yaxis=dict(gridcolor="rgba(180,195,255,0.16)"),
+            zaxis=dict(gridcolor="rgba(180,195,255,0.16)"),
+        ),
+        margin=dict(l=0, r=0, t=70, b=0),
+        legend=dict(x=0.02, y=0.98),
+    )
+    return fig
+
+
+def create_attention_heads_heatmap(
+    snapshot: dict[str, Any] | None,
+    sample_idx: int = 0,
+    layer_idx: int = 0,
+) -> go.Figure:
+    """Per-head self-attention heatmaps with noise level overlay.
+
+    Shows all heads in a grid layout with noise level bar on top,
+    denoising quality (cos pred→clean) sidebar, and cross-attention
+    summary at the bottom.
+    """
+    if snapshot is None:
+        return _empty_fig("Attention Heads + Noise Overlay")
+
+    attn = _get_attention_layer(snapshot, layer_idx, "self_attn")
+    cross_attn = _get_attention_layer(snapshot, layer_idx, "cross_attn")
+    meta = snapshot.get("attention_meta", {})
+    n_heads = meta.get("n_heads", 8)
+    ctx_len = meta.get("context_len", 0)
+
+    if attn is None or attn.ndim < 3:
+        return _empty_fig(
+            "Attention Heads + Noise Overlay",
+            f"No attention data for layer {layer_idx}",
+        )
+
+    idx = _valid_positions(snapshot, sample_idx)
+    if idx.size == 0:
+        return _empty_fig("Attention Heads + Noise Overlay", "No valid positions")
+
+    noise = _array_data(snapshot, "noise_levels", sample_idx)
+    df_cos = _array_data(snapshot, "df_cos", sample_idx)
+
+    n_show = min(n_heads, attn.shape[0])
+    # Grid: 2 rows per head pair + 1 for cross + 1 for noise bar.
+    n_rows = n_show + 2
+    subtitles = [f"Head {h}" for h in range(n_show)]
+    subtitles.append("Cross-Attn (head avg)")
+    subtitles.append("Noise level & DF cos")
+
+    fig = make_subplots(
+        rows=n_rows, cols=1,
+        shared_xaxes=True,
+        row_heights=[1.0] * n_show + [0.8, 0.5],
+        vertical_spacing=0.015,
+        subplot_titles=subtitles,
+    )
+
+    # Self-attention heads.
+    for h in range(n_show):
+        head_data = attn[h]  # [L, L]
+        head_valid = head_data[np.ix_(idx, idx)]
+        fig.add_trace(go.Heatmap(
+            z=head_valid,
+            x=idx,
+            y=idx,
+            colorscale="Turbo",
+            zmin=0.0,
+            zmax=float(np.max(head_valid)) + 1e-6,
+            showscale=(h == 0),
+            colorbar=dict(title="attn", len=0.3, y=0.85) if h == 0 else None,
+            hovertemplate="q=%{y} k=%{x} attn=%{z:.4f}<extra></extra>",
+        ), row=h + 1, col=1)
+
+    # Cross-attention (head average).
+    if cross_attn is not None and cross_attn.ndim >= 3:
+        cross_avg = cross_attn.mean(axis=0)  # [L, K]
+        cross_valid = cross_avg[idx, :]
+        ctx_labels = [f"ctx_{c}" for c in range(cross_avg.shape[1])]
+        fig.add_trace(go.Heatmap(
+            z=cross_valid,
+            x=ctx_labels,
+            y=idx,
+            colorscale="Viridis",
+            zmin=0.0,
+            zmax=float(np.max(cross_valid)) + 1e-6,
+            showscale=False,
+            hovertemplate="pos=%{y} %{x} attn=%{z:.4f}<extra></extra>",
+        ), row=n_show + 1, col=1)
+    else:
+        fig.add_annotation(
+            text="No cross-attention data",
+            x=0.5, y=0.5,
+            xref=f"x{n_show + 1} domain", yref=f"y{n_show + 1} domain",
+            showarrow=False, font=dict(color="#d8e2ff"),
+        )
+
+    # Bottom panel: noise + denoising quality.
+    noise_valid = noise[idx] if noise.size else np.zeros(len(idx))
+    fig.add_trace(go.Bar(
+        x=idx, y=noise_valid,
+        name="noise level",
+        marker_color="rgba(116,192,252,0.55)",
+        hovertemplate="pos=%{x} noise=%{y:.0f}<extra></extra>",
+    ), row=n_rows, col=1)
+    if df_cos.size:
+        cos_valid = df_cos[idx]
+        fig.add_trace(go.Scatter(
+            x=idx, y=cos_valid * float(np.max(noise_valid) if noise_valid.max() > 0 else 1.0),
+            mode="lines+markers",
+            name="DF cos (scaled)",
+            line=dict(color=COLORS["pred"], width=2.5),
+            marker=dict(size=4),
+            hovertemplate="pos=%{x} df_cos=%{customdata:.4f}<extra></extra>",
+            customdata=cos_valid,
+        ), row=n_rows, col=1)
+
+    # Context bank warning.
+    if ctx_len <= 1:
+        fig.add_annotation(
+            text="<b>context bank = 1 token: cross-attention is trivially 1.0</b>",
+            x=0.5, y=1.06,
+            xref="paper", yref="paper",
+            showarrow=False,
+            font=dict(size=13, color="#ff6b6b"),
+            bgcolor="rgba(255,107,107,0.12)",
+            bordercolor="#ff6b6b",
+            borderwidth=1,
+        )
+
+    answer_pos = _answer_pos(snapshot, sample_idx)
+    if answer_pos is not None:
+        fig.add_vline(x=answer_pos, line_color="#ffffff", line_dash="dash", opacity=0.6)
+
+    total_height = max(400, 130 * n_rows)
+    fig.update_layout(
+        template=PLOT_TEMPLATE,
+        title=(
+            f"Attention Heads + Noise | layer {layer_idx} | "
+            f"step {snapshot.get('global_step')}"
+        ),
+        paper_bgcolor="#0b111d",
+        plot_bgcolor="#0f1724",
+        height=total_height,
+        margin=dict(l=55, r=30, t=80, b=40),
+        showlegend=False,
+    )
+    return fig
+
+
+def create_noise_denoising_3d(
+    snapshot: dict[str, Any] | None,
+    sample_idx: int = 0,
+) -> go.Figure:
+    """3D visualization of noise field and denoising quality.
+
+    X = chain position, Y = metric type (noise level, DF cos, noisy cos,
+    TF cos, rollout cos), Z = value.  Each metric is a 3D ribbon at its
+    own Y-offset, colored by value.
+
+    Provides a multi-layer view of how noise corrupts the chain and how
+    well the denoiser (DF), teacher (TF), and free-run policy recover.
+    """
+    if snapshot is None:
+        return _empty_fig("Noise / Denoising 3D")
+
+    idx = _valid_positions(snapshot, sample_idx)
+    if idx.size == 0:
+        return _empty_fig("Noise / Denoising 3D", "No valid positions")
+
+    noise = _array_data(snapshot, "noise_levels", sample_idx)
+    answer_pos = _answer_pos(snapshot, sample_idx)
+
+    metrics_spec = [
+        ("noise_levels", "noise level", "Ice"),
+        ("noisy_cos", "cos(noisy, clean)", "RdYlGn"),
+        ("df_cos", "cos(DF pred, clean)", "Viridis"),
+        ("tf_cos", "cos(TF pred, clean)", "Cividis"),
+        ("roll_cos", "cos(rollout, clean)", "Plasma"),
+    ]
+
+    fig = go.Figure()
+    y_offsets = np.arange(len(metrics_spec), dtype=float) * 2.0
+
+    for i, (key, label, colorscale) in enumerate(metrics_spec):
+        arr = _array_data(snapshot, key, sample_idx)
+        if not arr.size:
+            continue
+        vals = arr[idx].astype(float)
+
+        # Normalize noise levels to [0, 1] range for comparable ribbon heights.
+        if key == "noise_levels":
+            max_val = float(np.max(vals)) if np.max(vals) > 0 else 1.0
+            vals_normed = vals / max_val
+        else:
+            vals_normed = vals
+
+        x_pos = idx.astype(float)
+        y_base = np.full_like(x_pos, y_offsets[i])
+
+        # Ribbon: two rows of points (base at y_offset, top at y_offset + height).
+        x_ribbon = np.concatenate([x_pos, x_pos])
+        y_ribbon = np.concatenate([y_base, y_base + 1.5])
+        z_ribbon = np.concatenate([np.zeros_like(vals_normed), vals_normed])
+        color_ribbon = np.concatenate([vals, vals])
+
+        # Create triangulated surface for the ribbon.
+        n = len(x_pos)
+        i_tri = []
+        j_tri = []
+        k_tri = []
+        for t in range(n - 1):
+            i_tri.extend([t, t + n, t])
+            j_tri.extend([t + 1, t + n + 1, t + n])
+            k_tri.extend([t + n, t + 1, t + n + 1])
+
+        fig.add_trace(go.Mesh3d(
+            x=x_ribbon, y=y_ribbon, z=z_ribbon,
+            i=i_tri, j=j_tri, k=k_tri,
+            intensity=color_ribbon,
+            colorscale=colorscale,
+            showscale=(i == 0),
+            colorbar=dict(title="value", len=0.4, y=0.8) if i == 0 else None,
+            opacity=0.82,
+            name=label,
+            hovertemplate=f"{label}<br>pos=%{{x:.0f}}<br>val=%{{z:.4f}}<extra></extra>",
+        ))
+
+        # Add label annotation at ribbon start.
+        fig.add_trace(go.Scatter3d(
+            x=[float(idx[0]) - 0.5],
+            y=[y_offsets[i] + 0.75],
+            z=[0.0],
+            mode="text",
+            text=[label],
+            textfont=dict(size=10, color="#d8e2ff"),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+    # Answer position marker as vertical line across all ribbons.
+    if answer_pos is not None and answer_pos in set(idx.tolist()):
+        y_span = np.linspace(0, y_offsets[-1] + 1.5, 20)
+        fig.add_trace(go.Scatter3d(
+            x=np.full(20, float(answer_pos)),
+            y=y_span,
+            z=np.full(20, 1.1),
+            mode="lines",
+            name="answer",
+            line=dict(color="#ffffff", width=3, dash="dash"),
+        ))
+
+    fig.update_layout(
+        template=PLOT_TEMPLATE,
+        title=(
+            f"Noise Field & Denoising Quality 3D | sample {sample_idx} | "
+            f"step {snapshot.get('global_step')}"
+        ),
+        paper_bgcolor="#0b111d",
+        scene=dict(
+            xaxis_title="chain position",
+            yaxis_title="metric",
+            zaxis_title="value (normalized)",
+            bgcolor="#0f1724",
+            xaxis=dict(gridcolor="rgba(180,195,255,0.16)"),
+            yaxis=dict(
+                gridcolor="rgba(180,195,255,0.16)",
+                tickvals=list(y_offsets + 0.75),
+                ticktext=[s[1] for s in metrics_spec],
+            ),
+            zaxis=dict(gridcolor="rgba(180,195,255,0.16)", range=[-0.05, 1.15]),
+            camera=dict(
+                eye=dict(x=1.8, y=-1.2, z=0.9),
+                up=dict(x=0, y=0, z=1),
+            ),
+        ),
+        margin=dict(l=0, r=0, t=70, b=0),
+    )
+    return fig
