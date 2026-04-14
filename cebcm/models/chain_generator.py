@@ -35,6 +35,76 @@ class ChainGeneratorConfig:
     # rescaled to the SONAR hypersphere scale instead of raw N(0, I).
     diffusion_noise_scale: float = 0.0
 
+    # ── v-prediction (Salimans & Ho 2022) ──
+    # "x0" = predict clean target, "v" = predict velocity, "eps" = predict noise.
+    prediction_type: str = "v"
+
+    # ── Classifier-Free Guidance ──
+    # During training, drop context with this probability to learn unconditional.
+    cfg_dropout_prob: float = 0.1
+
+    # ── Architecture extensions ──
+    # "swiglu" replaces SiLU FFN with gated SwiGLU (Shazeer 2020).
+    ffn_type: str = "swiglu"
+    # "ada_rmsnorm" = AdaLN with RMSNorm base for DF conditioning.
+    # "layernorm" = original LayerNorm (backward compatible).
+    norm_type: str = "ada_rmsnorm"
+
+
+# ---------------------------------------------------------------------------
+# Normalization & FFN building blocks
+# ---------------------------------------------------------------------------
+
+class AdaRMSNorm(nn.Module):
+    """RMSNorm with optional Adaptive Layer Normalization (AdaLN) conditioning.
+
+    Base: ``RMSNorm(x) = x / RMS(x) * γ``  (Zhang & Sennrich 2019)
+    AdaLN: ``AdaRMSN(x, s, b) = RMSNorm(x) * (1 + s) + b``
+    where *s* (scale) and *b* (shift) are produced by a timestep MLP.
+
+    When *scale* and *shift* are ``None`` the layer is a standard RMSNorm,
+    so teacher-forcing (no timestep) works unchanged.
+    """
+
+    def __init__(self, d: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(
+            self,
+            x: Tensor,
+            scale: Tensor | None = None,
+            shift: Tensor | None = None,
+    ) -> Tensor:
+        x_f = x.float()
+        rms = x_f.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        out = (x_f * rms).to(x.dtype) * self.weight
+        if scale is not None:
+            out = out * (1.0 + scale)
+        if shift is not None:
+            out = out + shift
+        return out
+
+
+class SwiGLUFFN(nn.Module):
+    """Gated Linear Unit with SiLU gate (Shazeer 2020, LLaMA-style).
+
+    ``SwiGLU(x) = W_down( SiLU(W_gate(x)) ⊙ W_up(x) )``
+
+    Three projections instead of two; no biases (standard practice).
+    """
+
+    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.w_gate = nn.Linear(d_model, d_hidden, bias=False)
+        self.w_up = nn.Linear(d_model, d_hidden, bias=False)
+        self.w_down = nn.Linear(d_hidden, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+
 
 class CrossAttention(nn.Module):
     """Multi-head cross-attention over context bank [B, K, D]."""
@@ -157,7 +227,17 @@ class CausalRoPESelfAttention(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Pre-norm decoder block: self-attn -> cross-attn -> ffn."""
+    """Pre-norm decoder block: self-attn → cross-attn → FFN.
+
+    Supports two norm types (configured at construction):
+    - ``"layernorm"``: standard ``nn.LayerNorm`` (original, no timestep cond.)
+    - ``"ada_rmsnorm"``: ``AdaRMSNorm`` with optional per-position scale/shift
+      from a diffusion timestep MLP (DiT-style AdaLN-Zero conditioning).
+
+    FFN type:
+    - ``"silu"``: ``Linear → SiLU → Linear`` (original)
+    - ``"swiglu"``: ``SwiGLUFFN`` with gated activation (LLaMA-style)
+    """
 
     def __init__(
         self,
@@ -166,37 +246,90 @@ class DecoderBlock(nn.Module):
         dim_feedforward: int,
         dropout: float = 0.1,
         max_seq_len: int = 32,
+        norm_type: str = "ada_rmsnorm",
+        ffn_type: str = "swiglu",
     ):
         super().__init__()
+        self._norm_type = norm_type
+        self._ffn_type = ffn_type
 
-        self.norm_self = nn.LayerNorm(d_model)
+        # ── Normalization ──
+        if norm_type == "ada_rmsnorm":
+            self.norm_self = AdaRMSNorm(d_model)
+            self.norm_cross = AdaRMSNorm(d_model)
+            self.norm_ffn = AdaRMSNorm(d_model)
+            # AdaLN modulation: 6 vectors (scale+shift for each of 3 norms).
+            self.adaln_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(d_model, 6 * d_model, bias=True),
+            )
+            # Zero-init so that at start the block is identity-through-norm
+            # (γ=0→multiply by 1, β=0→add 0), preserving backward compat.
+            nn.init.zeros_(self.adaln_modulation[-1].weight)
+            nn.init.zeros_(self.adaln_modulation[-1].bias)
+        else:
+            self.norm_self = nn.LayerNorm(d_model)
+            self.norm_cross = nn.LayerNorm(d_model)
+            self.norm_ffn = nn.LayerNorm(d_model)
+            self.adaln_modulation = None
+
+        # ── Sub-layers ──
         self.self_attn = CausalRoPESelfAttention(
             d_model=d_model,
             n_heads=n_heads,
             dropout=dropout,
             max_seq_len=max_seq_len,
         )
-
-        self.norm_cross = nn.LayerNorm(d_model)
         self.cross_attn = CrossAttention(
             d_model=d_model,
             n_heads=n_heads,
             dropout=dropout,
         )
 
-        self.norm_ffn = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
-        )
+        # ── FFN ──
+        if ffn_type == "swiglu":
+            self.ffn = SwiGLUFFN(d_model, dim_feedforward, dropout)
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout),
+            )
 
-    def forward(self, x: Tensor, context: Tensor, context_mask: Tensor | None = None) -> Tensor:
-        x = x + self.self_attn(self.norm_self(x))
-        x = x + self.cross_attn(self.norm_cross(x), context, context_mask=context_mask)
-        x = x + self.ffn(self.norm_ffn(x))
+    def forward(
+        self,
+        x: Tensor,
+        context: Tensor,
+        context_mask: Tensor | None = None,
+        t_emb: Tensor | None = None,
+    ) -> Tensor:
+        """Forward with optional timestep conditioning.
+
+        Args:
+            x: [B, L, D] input sequence.
+            context: [B, K, D] cross-attention context.
+            context_mask: [B, K] bool mask for context.
+            t_emb: [B, L, D] per-position timestep embedding (DF mode).
+                   ``None`` for teacher-forcing / generation without diffusion.
+        """
+        if self.adaln_modulation is not None and t_emb is not None:
+            # AdaLN-Zero: produce per-position scale/shift for each norm.
+            mod = self.adaln_modulation(t_emb)  # [B, L, 6D]
+            s_sa, sh_sa, s_ca, sh_ca, s_ff, sh_ff = mod.chunk(6, dim=-1)
+            x = x + self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa))
+            x = x + self.cross_attn(
+                self.norm_cross(x, scale=s_ca, shift=sh_ca),
+                context,
+                context_mask=context_mask,
+            )
+            x = x + self.ffn(self.norm_ffn(x, scale=s_ff, shift=sh_ff))
+        else:
+            # Standard pre-norm (no conditioning).
+            x = x + self.self_attn(self.norm_self(x))
+            x = x + self.cross_attn(self.norm_cross(x), context, context_mask=context_mask)
+            x = x + self.ffn(self.norm_ffn(x))
         return x
 
 
@@ -211,6 +344,11 @@ class ChainGenerator(nn.Module):
         # to correctly match the scaled residual stream magnitude.
         self.start_token = nn.Parameter(torch.randn(1, 1, self.cfg.d_model))
 
+        # Learnable null-context token for Classifier-Free Guidance (CFG).
+        # During training, context is replaced with this token with prob
+        # cfg_dropout_prob; at inference, used for unconditional forward pass.
+        self.null_context_token = nn.Parameter(torch.zeros(1, 1, self.cfg.d_model))
+
         max_seq = self.cfg.max_chain_len + 1
         self.layers = nn.ModuleList(
             [
@@ -220,18 +358,18 @@ class ChainGenerator(nn.Module):
                     dim_feedforward=self.cfg.dim_feedforward,
                     dropout=self.cfg.dropout,
                     max_seq_len=max_seq,
+                    norm_type=self.cfg.norm_type,
+                    ffn_type=self.cfg.ffn_type,
                 )
                 for _ in range(self.cfg.n_layers)
             ]
         )
 
-        self.final_norm = nn.LayerNorm(self.cfg.d_model)
-        self.output_proj = nn.Linear(self.cfg.d_model, self.cfg.d_model)
-        self.diffusion_time_mlp = nn.Sequential(
-            nn.Linear(self.cfg.d_model, self.cfg.d_model),
-            nn.SiLU(),
-            nn.Linear(self.cfg.d_model, self.cfg.d_model),
-        )
+        # Final norm matches the decoder block norm type.
+        if self.cfg.norm_type == "ada_rmsnorm":
+            self.final_norm = AdaRMSNorm(self.cfg.d_model)
+        else:
+            self.final_norm = nn.LayerNorm(self.cfg.d_model)
 
         self._build_diffusion_schedule()
 
@@ -278,6 +416,7 @@ class ChainGenerator(nn.Module):
         self.register_buffer(
             "_df_sqrt_one_minus_alphas_cumprod",
             (1.0 - alphas_cumprod).clamp(min=0.0).sqrt(),
+            self.register_buffer("_df_alphas_cumprod", alphas_cumprod.float(), persistent=True),
             persistent=True,
         )
         self.register_buffer("_df_snr", snr.float(), persistent=True)
@@ -338,6 +477,93 @@ class ChainGenerator(nn.Module):
         )[levels]
         x_noisy = sqrt_alpha.unsqueeze(-1) * x_start + sqrt_one_minus.unsqueeze(-1) * noise
         return x_noisy, noise
+
+    def diffusion_v_target(
+            self,
+            x_start: Tensor,
+            noise: Tensor,
+            noise_levels: Tensor,
+    ) -> Tensor:
+        """Compute v-prediction target: v_t = √α̅_t · ε − √(1−α̅_t) · x₀.
+
+        This is the "velocity" in the diffusion ODE interpretation
+        (Salimans & Ho 2022).  At t≈0, v ≈ ε (all noise); at t≈T, v ≈ −x₀
+        (all signal).  Both extremes are easy to predict, concentrating
+        difficulty at intermediate noise levels.
+        """
+        levels = noise_levels.to(device=x_start.device, dtype=torch.long).clamp(
+            min=0, max=max(int(self.cfg.diffusion_timesteps) - 1, 0),
+        )
+        sqrt_alpha = self._df_sqrt_alphas_cumprod.to(
+            device=x_start.device, dtype=x_start.dtype,
+        )[levels].unsqueeze(-1)
+        sqrt_one_minus = self._df_sqrt_one_minus_alphas_cumprod.to(
+            device=x_start.device, dtype=x_start.dtype,
+        )[levels].unsqueeze(-1)
+        return sqrt_alpha * noise - sqrt_one_minus * x_start
+
+    def predict_x0(
+            self,
+            x_t: Tensor,
+            model_output: Tensor,
+            noise_levels: Tensor,
+    ) -> Tensor:
+        """Recover clean x₀ from model output, respecting ``prediction_type``.
+
+        - x₀-prediction:  x₀ = model_output
+        - v-prediction:   x₀ = √α̅_t · x_t − √(1−α̅_t) · v_pred
+        - ε-prediction:   x₀ = (x_t − √(1−α̅_t) · ε_pred) / √α̅_t
+        """
+        pt = self.cfg.prediction_type
+        if pt == "x0":
+            return model_output
+        levels = noise_levels.to(device=x_t.device, dtype=torch.long).clamp(
+            min=0, max=max(int(self.cfg.diffusion_timesteps) - 1, 0),
+        )
+        sa = self._df_sqrt_alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[levels].unsqueeze(-1)
+        som = self._df_sqrt_one_minus_alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[levels].unsqueeze(-1)
+        if pt == "v":
+            return sa * x_t - som * model_output
+        if pt == "eps":
+            return (x_t - som * model_output) / sa.clamp(min=1e-8)
+        raise ValueError(f"Unknown prediction_type: {pt!r}")
+
+    def predict_eps(
+            self,
+            x_t: Tensor,
+            model_output: Tensor,
+            noise_levels: Tensor,
+    ) -> Tensor:
+        """Recover noise ε from model output, respecting ``prediction_type``."""
+        pt = self.cfg.prediction_type
+        if pt == "eps":
+            return model_output
+        levels = noise_levels.to(device=x_t.device, dtype=torch.long).clamp(
+            min=0, max=max(int(self.cfg.diffusion_timesteps) - 1, 0),
+        )
+        sa = self._df_sqrt_alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[levels].unsqueeze(-1)
+        som = self._df_sqrt_one_minus_alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[levels].unsqueeze(-1)
+        if pt == "v":
+            return som * x_t + sa * model_output
+        if pt == "x0":
+            return (x_t - sa * model_output) / som.clamp(min=1e-8)
+        raise ValueError(f"Unknown prediction_type: {pt!r}")
+
+    def diffusion_target(
+            self,
+            x_start: Tensor,
+            noise: Tensor,
+            noise_levels: Tensor,
+    ) -> Tensor:
+        """Return the supervision target for the current ``prediction_type``."""
+        pt = self.cfg.prediction_type
+        if pt == "x0":
+            return x_start
+        if pt == "eps":
+            return noise
+        if pt == "v":
+            return self.diffusion_v_target(x_start, noise, noise_levels)
+        raise ValueError(f"Unknown prediction_type: {pt!r}")
 
     def _safe_normalize(self, v: Tensor, dim: int = -1, eps: float = 1e-6) -> Tensor:
         """Numerically safe normalization that prevents NaN gradients.
@@ -503,15 +729,39 @@ class ChainGenerator(nn.Module):
         )
         return self._df_snr[levels].to(device=noise_levels.device)
 
+    def _apply_cfg_dropout(
+            self,
+            context: Tensor,
+            ctx_mask: Tensor | None,
+            bsz: int,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Replace context with null token for random samples (CFG training).
+
+        During training, each sample in the batch independently has its context
+        replaced with the learnable ``null_context_token`` with probability
+        ``cfg_dropout_prob``.  This teaches the model to generate without
+        context so that at inference classifier-free guidance can interpolate
+        between conditional and unconditional predictions.
+        """
+        p = float(self.cfg.cfg_dropout_prob)
+        if not self.training or p <= 0.0:
+            return context, ctx_mask
+        drop = torch.rand(bsz, 1, 1, device=context.device) < p  # [B, 1, 1]
+        null_ctx = self.null_context_token.expand(bsz, context.shape[1], -1)
+        null_ctx = self._to_residual_space(null_ctx)
+        context = torch.where(drop, null_ctx, context)
+        # Null context is always "valid" — keep mask unchanged.
+        return context, ctx_mask
+
     def forward_diffusion_forcing(
-        self,
-        v_query: Tensor,
-        v_target_chain: Tensor,
-        noise_levels: Tensor,
-        v_context_bank: Tensor | None = None,
-        context_mask: Tensor | None = None,
-        noise: Tensor | None = None,
-        return_noisy: bool = False,
+            self,
+            v_query: Tensor,
+            v_target_chain: Tensor,
+            noise_levels: Tensor,
+            v_context_bank: Tensor | None = None,
+            context_mask: Tensor | None = None,
+            noise: Tensor | None = None,
+            return_noisy: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         """Diffusion Forcing denoising pass over the whole chain.
 
@@ -520,6 +770,10 @@ class ChainGenerator(nn.Module):
         and the causal mask prevents future leakage.  This trains the decoder
         to repair partially corrupted self-generated prefixes instead of only
         one clean shifted prefix.
+
+        With ``norm_type="ada_rmsnorm"``, the timestep embedding is injected
+        via AdaLN conditioning in every DecoderBlock, instead of a simple
+        addition to the input.  This provides richer per-layer modulation.
         """
         bsz, num_steps, d_model = v_target_chain.shape
         if noise_levels.shape != (bsz, num_steps):
@@ -530,14 +784,26 @@ class ChainGenerator(nn.Module):
             raise ValueError(f"target dim {d_model} != config d_model {self.cfg.d_model}")
 
         context, ctx_mask = self._prepare_context(v_query, v_context_bank, context_mask)
+        # CFG training: randomly drop context for some samples.
+        context, ctx_mask = self._apply_cfg_dropout(context, ctx_mask, bsz)
+
         v_noisy, eps = self.diffusion_q_sample(v_target_chain, noise_levels, noise=noise)
 
         x = self._to_residual_space(v_noisy)
         t_emb = self._diffusion_timestep_embedding(noise_levels).to(device=x.device, dtype=x.dtype)
-        x = x + t_emb
 
-        for layer in self.layers:
-            x = layer(x, context, context_mask=ctx_mask)
+        if self.cfg.norm_type == "ada_rmsnorm":
+            # AdaLN path: pass t_emb through each layer for per-norm modulation.
+            # The input still gets a residual addition for backward compat and
+            # to provide a strong initial signal before the first norm.
+            x = x + t_emb
+            for layer in self.layers:
+                x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
+        else:
+            # Legacy: simple additive conditioning.
+            x = x + t_emb
+            for layer in self.layers:
+                x = layer(x, context, context_mask=ctx_mask)
 
         x = self.final_norm(x)
         v_pred = self.output_proj(x)
@@ -571,6 +837,8 @@ class ChainGenerator(nn.Module):
         oracle_guide: Tensor | None = None,
         oracle_max_retries: int = 0,
         oracle_prob: float = 0.0,
+        ddim_steps: int = 0,
+        cfg_scale: float = 1.0,
     ) -> Tensor | tuple[Tensor, dict[str, float | int | bool]]:
         """
         Autoregressive generation with adaptive stopping and resume support.
@@ -638,14 +906,30 @@ class ChainGenerator(nn.Module):
                 t_target = t_target.unsqueeze(0)
             t_target = t_target.to(device=v_query.device)
 
+        ddim_steps = max(0, int(ddim_steps))
+        cfg_scale = max(1.0, float(cfg_scale))
+
         steps = max(1, int(num_steps))
         for step_idx in range(steps):
-            x = chain
-            for layer in self.layers:
-                x = layer(x, context, context_mask=ctx_mask)
+            # ── DDIM multi-step refinement mode ──
+            if ddim_steps > 0 and not self.training:
+                ddim_result = self._ddim_denoise_position(
+                    chain, context, ctx_mask,
+                    ddim_steps=ddim_steps,
+                    cfg_scale=cfg_scale,
+                )
+                # ddim_result is [B, 1, D] in SONAR space, already sphere-projected.
+                # Convert to residual-space "raw" for the rest of the loop.
+                raw_next = ddim_result / self.cfg.target_norm * self.output_proj.weight.data.norm()
+                # But for consistency, just use the SONAR prediction directly:
+                raw_next = ddim_result
+            else:
+                x = chain
+                for layer in self.layers:
+                    x = layer(x, context, context_mask=ctx_mask)
 
-            x = self.final_norm(x)
-            raw_next = self.output_proj(x[:, -1:, :])
+                x = self.final_norm(x)
+                raw_next = self.output_proj(x[:, -1:, :])
 
             raw_norms.append(float(raw_next.detach().norm(dim=-1).mean().item()))
 
@@ -877,6 +1161,116 @@ class ChainGenerator(nn.Module):
             info["cos_final"] = float(cos_hist[-1])
 
         return chain_out, info
+
+        # ------------------------------------------------------------------
+        # DDIM iterative refinement at each autoregressive position
+        # ------------------------------------------------------------------
+
+        def _ddim_denoise_position(
+                self,
+                chain_residual: Tensor,
+                context: Tensor,
+                ctx_mask: Tensor | None,
+                ddim_steps: int = 3,
+                cfg_scale: float = 1.0,
+        ) -> Tensor:
+            """Refine the next chain position via DDIM multi-step denoising.
+
+            Instead of one-shot prediction, this starts from pure noise and
+            iteratively denoises through ``ddim_steps`` diffusion steps, using
+            the model's DF pathway.  The chain prefix is treated as clean (t=0).
+
+            Args:
+                chain_residual: [B, L, D] existing chain in residual space
+                                (start_token + generated so far).
+                context: [B, K, D] cross-attention context (residual space).
+                ctx_mask: [B, K] context mask.
+                ddim_steps: number of DDIM denoising steps.
+                cfg_scale: classifier-free guidance scale (1.0 = no guidance).
+
+            Returns:
+                x0_pred: [B, 1, D] predicted clean vector in **SONAR** space.
+            """
+            bsz = chain_residual.shape[0]
+            K = max(2, int(self.cfg.diffusion_timesteps))
+
+            # Build step schedule: evenly spaced from t_max down to 0.
+            # E.g. ddim_steps=3, K=64 → [63, 42, 21, 0]
+            schedule = torch.linspace(K - 1, 0, ddim_steps + 1).long().tolist()
+
+            # Start from pure SONAR-scaled noise for the new position.
+            noise_scale = self._diffusion_noise_scale()
+            x_t = noise_scale * torch.randn(
+                bsz, 1, self.cfg.d_model,
+                device=chain_residual.device,
+                dtype=chain_residual.dtype,
+            )
+
+            for i in range(ddim_steps):
+                t_cur = schedule[i]
+                t_next = schedule[i + 1]
+
+                # Build levels: 0 for clean prefix, t_cur for the new position.
+                prefix_len = chain_residual.shape[1]
+                levels_prefix = torch.zeros(bsz, prefix_len, device=chain_residual.device, dtype=torch.long)
+                levels_new = torch.full((bsz, 1), t_cur, device=chain_residual.device, dtype=torch.long)
+                levels = torch.cat([levels_prefix, levels_new], dim=1)  # [B, L+1]
+
+                # Concatenate prefix + noisy new position.
+                x_new_res = self._to_residual_space(x_t)
+                full_seq = torch.cat([chain_residual, x_new_res], dim=1)  # [B, L+1, D]
+
+                # Timestep embedding for the full sequence.
+                t_emb = self._diffusion_timestep_embedding(levels).to(
+                    device=full_seq.device, dtype=full_seq.dtype,
+                )
+
+                # Forward through transformer with timestep conditioning.
+                x = full_seq + t_emb
+                if self.cfg.norm_type == "ada_rmsnorm":
+                    for layer in self.layers:
+                        x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
+                else:
+                    for layer in self.layers:
+                        x = layer(x, context, context_mask=ctx_mask)
+
+                x = self.final_norm(x)
+                model_out = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+
+                # CFG: conditional + unconditional interpolation.
+                if cfg_scale > 1.0 and hasattr(self, "null_context_token"):
+                    null_ctx = self.null_context_token.expand(bsz, context.shape[1], -1)
+                    null_ctx = self._to_residual_space(null_ctx)
+                    x_uc = full_seq + t_emb
+                    if self.cfg.norm_type == "ada_rmsnorm":
+                        for layer in self.layers:
+                            x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask, t_emb=t_emb)
+                    else:
+                        for layer in self.layers:
+                            x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask)
+                    x_uc = self.final_norm(x_uc)
+                    model_out_uc = self.output_proj(x_uc[:, -1:, :])
+                    model_out = model_out_uc + cfg_scale * (model_out - model_out_uc)
+
+                # Recover x₀ and ε from model output.
+                level_new = levels_new  # [B, 1]
+                x0_pred = self.predict_x0(x_t, model_out, level_new)
+                eps_pred = self.predict_eps(x_t, model_out, level_new)
+
+                # DDIM deterministic step: x_{t'} = √α̅_{t'} · x₀ + √(1-α̅_{t'}) · ε
+                if t_next > 0:
+                    sa_next = self._df_sqrt_alphas_cumprod[t_next].to(
+                        device=x_t.device, dtype=x_t.dtype,
+                    )
+                    som_next = self._df_sqrt_one_minus_alphas_cumprod[t_next].to(
+                        device=x_t.device, dtype=x_t.dtype,
+                    )
+                    x_t = sa_next * x0_pred + som_next * eps_pred
+                else:
+                    x_t = x0_pred
+
+            # Project to SONAR sphere.
+            return self._sphere_project(x_t)
 
     def beam_generate(
         self,

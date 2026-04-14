@@ -477,7 +477,15 @@ def _sample_diffusion_noise_levels(
     *,
     eval_mode: bool = False,
 ) -> torch.Tensor:
-    """Sample independent per-position diffusion levels for valid targets."""
+    """Sample independent per-position diffusion levels for valid targets.
+
+    Supports two training sampling strategies:
+    - ``"independent"`` (default): Uniform random over [min_level, max_level].
+    - ``"logsnr"``:  Log-SNR stratified sampling (Karras et al. 2022).
+      Uniformly samples in log-SNR space, then maps to nearest timestep.
+      This gives more samples at intermediate noise levels (where denoising
+      is hardest) and fewer at extremes.
+    """
     timesteps = max(2, int(model.cfg.diffusion_timesteps))
     min_level = max(0, int(cfg.get("df_noise_level_min", 0)))
     max_level = int(cfg.get("df_noise_level_max", timesteps - 1))
@@ -487,10 +495,26 @@ def _sample_diffusion_noise_levels(
         eval_level = int(cfg.get("df_eval_noise_level", (min_level + max_level) // 2))
         levels = torch.full(mask.shape, eval_level, device=mask.device, dtype=torch.long)
     else:
-        sampling = str(cfg.get("df_noise_sampling", "independent")).lower()
-        if sampling != "independent":
-            raise ValueError(f"Unsupported df_noise_sampling={sampling}; use 'independent'")
-        levels = torch.randint(min_level, max_level + 1, mask.shape, device=mask.device)
+        sampling = str(cfg.get("df_noise_sampling", "logsnr")).lower()
+        if sampling == "logsnr":
+            # Log-SNR stratified sampling (Karras et al. 2022).
+            snr_buf = model._df_snr.float()  # [K]
+            log_snr = torch.log(snr_buf.clamp(min=1e-8))
+            log_snr_min = log_snr[max_level].item()   # noisiest
+            log_snr_max = log_snr[min_level].item()    # cleanest
+            # Sample uniformly in log-SNR, map to nearest timestep.
+            u = torch.rand(mask.shape, device=mask.device)
+            target_log_snr = log_snr_min + u * (log_snr_max - log_snr_min)
+            # Nearest-timestep lookup via argmin over the schedule.
+            diffs = (log_snr[min_level:max_level + 1].unsqueeze(0).unsqueeze(0)
+                     - target_log_snr.unsqueeze(-1)).abs()
+            levels = diffs.argmin(dim=-1) + min_level
+        elif sampling == "independent":
+            levels = torch.randint(min_level, max_level + 1, mask.shape, device=mask.device)
+        else:
+            raise ValueError(
+                f"Unsupported df_noise_sampling={sampling}; use 'independent' or 'logsnr'"
+            )
 
     return torch.where(mask.to(dtype=torch.bool), levels, torch.zeros_like(levels))
 
@@ -501,21 +525,32 @@ def _diffusion_forcing_weights(
     cfg: dict,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Optional Min-SNR-γ weights for DF loss (Hang et al. 2023).
+    """Min-SNR-γ weights for DF loss (Hang et al. 2023).
 
-    Default is uniform because SONAR pred-x0 cosine loss is already stable;
-    set df_min_snr_gamma > 0 only for ablations.  For x0-prediction the
-    weight is min(SNR, γ) / SNR — this downweights clean (high-SNR) tokens
-    where the prediction task is trivial, focusing training on the harder
-    noisy regime.
-    """
-    gamma = float(cfg.get("df_min_snr_gamma", 0.0))
+        Weight formula depends on ``prediction_type`` (Table 1 of Min-SNR paper):
+          - x₀-prediction: ``min(SNR, γ) / SNR``
+          - ε-prediction:  ``min(SNR, γ)``
+          - v-prediction:  ``min(SNR, γ) / (SNR + 1)``
+
+        Default gamma=5.0 (recommended by Hang et al.).  Set to 0 to disable.
+        """
+    gamma = float(cfg.get("df_min_snr_gamma", 5.0))
     if gamma <= 0.0:
         return torch.ones_like(noise_levels, dtype=torch.float32)
 
     snr = model.diffusion_snr(noise_levels).to(device=noise_levels.device).float().clamp(min=1e-8)
     gamma_t = torch.full_like(snr, gamma)
-    weights = torch.minimum(snr, gamma_t) / snr
+    clipped = torch.minimum(snr, gamma_t)
+
+    pt = getattr(model.cfg, "prediction_type", "x0")
+    if pt == "x0":
+        weights = clipped / snr
+    elif pt == "eps":
+        weights = clipped
+    elif pt == "v":
+        weights = clipped / (snr + 1.0)
+    else:
+        weights = clipped / snr  # fallback
     return torch.where(mask.to(dtype=torch.bool), weights, torch.zeros_like(weights))
 
 
