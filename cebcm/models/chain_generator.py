@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable
 
@@ -26,6 +27,13 @@ class ChainGeneratorConfig:
     # Supervised teacher-forcing step loss.
     loss_cosine_weight: float = 1.0
     loss_mse_weight: float = 0.1
+
+    # Diffusion Forcing (continuous SONAR-space denoising objective).
+    diffusion_timesteps: int = 64
+    diffusion_beta_schedule: str = "cosine"
+    # 0.0 means target_norm / sqrt(d_model), i.e. unit Gaussian direction
+    # rescaled to the SONAR hypersphere scale instead of raw N(0, I).
+    diffusion_noise_scale: float = 0.0
 
 
 class CrossAttention(nn.Module):
@@ -219,6 +227,13 @@ class ChainGenerator(nn.Module):
 
         self.final_norm = nn.LayerNorm(self.cfg.d_model)
         self.output_proj = nn.Linear(self.cfg.d_model, self.cfg.d_model)
+        self.diffusion_time_mlp = nn.Sequential(
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+            nn.SiLU(),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+        )
+
+        self._build_diffusion_schedule()
 
         self._init_weights()
 
@@ -232,6 +247,97 @@ class ChainGenerator(nn.Module):
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.01)
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
+
+    def _build_diffusion_schedule(self) -> None:
+        """Register DDPM schedule buffers used by Diffusion Forcing.
+
+        Timesteps are indexed 0..K-1.  t=0 is near-clean, t=K-1 is the
+        noisiest state.  Noise itself is SONAR-scaled in q_sample, not raw
+        N(0, I), so the vector norm stays compatible with the hypersphere.
+        """
+        timesteps = max(2, int(self.cfg.diffusion_timesteps))
+        schedule = str(self.cfg.diffusion_beta_schedule).lower()
+
+        if schedule == "cosine":
+            s = 0.008
+            x = torch.linspace(0, timesteps, timesteps + 1, dtype=torch.float64)
+            alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5).pow(2)
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0].clamp(min=1e-12)
+            betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1].clamp(min=1e-12))
+            betas = betas.clamp(min=1e-5, max=0.999)
+        elif schedule == "linear":
+            betas = torch.linspace(1e-4, 2e-2, timesteps, dtype=torch.float64)
+        else:
+            raise ValueError(f"Unsupported diffusion_beta_schedule: {self.cfg.diffusion_beta_schedule}")
+
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0).float()
+        snr = alphas_cumprod / (1.0 - alphas_cumprod).clamp(min=1e-8)
+
+        self.register_buffer("_df_sqrt_alphas_cumprod", alphas_cumprod.sqrt(), persistent=True)
+        self.register_buffer(
+            "_df_sqrt_one_minus_alphas_cumprod",
+            (1.0 - alphas_cumprod).clamp(min=0.0).sqrt(),
+            persistent=True,
+        )
+        self.register_buffer("_df_snr", snr.float(), persistent=True)
+
+    def _diffusion_noise_scale(self) -> float:
+        if float(self.cfg.diffusion_noise_scale) > 0.0:
+            return float(self.cfg.diffusion_noise_scale)
+        return float(self.cfg.target_norm) / math.sqrt(float(self.cfg.d_model))
+
+    def _diffusion_timestep_embedding(self, noise_levels: Tensor) -> Tensor:
+        """Sinusoidal timestep embedding projected to residual-stream scale."""
+        half = self.cfg.d_model // 2
+        if half <= 0:
+            raise ValueError("d_model must be >= 2 for diffusion timestep embeddings")
+
+        # Use raw diffusion level, not [0, 1] normalization.  Standard
+        # sinusoidal timestep embeddings rely on the timestep range itself;
+        # compressing 0..K-1 into 0..1 makes most frequencies nearly constant
+        # and weakens noise-level conditioning.
+        t = noise_levels.float()
+        freqs = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=noise_levels.device, dtype=torch.float32)
+            / max(half - 1, 1)
+        )
+        args = t.unsqueeze(-1) * freqs
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if emb.shape[-1] < self.cfg.d_model:
+            emb = F.pad(emb, (0, self.cfg.d_model - emb.shape[-1]))
+        emb = emb.to(dtype=self.diffusion_time_mlp[0].weight.dtype)
+        return self.diffusion_time_mlp(emb).to(dtype=self.start_token.dtype)
+
+    def diffusion_q_sample(
+        self,
+        x_start: Tensor,
+        noise_levels: Tensor,
+        noise: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """SONAR-safe forward diffusion: x_t = sqrt(a)*x0 + sqrt(1-a)*eps.
+
+        The returned epsilon has expected norm near target_norm, not sqrt(D).
+        This is the key adaptation to SONAR geometry and prevents raw DDPM
+        noise from dwarfing 0.205-norm semantic vectors.
+        """
+        if noise_levels.shape != x_start.shape[:2]:
+            raise ValueError(
+                f"noise_levels shape {tuple(noise_levels.shape)} must match x_start[:2]={tuple(x_start.shape[:2])}"
+            )
+        levels = noise_levels.to(device=x_start.device, dtype=torch.long).clamp(
+            min=0,
+            max=max(int(self.cfg.diffusion_timesteps) - 1, 0),
+        )
+        if noise is None:
+            noise = torch.randn_like(x_start) * self._diffusion_noise_scale()
+        sqrt_alpha = self._df_sqrt_alphas_cumprod.to(device=x_start.device, dtype=x_start.dtype)[levels]
+        sqrt_one_minus = self._df_sqrt_one_minus_alphas_cumprod.to(
+            device=x_start.device, dtype=x_start.dtype
+        )[levels]
+        x_noisy = sqrt_alpha.unsqueeze(-1) * x_start + sqrt_one_minus.unsqueeze(-1) * noise
+        return x_noisy, noise
 
     def _safe_normalize(self, v: Tensor, dim: int = -1, eps: float = 1e-6) -> Tensor:
         """Numerically safe normalization that prevents NaN gradients.
@@ -388,6 +494,56 @@ class ChainGenerator(nn.Module):
                 seq = torch.cat([seq, next_vec], dim=1)
 
         return torch.cat(preds, dim=1)
+
+    def diffusion_snr(self, noise_levels: Tensor) -> Tensor:
+        """Return schedule SNR for each noise level."""
+        levels = noise_levels.to(dtype=torch.long, device=self._df_snr.device).clamp(
+            min=0,
+            max=max(int(self.cfg.diffusion_timesteps) - 1, 0),
+        )
+        return self._df_snr[levels].to(device=noise_levels.device)
+
+    def forward_diffusion_forcing(
+        self,
+        v_query: Tensor,
+        v_target_chain: Tensor,
+        noise_levels: Tensor,
+        v_context_bank: Tensor | None = None,
+        context_mask: Tensor | None = None,
+        noise: Tensor | None = None,
+        return_noisy: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
+        """Diffusion Forcing denoising pass over the whole chain.
+
+        Each valid position receives its own diffusion noise level.  Unlike
+        teacher forcing, the noised token at position i is fed at position i
+        and the causal mask prevents future leakage.  This trains the decoder
+        to repair partially corrupted self-generated prefixes instead of only
+        one clean shifted prefix.
+        """
+        bsz, num_steps, d_model = v_target_chain.shape
+        if noise_levels.shape != (bsz, num_steps):
+            raise ValueError(
+                f"noise_levels shape {tuple(noise_levels.shape)} does not match {(bsz, num_steps)}"
+            )
+        if d_model != self.cfg.d_model:
+            raise ValueError(f"target dim {d_model} != config d_model {self.cfg.d_model}")
+
+        context, ctx_mask = self._prepare_context(v_query, v_context_bank, context_mask)
+        v_noisy, eps = self.diffusion_q_sample(v_target_chain, noise_levels, noise=noise)
+
+        x = self._to_residual_space(v_noisy)
+        t_emb = self._diffusion_timestep_embedding(noise_levels).to(device=x.device, dtype=x.dtype)
+        x = x + t_emb
+
+        for layer in self.layers:
+            x = layer(x, context, context_mask=ctx_mask)
+
+        x = self.final_norm(x)
+        v_pred = self.output_proj(x)
+        if return_noisy:
+            return v_pred, v_noisy, eps
+        return v_pred
 
     def generate(
         self,

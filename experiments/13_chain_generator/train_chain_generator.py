@@ -12,6 +12,8 @@ Objective:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -23,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cebcm.models.chain_generator import ChainGenerator, ChainGeneratorConfig
+from cebcm.models.chain_generator import ChainGenerator, ChainGeneratorConfig, _apply_rope
 from cebcm.training.stage2_utils import (
     MetricTracker,
     get_cosine_schedule_with_warmup,
@@ -68,8 +70,10 @@ class ChainDataset(Dataset):
         # equivalent of EOS.
         if v_steps.shape[0] > 0:
             chain = torch.cat([v_steps, v_a.unsqueeze(0)], dim=0)
+            answer_pos = int(v_steps.shape[0])
         else:
             chain = v_a.unsqueeze(0)
+            answer_pos = 0
 
         # Pad with answer repeats (before truncation to max_chain_len).
         if self.answer_repeat_pad > 0:
@@ -80,8 +84,10 @@ class ChainDataset(Dataset):
             keep_reasoning = max(self.max_chain_len - 1, 0)
             if keep_reasoning > 0:
                 chain = torch.cat([chain[:keep_reasoning], chain[-1:]], dim=0)
+                answer_pos = keep_reasoning
             else:
                 chain = chain[-1:]
+                answer_pos = 0
 
         # Context memory-bank: [query, evidence_slots...]
         # Keep evidence from reasoning steps only (never answer token).
@@ -96,6 +102,7 @@ class ChainDataset(Dataset):
             "v_question": v_q,
             "chain": chain,
             "chain_len": chain.shape[0],
+            "answer_pos": answer_pos,
             "context_bank": context_bank,
             "context_len": context_bank.shape[0],
         }
@@ -109,6 +116,7 @@ def collate_chains(batch: list[dict]) -> dict:
     v_questions = torch.stack([b["v_question"] for b in batch])
 
     chain_lens = torch.tensor([b["chain_len"] for b in batch], dtype=torch.long)
+    answer_pos = torch.tensor([b["answer_pos"] for b in batch], dtype=torch.long)
     max_chain = int(chain_lens.max().item())
     chains = torch.zeros(bsz, max_chain, d_model)
     for i, b in enumerate(batch):
@@ -128,6 +136,7 @@ def collate_chains(batch: list[dict]) -> dict:
         "v_questions": v_questions,
         "chains": chains,
         "chain_lens": chain_lens,
+        "answer_pos": answer_pos,
         "context_banks": context_banks,
         "context_mask": context_mask,
     }
@@ -156,6 +165,7 @@ def summarize_chain_dataset(
     """Print cheap dataset diagnostics before spending GPU time."""
     step_lens: list[float] = []
     chain_lens: list[float] = []
+    answer_positions: list[float] = []
     ctx_lens: list[float] = []
     q_norms: list[float] = []
     a_norms: list[float] = []
@@ -168,9 +178,13 @@ def summarize_chain_dataset(
         n_steps = int(v_steps.shape[0])
         raw_chain_len = n_steps + 1 + max(0, int(answer_repeat_pad))
         final_chain_len = min(raw_chain_len, int(max_chain_len))
+        answer_pos = n_steps
+        if raw_chain_len > max_chain_len:
+            answer_pos = max(final_chain_len - 1, 0)
 
         step_lens.append(float(n_steps))
         chain_lens.append(float(final_chain_len))
+        answer_positions.append(float(answer_pos))
         ctx_lens.append(float(min(1 + n_steps, max(1, int(context_bank_size)))))
         q_norms.append(float(s["v_question"].norm().item()))
         a_norms.append(float(s["v_answer"].norm().item()))
@@ -183,7 +197,7 @@ def summarize_chain_dataset(
             truncated += 1
 
     n = max(len(samples), 1)
-    coverage = sum(1 for x in chain_lens if x <= max_chain_steps) / n
+    coverage = sum(1 for x in answer_positions if (x + 1) <= max_chain_steps) / n
     stats = {
         "n": float(len(samples)),
         "steps_mean": _mean(step_lens),
@@ -235,36 +249,48 @@ def get_chain_steps(epoch: int, cfg: dict) -> int:
 def select_training_targets(
     chains: torch.Tensor,
     chain_lens: torch.Tensor,
+    answer_pos: torch.Tensor,
     target_steps: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Select training targets aligned to the generation process.
 
-    Fix #6: Two regimes:
-      - System1 (target_steps=1): suffix-aligned — take the LAST valid token
-        (the answer), because the model must learn single-step direct QA.
-      - System2 (target_steps>1): prefix-aligned — take chains[0:target_steps],
+    Two regimes:
+      - System1 (target_steps=1): answer-aligned; take the first answer token,
+        not the first reasoning token and not an answer-repeat pad.
+      - System2 (target_steps>1): prefix-aligned; take chains[0:target_steps],
         matching what generate() produces autoregressively from position 0.
     """
     bsz, full_len, d_model = chains.shape
     steps = max(1, min(int(target_steps), full_len))
     targets = torch.zeros(bsz, steps, d_model, device=chains.device, dtype=chains.dtype)
     mask = torch.zeros(bsz, steps, device=chains.device, dtype=torch.bool)
+    target_answer_pos = torch.zeros(bsz, device=chains.device, dtype=torch.long)
+    target_has_answer = torch.zeros(bsz, device=chains.device, dtype=torch.bool)
 
     for i in range(bsz):
         li = max(1, min(int(chain_lens[i].item()), full_len))
         ti = min(steps, li)
+        ai = max(0, min(int(answer_pos[i].item()), li - 1))
 
         if steps == 1:
-            # System1: suffix-aligned — always the answer (last valid token).
-            targets[i, 0] = chains[i, li - 1]
+            # System1: direct answer.  Use the first answer vector, not an
+            # arbitrary repeated answer pad at the end of the chain.
+            targets[i, 0] = chains[i, ai]
             mask[i, 0] = True
+            target_answer_pos[i] = 0
+            target_has_answer[i] = True
         else:
             # System2: prefix-aligned — first ti tokens.
             targets[i, :ti] = chains[i, :ti]
             mask[i, :ti] = True
+            if ai < ti:
+                target_answer_pos[i] = ai
+                target_has_answer[i] = True
+            else:
+                target_answer_pos[i] = max(ti - 1, 0)
 
-    return targets, mask
+    return targets, mask, target_answer_pos, target_has_answer
 
 
 def _masked_step_losses(
@@ -295,6 +321,37 @@ def _masked_step_losses(
         "cos_loss": cos_loss,
         "mse_loss": mse_loss,
         "mask_sum": mask_sum,
+    }
+
+
+def _masked_weighted_step_losses(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    weights: torch.Tensor,
+    d_model: int,
+    cosine_weight: float,
+    mse_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    pred = pred.float()
+    target = target.float()
+    mask_bool = mask.to(device=pred.device, dtype=torch.bool)
+    weights = weights.to(device=pred.device, dtype=pred.dtype)
+    weights = torch.where(mask_bool, weights, torch.zeros_like(weights))
+    weight_sum = weights.sum().clamp(min=1.0)
+
+    cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+    cos_loss = ((1.0 - cos_sim) * weights).sum() / weight_sum
+
+    mse_per = (pred - target).pow(2).sum(dim=-1)
+    mse_loss = (mse_per * weights).sum() / weight_sum
+
+    loss = cosine_weight * cos_loss + mse_weight * mse_loss
+    return loss, {
+        "cos_sim": cos_sim,
+        "cos_loss": cos_loss,
+        "mse_loss": mse_loss,
+        "weight_sum": weight_sum,
     }
 
 
@@ -413,12 +470,183 @@ def _get_tf_noise_std(epoch: int, cfg: dict) -> float:
     return max_noise * progress
 
 
+def _sample_diffusion_noise_levels(
+    mask: torch.Tensor,
+    cfg: dict,
+    model: ChainGenerator,
+    *,
+    eval_mode: bool = False,
+) -> torch.Tensor:
+    """Sample independent per-position diffusion levels for valid targets."""
+    timesteps = max(2, int(model.cfg.diffusion_timesteps))
+    min_level = max(0, int(cfg.get("df_noise_level_min", 0)))
+    max_level = int(cfg.get("df_noise_level_max", timesteps - 1))
+    max_level = max(min_level, min(max_level, timesteps - 1))
+
+    if eval_mode:
+        eval_level = int(cfg.get("df_eval_noise_level", (min_level + max_level) // 2))
+        levels = torch.full(mask.shape, eval_level, device=mask.device, dtype=torch.long)
+    else:
+        sampling = str(cfg.get("df_noise_sampling", "independent")).lower()
+        if sampling != "independent":
+            raise ValueError(f"Unsupported df_noise_sampling={sampling}; use 'independent'")
+        levels = torch.randint(min_level, max_level + 1, mask.shape, device=mask.device)
+
+    return torch.where(mask.to(dtype=torch.bool), levels, torch.zeros_like(levels))
+
+
+def _diffusion_forcing_weights(
+    model: ChainGenerator,
+    noise_levels: torch.Tensor,
+    cfg: dict,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Optional Min-SNR-style weights for DF loss.
+
+    Default is uniform because SONAR pred-x0 cosine loss is already stable;
+    set df_min_snr_gamma > 0 only for ablations.  This path predicts clean
+    x0, not epsilon, so the Min-SNR form is clipped_snr/gamma.  Using
+    clipped_snr/snr would be the pred-noise weighting and would suppress
+    clean/low-noise positions incorrectly.
+    """
+    gamma = float(cfg.get("df_min_snr_gamma", 0.0))
+    if gamma <= 0.0:
+        return torch.ones_like(noise_levels, dtype=torch.float32)
+
+    snr = model.diffusion_snr(noise_levels).to(device=noise_levels.device).float().clamp(min=1e-8)
+    gamma_t = torch.full_like(snr, gamma)
+    weights = torch.minimum(snr, gamma_t) / gamma_t.clamp(min=1e-8)
+    return torch.where(mask.to(dtype=torch.bool), weights, torch.zeros_like(weights))
+
+
+def _make_diffusion_eval_noise_like(
+    chains: torch.Tensor,
+    cfg: dict,
+    model: ChainGenerator,
+) -> torch.Tensor:
+    """Deterministic Gaussian eval noise for stable DF validation metrics."""
+    base_seed = int(cfg.get("df_eval_noise_seed", 12345))
+    with torch.no_grad():
+        # Data-dependent seed keeps the noise stable for the same validation
+        # batch while avoiding identical noise for every batch with same shape.
+        digest = torch.abs(chains[: min(chains.shape[0], 4), :1, :16].float()).sum()
+        digest_int = int((digest * 1_000_000).detach().cpu().item()) % 2_147_483_647
+    seed = (base_seed + digest_int) % 2_147_483_647
+    scale = float(model.cfg.diffusion_noise_scale)
+    if scale <= 0.0:
+        scale = float(model.cfg.target_norm) / math.sqrt(float(model.cfg.d_model))
+
+    try:
+        gen = torch.Generator(device=chains.device)
+        gen.manual_seed(seed)
+        noise = torch.randn(
+            chains.shape,
+            device=chains.device,
+            dtype=chains.dtype,
+            generator=gen,
+        )
+    except (TypeError, RuntimeError):
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+        noise = torch.randn(chains.shape, dtype=chains.dtype, generator=gen).to(device=chains.device)
+    return noise * scale
+
+
+def _to_jsonable(value):
+    """Convert common numeric/tensor values to JSON-safe scalars."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return float(value.detach().cpu().item())
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (int, float, str, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_to_jsonable(payload), ensure_ascii=False) + "\n")
+
+
+def _diffusion_forcing_objective(
+    model: ChainGenerator,
+    v_q: torch.Tensor,
+    chains: torch.Tensor,
+    chain_mask: torch.Tensor,
+    context_banks: torch.Tensor,
+    context_mask: torch.Tensor,
+    cfg: dict,
+    *,
+    eval_mode: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Masked Diffusion Forcing loss in SONAR space."""
+    bsz, steps, d_model = chains.shape
+    levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=eval_mode)
+    weights = _diffusion_forcing_weights(model, levels, cfg, chain_mask)
+    noise = None
+    if eval_mode and bool(cfg.get("df_eval_deterministic_noise", True)):
+        noise = _make_diffusion_eval_noise_like(chains, cfg, model)
+
+    v_df, v_noisy, eps = model.forward_diffusion_forcing(
+        v_q,
+        chains,
+        levels,
+        v_context_bank=context_banks,
+        context_mask=context_mask,
+        noise=noise,
+        return_noisy=True,
+    )
+    loss, stats = _masked_weighted_step_losses(
+        v_df,
+        chains,
+        chain_mask,
+        weights,
+        d_model,
+        float(model.cfg.loss_cosine_weight),
+        float(model.cfg.loss_mse_weight),
+    )
+
+    with torch.no_grad():
+        maskf = chain_mask.to(dtype=torch.float32)
+        valid = maskf.sum().clamp(min=1.0)
+        cos_sim = stats["cos_sim"]
+        cos_mean = torch.where(chain_mask, cos_sim, torch.zeros_like(cos_sim)).sum() / valid
+        valid_levels = torch.where(chain_mask, levels.float(), torch.zeros_like(levels.float()))
+        noisy_norm = torch.where(chain_mask, v_noisy.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+        eps_norm = torch.where(chain_mask, eps.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+        pred_norm = torch.where(chain_mask, v_df.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+
+        metrics = {
+            "loss_df": float(loss.item()),
+            "df_cos": float(cos_mean.item()),
+            "df_cos_loss_raw": float(stats["cos_loss"].item()),
+            "df_mse_loss_raw": float(stats["mse_loss"].item()),
+            "df_noise_level_mean": float((valid_levels.sum() / valid).item()),
+            "df_noise_level_max": float(levels[chain_mask].max().item()) if chain_mask.any() else 0.0,
+            "df_noisy_norm": float(noisy_norm.item()),
+            "df_eps_norm": float(eps_norm.item()),
+            "df_pred_norm": float(pred_norm.item()),
+            "df_weight_mean": float((weights * maskf).sum().item() / valid.item()),
+        }
+
+    return loss, metrics
+
+
 def compute_composite_objective(
     model: ChainGenerator,
     v_q: torch.Tensor,
     chains: torch.Tensor,
     chain_mask: torch.Tensor,
     chain_lens: torch.Tensor,
+    answer_pos: torch.Tensor,
+    has_answer: torch.Tensor,
     context_banks: torch.Tensor,
     context_mask: torch.Tensor,
     cfg: dict,
@@ -426,28 +654,28 @@ def compute_composite_objective(
     free_run_noise_std: float = 0.0,
     oracle_prob: float = 0.0,
     tf_noise_std: float = 0.0,
+    eval_mode: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute full autoregressive objective for one batch."""
     bsz, steps, d_model = chains.shape
     valid_lens = chain_mask.sum(dim=1).long().clamp(min=1)
+    answer_pos = answer_pos.to(device=chains.device).long().clamp(min=0, max=max(steps - 1, 0))
+    has_answer = has_answer.to(device=chains.device, dtype=torch.bool)
 
     # Lambda weights.
     lambda_step = float(cfg.get("loss_lambda_step", 1.0))
     lambda_ans = float(cfg.get("loss_lambda_answer", 1.0))
     lambda_roll = float(cfg.get("loss_lambda_roll", 1.0))
     lambda_rank = float(cfg.get("loss_lambda_rank", 0.1))
+    lambda_df = float(cfg.get("loss_lambda_diffusion", 0.0))
     rank_enabled = lambda_rank > 0.0
+    df_enabled = bool(cfg.get("enable_diffusion_forcing", False)) and lambda_df > 0.0
     oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
     effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
 
     # Base cosine/MSE weights from model config.
     w_cos = float(model.cfg.loss_cosine_weight)
     w_mse = float(model.cfg.loss_mse_weight)
-
-    # Determine whether the training window includes the answer per-sample.
-    # System1 (steps=1): target is always the answer (suffix-aligned).
-    # System2 (steps>1): answer is contained if the full chain fits in the window.
-    has_answer = (chain_lens <= steps) | (steps == 1)
 
     # 1) Teacher-forced masked step loss (with optional scheduled sampling).
     # Noisy TF: inject noise into the teacher-forced prefix so the model
@@ -466,19 +694,22 @@ def compute_composite_objective(
     step_mask = chain_mask.clone()
     for i in range(bsz):
         if has_answer[i]:
-            last_idx = int(valid_lens[i].item()) - 1
-            if last_idx >= 0:
-                step_mask[i, last_idx] = False
+            ans_idx = int(answer_pos[i].item())
+            if ans_idx >= 0 and ans_idx < step_mask.shape[1]:
+                step_mask[i, ans_idx] = False
 
     l_step, tf_stats = _masked_step_losses(v_tf, chains, step_mask, d_model, w_cos, w_mse)
 
     # 2) Final-answer supervised loss — only on samples that reached the answer.
     tf_final = _gather_last_valid(v_tf, valid_lens)
     tgt_final = _gather_last_valid(chains, valid_lens)
+    batch_idx = torch.arange(bsz, device=chains.device)
+    tf_answer_all = v_tf[batch_idx, answer_pos]
+    tgt_answer_all = chains[batch_idx, answer_pos]
     
     if has_answer.any():
-        tf_ans = tf_final[has_answer].float()
-        tgt_ans = tgt_final[has_answer].float()
+        tf_ans = tf_answer_all[has_answer].float()
+        tgt_ans = tgt_answer_all[has_answer].float()
         ans_cos_sim = (_safe_normalize(tf_ans, dim=-1) * _safe_normalize(tgt_ans, dim=-1)).sum(dim=-1)
         ans_cos = (1.0 - ans_cos_sim).mean()
         ans_mse = (tf_ans - tgt_ans).pow(2).sum(dim=-1).mean()
@@ -509,26 +740,57 @@ def compute_composite_objective(
 
     # 4) In-batch contrastive ranking on final rollout answer.
     roll_final = _gather_last_valid(v_roll, valid_lens)
-    if rank_enabled:
+    roll_answer_all = v_roll[batch_idx, answer_pos]
+    if rank_enabled and has_answer.any():
         l_rank, rank_acc = _inbatch_contrastive_loss(
-            roll_final,
-            tgt_final,
+            roll_answer_all[has_answer],
+            tgt_answer_all[has_answer],
             temperature=float(cfg.get("contrastive_temperature", 0.07)),
         )
     else:
         l_rank = chains.new_zeros(())
         with torch.no_grad():
-            _, rank_acc = _inbatch_contrastive_loss(
-                roll_final.detach(),
-                tgt_final.detach(),
-                temperature=float(cfg.get("contrastive_temperature", 0.07)),
-            )
-            if not torch.isfinite(rank_acc):
+            if has_answer.any():
+                _, rank_acc = _inbatch_contrastive_loss(
+                    roll_answer_all[has_answer].detach(),
+                    tgt_answer_all[has_answer].detach(),
+                    temperature=float(cfg.get("contrastive_temperature", 0.07)),
+                )
+                if not torch.isfinite(rank_acc):
+                    rank_acc = chains.new_zeros(())
+            else:
                 rank_acc = chains.new_zeros(())
 
     loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll
     if rank_enabled:
         loss = loss + lambda_rank * l_rank
+
+    if df_enabled:
+        l_df, df_metrics = _diffusion_forcing_objective(
+            model,
+            v_q,
+            chains,
+            chain_mask,
+            context_banks,
+            context_mask,
+            cfg,
+            eval_mode=eval_mode,
+        )
+        loss = loss + lambda_df * l_df
+    else:
+        l_df = chains.new_zeros(())
+        df_metrics = {
+            "loss_df": 0.0,
+            "df_cos": 0.0,
+            "df_cos_loss_raw": 0.0,
+            "df_mse_loss_raw": 0.0,
+            "df_noise_level_mean": 0.0,
+            "df_noise_level_max": 0.0,
+            "df_noisy_norm": 0.0,
+            "df_eps_norm": 0.0,
+            "df_pred_norm": 0.0,
+            "df_weight_mean": 0.0,
+        }
 
     with torch.no_grad():
         # Use FULL mask (incl. answer) for reporting metrics.
@@ -556,12 +818,12 @@ def compute_composite_objective(
         ).sum(dim=-1).mean().item()
         if has_answer.any():
             roll_answer_cos = (
-                _safe_normalize(roll_final[has_answer].float(), dim=-1)
-                * _safe_normalize(tgt_final[has_answer].float(), dim=-1)
+                _safe_normalize(roll_answer_all[has_answer].float(), dim=-1)
+                * _safe_normalize(tgt_answer_all[has_answer].float(), dim=-1)
             ).sum(dim=-1).mean().item()
             tf_answer_cos = (
-                _safe_normalize(tf_final[has_answer].float(), dim=-1)
-                * _safe_normalize(tgt_final[has_answer].float(), dim=-1)
+                _safe_normalize(tf_answer_all[has_answer].float(), dim=-1)
+                * _safe_normalize(tgt_answer_all[has_answer].float(), dim=-1)
             ).sum(dim=-1).mean().item()
         else:
             roll_answer_cos = 0.0
@@ -577,6 +839,7 @@ def compute_composite_objective(
             "loss_ans": float(l_ans.item()),
             "loss_roll": float(l_roll.item()),
             "loss_rank": float(l_rank.item()),
+            "loss_df": float(l_df.item()),
             "tf_cos_mean": float(tf_cos_mean),
             "tf_cos_last": float(tf_cos_last),
             "tf_cos_answer": float(tf_answer_cos),
@@ -594,9 +857,11 @@ def compute_composite_objective(
             "lambda_ans": lambda_ans,
             "lambda_roll": lambda_roll,
             "lambda_rank": lambda_rank,
+            "lambda_df": lambda_df,
             "ss_prob": float(scheduled_sampling_prob),
             "free_run_noise_std": float(free_run_noise_std),
             "tf_noise_std": float(tf_noise_std),
+            "df_enabled": 1.0 if df_enabled else 0.0,
             "oracle_enabled": 1.0 if oracle_enabled else 0.0,
             "oracle_prob": float(effective_oracle_prob),
             "answer_coverage": float(has_answer.float().mean().item()),
@@ -608,6 +873,7 @@ def compute_composite_objective(
         metrics["tf_mse_loss_raw"] = float(tf_stats["mse_loss"].item())
         metrics["roll_cos_loss_raw"] = float(roll_stats["cos_loss"].item())
         metrics["roll_mse_loss_raw"] = float(roll_stats["mse_loss"].item())
+        metrics.update(df_metrics)
 
     return loss, metrics
 
@@ -630,10 +896,13 @@ def train_step(
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
     chain_lens = batch["chain_lens"].to(device)
+    answer_pos = batch["answer_pos"].to(device)
     context_banks = batch["context_banks"].to(device)
     context_mask = batch["context_mask"].to(device)
 
-    chains_trunc, chain_mask = select_training_targets(chains, chain_lens, target_steps)
+    chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
+        chains, chain_lens, answer_pos, target_steps
+    )
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -644,6 +913,8 @@ def train_step(
             chains_trunc,
             chain_mask,
             chain_lens,
+            target_answer_pos,
+            target_has_answer,
             context_banks,
             context_mask,
             cfg,
@@ -711,10 +982,13 @@ def eval_step(
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
     chain_lens = batch["chain_lens"].to(device)
+    answer_pos = batch["answer_pos"].to(device)
     context_banks = batch["context_banks"].to(device)
     context_mask = batch["context_mask"].to(device)
 
-    chains_trunc, chain_mask = select_training_targets(chains, chain_lens, gen_steps)
+    chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
+        chains, chain_lens, answer_pos, gen_steps
+    )
 
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
         _, metrics = compute_composite_objective(
@@ -723,10 +997,13 @@ def eval_step(
             chains_trunc,
             chain_mask,
             chain_lens,
+            target_answer_pos,
+            target_has_answer,
             context_banks,
             context_mask,
             cfg,
             free_run_noise_std=float(cfg.get("eval_free_run_noise_std", 0.0)),
+            eval_mode=True,
         )
 
     return {
@@ -735,6 +1012,7 @@ def eval_step(
         "val_loss_ans": metrics["loss_ans"],
         "val_loss_roll": metrics["loss_roll"],
         "val_loss_rank": metrics["loss_rank"],
+        "val_loss_df": metrics["loss_df"],
         "val_tf_cos": metrics["tf_cos_mean"],
         "val_tf_cos_last": metrics["tf_cos_last"],
         "val_tf_cos_answer": metrics["tf_cos_answer"],
@@ -742,10 +1020,250 @@ def eval_step(
         "val_roll_cos_last": metrics["roll_cos_last"],
         "val_roll_cos_answer": metrics["roll_cos_answer"],
         "val_rank_acc": metrics["rank_acc"],
+        "val_df_cos": metrics["df_cos"],
+        "val_df_noise_level": metrics["df_noise_level_mean"],
+        "val_df_noisy_norm": metrics["df_noisy_norm"],
+        "val_df_eps_norm": metrics["df_eps_norm"],
+        "val_df_pred_norm": metrics["df_pred_norm"],
         "val_norm_tf": metrics["pred_norm_mean_tf"],
         "val_norm_roll": metrics["pred_norm_mean_roll"],
         "val_answer_coverage": metrics["answer_coverage"],
     }
+
+
+def _fit_probe_projection_basis(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fit a deterministic 3D PCA basis on CPU for stable probe visualization."""
+    points = points.detach().float().cpu()
+    if points.dim() != 2:
+        points = points.reshape(-1, points.shape[-1])
+    if points.shape[0] == 0:
+        raise ValueError("Cannot fit projection basis on empty point set")
+
+    mean = points.mean(dim=0)
+    centered = points - mean
+    if points.shape[0] < 2:
+        basis = torch.eye(points.shape[1], dtype=torch.float32)[:3]
+        if basis.shape[0] < 3:
+            basis = F.pad(basis, (0, 0, 0, 3 - basis.shape[0]))
+        explained = torch.zeros(3, dtype=torch.float32)
+        return mean, basis, explained
+
+    try:
+        _, svals, vh = torch.linalg.svd(centered, full_matrices=False)
+        basis = vh[:3].contiguous()
+        denom = centered.shape[0] - 1
+        variance = (svals[:3].pow(2) / max(denom, 1)).float()
+    except RuntimeError:
+        cov = centered.t().matmul(centered) / max(centered.shape[0] - 1, 1)
+        evals, evecs = torch.linalg.eigh(cov)
+        idx = torch.argsort(evals, descending=True)[:3]
+        basis = evecs[:, idx].t().contiguous()
+        variance = evals[idx].float().clamp(min=0.0)
+
+    if basis.shape[0] < 3:
+        pad = torch.eye(points.shape[1], dtype=torch.float32)[: 3 - basis.shape[0]]
+        basis = torch.cat([basis, pad], dim=0)
+        variance = F.pad(variance, (0, 3 - variance.shape[0]))
+
+    # Fix sign ambiguity so projections do not flip between independent fits.
+    for i in range(basis.shape[0]):
+        max_idx = int(torch.argmax(basis[i].abs()).item())
+        if basis[i, max_idx] < 0:
+            basis[i] = -basis[i]
+
+    total_var = (centered.pow(2).sum() / max(centered.shape[0] - 1, 1)).clamp(min=1e-12)
+    explained = (variance / total_var).float()
+    return mean, basis[:3], explained[:3]
+
+
+def _project_probe_tensor(x: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    x_cpu = x.detach().float().cpu()
+    flat = x_cpu.reshape(-1, x_cpu.shape[-1])
+    proj = (flat - mean).matmul(basis.t())
+    return proj.reshape(*x_cpu.shape[:-1], 3).contiguous()
+
+
+def _masked_probe_points(*vectors: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_cpu = mask.detach().bool().cpu()
+    chunks: list[torch.Tensor] = []
+    for vec in vectors:
+        vec_cpu = vec.detach().float().cpu()
+        if vec_cpu.shape[:2] != mask_cpu.shape:
+            continue
+        chunks.append(vec_cpu[mask_cpu])
+    if not chunks:
+        raise ValueError("No valid probe vectors found for PCA basis")
+    return torch.cat(chunks, dim=0)
+
+
+@torch.no_grad()
+def write_training_probe_snapshot(
+    *,
+    model: ChainGenerator,
+    probe_batch: dict,
+    cfg: dict,
+    device: torch.device,
+    probe_dir: Path,
+    epoch: int,
+    batch_idx: int,
+    global_step: int,
+    target_steps: int,
+    projection_state: dict | None,
+) -> dict:
+    """Write a compact fixed-probe geometry snapshot for GUI inspection."""
+    was_training = model.training
+    model.eval()
+
+    try:
+        max_samples = max(1, int(cfg.get("probe_num_samples", 4)))
+        probe_steps_cfg = int(cfg.get("probe_steps", 0))
+        steps = target_steps if probe_steps_cfg <= 0 else min(
+            probe_steps_cfg,
+            int(cfg.get("max_chain_steps", target_steps)),
+        )
+
+        v_q = probe_batch["v_questions"][:max_samples].to(device)
+        chains = probe_batch["chains"][:max_samples].to(device)
+        chain_lens = probe_batch["chain_lens"][:max_samples].to(device)
+        answer_pos = probe_batch["answer_pos"][:max_samples].to(device)
+        context_banks = probe_batch["context_banks"][:max_samples].to(device)
+        context_mask = probe_batch["context_mask"][:max_samples].to(device)
+
+        chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
+            chains,
+            chain_lens,
+            answer_pos,
+            steps,
+        )
+        context_mask = context_mask[:, : context_banks.shape[1]]
+
+        levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=True)
+        noise = _make_diffusion_eval_noise_like(chains_trunc, cfg, model)
+        v_df, v_noisy, eps = model.forward_diffusion_forcing(
+            v_q,
+            chains_trunc,
+            levels,
+            v_context_bank=context_banks,
+            context_mask=context_mask,
+            noise=noise,
+            return_noisy=True,
+        )
+        v_tf = model.forward(
+            v_q,
+            chains_trunc,
+            v_context_bank=context_banks,
+            context_mask=context_mask,
+            scheduled_sampling_prob=0.0,
+            tf_noise_std=0.0,
+        )
+        v_roll, roll_info = model.generate(
+            v_q,
+            num_steps=chains_trunc.shape[1],
+            v_context_bank=context_banks,
+            context_mask=context_mask,
+            temperature=float(cfg.get("free_run_temperature", 1.0)),
+            latent_noise_std=float(cfg.get("eval_free_run_noise_std", 0.0)),
+            repeat_penalty=float(cfg.get("free_run_repeat_penalty", 0.0)),
+            repeat_cos_threshold=float(cfg.get("free_run_repeat_cos_threshold", 0.98)),
+            repeat_ban_threshold=float(cfg.get("free_run_repeat_ban_threshold", 0.995)),
+            repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 3)),
+            return_info=True,
+        )
+
+        if projection_state is None:
+            points = _masked_probe_points(chains_trunc, v_noisy, v_df, v_roll, v_tf, mask=chain_mask)
+            mean, basis, explained = _fit_probe_projection_basis(points)
+            projection_state = {
+                "mean": mean,
+                "basis": basis,
+                "explained": explained,
+            }
+        else:
+            mean = projection_state["mean"].detach().float().cpu()
+            basis = projection_state["basis"].detach().float().cpu()
+            explained = projection_state.get("explained", torch.zeros(3)).detach().float().cpu()
+
+        clean = chains_trunc.detach().float()
+        mask = chain_mask.detach().bool()
+
+        def cos_to_clean(x: torch.Tensor) -> torch.Tensor:
+            return (_safe_normalize(x.float(), dim=-1) * _safe_normalize(clean.float(), dim=-1)).sum(dim=-1)
+
+        def l2_to_clean(x: torch.Tensor) -> torch.Tensor:
+            return (x.float() - clean.float()).norm(dim=-1)
+
+        snapshot = {
+            "schema": "chain_generator_probe_v1",
+            "global_step": int(global_step),
+            "epoch": int(epoch),
+            "batch_idx": int(batch_idx),
+            "target_steps": int(steps),
+            "mode": "system1" if int(steps) == 1 else "system2",
+            "projection": {
+                "mean": mean,
+                "basis": basis,
+                "explained": explained,
+            },
+            "projected": {
+                "clean": _project_probe_tensor(clean, mean, basis),
+                "noisy": _project_probe_tensor(v_noisy, mean, basis),
+                "pred_x0": _project_probe_tensor(v_df, mean, basis),
+                "teacher_forced": _project_probe_tensor(v_tf, mean, basis),
+                "rollout": _project_probe_tensor(v_roll, mean, basis),
+            },
+            "arrays": {
+                "mask": mask.cpu(),
+                "noise_levels": levels.detach().cpu(),
+                "answer_pos": target_answer_pos.detach().cpu(),
+                "has_answer": target_has_answer.detach().cpu(),
+                "df_cos": torch.where(mask, cos_to_clean(v_df), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "noisy_cos": torch.where(mask, cos_to_clean(v_noisy), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "tf_cos": torch.where(mask, cos_to_clean(v_tf), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "roll_cos": torch.where(mask, cos_to_clean(v_roll), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "df_l2": torch.where(mask, l2_to_clean(v_df), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "noisy_l2": torch.where(mask, l2_to_clean(v_noisy), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "roll_l2": torch.where(mask, l2_to_clean(v_roll), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "clean_norm": torch.where(mask, clean.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "noisy_norm": torch.where(mask, v_noisy.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "pred_norm": torch.where(mask, v_df.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "roll_norm": torch.where(mask, v_roll.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+            },
+            "metrics": {
+                "df_cos_mean": float(cos_to_clean(v_df)[mask].mean().item()) if mask.any() else 0.0,
+                "noisy_cos_mean": float(cos_to_clean(v_noisy)[mask].mean().item()) if mask.any() else 0.0,
+                "roll_cos_mean": float(cos_to_clean(v_roll)[mask].mean().item()) if mask.any() else 0.0,
+                "tf_cos_mean": float(cos_to_clean(v_tf)[mask].mean().item()) if mask.any() else 0.0,
+                "noise_level_mean": float(levels[mask].float().mean().item()) if mask.any() else 0.0,
+                "noise_level_max": float(levels[mask].float().max().item()) if mask.any() else 0.0,
+                "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
+            },
+        }
+
+        if bool(cfg.get("probe_save_raw_vectors", False)):
+            snapshot["raw"] = {
+                "clean": clean.detach().cpu(),
+                "noisy": v_noisy.detach().cpu(),
+                "pred_x0": v_df.detach().cpu(),
+                "teacher_forced": v_tf.detach().cpu(),
+                "rollout": v_roll.detach().cpu(),
+                "eps": eps.detach().cpu(),
+            }
+
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        out_path = probe_dir / f"probe_step_{int(global_step):010d}.pt"
+        torch.save(snapshot, out_path)
+
+        return {
+            "path": str(out_path),
+            "global_step": int(global_step),
+            "df_cos_mean": snapshot["metrics"]["df_cos_mean"],
+            "roll_cos_mean": snapshot["metrics"]["roll_cos_mean"],
+            "target_steps": int(steps),
+            "projection_state": projection_state,
+        }
+    finally:
+        if was_training:
+            model.train()
 
 
 def main() -> None:
@@ -872,12 +1390,18 @@ def main() -> None:
 
     start_epoch = 0
     best_metric = float("-inf")
+    global_step = 0
     if args.finetune:
         ckpt = torch.load(args.finetune, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        load_result = model.load_state_dict(ckpt["model"], strict=False)
         src_epoch = ckpt.get("epoch", "?")
         src_metric = ckpt.get("best_metric", "?")
         print(f"Fine-tune from {args.finetune} (src epoch={src_epoch}, metric={src_metric})")
+        if load_result.missing_keys or load_result.unexpected_keys:
+            print(
+                f"  Compat load: missing={len(load_result.missing_keys)}, "
+                f"unexpected={len(load_result.unexpected_keys)}"
+            )
         print("  Fresh optimizer, scheduler, epoch counter.")
     elif args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -886,12 +1410,38 @@ def main() -> None:
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_metric = float(ckpt.get("best_metric", best_metric))
+        global_step = int(ckpt.get("global_step", 0))
         print(f"Resumed from {args.resume}: epoch={start_epoch}, best={best_metric:.4f}")
 
     log_every = int(train_cfg.get("log_every", 50))
     ckpt_every = int(train_cfg.get("checkpoint_every", 5))
     patience = int(train_cfg.get("early_stop_patience", 15))
     no_improve = 0
+    logs_dir = Path(out_cfg["logs_dir"])
+    metrics_log_path = logs_dir / str(train_cfg.get("metrics_log_name", "chain_generator_training.jsonl"))
+    probe_enabled = bool(train_cfg.get("enable_training_geometry_probe", True))
+    probe_every_steps = int(train_cfg.get("probe_every_steps", 200))
+    probe_dir = logs_dir / str(train_cfg.get("probe_dir_name", "geometry_probes"))
+    probe_state: dict | None = None
+    probe_batch = None
+    if probe_enabled and probe_every_steps > 0:
+        try:
+            probe_batch = next(iter(val_loader))
+        except StopIteration:
+            probe_enabled = False
+    _append_jsonl(
+        metrics_log_path,
+        {
+            "event": "run_start",
+            "global_step": int(global_step),
+            "start_epoch": int(start_epoch),
+            "config_path": str(args.config),
+            "probe_enabled": bool(probe_enabled),
+            "probe_every_steps": int(probe_every_steps),
+            "probe_dir": str(probe_dir),
+            "timestamp": time.time(),
+        },
+    )
 
     tracker = MetricTracker()
     
@@ -908,7 +1458,8 @@ def main() -> None:
         f"step*{train_cfg.get('loss_lambda_step', 1.0)} + "
         f"ans*{train_cfg.get('loss_lambda_answer', 1.0)} + "
         f"roll*{train_cfg.get('loss_lambda_roll', 1.0)} + "
-        f"rank*{train_cfg.get('loss_lambda_rank', 0.1)}"
+        f"rank*{train_cfg.get('loss_lambda_rank', 0.1)} + "
+        f"df*{train_cfg.get('loss_lambda_diffusion', 0.0)}"
     )
     print(
         f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
@@ -922,6 +1473,17 @@ def main() -> None:
         f"  oracle_dagger: enabled={bool(train_cfg.get('enable_oracle_dagger', False))}, "
         f"max_retries={train_cfg.get('oracle_max_retries', 0)}, "
         f"prob_max={train_cfg.get('oracle_prob_max', 0.0)}"
+    )
+    print(
+        f"  diffusion_forcing: enabled={bool(train_cfg.get('enable_diffusion_forcing', False))}, "
+        f"K={gen_cfg.diffusion_timesteps}, schedule={gen_cfg.diffusion_beta_schedule}, "
+        f"levels=[{train_cfg.get('df_noise_level_min', 0)}, "
+        f"{train_cfg.get('df_noise_level_max', gen_cfg.diffusion_timesteps - 1)}], "
+        f"eval_level={train_cfg.get('df_eval_noise_level', (gen_cfg.diffusion_timesteps - 1) // 2)}"
+    )
+    print(
+        f"  training_geometry: enabled={probe_enabled}, every={probe_every_steps}, "
+        f"samples={train_cfg.get('probe_num_samples', 4)}, dir={probe_dir}"
     )
     print("=" * 70)
 
@@ -974,6 +1536,7 @@ def main() -> None:
             )
             if metrics.get("optimizer_stepped", 0.0) > 0.0:
                 scheduler.step()
+            global_step += 1
             tracker.update(metrics)
 
             if metrics.get("nan_skipped", 0.0) > 0:
@@ -1020,6 +1583,59 @@ def main() -> None:
             else:
                 sadt_cooldown -= 1
 
+            if (
+                probe_enabled
+                and probe_batch is not None
+                and probe_every_steps > 0
+                and global_step % probe_every_steps == 0
+            ):
+                try:
+                    probe_info = write_training_probe_snapshot(
+                        model=model,
+                        probe_batch=probe_batch,
+                        cfg=train_cfg,
+                        device=device,
+                        probe_dir=probe_dir,
+                        epoch=epoch,
+                        batch_idx=step + 1,
+                        global_step=global_step,
+                        target_steps=target_steps,
+                        projection_state=probe_state,
+                    )
+                    probe_state = probe_info.pop("projection_state")
+                    _append_jsonl(
+                        metrics_log_path,
+                        {
+                            "event": "probe_snapshot",
+                            "epoch": int(epoch),
+                            "batch_idx": int(step + 1),
+                            "global_step": int(global_step),
+                            "target_steps": int(target_steps),
+                            "phase": phase,
+                            "probe": probe_info,
+                            "timestamp": time.time(),
+                        },
+                    )
+                    print(
+                        f"  [PROBE] step={global_step} "
+                        f"df_cos={probe_info.get('df_cos_mean', 0.0):.4f} "
+                        f"roll_cos={probe_info.get('roll_cos_mean', 0.0):.4f} "
+                        f"path={probe_info.get('path')}"
+                    )
+                except Exception as exc:
+                    _append_jsonl(
+                        metrics_log_path,
+                        {
+                            "event": "probe_error",
+                            "epoch": int(epoch),
+                            "batch_idx": int(step + 1),
+                            "global_step": int(global_step),
+                            "error": str(exc),
+                            "timestamp": time.time(),
+                        },
+                    )
+                    print(f"  [PROBE ERROR] step={global_step}: {exc}")
+
             if (step + 1) % log_every == 0:
                 avg = tracker.get()
                 lr_now = optimizer.param_groups[0]["lr"]
@@ -1032,13 +1648,36 @@ def main() -> None:
                     f"ans={avg.get('loss_ans', 0.0):.4f} "
                     f"roll={avg.get('loss_roll', 0.0):.4f} "
                     f"rank={avg.get('loss_rank', 0.0):.4f} "
+                    f"df={avg.get('loss_df', 0.0):.4f} "
                     f"tf_cos={avg.get('tf_cos_mean', 0.0):.4f} "
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
                     f"roll_ans={avg.get('roll_cos_answer', 0.0):.4f} "
+                    f"df_cos={avg.get('df_cos', 0.0):.4f} "
+                    f"df_t={avg.get('df_noise_level_mean', 0.0):.1f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
                     f"ans_cov={avg.get('answer_coverage', 0.0):.2f} "
                     f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
                     f"lr={lr_now:.2e}{sadt_info}{nan_info}"
+                )
+                _append_jsonl(
+                    metrics_log_path,
+                    {
+                        "event": "train_step",
+                        "epoch": int(epoch),
+                        "batch_idx": int(step + 1),
+                        "global_step": int(global_step),
+                        "target_steps": int(target_steps),
+                        "phase": phase,
+                        "lr": float(lr_now),
+                        "scheduled_sampling_prob": float(ss_prob),
+                        "free_run_noise_std": float(noise_std),
+                        "tf_noise_std": float(tf_noise),
+                        "oracle_prob": float(oracle_prob),
+                        "nan_count_epoch": int(nan_count),
+                        "sadt": dict(sadt_events),
+                        "train_metrics": avg,
+                        "timestamp": time.time(),
+                    },
                 )
                 tracker.reset()
                 sadt_events = {"throttle": 0, "turbo": 0}
@@ -1071,10 +1710,26 @@ def main() -> None:
             f"roll_cos={val.get('val_roll_cos', 0.0):.4f} "
             f"roll_cos_last={val.get('val_roll_cos_last', 0.0):.4f} "
             f"roll_ans={val.get('val_roll_cos_answer', 0.0):.4f} "
+            f"df_cos={val.get('val_df_cos', 0.0):.4f} "
+            f"df_t={val.get('val_df_noise_level', 0.0):.1f} "
             f"rank_acc={val.get('val_rank_acc', 0.0):.3f} "
             f"ans_cov={val.get('val_answer_coverage', 0.0):.2f} "
             f"norm_roll={val.get('val_norm_roll', 0.0):.4f} "
             f"({epoch_time:.1f}s)"
+        )
+        _append_jsonl(
+            metrics_log_path,
+            {
+                "event": "val_epoch",
+                "epoch": int(epoch),
+                "global_step": int(global_step),
+                "target_steps": int(target_steps),
+                "phase": phase,
+                "epoch_time_sec": float(epoch_time),
+                "val_metric": float(val_metric),
+                "val_metrics": val,
+                "timestamp": time.time(),
+            },
         )
 
         improved = val_metric > best_metric
@@ -1090,6 +1745,7 @@ def main() -> None:
                     "scheduler": scheduler.state_dict(),
                     "config": config,
                     "best_metric": best_metric,
+                    "global_step": global_step,
                 },
             )
             print(f"  ** New best: val_roll_cos_last={best_metric:.4f}")
@@ -1106,6 +1762,7 @@ def main() -> None:
                     "scheduler": scheduler.state_dict(),
                     "config": config,
                     "best_metric": best_metric,
+                    "global_step": global_step,
                 },
             )
 
@@ -1116,6 +1773,15 @@ def main() -> None:
     print("\nTraining complete")
     print(f"Best val_roll_cos_last={best_metric:.4f}")
     print(f"Checkpoints: {out_cfg['checkpoint_dir']}")
+    _append_jsonl(
+        metrics_log_path,
+        {
+            "event": "run_complete",
+            "global_step": int(global_step),
+            "best_metric": float(best_metric),
+            "timestamp": time.time(),
+        },
+    )
 
 
 if __name__ == "__main__":

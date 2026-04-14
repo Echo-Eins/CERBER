@@ -10,7 +10,10 @@
         "dropout": 0.1,
         "target_norm": 0.2051,
         "loss_cosine_weight": 1.0,
-        "loss_mse_weight": 0.1
+        "loss_mse_weight": 0.1,
+        "diffusion_timesteps": 64,
+        "diffusion_beta_schedule": "cosine",
+        "diffusion_noise_scale": 0.0
     },
 
     "critic": {
@@ -57,6 +60,15 @@
         "loss_lambda_answer": 1.0,
         "loss_lambda_roll": 1.0,
         "loss_lambda_rank": 0.0,
+        "enable_diffusion_forcing": true,
+        "loss_lambda_diffusion": 0.5,
+        "df_noise_sampling": "independent",
+        "df_noise_level_min": 0,
+        "df_noise_level_max": 63,
+        "df_eval_noise_level": 32,
+        "df_eval_deterministic_noise": true,
+        "df_eval_noise_seed": 12345,
+        "df_min_snr_gamma": 0.0,
         "contrastive_temperature": 0.07,
         "enable_oracle_dagger": false,
         "oracle_max_retries": 0,
@@ -79,7 +91,7 @@
         "free_run_noise_std_max": 0.0,
         "eval_free_run_noise_std": 0.0,
 
-        "tf_noise_std_max": 0.005,
+        "tf_noise_std_max": 0.0,
         "tf_noise_ramp_epochs": 5,
         "free_run_repeat_penalty": 0.15,
         "free_run_repeat_cos_threshold": 0.98,
@@ -90,6 +102,13 @@
         "answer_repeat_pad": 2,
 
         "log_every": 50,
+        "metrics_log_name": "chain_generator_training.jsonl",
+        "enable_training_geometry_probe": true,
+        "probe_every_steps": 200,
+        "probe_num_samples": 4,
+        "probe_steps": 0,
+        "probe_dir_name": "geometry_probes",
+        "probe_save_raw_vectors": false,
         "checkpoint_every": 5,
         "early_stop_patience": 15
     },

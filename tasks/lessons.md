@@ -2023,3 +2023,45 @@ Teacher-forced-only chain supervision can look stable in logs but collapses in r
 2. If cross-attention key length is 1, do not treat attention plots as evidence of context reasoning.
 3. Reranker quality requires candidate diversity; deterministic best-of-N is a no-op.
 4. Train and inference horizons must be aligned or explicitly capped.
+
+## 2026-04-13 - Diffusion Forcing in SONAR space must use SONAR-scaled noise
+
+### Pattern
+Diffusion Forcing uses DDPM-style per-position noise levels, but raw DDPM epsilon `N(0, I)` is mathematically wrong for 1024D SONAR vectors with norm near 0.205. Raw epsilon has expected norm near 32 and recreates the same failure mode as uncalibrated rollout noise: the noise dominates semantic signal before attention can use it.
+
+### Rule
+1. In SONAR-space diffusion objectives, default epsilon scale must be `target_norm / sqrt(d_model)`, not 1.0 per dimension.
+2. Keep the AR/free-run objective active when adding Diffusion Forcing. DF is an additional robustness objective, not proof that rollout works.
+3. Train with independent per-position noise levels, but validate DF at a fixed noise level so diagnostics are comparable across epochs.
+4. Monitor `roll_cos`, `roll_ans`, and `ans_cov` as the real QA rollout metrics. `df_cos` only proves denoising skill at a chosen noise level.
+
+## 2026-04-13 - Diffusion timestep embeddings and Min-SNR weights must match objective type
+
+### Pattern
+A diffusion timestep embedding normalized to [0, 1] weakens sinusoidal conditioning for small K (e.g. K=64): most frequency channels become nearly constant, so the model can under-use the noise level. Also Min-SNR weights depend on the prediction target. `clipped_snr/snr` is for epsilon/pred-noise style objectives, not pred-x0.
+
+### Rule
+1. Use raw diffusion levels (0..K-1) for sinusoidal timestep embeddings unless the embedding implementation explicitly expects normalized continuous log-SNR.
+2. For pred-x0 DF loss, use clipped-SNR style weights (`min(snr, gamma)` optionally normalized by gamma), not `min(snr, gamma) / snr`.
+3. Keep Min-SNR disabled by default until an ablation proves it improves rollout metrics, not just DF denoising metrics.
+
+## 2026-04-13 - Diffusion eval must fix both timestep and epsilon noise for stable diagnostics
+
+### Pattern
+Fixing only `df_eval_noise_level` is not enough for stable validation metrics. If epsilon is still sampled from the global RNG, `val_df_cos` changes across epochs even when the model is unchanged, making DF diagnostics harder to interpret.
+
+### Rule
+1. For DF validation diagnostics, use a fixed noise level and deterministic Gaussian epsilon per validation batch.
+2. Do not use deterministic eval noise for training; train still needs independent stochastic noise levels and epsilon samples.
+3. Keep rollout metrics (`val_roll_cos_last`, `val_roll_ans`) as the selection metric; deterministic DF eval is a diagnostic, not the final QA metric.
+
+## 2026-04-13 - Answer-repeat padding must not drive System1/System2 answer supervision
+
+### Pattern
+`answer_repeat_pad` makes the last valid chain position an answer duplicate, not necessarily the first answer position. If answer coverage is inferred from `chain_len <= target_steps`, System2 can delay `L_ans`, rollout-answer metrics, and rank diagnostics until all repeated answer pads enter the horizon. That makes multi-step training misreport whether the actual answer is supervised.
+
+### Rule
+1. Store and propagate the first answer position (`answer_pos`) separately from `chain_len`.
+2. System1 (`target_steps=1`) must train directly on `chains[answer_pos]`, not on the first reasoning step or the final repeat pad.
+3. System2 should use prefix-aligned targets, but activate answer-specific losses and metrics as soon as `answer_pos < target_steps`.
+4. Rank diagnostics and answer metrics should compare rollout at `answer_pos` to the first answer vector, not to an arbitrary last valid repeat.
