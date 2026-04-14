@@ -371,6 +371,15 @@ class ChainGenerator(nn.Module):
         else:
             self.final_norm = nn.LayerNorm(self.cfg.d_model)
 
+        self.output_proj = nn.Linear(self.cfg.d_model, self.cfg.d_model)
+
+        # Timestep MLP for diffusion noise-level conditioning.
+        self.diffusion_time_mlp = nn.Sequential(
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+            nn.SiLU(),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+        )
+
         self._build_diffusion_schedule()
 
         self._init_weights()
@@ -416,9 +425,9 @@ class ChainGenerator(nn.Module):
         self.register_buffer(
             "_df_sqrt_one_minus_alphas_cumprod",
             (1.0 - alphas_cumprod).clamp(min=0.0).sqrt(),
-            self.register_buffer("_df_alphas_cumprod", alphas_cumprod.float(), persistent=True),
             persistent=True,
         )
+        self.register_buffer("_df_alphas_cumprod", alphas_cumprod.float(), persistent=True)
         self.register_buffer("_df_snr", snr.float(), persistent=True)
 
     def _diffusion_noise_scale(self) -> float:
@@ -1162,115 +1171,118 @@ class ChainGenerator(nn.Module):
 
         return chain_out, info
 
-        # ------------------------------------------------------------------
-        # DDIM iterative refinement at each autoregressive position
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # DDIM iterative refinement at each autoregressive position
+    # ------------------------------------------------------------------
 
-        def _ddim_denoise_position(
-                self,
-                chain_residual: Tensor,
-                context: Tensor,
-                ctx_mask: Tensor | None,
-                ddim_steps: int = 3,
-                cfg_scale: float = 1.0,
-        ) -> Tensor:
-            """Refine the next chain position via DDIM multi-step denoising.
+    def _ddim_denoise_position(
+            self,
+            chain_residual: Tensor,
+            context: Tensor,
+            ctx_mask: Tensor | None,
+            ddim_steps: int = 3,
+            cfg_scale: float = 1.0,
+    ) -> Tensor:
+        """Refine the next chain position via DDIM multi-step denoising.
 
-            Instead of one-shot prediction, this starts from pure noise and
-            iteratively denoises through ``ddim_steps`` diffusion steps, using
-            the model's DF pathway.  The chain prefix is treated as clean (t=0).
+        Instead of one-shot prediction, this starts from pure noise and
+        iteratively denoises through ``ddim_steps`` diffusion steps, using
+        the model's DF pathway.  The chain prefix is treated as clean (t=0).
 
-            Args:
-                chain_residual: [B, L, D] existing chain in residual space
-                                (start_token + generated so far).
-                context: [B, K, D] cross-attention context (residual space).
-                ctx_mask: [B, K] context mask.
-                ddim_steps: number of DDIM denoising steps.
-                cfg_scale: classifier-free guidance scale (1.0 = no guidance).
+        Args:
+            chain_residual: [B, L, D] existing chain in residual space
+                            (start_token + generated so far).
+            context: [B, K, D] cross-attention context (residual space).
+            ctx_mask: [B, K] context mask.
+            ddim_steps: number of DDIM denoising steps.
+            cfg_scale: classifier-free guidance scale (1.0 = no guidance).
 
-            Returns:
-                x0_pred: [B, 1, D] predicted clean vector in **SONAR** space.
-            """
-            bsz = chain_residual.shape[0]
-            K = max(2, int(self.cfg.diffusion_timesteps))
+        Returns:
+            x0_pred: [B, 1, D] predicted clean vector in **SONAR** space.
+        """
+        bsz = chain_residual.shape[0]
+        K = max(2, int(self.cfg.diffusion_timesteps))
 
-            # Build step schedule: evenly spaced from t_max down to 0.
-            # E.g. ddim_steps=3, K=64 → [63, 42, 21, 0]
-            schedule = torch.linspace(K - 1, 0, ddim_steps + 1).long().tolist()
+        # Build step schedule: evenly spaced from t_max down to 0.
+        # E.g. ddim_steps=3, K=64 → [63, 42, 21, 0]
+        schedule = torch.linspace(K - 1, 0, ddim_steps + 1).long().tolist()
 
-            # Start from pure SONAR-scaled noise for the new position.
-            noise_scale = self._diffusion_noise_scale()
-            x_t = noise_scale * torch.randn(
-                bsz, 1, self.cfg.d_model,
-                device=chain_residual.device,
-                dtype=chain_residual.dtype,
+        # Start from pure SONAR-scaled noise for the new position.
+        noise_scale = self._diffusion_noise_scale()
+        x_t = noise_scale * torch.randn(
+            bsz, 1, self.cfg.d_model,
+            device=chain_residual.device,
+            dtype=chain_residual.dtype,
+        )
+
+        for i in range(ddim_steps):
+            t_cur = schedule[i]
+            t_next = schedule[i + 1]
+
+            # Build levels: 0 for clean prefix, t_cur for the new position.
+            prefix_len = chain_residual.shape[1]
+            levels_prefix = torch.zeros(bsz, prefix_len, device=chain_residual.device, dtype=torch.long)
+            levels_new = torch.full((bsz, 1), t_cur, device=chain_residual.device, dtype=torch.long)
+            levels = torch.cat([levels_prefix, levels_new], dim=1)  # [B, L+1]
+
+            # Concatenate prefix + noisy new position.
+            x_new_res = self._to_residual_space(x_t)
+            full_seq = torch.cat([chain_residual, x_new_res], dim=1)  # [B, L+1, D]
+
+            # Timestep embedding for the full sequence.
+            t_emb = self._diffusion_timestep_embedding(levels).to(
+                device=full_seq.device, dtype=full_seq.dtype,
             )
 
-            for i in range(ddim_steps):
-                t_cur = schedule[i]
-                t_next = schedule[i + 1]
-
-                # Build levels: 0 for clean prefix, t_cur for the new position.
-                prefix_len = chain_residual.shape[1]
-                levels_prefix = torch.zeros(bsz, prefix_len, device=chain_residual.device, dtype=torch.long)
-                levels_new = torch.full((bsz, 1), t_cur, device=chain_residual.device, dtype=torch.long)
-                levels = torch.cat([levels_prefix, levels_new], dim=1)  # [B, L+1]
-
-                # Concatenate prefix + noisy new position.
-                x_new_res = self._to_residual_space(x_t)
-                full_seq = torch.cat([chain_residual, x_new_res], dim=1)  # [B, L+1, D]
-
-                # Timestep embedding for the full sequence.
-                t_emb = self._diffusion_timestep_embedding(levels).to(
-                    device=full_seq.device, dtype=full_seq.dtype,
-                )
-
-                # Forward through transformer with timestep conditioning.
+            # Forward through transformer with timestep conditioning.
+            if self.cfg.norm_type == "ada_rmsnorm":
                 x = full_seq + t_emb
+                for layer in self.layers:
+                    x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
+            else:
+                x = full_seq + t_emb
+                for layer in self.layers:
+                    x = layer(x, context, context_mask=ctx_mask)
+
+            x = self.final_norm(x)
+            model_out = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+
+            # CFG: conditional + unconditional interpolation (at the prediction,
+            # not x0 — mathematically equivalent for linear prediction types).
+            if cfg_scale > 1.0 and hasattr(self, "null_context_token"):
+                null_ctx = self.null_context_token.expand(bsz, context.shape[1], -1)
+                null_ctx = self._to_residual_space(null_ctx)
                 if self.cfg.norm_type == "ada_rmsnorm":
-                    for layer in self.layers:
-                        x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
-                else:
-                    for layer in self.layers:
-                        x = layer(x, context, context_mask=ctx_mask)
-
-                x = self.final_norm(x)
-                model_out = self.output_proj(x[:, -1:, :])  # [B, 1, D]
-
-                # CFG: conditional + unconditional interpolation.
-                if cfg_scale > 1.0 and hasattr(self, "null_context_token"):
-                    null_ctx = self.null_context_token.expand(bsz, context.shape[1], -1)
-                    null_ctx = self._to_residual_space(null_ctx)
                     x_uc = full_seq + t_emb
-                    if self.cfg.norm_type == "ada_rmsnorm":
-                        for layer in self.layers:
-                            x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask, t_emb=t_emb)
-                    else:
-                        for layer in self.layers:
-                            x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask)
-                    x_uc = self.final_norm(x_uc)
-                    model_out_uc = self.output_proj(x_uc[:, -1:, :])
-                    model_out = model_out_uc + cfg_scale * (model_out - model_out_uc)
-
-                # Recover x₀ and ε from model output.
-                level_new = levels_new  # [B, 1]
-                x0_pred = self.predict_x0(x_t, model_out, level_new)
-                eps_pred = self.predict_eps(x_t, model_out, level_new)
-
-                # DDIM deterministic step: x_{t'} = √α̅_{t'} · x₀ + √(1-α̅_{t'}) · ε
-                if t_next > 0:
-                    sa_next = self._df_sqrt_alphas_cumprod[t_next].to(
-                        device=x_t.device, dtype=x_t.dtype,
-                    )
-                    som_next = self._df_sqrt_one_minus_alphas_cumprod[t_next].to(
-                        device=x_t.device, dtype=x_t.dtype,
-                    )
-                    x_t = sa_next * x0_pred + som_next * eps_pred
+                    for layer in self.layers:
+                        x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask, t_emb=t_emb)
                 else:
-                    x_t = x0_pred
+                    x_uc = full_seq + t_emb
+                    for layer in self.layers:
+                        x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask)
+                x_uc = self.final_norm(x_uc)
+                model_out_uc = self.output_proj(x_uc[:, -1:, :])
+                model_out = model_out_uc + cfg_scale * (model_out - model_out_uc)
 
-            # Project to SONAR sphere.
-            return self._sphere_project(x_t)
+            # Recover x₀ and ε from model output.
+            level_new = levels_new  # [B, 1]
+            x0_pred = self.predict_x0(x_t, model_out, level_new)
+            eps_pred = self.predict_eps(x_t, model_out, level_new)
+
+            # DDIM deterministic step: x_{t'} = √α̅_{t'} · x₀ + √(1-α̅_{t'}) · ε
+            if t_next > 0:
+                sa_next = self._df_sqrt_alphas_cumprod[t_next].to(
+                    device=x_t.device, dtype=x_t.dtype,
+                )
+                som_next = self._df_sqrt_one_minus_alphas_cumprod[t_next].to(
+                    device=x_t.device, dtype=x_t.dtype,
+                )
+                x_t = sa_next * x0_pred + som_next * eps_pred
+            else:
+                x_t = x0_pred
+
+        # Project to SONAR sphere.
+        return self._sphere_project(x_t)
 
     def beam_generate(
         self,

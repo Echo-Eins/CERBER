@@ -324,6 +324,102 @@ def _masked_step_losses(
     }
 
 
+class ModelEMA:
+    """Exponential Moving Average of model parameters (Arch-1).
+
+    Maintains a shadow copy of the model weights updated after every
+    optimizer step as ``ema = decay · ema + (1 − decay) · live``.
+    At eval time we swap the live weights with the EMA shadow to get a
+    smoother, less noisy prediction — standard in modern diffusion training.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999) -> None:
+        self.decay = float(decay)
+        # Store shadow on the same device as the model.
+        self.shadow: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+        # Also track buffers so norm running_mean/var stay consistent.
+        self.buffers: dict[str, torch.Tensor] = {
+            n: b.detach().clone() for n, b in model.named_buffers()
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        d = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            s = self.shadow.get(name)
+            if s is None:
+                self.shadow[name] = p.detach().clone()
+                continue
+            s.mul_(d).add_(p.detach(), alpha=1.0 - d)
+        # Buffers: just copy (they're not part of SGD anyway).
+        for name, b in model.named_buffers():
+            self.buffers[name] = b.detach().clone()
+
+    @torch.no_grad()
+    def apply_to(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """Swap model params with EMA shadow; return original weights for restore."""
+        backup: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = p.detach().clone()
+                p.data.copy_(self.shadow[name])
+        return backup
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        for name, p in model.named_parameters():
+            if name in backup:
+                p.data.copy_(backup[name])
+
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "shadow": {k: v.detach().cpu() for k, v in self.shadow.items()},
+            "buffers": {k: v.detach().cpu() for k, v in self.buffers.items()},
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.decay = float(sd.get("decay", self.decay))
+        for k, v in sd.get("shadow", {}).items():
+            self.shadow[k] = v
+        for k, v in sd.get("buffers", {}).items():
+            self.buffers[k] = v
+
+
+def _build_wd_param_groups(
+    model: torch.nn.Module,
+    weight_decay: float,
+) -> list[dict]:
+    """Split parameters into decayed / non-decayed groups (Arch-6).
+
+    Non-decayed: biases, norm layers (LayerNorm/AdaRMSNorm weights),
+    start_token, null_context_token. Everything else gets weight decay.
+    Standard recipe from transformer training (Loshchilov 2019).
+    """
+    decay, no_decay = [], []
+    no_decay_names: set[str] = set()
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # 1-D parameters → biases or norm weights → no WD.
+        is_bias_or_norm = p.ndim <= 1
+        is_special_token = name.endswith("start_token") or name.endswith("null_context_token")
+        if is_bias_or_norm or is_special_token:
+            no_decay.append(p)
+            no_decay_names.add(name)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": float(weight_decay)},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def _masked_weighted_step_losses(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -610,6 +706,52 @@ def _append_jsonl(path: Path, payload: dict) -> None:
         f.write(json.dumps(_to_jsonable(payload), ensure_ascii=False) + "\n")
 
 
+def _positional_df_weights(
+    chain_mask: torch.Tensor,
+    answer_pos: torch.Tensor | None,
+    cfg: dict,
+) -> torch.Tensor:
+    """Per-position multiplier emphasizing positions near the answer.
+
+    DF-6: exponential ramp — later positions (closer to answer_pos) receive
+    higher weight, because the autoregressive error compounds toward the
+    answer and the answer position is the primary supervision target.
+
+    Returns a [B, T] float tensor.  Identity (all-ones) when disabled.
+    """
+    weight_type = str(cfg.get("positional_weight_type", "none")).lower()
+    if weight_type == "none":
+        return torch.ones_like(chain_mask, dtype=torch.float32)
+
+    bsz, steps = chain_mask.shape
+    device = chain_mask.device
+    pos = torch.arange(steps, device=device, dtype=torch.float32).unsqueeze(0).expand(bsz, -1)
+
+    if answer_pos is None:
+        # Fall back to last valid position per row.
+        ap = chain_mask.sum(dim=1).clamp(min=1).long() - 1
+    else:
+        ap = answer_pos.to(device=device).long().clamp(min=0, max=max(steps - 1, 0))
+    ap_f = ap.to(dtype=torch.float32).unsqueeze(-1)  # [B, 1]
+
+    if weight_type == "exponential":
+        # w(i) = base^(-(ap - i)), clipped at 0..ap; base > 1.
+        base = float(cfg.get("positional_weight_base", 1.15))
+        dist = (ap_f - pos).clamp(min=0.0)
+        w = torch.pow(torch.tensor(base, device=device), -dist)
+    elif weight_type == "linear":
+        # w(i) = 1 + alpha * (i / ap); at i=ap weight is 1+alpha.
+        alpha = float(cfg.get("positional_weight_alpha", 1.0))
+        denom = ap_f.clamp(min=1.0)
+        w = 1.0 + alpha * (pos / denom).clamp(min=0.0, max=1.0)
+    else:
+        raise ValueError(f"Unsupported positional_weight_type={weight_type}")
+
+    # Zero-out padded positions so the mask still dominates.
+    w = torch.where(chain_mask, w, torch.zeros_like(w))
+    return w
+
+
 def _diffusion_forcing_objective(
     model: ChainGenerator,
     v_q: torch.Tensor,
@@ -619,17 +761,26 @@ def _diffusion_forcing_objective(
     context_mask: torch.Tensor,
     cfg: dict,
     *,
+    answer_pos: torch.Tensor | None = None,
     eval_mode: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Masked Diffusion Forcing loss in SONAR space."""
+    """Masked Diffusion Forcing loss in SONAR space.
+
+    Correctly handles ``prediction_type`` (x0 / eps / v) by computing the
+    proper supervision target and DF-6 positional reweighting.
+    """
     bsz, steps, d_model = chains.shape
     levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=eval_mode)
-    weights = _diffusion_forcing_weights(model, levels, cfg, chain_mask)
+    snr_weights = _diffusion_forcing_weights(model, levels, cfg, chain_mask)
+    pos_weights = _positional_df_weights(chain_mask, answer_pos, cfg).to(
+        device=snr_weights.device, dtype=snr_weights.dtype,
+    )
+    weights = snr_weights * pos_weights
     noise = None
     if eval_mode and bool(cfg.get("df_eval_deterministic_noise", True)):
         noise = _make_diffusion_eval_noise_like(chains, cfg, model)
 
-    v_df, v_noisy, eps = model.forward_diffusion_forcing(
+    model_out, v_noisy, eps = model.forward_diffusion_forcing(
         v_q,
         chains,
         levels,
@@ -638,29 +789,43 @@ def _diffusion_forcing_objective(
         noise=noise,
         return_noisy=True,
     )
+
+    # Compute prediction-type-aware target.
+    target = model.diffusion_target(chains, eps, levels)
+
     loss, stats = _masked_weighted_step_losses(
-        v_df,
-        chains,
+        model_out,
+        target,
         chain_mask,
         weights,
         d_model,
         float(model.cfg.loss_cosine_weight),
         float(model.cfg.loss_mse_weight),
     )
-
     with torch.no_grad():
         maskf = chain_mask.to(dtype=torch.float32)
         valid = maskf.sum().clamp(min=1.0)
-        cos_sim = stats["cos_sim"]
-        cos_mean = torch.where(chain_mask, cos_sim, torch.zeros_like(cos_sim)).sum() / valid
+
+        # Prediction-type-space cosine (v vs v_target, or x0 vs x0, etc.).
+        cos_sim_pred = stats["cos_sim"]
+        cos_mean_pred = torch.where(chain_mask, cos_sim_pred, torch.zeros_like(cos_sim_pred)).sum() / valid
+
+        # Diagnostic: decode model output to x0 space and report cos vs clean chain.
+        x0_pred = model.predict_x0(v_noisy, model_out, levels).float()
+        cos_x0 = (
+            _safe_normalize(x0_pred, dim=-1) * _safe_normalize(chains.float(), dim=-1)
+        ).sum(dim=-1)
+        cos_x0_mean = torch.where(chain_mask, cos_x0, torch.zeros_like(cos_x0)).sum() / valid
+
         valid_levels = torch.where(chain_mask, levels.float(), torch.zeros_like(levels.float()))
         noisy_norm = torch.where(chain_mask, v_noisy.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
         eps_norm = torch.where(chain_mask, eps.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
-        pred_norm = torch.where(chain_mask, v_df.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+        pred_norm = torch.where(chain_mask, model_out.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
 
         metrics = {
             "loss_df": float(loss.item()),
-            "df_cos": float(cos_mean.item()),
+            "df_cos": float(cos_x0_mean.item()),  # x0-space (interpretable across pred_type)
+            "df_cos_target": float(cos_mean_pred.item()),  # raw target-space cos (pred_type dep.)
             "df_cos_loss_raw": float(stats["cos_loss"].item()),
             "df_mse_loss_raw": float(stats["mse_loss"].item()),
             "df_noise_level_mean": float((valid_levels.sum() / valid).item()),
@@ -669,6 +834,7 @@ def _diffusion_forcing_objective(
             "df_eps_norm": float(eps_norm.item()),
             "df_pred_norm": float(pred_norm.item()),
             "df_weight_mean": float((weights * maskf).sum().item() / valid.item()),
+            "df_pos_weight_mean": float((pos_weights * maskf).sum().item() / valid.item()),
         }
 
     return loss, metrics
@@ -809,6 +975,7 @@ def compute_composite_objective(
             context_banks,
             context_mask,
             cfg,
+            answer_pos=answer_pos,
             eval_mode=eval_mode,
         )
         loss = loss + lambda_df * l_df
@@ -927,6 +1094,7 @@ def train_step(
     free_run_noise_std: float = 0.0,
     oracle_prob: float = 0.0,
     tf_noise_std: float = 0.0,
+    ema: "ModelEMA | None" = None,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
@@ -994,6 +1162,10 @@ def train_step(
 
     scaler.step(optimizer)
     scaler.update()
+
+    # EMA update after a real optimizer step.
+    if ema is not None:
+        ema.update(model)
 
     metrics["nan_skipped"] = 0.0
     metrics["nan_loss_skipped"] = 0.0
@@ -1517,11 +1689,16 @@ def main() -> None:
     )
 
     lr = float(train_cfg.get("lr", 1e-4))
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
-    )
+    wd = float(train_cfg.get("weight_decay", 1e-4))
+    param_groups = _build_wd_param_groups(model, wd)
+    optimizer = torch.optim.AdamW(param_groups, lr=lr)
+
+    # EMA (Arch-1).  Decay=0 disables.
+    ema_decay = float(train_cfg.get("model_ema_decay", 0.0))
+    ema: ModelEMA | None = None
+    if ema_decay > 0.0:
+        ema = ModelEMA(model, decay=ema_decay)
+        print(f"EMA enabled with decay={ema_decay}")
 
     num_epochs = int(args.max_epochs or train_cfg.get("num_epochs", 50))
     total_steps = num_epochs * len(train_loader)
@@ -1558,6 +1735,8 @@ def main() -> None:
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_metric = float(ckpt.get("best_metric", best_metric))
         global_step = int(ckpt.get("global_step", 0))
+        if ema is not None and ckpt.get("ema") is not None:
+            ema.load_state_dict(ckpt["ema"])
         print(f"Resumed from {args.resume}: epoch={start_epoch}, best={best_metric:.4f}")
 
     log_every = int(train_cfg.get("log_every", 50))
@@ -1680,6 +1859,7 @@ def main() -> None:
                 free_run_noise_std=noise_std,
                 oracle_prob=oracle_prob,
                 tf_noise_std=tf_noise,
+                ema=ema,
             )
             if metrics.get("optimizer_stepped", 0.0) > 0.0:
                 scheduler.step()
@@ -1831,6 +2011,10 @@ def main() -> None:
                 sadt_events = {"throttle": 0, "turbo": 0}
 
         model.eval()
+        # Swap in EMA weights for evaluation (Arch-1).
+        ema_backup: dict[str, torch.Tensor] | None = None
+        if ema is not None:
+            ema_backup = ema.apply_to(model)
         val_tracker = MetricTracker()
         eval_steps = target_steps
         for batch in val_loader:
@@ -1844,6 +2028,8 @@ def main() -> None:
                 gen_steps=eval_steps,
             )
             val_tracker.update(vm)
+        if ema is not None and ema_backup is not None:
+            ema.restore(model, ema_backup)
 
         val = val_tracker.get()
         epoch_time = time.time() - epoch_start
@@ -1894,6 +2080,7 @@ def main() -> None:
                     "config": config,
                     "best_metric": best_metric,
                     "global_step": global_step,
+                    "ema": ema.state_dict() if ema is not None else None,
                 },
             )
             print(f"  ** New best: val_roll_cos_last={best_metric:.4f}")
@@ -1911,6 +2098,7 @@ def main() -> None:
                     "config": config,
                     "best_metric": best_metric,
                     "global_step": global_step,
+                    "ema": ema.state_dict() if ema is not None else None,
                 },
             )
 
