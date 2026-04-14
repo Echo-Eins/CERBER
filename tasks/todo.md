@@ -2394,3 +2394,25 @@ Run `Arch 14_01_26 full training log.txt` converged to `val_roll_cos_last=0.7554
 - **Observability improvements**: `df_lam` is now in per-step training logs; `val_answer_coverage` gets a rolling `[WARN]` below `0.10` so the collapse pattern is caught early instead of at early-stop.
 - **Static verification passed**: `python -m py_compile experiments/13_chain_generator/train_chain_generator.py cebcm/models/chain_generator.py` and `json.load` on `configs/chain_generator_config.json` both clean.
 - **Not verified**: live training run with a few epochs on real data. This is a code-level fix; empirical validation requires GPU time and is the next action for the training engineer.
+
+## 2026-04-14 - ChainGenerator probe fix: decode v-prediction through `predict_x0`
+
+### Context
+After the NaN-collapse fixes landed, a live training run showed a scary contradiction in the GUI: `train df_cos ≈ 0.72` climbing, but `probe df_cos_mean ≈ −0.68` going more negative with steps; the 3D plot drew "DF pred_x0" antipodally to the clean target. User asked whether the model was going backwards.
+
+It was not. Under `prediction_type="v"` the raw model output is velocity, not `x₀`. At mid-range `t` with cosine schedule, `cos(v_pred, x₀_clean)` asymptotes to `−√(1−ᾱ_t) ≈ −0.707` when the model is learning correctly. The training-side `df_cos` already decoded to `pred_x0` via `predict_x0` before computing the cosine; the probe did not. The probe was lying.
+
+### Tasks
+- [x] Trace `v_df` from `forward_diffusion_forcing` through `write_training_probe_snapshot`.
+- [x] Confirm raw output is v-prediction, not x₀ — verified against `predict_x0` definition in `cebcm/models/chain_generator.py::514`.
+- [x] Decode `v_df = predict_x0(v_noisy, v_df_raw, levels)` immediately after the DF forward pass.
+- [x] Verify all downstream sites (`projected["pred_x0"]`, `df_cos`, `df_l2`, `pred_norm`, PCA basis fitting, `raw["pred_x0"]`, metric `df_cos_mean`) now consume the decoded tensor.
+- [x] Keep `v_noisy` in its original space — it is `x_t`, correctly compared to the clean target directly.
+- [x] Static verification: `python -m py_compile experiments/13_chain_generator/train_chain_generator.py`.
+- [x] Update `tasks/lessons.md` with full root cause + carry-forward rules.
+
+### Review
+- One-line root cause: the probe saved `forward_diffusion_forcing()`'s raw output under the label `pred_x0` without decoding the v-prediction back to x₀-space. Every cosine/L2/PCA projection downstream inherited the wrong space.
+- Fix is minimal: introduce `v_df_raw`, decode to `v_df = model.predict_x0(v_noisy, v_df_raw, levels)`, let the rest of the function consume `v_df`. The user-facing semantics of the snapshot field `pred_x0` is now honest.
+- Carry-forward rule added to `tasks/lessons.md`: any "cos to clean" in training/probe code MUST live in x₀-space; grep for `forward_diffusion_forcing` call sites whenever diffusion math is touched; also, when a training metric and a probe metric disagree in sign, suspect the probe first because it's newer and less battle-tested.
+- Static `py_compile` passed. Empirical validation: the next probe snapshot after this fix should show `df_cos_mean` climbing toward `+1` alongside `tf_cos_mean`/`noisy_cos_mean`, and the 3D "DF pred_x0" marker should sit near the clean target instead of antipodally.

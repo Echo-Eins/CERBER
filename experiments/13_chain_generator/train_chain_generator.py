@@ -1487,7 +1487,7 @@ def write_training_probe_snapshot(
 
         levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=True)
         noise = _make_diffusion_eval_noise_like(chains_trunc, cfg, model)
-        v_df, v_noisy, eps = model.forward_diffusion_forcing(
+        v_df_raw, v_noisy, eps = model.forward_diffusion_forcing(
             v_q,
             chains_trunc,
             levels,
@@ -1496,6 +1496,13 @@ def write_training_probe_snapshot(
             noise=noise,
             return_noisy=True,
         )
+        # ``forward_diffusion_forcing`` returns the raw model output which under
+        # ``prediction_type="v"`` (or "eps") is NOT the clean x0 — comparing it
+        # directly to the clean target yields an antipodal cosine (v ≈ −σ·x0
+        # at mid noise, so cos(v, x0) → −√(1−α̅_t)). Decode to pred_x0 first so
+        # every downstream cosine/L2 and the exported "pred_x0" field live in
+        # the same space as the clean target.
+        v_df = model.predict_x0(v_noisy, v_df_raw, levels).to(dtype=v_df_raw.dtype)
         v_tf = model.forward(
             v_q,
             chains_trunc,

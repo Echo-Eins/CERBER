@@ -1,5 +1,42 @@
 # Lessons
 
+## 2026-04-14 - ChainGenerator probe: v-prediction misread as x₀ caused antipodal `df_cos_mean` in GUI
+
+### Pattern
+After the NaN-collapse fixes, the GUI showed:
+- `train df_cos = 0.72` (training metric — positive, climbing)
+- `probe df_cos_mean = −0.68` (geometry probe — negative, "going more wrong")
+- 3D view: "DF pred_x0" marker antipodal to the clean target along PC1
+
+User reported "модель идёт в обратную сторону". In reality the model was learning correctly; the probe was lying.
+
+### Root Cause
+`write_training_probe_snapshot` took the raw output of `model.forward_diffusion_forcing(...)` and stored/compared it as `pred_x0`. Under `prediction_type="v"` the raw output is the velocity `v = √ᾱ_t · ε − √(1−ᾱ_t) · x₀`, not x₀. At mid-range noise levels (`t≈32` with cosine schedule, √ᾱ ≈ √(1−ᾱ) ≈ 0.707) the expectation of `cos(v_pred, x₀_clean)` when the model is *perfect* is approximately `−√(1−ᾱ_t) ≈ −0.707`. The observed `−0.64 → −0.68` was converging toward that asymptote — i.e. evidence of correct learning, not regression.
+
+Meanwhile the per-step `df_cos` logged by `_diffusion_forcing_objective` is computed AFTER `predict_x0` decoding in x₀-space, so it reads positive. The probe and the training metric were literally in different spaces.
+
+### Fix
+In `experiments/13_chain_generator/train_chain_generator.py::write_training_probe_snapshot`:
+```python
+v_df_raw, v_noisy, eps = model.forward_diffusion_forcing(..., return_noisy=True)
+v_df = model.predict_x0(v_noisy, v_df_raw, levels).to(dtype=v_df_raw.dtype)
+```
+All downstream uses (`projected["pred_x0"]`, `df_cos`, `df_l2`, `pred_norm`, PCA basis fitting in `_masked_probe_points`, `raw["pred_x0"]`, metric `df_cos_mean`) now consume the x₀-decoded tensor, consistent with the clean target and with the training-side `df_cos` metric.
+
+`v_noisy` stays untouched — it already lives in the clean/x_t space, which is what `noisy_cos_mean` and the `Clean → Noisy → Pred x₀` trajectory actually want.
+
+### Rules
+1. **Every "cos to clean" in training/probe code must live in x₀-space**. Whenever `prediction_type ∈ {"v", "eps"}`, route the raw model output through `predict_x0(x_t, model_out, t)` *before* any cosine/L2/projection comparison against `x₀`. Grep for `forward_diffusion_forcing` call sites every time you touch the diffusion math.
+2. **When the training metric and the probe metric diverge in sign, the bug is in the one that is not the training metric** (usually). Training metrics have been debugged across many runs; probe code is newer and drifts. Start suspicion there.
+3. **Probe export names are load-bearing**. If a field is called `pred_x0`, it MUST be in x₀-space. Mislabelled fields become silent time bombs for downstream GUI math (heatmaps, PCA basis, distance metrics) and confuse the user into thinking the model is broken.
+4. **Expected asymptotes for a correct v-prediction model** (cosine schedule, `d_model=1024`, `T=64`):
+   - At `t≈0`: `cos(v_pred, x₀) → 0` (v ≈ ε, orthogonal to x₀ in expectation)
+   - At `t≈T/2`: `cos(v_pred, x₀) → −√(1−ᾱ_t) ≈ −0.707`
+   - At `t≈T`: `cos(v_pred, x₀) → −1`
+   If you see any of these numbers where you expected `+1`, you forgot to decode v.
+
+---
+
 ## 2026-04-14 - ChainGenerator NaN collapse (E3→E4): NaN×0 trap recurrence, Min-SNR x₀/ε swap, defense-in-depth
 
 ### Pattern
