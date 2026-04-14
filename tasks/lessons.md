@@ -1,5 +1,45 @@
 # Lessons
 
+## 2026-04-14 - ChainGenerator "frozen zombie" model: Adam momentum corruption + skip-on-NaN trap
+
+### Pattern
+After the first round of NaN-collapse fixes, training reached E9 and then locked into a "zombie" state:
+- `loss=0.73` (finite), `grad=0.0000` **every step**,
+- `NaN:N` counter incrementing `+1` each step (100% NaN-skip rate),
+- `lr` frozen, geometry probe values **byte-identical** across hundreds of steps,
+- `val_roll_cos` plateaued at `0.7237` from E2 onward.
+
+Training appeared to run (forward produced finite loss via defensive `nan_to_num` scrubs) but NO parameter updates occurred. Fresh corruption on every batch, perpetually skipped.
+
+### Root Causes
+1. **Skip-on-NaN-grad is a trap**. `train_step` pattern `if not torch.isfinite(total_norm): optimizer.zero_grad(); return` means HEALTHY parameters never update either — any batch that has one sick gradient poisons ALL updates that step. Over time: 100% skip rate, zero progress.
+2. **Adam momentum state is sticky**. `optimizer.zero_grad()` only clears `.grad`; it does NOT touch `exp_avg` and `exp_avg_sq`. A single NaN that made it into Adam buffers persists forever. On the next step Adam computes `new_exp_avg = β1·old_exp_avg + (1−β1)·grad` → still NaN → output param becomes NaN → next forward uses `nan_to_num` to scrub the value but **the parameter is still NaN in memory**, and its gradient will be NaN again. Self-propagating.
+3. **`nan_to_num` is NOT a gradient barrier**. Scrubbing `model_out` after forward only fixes the forward value, not the backward graph. If any weight in the graph is NaN, d(loss)/d(weight) is still NaN even though `loss` itself became `0.0` via scrubbing.
+4. **`clamp(min=1e-8)` is a no-op on NaN**. NaN passes through `clamp` unchanged. `weight_sum = weights.sum().clamp(min=1.0)` still yields NaN when `weights.sum()` is NaN, which then makes `loss = cos_term.sum() / NaN → NaN`.
+5. **bf16 denormal underflow**. `snr.to(bf16).clamp(min=1e-8)` is ineffective: bf16 has no denormals, so any value `< ~1.17e-38` silently underflows to 0 BEFORE clamp sees it. Then `1/snr → Inf → NaN`. Min-SNR must be computed entirely in fp32.
+
+### Fix
+In `experiments/13_chain_generator/train_chain_generator.py`:
+
+1. **Sanitize gradients, don't skip the step**: in `train_step`, replace `if NaN: skip` with an in-place `.grad.masked_fill_(bad, 0.0)` scrub for each parameter whose gradient contains NaN/Inf. Healthy parameters keep training, sick ones get a zero-update this step. Log `grad_sanitized` count.
+2. **Rescue Adam state on corruption**: for every parameter whose `.grad` was sanitized, walk `optimizer.state[p]` and `torch.nan_to_num(buf, out=buf)` for `exp_avg`, `exp_avg_sq`, `max_exp_avg_sq`. This breaks the self-propagation loop.
+3. **Post-step parameter sanity + EMA rescue**: after `optimizer.step()`, scan `model.named_parameters()`. For any parameter with non-finite values, `copy_(ema.shadow[name])` as a break-glass restore. EMA is our last known-good copy. Skip `ema.update(model)` on the step where a param was restored, so we don't pollute the shadow.
+4. **SNR entirely in fp32 with autocast disabled**: wrap `model.diffusion_snr(...)` in `torch.autocast(device_type=..., enabled=False)`, cast output `.to(dtype=torch.float32)`, `nan_to_num` with `posinf=1e4` BEFORE clamp, then `clamp(min=1e-6, max=1e4)`. Never allow bf16 to see SNR numerics.
+5. **Scrub `.sum()` before `.clamp()`**: replace `weights.sum().clamp(min=1.0)` with `torch.nan_to_num(weights.sum(), nan=1.0, posinf=1.0, neginf=1.0).clamp(min=1.0)` in both `_masked_step_losses` and `_masked_weighted_step_losses`.
+6. **Scrub loss before backward**: final `loss = torch.nan_to_num(loss)` in `train_step`, and skip backward only when the sanitized value is exactly zero (no signal to propagate).
+7. **Config**: bump `df_warmup_epochs` 3→5 and lower `loss_lambda_diffusion` 0.25→0.15 to give the critic more headroom before DF supervision kicks in at full strength.
+
+### Rules
+1. **NEVER `skip step` on NaN gradient**. Sanitize in place, log the count, let healthy params train. The skip-pattern is an anti-pattern that converts transient errors into permanent plateaus.
+2. **Optimizer state must be scrubbed alongside grads**. `optimizer.zero_grad()` does NOT touch momentum buffers. Any NaN protection that only scrubs `.grad` is incomplete — Adam's `exp_avg`/`exp_avg_sq` must be scrubbed too, otherwise the next step recreates the NaN.
+3. **Clamp is not NaN-safe**. `clamp(min=ε)` passes NaN through unchanged. ALWAYS `nan_to_num` before `clamp` when the input could be non-finite. Same for `clip_grad_norm_` — check the returned norm for `isfinite`, don't assume clipping sanitized it.
+4. **Keep Min-SNR / any numerics-sensitive math in fp32**. Use `torch.autocast(..., enabled=False)` inside the helper. bf16 has no denormals → silent underflow → div-by-zero → NaN.
+5. **EMA is break-glass recovery, not just "nicer eval weights"**. Maintain it, check parameter finiteness after every `optimizer.step()`, restore from shadow on corruption. A single corrupt step without rescue means the run is dead.
+6. **`nan_to_num` is a forward-only value scrub, not a gradient barrier**. If a weight is NaN, its gradient is NaN regardless of downstream scrubs. Fix at the source (the parameter/optimizer state) not just at the loss.
+7. **When every step reports `grad=0` and `NaN:N` climbs linearly, it is not a plateau — it is a zombie model**. Distinguish this from genuine convergence by checking: (a) probe values byte-identical across steps, (b) `optimizer_stepped` metric → 0, (c) `nan_grad_skipped` metric → step count. If all three are true, parameters are frozen / corrupt, not converged.
+
+---
+
 ## 2026-04-14 - ChainGenerator probe: v-prediction misread as x₀ caused antipodal `df_cos_mean` in GUI
 
 ### Pattern

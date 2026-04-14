@@ -303,9 +303,13 @@ def _masked_step_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     pred = pred.float()
     target = target.float()
+    pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     mask_bool = mask.to(device=pred.device, dtype=torch.bool)
     maskf = mask_bool.to(dtype=pred.dtype)
-    mask_sum = maskf.sum().clamp(min=1.0)
+    # NaN×0 trap: clamp(min=1.0) does NOT fix NaN; NaN passes through
+    # clamp unchanged.  Must scrub BEFORE clamping (lesson 2026-04-14).
+    mask_sum = torch.nan_to_num(maskf.sum(), nan=1.0, posinf=1.0, neginf=1.0).clamp(min=1.0)
 
     cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
     # Clamp to valid cosine range and scrub NaN (fp-rounding or poisoned
@@ -320,6 +324,7 @@ def _masked_step_losses(
     mse_loss = mse_term.sum() / mask_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
     return loss, {
         "cos_sim": cos_sim,
         "cos_loss": cos_loss,
@@ -435,12 +440,19 @@ def _masked_weighted_step_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     pred = pred.float()
     target = target.float()
+    pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     mask_bool = mask.to(device=pred.device, dtype=torch.bool)
     weights = weights.to(device=pred.device, dtype=pred.dtype)
-    weights = torch.where(mask_bool, weights, torch.zeros_like(weights))
-    # Guard against non-finite weights from an upstream SNR overflow.
+    # Guard against non-finite weights from an upstream SNR overflow BEFORE
+    # masking, so torch.where never has to choose between NaN and zero.
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-    weight_sum = weights.sum().clamp(min=1.0)
+    weights = torch.where(mask_bool, weights, torch.zeros_like(weights))
+    # NaN×0 trap: clamp(min=1.0) does NOT fix NaN, it passes through.
+    # Must scrub BEFORE clamping (lesson 2026-04-14 Adam-zombie).
+    weight_sum = torch.nan_to_num(
+        weights.sum(), nan=1.0, posinf=1.0, neginf=1.0
+    ).clamp(min=1.0)
 
     cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
     cos_sim = torch.nan_to_num(cos_sim.clamp(min=-1.0, max=1.0), nan=0.0)
@@ -461,6 +473,7 @@ def _masked_weighted_step_losses(
     mse_loss = mse_term.sum() / weight_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
     return loss, {
         "cos_sim": cos_sim,
         "cos_loss": cos_loss,
@@ -669,28 +682,35 @@ def _diffusion_forcing_weights(
     if gamma <= 0.0:
         return torch.ones_like(noise_levels, dtype=torch.float32)
 
-    # Clamp SNR both sides: min to avoid log(0) / div-by-0, max to avoid
-    # bfloat16 overflow at the cleanest timesteps where SNR can reach 1e8+.
-    snr = (
-        model.diffusion_snr(noise_levels)
-        .to(device=noise_levels.device)
-        .float()
-        .clamp(min=1e-8, max=1e4)
-    )
-    gamma_t = torch.full_like(snr, gamma)
-    clipped = torch.minimum(snr, gamma_t)
+    # SNR must be computed entirely in float32: bf16 has no denormals and
+    # ``clamp(min=1e-8)`` is a no-op when the value underflows to 0, which
+    # then produces div-by-zero → Inf → NaN downstream.  Lesson 2026-04-14
+    # (frozen-model zombie): keep ENTIRE min-SNR pipeline in fp32, scrub
+    # NaN/Inf at every stage, only cast to fp32 output at the end.
+    with torch.autocast(device_type=noise_levels.device.type, enabled=False):
+        snr_raw = model.diffusion_snr(noise_levels).to(
+            device=noise_levels.device, dtype=torch.float32
+        )
+        snr_raw = torch.nan_to_num(snr_raw, nan=0.0, posinf=1e4, neginf=0.0)
+        # Both-sides clamp: min to avoid div-by-0, max to avoid numerical
+        # blow-up at the cleanest timesteps where SNR can reach 1e8+.
+        snr = snr_raw.clamp(min=1e-6, max=1e4)
+        gamma_t = torch.full_like(snr, gamma)
+        clipped = torch.minimum(snr, gamma_t)
 
-    pt = getattr(model.cfg, "prediction_type", "x0")
-    if pt == "x0":
-        weights = clipped  # Fixed: was clipped/snr
-    elif pt == "eps":
-        weights = clipped / snr  # Fixed: was clipped
-    elif pt == "v":
-        weights = clipped / (snr + 1.0)
-    else:
-        weights = clipped / (snr + 1.0)  # safe fallback matching v-pred
-    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-    return torch.where(mask.to(dtype=torch.bool), weights, torch.zeros_like(weights))
+        pt = getattr(model.cfg, "prediction_type", "x0")
+        if pt == "x0":
+            weights = clipped  # Fixed: was clipped/snr
+        elif pt == "eps":
+            weights = clipped / snr  # Fixed: was clipped
+        elif pt == "v":
+            weights = clipped / (snr + 1.0)
+        else:
+            weights = clipped / (snr + 1.0)  # safe fallback matching v-pred
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.where(
+        mask.to(dtype=torch.bool), weights, torch.zeros_like(weights)
+    )
 
 
 def _make_diffusion_eval_noise_like(
@@ -1183,49 +1203,123 @@ def train_step(
             tf_noise_std=tf_noise_std,
         )
 
-    # NaN guard: if loss is NaN/Inf, skip this step entirely.
-    # This prevents a single bad batch from permanently corrupting all weights.
-    if not torch.isfinite(loss):
+    # Defense-in-depth: scrub any residual NaN/Inf in the final loss scalar
+    # before backward.  Even if upstream guards catch most issues, a single
+    # poisoned element elsewhere in the graph can still propagate; we must
+    # never hand NaN to autograd (lesson 2026-04-14 Adam-zombie).
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+    # A completely scrubbed-to-zero loss has no signal — skip the backward
+    # so we don't waste compute on a no-op step, but crucially keep the
+    # optimizer / scaler state clean.
+    if not torch.isfinite(loss) or float(loss.detach()) == 0.0:
         optimizer.zero_grad(set_to_none=True)
         metrics["nan_skipped"] = 1.0
         metrics["nan_loss_skipped"] = 1.0
         metrics["nan_grad_skipped"] = 0.0
+        metrics["grad_sanitized"] = 0.0
+        metrics["param_restored"] = 0.0
         metrics["optimizer_stepped"] = 0.0
         metrics["target_steps"] = float(target_steps)
         metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
         return metrics
 
     scaler.scale(loss).backward()
-
-    # Unscale once, then clip + check for NaN gradients.
     scaler.unscale_(optimizer)
+
+    # --- Gradient sanitation (Adam-zombie defense) ------------------
+    # Skipping the step on NaN grad is a TRAP: healthy parameters never
+    # update, and worse, the Adam momentum buffers (exp_avg, exp_avg_sq)
+    # keep whatever poisoned state sneaked in earlier.  A cleaner fix is
+    # to ZERO the NaN/Inf entries in ``.grad`` in-place, so healthy
+    # parameters continue training and sick parameters simply get a
+    # zero-update this step.  We additionally scrub Adam's momentum
+    # buffers on the affected parameters.
+    grad_had_nan = False
+    sanitized_count = 0
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad
+        bad = ~torch.isfinite(g)
+        if bad.any():
+            grad_had_nan = True
+            sanitized_count += 1
+            g.masked_fill_(bad, 0.0)
+            # Rescue Adam state for this parameter if corrupted.
+            state = optimizer.state.get(p)
+            if state:
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    buf = state.get(key)
+                    if buf is not None and not torch.isfinite(buf).all():
+                        torch.nan_to_num(
+                            buf, nan=0.0, posinf=0.0, neginf=0.0, out=buf
+                        )
 
     clip_grad = float(cfg.get("clip_grad_norm", 1.0))
     if clip_grad > 0:
         total_norm = nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         if not torch.isfinite(total_norm):
-            # NaN/Inf in gradients — must still call scaler.update() to
-            # keep its internal state consistent, then skip optimizer.step().
+            # Defensive: extremely unlikely after the sanitation above,
+            # but if it still happens, zero grads and skip the step.
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
             metrics["nan_skipped"] = 1.0
             metrics["nan_loss_skipped"] = 0.0
             metrics["nan_grad_skipped"] = 1.0
+            metrics["grad_sanitized"] = float(sanitized_count)
+            metrics["param_restored"] = 0.0
             metrics["optimizer_stepped"] = 0.0
             metrics["target_steps"] = float(target_steps)
             metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
             return metrics
+    else:
+        total_norm = torch.tensor(0.0, device=device)
 
     scaler.step(optimizer)
     scaler.update()
 
-    # EMA update after a real optimizer step.
+    # --- Post-step parameter sanity check (EMA break-glass) --------
+    # If the optimizer step somehow produced NaN in parameters (e.g.
+    # corrupted Adam state slipped through), restore from EMA.  The EMA
+    # shadow is our last known-good copy (only updated after a healthy
+    # step).  Without this, a single corrupted step persists forever.
+    params_restored = 0
     if ema is not None:
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if not torch.isfinite(p.data).all():
+                shadow = ema.shadow.get(name)
+                if shadow is not None and torch.isfinite(shadow).all():
+                    p.data.copy_(shadow)
+                    params_restored += 1
+                else:
+                    # No clean shadow either — last resort scrub.
+                    torch.nan_to_num(
+                        p.data, nan=0.0, posinf=0.0, neginf=0.0, out=p.data
+                    )
+                    params_restored += 1
+                # Also scrub Adam state so corruption doesn't reappear.
+                state = optimizer.state.get(p)
+                if state:
+                    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                        buf = state.get(key)
+                        if buf is not None:
+                            torch.nan_to_num(
+                                buf, nan=0.0, posinf=0.0, neginf=0.0, out=buf
+                            )
+
+    # EMA update after a real optimizer step — ONLY if params are clean,
+    # otherwise we'd pollute the shadow with the very corruption we're
+    # trying to rescue from.
+    if ema is not None and params_restored == 0:
         ema.update(model)
 
-    metrics["nan_skipped"] = 0.0
+    metrics["nan_skipped"] = 1.0 if (grad_had_nan or params_restored > 0) else 0.0
     metrics["nan_loss_skipped"] = 0.0
     metrics["nan_grad_skipped"] = 0.0
+    metrics["grad_sanitized"] = float(sanitized_count)
+    metrics["param_restored"] = float(params_restored)
     metrics["optimizer_stepped"] = 1.0
     metrics["grad_norm"] = float(total_norm.item()) if clip_grad > 0 else 0.0
     metrics["target_steps"] = float(target_steps)

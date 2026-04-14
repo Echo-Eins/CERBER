@@ -2416,3 +2416,40 @@ It was not. Under `prediction_type="v"` the raw model output is velocity, not `x
 - Fix is minimal: introduce `v_df_raw`, decode to `v_df = model.predict_x0(v_noisy, v_df_raw, levels)`, let the rest of the function consume `v_df`. The user-facing semantics of the snapshot field `pred_x0` is now honest.
 - Carry-forward rule added to `tasks/lessons.md`: any "cos to clean" in training/probe code MUST live in x₀-space; grep for `forward_diffusion_forcing` call sites whenever diffusion math is touched; also, when a training metric and a probe metric disagree in sign, suspect the probe first because it's newer and less battle-tested.
 - Static `py_compile` passed. Empirical validation: the next probe snapshot after this fix should show `df_cos_mean` climbing toward `+1` alongside `tf_cos_mean`/`noisy_cos_mean`, and the 3D "DF pred_x0" marker should sit near the clean target instead of antipodally.
+
+## 2026-04-14 - ChainGenerator "frozen zombie": Adam momentum corruption + skip-on-NaN trap
+
+### Context
+Live training run with the prior two fixes reached E9 and then locked into a zombie state: `loss≈0.73` finite, `grad=0.0000` every step, `NaN:N` counter `+1` every step, `lr` frozen, probe values byte-identical, `val_roll_cos` plateaued at `0.7237` from E2. User: "Опять сраное плато и 0 прогресса". Training APPEARED to run (forward finite via defensive scrubs) but no parameter updates occurred.
+
+### Root Cause Analysis
+1. `train_step` had a skip-on-NaN-grad pattern: any step where one gradient was non-finite zeroed ALL grads and returned. Healthy params never updated. Once Adam state got poisoned, every batch hit the skip path forever.
+2. `optimizer.zero_grad()` only clears `.grad`; it does NOT touch Adam `exp_avg`/`exp_avg_sq`. A NaN that slipped into those momentum buffers persisted and re-emerged as a NaN gradient on the next step → self-propagating zombie.
+3. `nan_to_num` in the forward pass scrubs values, NOT the backward graph. If a WEIGHT is NaN, d(loss)/d(weight) is still NaN even though `loss` reads as finite.
+4. `weights.sum().clamp(min=1.0)` does NOT fix NaN — NaN passes through `clamp` unchanged, then divides into the loss.
+5. `snr.to(bf16).clamp(min=1e-8)` is ineffective because bf16 has no denormals; values `< ~1.17e-38` silently underflow to 0 before clamp sees them, causing `1/snr → Inf → NaN` downstream.
+
+### Tasks
+- [x] Replace skip-on-NaN-grad with in-place `.grad.masked_fill_(bad, 0.0)` sanitation; log `grad_sanitized` count.
+- [x] Rescue Adam momentum: when a parameter's grad is sanitized, `nan_to_num(buf, out=buf)` for `exp_avg`, `exp_avg_sq`, `max_exp_avg_sq`.
+- [x] Post-step param sanity: after `optimizer.step()`, scan for non-finite params, `copy_(ema.shadow[name])` to restore from last known-good weights, also scrub Adam state on restored params, skip `ema.update(model)` on restore steps.
+- [x] Move `_diffusion_forcing_weights` SNR computation entirely into fp32 via `torch.autocast(device_type=..., enabled=False)`; `nan_to_num` before clamp; `clamp(min=1e-6, max=1e4)`.
+- [x] Scrub `mask_sum` / `weight_sum` via `nan_to_num` BEFORE `clamp(min=1.0)` in both `_masked_step_losses` and `_masked_weighted_step_losses`.
+- [x] Final defensive `nan_to_num` on loss before backward; skip backward only when sanitized loss is exactly zero.
+- [x] Config: `df_warmup_epochs 3→5`, `loss_lambda_diffusion 0.25→0.15`.
+- [x] `python -m py_compile experiments/13_chain_generator/train_chain_generator.py` + `json.tool configs/chain_generator_config.json` — both clean.
+- [x] Update `tasks/lessons.md` with the frozen-zombie pattern and 7 carry-forward rules.
+
+### Files Touched
+- `experiments/13_chain_generator/train_chain_generator.py` — `_masked_step_losses`, `_masked_weighted_step_losses`, `_diffusion_forcing_weights`, `train_step` (grad sanitation + Adam rescue + post-step EMA restore).
+- `configs/chain_generator_config.json` — `loss_lambda_diffusion 0.25→0.15`, `df_warmup_epochs 3→5`.
+- `tasks/lessons.md` — 2026-04-14 "frozen zombie" entry with Adam momentum + skip-trap + bf16 denormal rules.
+
+### Review
+- **Skip-on-NaN-grad was the primary trap**. The previous "safe" pattern (`if not finite: skip step`) converted transient errors into a permanent plateau. The fix is to sanitize in place and let healthy gradients keep training — corruption that actually reaches parameters is caught by the post-step EMA restore.
+- **Adam momentum state was the persistence mechanism**. `optimizer.zero_grad()` never touches momentum buffers; any NaN that made it into `exp_avg`/`exp_avg_sq` self-propagated forever. Now scrubbed whenever a grad is sanitized or a param is restored.
+- **EMA as break-glass recovery, not just "smoother eval"**. Post-step param sanity + `copy_(ema.shadow[name])` means a single corrupt step can no longer kill the run. EMA update is skipped on restore steps to avoid polluting the shadow with the very corruption we're rescuing from.
+- **bf16 has no denormals**. `clamp(min=1e-8)` is a no-op on bf16 underflow. SNR math now runs in an explicit `autocast(enabled=False)` region and never touches bf16. This is the SOTA pattern for Min-SNR under bf16 AMP.
+- **Two-layer NaN scrubbing** (scrub sums before clamp + scrub loss before backward) gives ~zero runtime cost defense-in-depth.
+- **Config tightening**: lowered DF lambda and extended warm-up to give the backbone more stable headroom before DF supervision kicks in at full strength — addresses the observed E2→E9 drift where the zombie state emerged.
+- **Static verification passed**. Empirical validation: the next run should show (a) `NaN:N` counter ≈ 0 or very low, (b) `grad_norm > 0` every step, (c) `val_roll_cos` moving past 0.7237 by E5+, (d) probe values changing step-to-step.
