@@ -245,13 +245,18 @@ def load_generator(ckpt_path: str, device: str = "auto") -> str:
 
         model = ChainGenerator(cfg).to(dev)
 
-        # Load state dict
+        # Load state dict.  Newer ChainGenerator checkpoints may include
+        # Diffusion-Forcing timestep parameters/buffers; older checkpoints do
+        # not.  strict=False keeps old GUI diagnostics loadable while reporting
+        # the compatibility gap to the user.
         if "model" in ckpt:
-            model.load_state_dict(ckpt["model"])
+            state_dict = ckpt["model"]
         elif "generator" in ckpt:
-            model.load_state_dict(ckpt["generator"])
+            state_dict = ckpt["generator"]
         else:
-            model.load_state_dict(ckpt)
+            state_dict = ckpt
+
+        load_result = model.load_state_dict(state_dict, strict=False)
 
         model.eval()
         _state.generator = model
@@ -265,6 +270,12 @@ def load_generator(ckpt_path: str, device: str = "auto") -> str:
         train_steps_text = (
             str(train_max_steps) if train_max_steps is not None else "unknown"
         )
+        compat_text = ""
+        if load_result.missing_keys or load_result.unexpected_keys:
+            compat_text = (
+                f"\n  Compat load: missing={len(load_result.missing_keys)}, "
+                f"unexpected={len(load_result.unexpected_keys)}"
+            )
         return (
             f"ChainGenerator loaded: {model.num_params:,} params\n"
             f"  Epoch: {epoch}, Best cos: {best}\n"
@@ -272,6 +283,7 @@ def load_generator(ckpt_path: str, device: str = "auto") -> str:
             f"  Train max steps: {train_steps_text}, Arch max len: {cfg.max_chain_len}\n"
             f"  Context bank size: {context_bank_size if context_bank_size is not None else 'unknown'}\n"
             f"  Device: {dev}"
+            f"{compat_text}"
         )
     except Exception as e:
         import traceback
@@ -714,7 +726,7 @@ def run_generation(
     device = torch.device(_state.device)
     t0 = time.time()
 
-    effective_steps, _, _ = _resolve_num_steps(num_steps)
+    effective_steps, step_cap_applied, step_cap_reason = _resolve_num_steps(num_steps)
 
     v_q = v_query.unsqueeze(0).to(device)  # [1, D]
     v_ctx = v_q if v_context is None else v_context.unsqueeze(0).to(device)
@@ -1476,6 +1488,9 @@ def run_from_data(
     sample_idx: int = 0,
     num_steps: int = 1,
     num_candidates: int = 1,
+    beam_width: int = 1,
+    temperature: float = 1.0,
+    noise_std: float = 0.01,
     grid_size: int = 30,
 ) -> GenerationResult:
     """
@@ -1505,6 +1520,9 @@ def run_from_data(
         num_steps=num_steps,
         v_target=v_answer,
         num_candidates=num_candidates,
+        beam_width=beam_width,
+        temperature=temperature,
+        noise_std=noise_std,
         v_context=v_context,
         v_context_bank=v_context_bank,
         context_labels=context_labels,
@@ -1530,6 +1548,9 @@ def run_from_text(
     text: str,
     num_steps: int = 1,
     num_candidates: int = 1,
+    beam_width: int = 1,
+    temperature: float = 1.0,
+    noise_std: float = 0.01,
     grid_size: int = 30,
 ) -> GenerationResult:
     """
@@ -1553,6 +1574,9 @@ def run_from_text(
         v_query,
         num_steps=num_steps,
         num_candidates=num_candidates,
+        beam_width=beam_width,
+        temperature=temperature,
+        noise_std=noise_std,
         v_context=v_query,
         v_context_bank=v_context_bank,
         context_labels=context_labels,

@@ -2225,3 +2225,135 @@ Only if Phase 1-3 don't reach 0.90 roll_cos:
 ### Files created/modified
 - [x] `experiments/13_chain_generator/train_chain_generator.py` — added `--finetune` flag, `system2_start_steps`
 - [x] `configs/chain_generator_finetune.json` — fine-tune config
+
+
+---
+## 2026-04-13 - Diffusion-Inspired Exposure Bias Fix + GUI Repair
+
+### Objective
+Fix the root cause of val_roll_cos_last ceiling at 0.60: the model never sees imperfect contexts during teacher forcing. Implement noisy teacher forcing (diffusion-inspired multi-noise-level training). Fix GUI inference crash. Remove pointless train generate() noise.
+
+### Analysis Validated
+- [x] Training log confirms user's analysis: oracle inflated train_roll_cos, noise destroyed eval_roll_cos
+- [x] Root cause of 0.16 gap at steps=1: eval noise_std=0.01 in d=1024 → noise_norm=0.32 vs signal=0.4 (SNR=1.25)
+- [x] NaN:3 per epoch is cumulative, not per-batch-window; happens at initialization
+- [x] val_tf_cos=0.87 proves model capacity is sufficient; problem is training distribution
+
+### Changes
+- [x] Fix GUI `run_from_text`/`run_from_data` — add missing `beam_width`, `temperature`, `noise_std` params
+- [x] Remove train generate() noise: `free_run_noise_std=0.0` (noise was only useful for oracle candidate selection, now disabled)
+- [x] Implement Noisy Teacher Forcing in `forward()`:
+  - Per-sample noise level σ ~ U[0, tf_noise_std]
+  - Applied to GT prefix in SONAR space before residual scaling
+  - Calibrated: tf_noise_std_max=0.005 → angular perturbation ≈ 38° at max
+  - Active in both pure TF and scheduled sampling paths
+- [x] Add `_get_tf_noise_std()` scheduler: ramps 0→tf_noise_std_max over tf_noise_ramp_epochs
+- [x] Thread tf_noise_std through train_step → compute_composite_objective → model.forward()
+- [x] Log tf_noise_std in metrics
+- [x] Update lessons.md with noise calibration rules
+
+### Next Steps (Priority Order)
+- [ ] Run clean training from scratch — establish honest baseline with oracle disabled + noisy TF
+- [ ] If val_roll_cos_last plateaus < 0.65: implement self-conditioning (second forward pass with preliminary prediction as conditioning)
+- [ ] If val_roll_cos_last plateaus < 0.80: implement iterative refinement per autoregressive step (K=2-4 refinement passes)
+- [ ] Consider Diffusion Forcing for hybrid autoregressive-diffusion architecture (major effort)
+
+## 2026-04-11 - Disable Oracle/DAger and Fix ChainGenerator NaNs
+
+### Objective
+Disable oracle-guided DAger by default, remove train/eval oracle leakage, fix NaN sources in the ChainGenerator objective, and add dataset/training diagnostics that explain the current 0.90 train vs ~0.49 eval gap.
+
+### Checklist
+- [x] Gate oracle/DAger behind `enable_oracle_dagger=false` and default oracle probability/retries to zero.
+- [x] Stop passing oracle guidance into free-run rollout unless explicitly enabled.
+- [x] Fix disabled-rank-loss NaN contamination by skipping rank loss computation when `loss_lambda_rank=0`.
+- [x] Replace unsafe normalize paths with fp32 safe normalization for tiny SONAR-sphere vectors.
+- [x] Replace latent-vector cosine checks in generation with safe-normalize cosine.
+- [x] Replace masked `loss * mask` with `torch.where(mask, loss, 0)` to avoid `NaN * 0`.
+- [x] Disable repeat-ban during training rollouts so the training objective stays differentiable and stable.
+- [x] Skip scheduler stepping when the optimizer step is skipped due non-finite loss or gradients.
+- [x] Add train/val dataset diagnostics: chain length, truncation, answer coverage, norms, answer text length, context length.
+- [x] Add answer-specific metrics: teacher-forced answer cosine, rollout answer cosine, answer coverage.
+- [x] Re-run static verification: Python compile, JSON parse, and git whitespace checks.
+
+### Review
+- Oracle-guided DAger is now opt-in only. Default training/eval measures real free-run quality instead of oracle-assisted rollout.
+- Primary NaN root causes were disabled rank loss still producing NaNs, unsafe normalization on tiny vectors, masked multiplication by zero, and scheduler advancement after skipped steps.
+- The next full training run should be started from a clean checkpoint or explicitly treated as fine-tuning from an oracle-contaminated checkpoint.
+
+---
+## 2026-04-13 - Full Diffusion Forcing for ChainGenerator
+
+### Objective
+Implement a mathematically controlled Diffusion Forcing variant for SONAR-space autoregressive QA: independent per-position diffusion noise levels, timestep/noise conditioning in ChainGenerator, masked diffusion loss, and diagnostics that expose whether diffusion is improving real rollout rather than only teacher-forced metrics.
+
+### Source Principles to Preserve
+- Independent noise level per sequence token/position, not one global sequence noise level.
+- DDPM-style forward process: x_k = sqrt(alpha_bar_k) * x0 + sqrt(1-alpha_bar_k) * eps.
+- Causal decoder must still preserve autoregressive direction: position i may condition on previous/noisy-clean mixed prefix only via causal mask.
+- No oracle/DAger. No train-only reranking. No unsafe normalize or NaN * 0 masking.
+- SONAR norm must remain interpretable: clean prediction is still sphere-projected to target_norm for autoregressive output metrics.
+
+### Implementation Checklist
+- [x] Add diffusion/noise timestep embeddings to `ChainGenerator` and inject them into decoder inputs without breaking residual-space scaling.
+- [x] Add diffusion schedule buffers/helpers: beta schedule, alpha_bar extraction, SONAR-safe q_sample, SNR lookup.
+- [x] Add diffusion-forced teacher path where each chain position gets an independent noise level and the model predicts clean x0 under mask.
+- [x] Add diffusion-forcing loss term with masked reductions and diagnostics: df_loss, df_cos_x0, df_noise_mse, noise_level mean/max, clean/noisy/noise norm.
+- [x] Wire config controls: enable flag, timesteps, schedule, loss weight, noise sampling policy, max noise level, min-SNR style weighting if needed.
+- [x] Keep standard AR loss and rollout loss alive for compatibility; DF is an additional objective, not a silent replacement on first pass.
+- [x] Add validation-time DF diagnostics with fixed eval noise level for stable monitoring.
+- [x] Run static checks. Torch smoke test is blocked in the Windows workspace because no local torch environment is available here; use project `.venv` on the training machine for runtime smoke.
+
+### Acceptance Criteria
+- [x] Existing checkpoints can load with `strict=False` or config-gated new parameters where necessary.
+- [x] Training prints DF metrics and keeps rollout metrics visible.
+- [x] No `NaN * 0`, no unsafe `F.normalize` on train path, no uncalibrated per-dim noise defaults.
+- [x] `roll_cos`, `roll_ans`, and `ans_cov` remain logged; DF must be evaluated by rollout quality, not just diffusion loss.
+
+### Review
+- Implemented pred-x0 Diffusion Forcing as an additional loss (`loss_lambda_diffusion`) rather than replacing AR/rollout objectives.
+- Noise is scaled as `target_norm / sqrt(d_model)` by default, so epsilon norm is comparable to SONAR vector norm instead of raw DDPM `sqrt(d_model)`.
+- Training samples independent noise levels per valid chain position; validation uses a fixed `df_eval_noise_level` for stable monitoring.
+- GUI generator loading now uses `strict=False` so old checkpoints missing DF timestep parameters/buffers still load.
+- Runtime forward smoke could not be executed in this Windows workspace because neither `python` nor `uv` has a torch-enabled environment. Static compile and JSON validation passed.
+- Second math review fixed two issues: timestep embeddings now use raw diffusion level 0..K-1, and optional Min-SNR weighting now matches pred-x0 instead of pred-noise.
+- Eval-path review fixed DF validation stochasticity: validation now uses fixed noise level and deterministic Gaussian epsilon per validation batch for stable val_df_cos.
+- Third math review fixed answer-repeat padding semantics: training now tracks `answer_pos`, System1 uses the first answer vector directly, System2 answer losses/metrics activate when the first answer enters the prefix horizon, and disabled-rank diagnostics compare answer vectors instead of last repeat pads.
+
+---
+## 2026-04-13 - ChainGenerator Training Geometry GUI
+
+### Objective
+Add a mathematically honest and visually useful Web GUI diagnostics path for step-level ChainGenerator training geometry: fixed probe artifacts, Diffusion Forcing noise/denoise trajectories, rollout-vs-target trajectories, and stable 2D/3D projections that can be inspected by global training step.
+
+### Design Requirements
+- Use fixed probe batches and fixed PCA basis; do not recompute projection per step.
+- Visualize real objects from the model: clean `x0`, noised `x_t`, predicted `pred_x0`, rollout chain, target chain, noise levels, answer position, and masks.
+- Separate DF diagnostic quality (`df_cos`) from true autoregressive quality (`roll_cos_answer`, `roll_cos_last`).
+- Keep artifact size bounded; save probe snapshots only every configured N steps.
+- GUI must work even before artifacts exist and must fail with actionable messages.
+
+### Implementation Checklist
+- [x] Inspect existing GUI metrics/plot infrastructure and training script logging hooks.
+- [x] Add probe artifact writer to ChainGenerator training with config controls.
+- [x] Add stable PCA/projection utilities and compact snapshot schema.
+- [x] Add GUI loader/render functions for 3D DF geometry, rollout trajectory, noise heatmap, and step-level scalar metrics.
+- [x] Wire a new Training Geometry tab into `cerber_gui/app.py`.
+- [x] Add config defaults and documentation/review notes.
+- [x] Run static checks and any available non-torch GUI helper checks.
+
+### Acceptance Criteria
+- [x] Training can save probe artifacts without changing main loss math.
+- [x] GUI can load probe artifacts and display 3D/2D/heatmap plots by `global_step`.
+- [x] Projections are stable across steps for honest visual comparison.
+- [x] Missing artifacts or missing torch fail cleanly.
+
+### Review
+- Added fixed-probe geometry snapshots in `train_chain_generator.py`: clean target chain, noised DF input, DF `pred_x0`, teacher-forced prediction, free rollout, masks, answer position, noise levels, per-token cos/L2/norms, and stable PCA basis.
+- Added step-level JSONL events to `chain_generator_training.jsonl`: `run_start`, `train_step`, `probe_snapshot`, `probe_error`, `val_epoch`, and `run_complete`.
+- Added config controls in `configs/chain_generator_config.json`: `metrics_log_name`, `enable_training_geometry_probe`, `probe_every_steps`, `probe_num_samples`, `probe_steps`, `probe_dir_name`, `probe_save_raw_vectors`.
+- Added `cerber_gui/training_geometry.py` with 3D DF trajectory, 3D rollout trajectory, noise/cos/L2 heatmap, per-token metric chart, and scalar training metric chart.
+- Wired new `Training Geometry` tab in `cerber_gui/app.py` with logs/probe loader, snapshot selector, sample selector, summary, and four focused plot tabs.
+- Manual math review fixed PCA explained variance normalization: numerator and denominator now use the same variance units instead of mixing variance with total sum-of-squares.
+- Verification passed: `uv run python -m py_compile experiments/13_chain_generator/train_chain_generator.py cerber_gui/app.py cerber_gui/training_geometry.py`, `uv run python -m json.tool configs/chain_generator_config.json`, `git diff --check`, and manual trailing-whitespace check for the new GUI module.
+- Runtime import smoke is blocked in this Windows `uv` environment because `torch` is not installed and `cerber_gui.__init__` imports torch-dependent modules. Use the project `.venv` training environment for live GUI smoke.

@@ -12,6 +12,8 @@ Objective:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -23,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cebcm.models.chain_generator import ChainGenerator, ChainGeneratorConfig
+from cebcm.models.chain_generator import ChainGenerator, ChainGeneratorConfig, _apply_rope
 from cebcm.training.stage2_utils import (
     MetricTracker,
     get_cosine_schedule_with_warmup,
@@ -68,8 +70,10 @@ class ChainDataset(Dataset):
         # equivalent of EOS.
         if v_steps.shape[0] > 0:
             chain = torch.cat([v_steps, v_a.unsqueeze(0)], dim=0)
+            answer_pos = int(v_steps.shape[0])
         else:
             chain = v_a.unsqueeze(0)
+            answer_pos = 0
 
         # Pad with answer repeats (before truncation to max_chain_len).
         if self.answer_repeat_pad > 0:
@@ -80,8 +84,10 @@ class ChainDataset(Dataset):
             keep_reasoning = max(self.max_chain_len - 1, 0)
             if keep_reasoning > 0:
                 chain = torch.cat([chain[:keep_reasoning], chain[-1:]], dim=0)
+                answer_pos = keep_reasoning
             else:
                 chain = chain[-1:]
+                answer_pos = 0
 
         # Context memory-bank: [query, evidence_slots...]
         # Keep evidence from reasoning steps only (never answer token).
@@ -96,6 +102,7 @@ class ChainDataset(Dataset):
             "v_question": v_q,
             "chain": chain,
             "chain_len": chain.shape[0],
+            "answer_pos": answer_pos,
             "context_bank": context_bank,
             "context_len": context_bank.shape[0],
         }
@@ -109,6 +116,7 @@ def collate_chains(batch: list[dict]) -> dict:
     v_questions = torch.stack([b["v_question"] for b in batch])
 
     chain_lens = torch.tensor([b["chain_len"] for b in batch], dtype=torch.long)
+    answer_pos = torch.tensor([b["answer_pos"] for b in batch], dtype=torch.long)
     max_chain = int(chain_lens.max().item())
     chains = torch.zeros(bsz, max_chain, d_model)
     for i, b in enumerate(batch):
@@ -128,9 +136,98 @@ def collate_chains(batch: list[dict]) -> dict:
         "v_questions": v_questions,
         "chains": chains,
         "chain_lens": chain_lens,
+        "answer_pos": answer_pos,
         "context_banks": context_banks,
         "context_mask": context_mask,
     }
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    idx = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * q))))
+    return float(vals[idx])
+
+
+def _mean(values: list[float]) -> float:
+    return float(sum(values) / max(len(values), 1))
+
+
+def summarize_chain_dataset(
+    samples: list[dict],
+    label: str,
+    max_chain_len: int,
+    max_chain_steps: int,
+    answer_repeat_pad: int,
+    context_bank_size: int,
+) -> dict[str, float]:
+    """Print cheap dataset diagnostics before spending GPU time."""
+    step_lens: list[float] = []
+    chain_lens: list[float] = []
+    answer_positions: list[float] = []
+    ctx_lens: list[float] = []
+    q_norms: list[float] = []
+    a_norms: list[float] = []
+    step_norms: list[float] = []
+    answer_word_lens: list[float] = []
+    truncated = 0
+
+    for s in samples:
+        v_steps = s["v_steps"]
+        n_steps = int(v_steps.shape[0])
+        raw_chain_len = n_steps + 1 + max(0, int(answer_repeat_pad))
+        final_chain_len = min(raw_chain_len, int(max_chain_len))
+        answer_pos = n_steps
+        if raw_chain_len > max_chain_len:
+            answer_pos = max(final_chain_len - 1, 0)
+
+        step_lens.append(float(n_steps))
+        chain_lens.append(float(final_chain_len))
+        answer_positions.append(float(answer_pos))
+        ctx_lens.append(float(min(1 + n_steps, max(1, int(context_bank_size)))))
+        q_norms.append(float(s["v_question"].norm().item()))
+        a_norms.append(float(s["v_answer"].norm().item()))
+        if n_steps > 0:
+            step_norms.append(float(v_steps.norm(dim=-1).mean().item()))
+        answer_text = s.get("answer")
+        if isinstance(answer_text, str):
+            answer_word_lens.append(float(len(answer_text.split())))
+        if raw_chain_len > max_chain_len:
+            truncated += 1
+
+    n = max(len(samples), 1)
+    coverage = sum(1 for x in answer_positions if (x + 1) <= max_chain_steps) / n
+    stats = {
+        "n": float(len(samples)),
+        "steps_mean": _mean(step_lens),
+        "steps_p50": _percentile(step_lens, 0.50),
+        "steps_p95": _percentile(step_lens, 0.95),
+        "steps_max": max(step_lens) if step_lens else 0.0,
+        "chain_mean": _mean(chain_lens),
+        "chain_p50": _percentile(chain_lens, 0.50),
+        "chain_p95": _percentile(chain_lens, 0.95),
+        "chain_max": max(chain_lens) if chain_lens else 0.0,
+        "truncated_pct": 100.0 * truncated / n,
+        "answer_coverage_at_max_steps_pct": 100.0 * coverage,
+        "context_len_mean": _mean(ctx_lens),
+        "q_norm_mean": _mean(q_norms),
+        "a_norm_mean": _mean(a_norms),
+        "step_norm_mean": _mean(step_norms),
+        "answer_words_mean": _mean(answer_word_lens),
+        "answer_words_p95": _percentile(answer_word_lens, 0.95),
+    }
+    print(
+        f"  [{label}] chain_len mean/p50/p95/max="
+        f"{stats['chain_mean']:.1f}/{stats['chain_p50']:.0f}/{stats['chain_p95']:.0f}/{stats['chain_max']:.0f}; "
+        f"steps mean/p95={stats['steps_mean']:.1f}/{stats['steps_p95']:.0f}; "
+        f"truncated={stats['truncated_pct']:.1f}%; "
+        f"answer_coverage@max_steps={stats['answer_coverage_at_max_steps_pct']:.1f}%; "
+        f"answer_words mean/p95={stats['answer_words_mean']:.1f}/{stats['answer_words_p95']:.0f}; "
+        f"norm q/a/step={stats['q_norm_mean']:.4f}/{stats['a_norm_mean']:.4f}/{stats['step_norm_mean']:.4f}; "
+        f"context_len_mean={stats['context_len_mean']:.1f}"
+    )
+    return stats
 
 
 def get_chain_steps(epoch: int, cfg: dict) -> int:
@@ -152,36 +249,48 @@ def get_chain_steps(epoch: int, cfg: dict) -> int:
 def select_training_targets(
     chains: torch.Tensor,
     chain_lens: torch.Tensor,
+    answer_pos: torch.Tensor,
     target_steps: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Select training targets aligned to the generation process.
 
-    Fix #6: Two regimes:
-      - System1 (target_steps=1): suffix-aligned — take the LAST valid token
-        (the answer), because the model must learn single-step direct QA.
-      - System2 (target_steps>1): prefix-aligned — take chains[0:target_steps],
+    Two regimes:
+      - System1 (target_steps=1): answer-aligned; take the first answer token,
+        not the first reasoning token and not an answer-repeat pad.
+      - System2 (target_steps>1): prefix-aligned; take chains[0:target_steps],
         matching what generate() produces autoregressively from position 0.
     """
     bsz, full_len, d_model = chains.shape
     steps = max(1, min(int(target_steps), full_len))
     targets = torch.zeros(bsz, steps, d_model, device=chains.device, dtype=chains.dtype)
     mask = torch.zeros(bsz, steps, device=chains.device, dtype=torch.bool)
+    target_answer_pos = torch.zeros(bsz, device=chains.device, dtype=torch.long)
+    target_has_answer = torch.zeros(bsz, device=chains.device, dtype=torch.bool)
 
     for i in range(bsz):
         li = max(1, min(int(chain_lens[i].item()), full_len))
         ti = min(steps, li)
+        ai = max(0, min(int(answer_pos[i].item()), li - 1))
 
         if steps == 1:
-            # System1: suffix-aligned — always the answer (last valid token).
-            targets[i, 0] = chains[i, li - 1]
+            # System1: direct answer.  Use the first answer vector, not an
+            # arbitrary repeated answer pad at the end of the chain.
+            targets[i, 0] = chains[i, ai]
             mask[i, 0] = True
+            target_answer_pos[i] = 0
+            target_has_answer[i] = True
         else:
             # System2: prefix-aligned — first ti tokens.
             targets[i, :ti] = chains[i, :ti]
             mask[i, :ti] = True
+            if ai < ti:
+                target_answer_pos[i] = ai
+                target_has_answer[i] = True
+            else:
+                target_answer_pos[i] = max(ti - 1, 0)
 
-    return targets, mask
+    return targets, mask, target_answer_pos, target_has_answer
 
 
 def _masked_step_losses(
@@ -192,14 +301,19 @@ def _masked_step_losses(
     cosine_weight: float,
     mse_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    maskf = mask.to(dtype=pred.dtype)
+    pred = pred.float()
+    target = target.float()
+    mask_bool = mask.to(device=pred.device, dtype=torch.bool)
+    maskf = mask_bool.to(dtype=pred.dtype)
     mask_sum = maskf.sum().clamp(min=1.0)
 
-    cos_sim = F.cosine_similarity(pred, target, dim=-1)
-    cos_loss = ((1.0 - cos_sim) * maskf).sum() / mask_sum
+    cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+    cos_term = torch.where(mask_bool, 1.0 - cos_sim, torch.zeros_like(cos_sim))
+    cos_loss = cos_term.sum() / mask_sum
 
     mse_per = (pred - target).pow(2).sum(dim=-1)
-    mse_loss = (mse_per * maskf).sum() / mask_sum
+    mse_term = torch.where(mask_bool, mse_per, torch.zeros_like(mse_per))
+    mse_loss = mse_term.sum() / mask_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
     return loss, {
@@ -210,9 +324,45 @@ def _masked_step_losses(
     }
 
 
+def _masked_weighted_step_losses(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    weights: torch.Tensor,
+    d_model: int,
+    cosine_weight: float,
+    mse_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    pred = pred.float()
+    target = target.float()
+    mask_bool = mask.to(device=pred.device, dtype=torch.bool)
+    weights = weights.to(device=pred.device, dtype=pred.dtype)
+    weights = torch.where(mask_bool, weights, torch.zeros_like(weights))
+    weight_sum = weights.sum().clamp(min=1.0)
+
+    cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+    cos_loss = ((1.0 - cos_sim) * weights).sum() / weight_sum
+
+    mse_per = (pred - target).pow(2).sum(dim=-1)
+    mse_loss = (mse_per * weights).sum() / weight_sum
+
+    loss = cosine_weight * cos_loss + mse_weight * mse_loss
+    return loss, {
+        "cos_sim": cos_sim,
+        "cos_loss": cos_loss,
+        "mse_loss": mse_loss,
+        "weight_sum": weight_sum,
+    }
+
+
 def _gather_last_valid(x: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tensor:
     idx = (valid_lens - 1).clamp(min=0)
     return x[torch.arange(x.shape[0], device=x.device), idx]
+
+
+def _safe_normalize(v: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    v_float = v.float()
+    return v_float / v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
 
 
 def _inbatch_contrastive_loss(
@@ -227,8 +377,8 @@ def _inbatch_contrastive_loss(
         return zero, one
 
     temp = max(float(temperature), 1e-4)
-    p = F.normalize(pred_final, dim=-1)
-    t = F.normalize(tgt_final, dim=-1)
+    p = _safe_normalize(pred_final.float(), dim=-1)
+    t = _safe_normalize(tgt_final.float(), dim=-1)
 
     logits = (p @ t.t()) / temp
     labels = torch.arange(bsz, device=pred_final.device)
@@ -258,6 +408,28 @@ def _get_scheduled_sampling_prob(epoch: int, cfg: dict) -> float:
     return ss_max * progress
 
 
+def _get_oracle_prob(epoch: int, cfg: dict) -> float:
+    """Compute oracle guidance probability for the current epoch.
+
+    Oracle guidance is disabled by default because it creates a train/eval
+    distribution mismatch: during training it helps the model stay close to
+    GT, but at eval the oracle is absent (self.training=False). That makes
+    train rollouts look much better than real rollouts.
+
+    If explicitly re-enabled for an ablation, decay oracle_prob over training.
+    """
+    if not bool(cfg.get("enable_oracle_dagger", False)):
+        return 0.0
+
+    oracle_max = float(cfg.get("oracle_prob_max", 0.0))
+    oracle_min = float(cfg.get("oracle_prob_min", 0.0))
+    oracle_ramp = int(cfg.get("oracle_decay_epochs", 20))
+    if oracle_ramp <= 0:
+        return oracle_min
+    progress = min(1.0, epoch / oracle_ramp)
+    return oracle_max - (oracle_max - oracle_min) * progress
+
+
 def _get_scheduled_noise_std(epoch: int, cfg: dict) -> float:
     """Compute noise std for the current epoch.
 
@@ -276,44 +448,280 @@ def _get_scheduled_noise_std(epoch: int, cfg: dict) -> float:
     return base_noise + (max_noise - base_noise) * progress
 
 
+def _get_tf_noise_std(epoch: int, cfg: dict) -> float:
+    """Compute noisy teacher-forcing noise std for the current epoch.
+
+    Diffusion-inspired: add noise to the teacher-forced prefix so the model
+    learns to predict from imperfect contexts.  Noise is in SONAR space
+    (pre-residual-scaling), so values are relative to target_norm≈0.2051.
+
+    Returns 0.0 if tf_noise_std_max is 0 or absent (disabled by default).
+    Ramps linearly from 0 to tf_noise_std_max over tf_noise_ramp_epochs,
+    then stays at max.  Starting from 0 ensures early training focuses on
+    learning the clean mapping before introducing perturbation.
+    """
+    max_noise = float(cfg.get("tf_noise_std_max", 0.0))
+    if max_noise <= 0.0:
+        return 0.0
+    ramp_epochs = int(cfg.get("tf_noise_ramp_epochs", 5))
+    if ramp_epochs <= 0:
+        return max_noise
+    progress = min(1.0, epoch / ramp_epochs)
+    return max_noise * progress
+
+
+def _sample_diffusion_noise_levels(
+    mask: torch.Tensor,
+    cfg: dict,
+    model: ChainGenerator,
+    *,
+    eval_mode: bool = False,
+) -> torch.Tensor:
+    """Sample independent per-position diffusion levels for valid targets.
+
+    Supports two training sampling strategies:
+    - ``"independent"`` (default): Uniform random over [min_level, max_level].
+    - ``"logsnr"``:  Log-SNR stratified sampling (Karras et al. 2022).
+      Uniformly samples in log-SNR space, then maps to nearest timestep.
+      This gives more samples at intermediate noise levels (where denoising
+      is hardest) and fewer at extremes.
+    """
+    timesteps = max(2, int(model.cfg.diffusion_timesteps))
+    min_level = max(0, int(cfg.get("df_noise_level_min", 0)))
+    max_level = int(cfg.get("df_noise_level_max", timesteps - 1))
+    max_level = max(min_level, min(max_level, timesteps - 1))
+
+    if eval_mode:
+        eval_level = int(cfg.get("df_eval_noise_level", (min_level + max_level) // 2))
+        levels = torch.full(mask.shape, eval_level, device=mask.device, dtype=torch.long)
+    else:
+        sampling = str(cfg.get("df_noise_sampling", "logsnr")).lower()
+        if sampling == "logsnr":
+            # Log-SNR stratified sampling (Karras et al. 2022).
+            snr_buf = model._df_snr.float()  # [K]
+            log_snr = torch.log(snr_buf.clamp(min=1e-8))
+            log_snr_min = log_snr[max_level].item()   # noisiest
+            log_snr_max = log_snr[min_level].item()    # cleanest
+            # Sample uniformly in log-SNR, map to nearest timestep.
+            u = torch.rand(mask.shape, device=mask.device)
+            target_log_snr = log_snr_min + u * (log_snr_max - log_snr_min)
+            # Nearest-timestep lookup via argmin over the schedule.
+            diffs = (log_snr[min_level:max_level + 1].unsqueeze(0).unsqueeze(0)
+                     - target_log_snr.unsqueeze(-1)).abs()
+            levels = diffs.argmin(dim=-1) + min_level
+        elif sampling == "independent":
+            levels = torch.randint(min_level, max_level + 1, mask.shape, device=mask.device)
+        else:
+            raise ValueError(
+                f"Unsupported df_noise_sampling={sampling}; use 'independent' or 'logsnr'"
+            )
+
+    return torch.where(mask.to(dtype=torch.bool), levels, torch.zeros_like(levels))
+
+
+def _diffusion_forcing_weights(
+    model: ChainGenerator,
+    noise_levels: torch.Tensor,
+    cfg: dict,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Min-SNR-γ weights for DF loss (Hang et al. 2023).
+
+        Weight formula depends on ``prediction_type`` (Table 1 of Min-SNR paper):
+          - x₀-prediction: ``min(SNR, γ) / SNR``
+          - ε-prediction:  ``min(SNR, γ)``
+          - v-prediction:  ``min(SNR, γ) / (SNR + 1)``
+
+        Default gamma=5.0 (recommended by Hang et al.).  Set to 0 to disable.
+        """
+    gamma = float(cfg.get("df_min_snr_gamma", 5.0))
+    if gamma <= 0.0:
+        return torch.ones_like(noise_levels, dtype=torch.float32)
+
+    snr = model.diffusion_snr(noise_levels).to(device=noise_levels.device).float().clamp(min=1e-8)
+    gamma_t = torch.full_like(snr, gamma)
+    clipped = torch.minimum(snr, gamma_t)
+
+    pt = getattr(model.cfg, "prediction_type", "x0")
+    if pt == "x0":
+        weights = clipped / snr
+    elif pt == "eps":
+        weights = clipped
+    elif pt == "v":
+        weights = clipped / (snr + 1.0)
+    else:
+        weights = clipped / snr  # fallback
+    return torch.where(mask.to(dtype=torch.bool), weights, torch.zeros_like(weights))
+
+
+def _make_diffusion_eval_noise_like(
+    chains: torch.Tensor,
+    cfg: dict,
+    model: ChainGenerator,
+) -> torch.Tensor:
+    """Deterministic Gaussian eval noise for stable DF validation metrics."""
+    base_seed = int(cfg.get("df_eval_noise_seed", 12345))
+    with torch.no_grad():
+        # Data-dependent seed keeps the noise stable for the same validation
+        # batch while avoiding identical noise for every batch with same shape.
+        digest = torch.abs(chains[: min(chains.shape[0], 4), :1, :16].float()).sum()
+        digest_int = int((digest * 1_000_000).detach().cpu().item()) % 2_147_483_647
+    seed = (base_seed + digest_int) % 2_147_483_647
+    scale = float(model.cfg.diffusion_noise_scale)
+    if scale <= 0.0:
+        scale = float(model.cfg.target_norm) / math.sqrt(float(model.cfg.d_model))
+
+    try:
+        gen = torch.Generator(device=chains.device)
+        gen.manual_seed(seed)
+        noise = torch.randn(
+            chains.shape,
+            device=chains.device,
+            dtype=chains.dtype,
+            generator=gen,
+        )
+    except (TypeError, RuntimeError):
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+        noise = torch.randn(chains.shape, dtype=chains.dtype, generator=gen).to(device=chains.device)
+    return noise * scale
+
+
+def _to_jsonable(value):
+    """Convert common numeric/tensor values to JSON-safe scalars."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return float(value.detach().cpu().item())
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (int, float, str, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_to_jsonable(payload), ensure_ascii=False) + "\n")
+
+
+def _diffusion_forcing_objective(
+    model: ChainGenerator,
+    v_q: torch.Tensor,
+    chains: torch.Tensor,
+    chain_mask: torch.Tensor,
+    context_banks: torch.Tensor,
+    context_mask: torch.Tensor,
+    cfg: dict,
+    *,
+    eval_mode: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Masked Diffusion Forcing loss in SONAR space."""
+    bsz, steps, d_model = chains.shape
+    levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=eval_mode)
+    weights = _diffusion_forcing_weights(model, levels, cfg, chain_mask)
+    noise = None
+    if eval_mode and bool(cfg.get("df_eval_deterministic_noise", True)):
+        noise = _make_diffusion_eval_noise_like(chains, cfg, model)
+
+    v_df, v_noisy, eps = model.forward_diffusion_forcing(
+        v_q,
+        chains,
+        levels,
+        v_context_bank=context_banks,
+        context_mask=context_mask,
+        noise=noise,
+        return_noisy=True,
+    )
+    loss, stats = _masked_weighted_step_losses(
+        v_df,
+        chains,
+        chain_mask,
+        weights,
+        d_model,
+        float(model.cfg.loss_cosine_weight),
+        float(model.cfg.loss_mse_weight),
+    )
+
+    with torch.no_grad():
+        maskf = chain_mask.to(dtype=torch.float32)
+        valid = maskf.sum().clamp(min=1.0)
+        cos_sim = stats["cos_sim"]
+        cos_mean = torch.where(chain_mask, cos_sim, torch.zeros_like(cos_sim)).sum() / valid
+        valid_levels = torch.where(chain_mask, levels.float(), torch.zeros_like(levels.float()))
+        noisy_norm = torch.where(chain_mask, v_noisy.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+        eps_norm = torch.where(chain_mask, eps.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+        pred_norm = torch.where(chain_mask, v_df.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+
+        metrics = {
+            "loss_df": float(loss.item()),
+            "df_cos": float(cos_mean.item()),
+            "df_cos_loss_raw": float(stats["cos_loss"].item()),
+            "df_mse_loss_raw": float(stats["mse_loss"].item()),
+            "df_noise_level_mean": float((valid_levels.sum() / valid).item()),
+            "df_noise_level_max": float(levels[chain_mask].max().item()) if chain_mask.any() else 0.0,
+            "df_noisy_norm": float(noisy_norm.item()),
+            "df_eps_norm": float(eps_norm.item()),
+            "df_pred_norm": float(pred_norm.item()),
+            "df_weight_mean": float((weights * maskf).sum().item() / valid.item()),
+        }
+
+    return loss, metrics
+
+
 def compute_composite_objective(
     model: ChainGenerator,
     v_q: torch.Tensor,
     chains: torch.Tensor,
     chain_mask: torch.Tensor,
     chain_lens: torch.Tensor,
+    answer_pos: torch.Tensor,
+    has_answer: torch.Tensor,
     context_banks: torch.Tensor,
     context_mask: torch.Tensor,
     cfg: dict,
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
+    oracle_prob: float = 0.0,
+    tf_noise_std: float = 0.0,
+    eval_mode: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute full autoregressive objective for one batch."""
     bsz, steps, d_model = chains.shape
     valid_lens = chain_mask.sum(dim=1).long().clamp(min=1)
+    answer_pos = answer_pos.to(device=chains.device).long().clamp(min=0, max=max(steps - 1, 0))
+    has_answer = has_answer.to(device=chains.device, dtype=torch.bool)
 
     # Lambda weights.
     lambda_step = float(cfg.get("loss_lambda_step", 1.0))
     lambda_ans = float(cfg.get("loss_lambda_answer", 1.0))
     lambda_roll = float(cfg.get("loss_lambda_roll", 1.0))
     lambda_rank = float(cfg.get("loss_lambda_rank", 0.1))
+    lambda_df = float(cfg.get("loss_lambda_diffusion", 0.0))
+    rank_enabled = lambda_rank > 0.0
+    df_enabled = bool(cfg.get("enable_diffusion_forcing", False)) and lambda_df > 0.0
+    oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
+    effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
 
     # Base cosine/MSE weights from model config.
     w_cos = float(model.cfg.loss_cosine_weight)
     w_mse = float(model.cfg.loss_mse_weight)
 
-    # Determine whether the training window includes the answer per-sample.
-    # System1 (steps=1): target is always the answer (suffix-aligned).
-    # System2 (steps>1): answer is contained if the full chain fits in the window.
-    has_answer = (chain_lens <= steps) | (steps == 1)
-
     # 1) Teacher-forced masked step loss (with optional scheduled sampling).
+    # Noisy TF: inject noise into the teacher-forced prefix so the model
+    # learns to predict from imperfect contexts (diffusion-inspired).
     v_tf = model.forward(
         v_q,
         chains,
         v_context_bank=context_banks,
         context_mask=context_mask,
         scheduled_sampling_prob=scheduled_sampling_prob,
+        tf_noise_std=tf_noise_std,
     )
 
     # Fix #7: Only exclude last position from L_step when L_ans is active
@@ -321,19 +729,25 @@ def compute_composite_objective(
     step_mask = chain_mask.clone()
     for i in range(bsz):
         if has_answer[i]:
-            last_idx = int(valid_lens[i].item()) - 1
-            if last_idx >= 0:
-                step_mask[i, last_idx] = False
+            ans_idx = int(answer_pos[i].item())
+            if ans_idx >= 0 and ans_idx < step_mask.shape[1]:
+                step_mask[i, ans_idx] = False
 
     l_step, tf_stats = _masked_step_losses(v_tf, chains, step_mask, d_model, w_cos, w_mse)
 
     # 2) Final-answer supervised loss — only on samples that reached the answer.
     tf_final = _gather_last_valid(v_tf, valid_lens)
     tgt_final = _gather_last_valid(chains, valid_lens)
+    batch_idx = torch.arange(bsz, device=chains.device)
+    tf_answer_all = v_tf[batch_idx, answer_pos]
+    tgt_answer_all = chains[batch_idx, answer_pos]
     
     if has_answer.any():
-        ans_cos = (1.0 - F.cosine_similarity(tf_final[has_answer], tgt_final[has_answer], dim=-1)).mean()
-        ans_mse = (tf_final[has_answer] - tgt_final[has_answer]).pow(2).sum(dim=-1).mean()
+        tf_ans = tf_answer_all[has_answer].float()
+        tgt_ans = tgt_answer_all[has_answer].float()
+        ans_cos_sim = (_safe_normalize(tf_ans, dim=-1) * _safe_normalize(tgt_ans, dim=-1)).sum(dim=-1)
+        ans_cos = (1.0 - ans_cos_sim).mean()
+        ans_mse = (tf_ans - tgt_ans).pow(2).sum(dim=-1).mean()
         l_ans = w_cos * ans_cos + w_mse * ans_mse
     else:
         # System2: No sample reached the answer in this window.
@@ -352,34 +766,103 @@ def compute_composite_objective(
         repeat_cos_threshold=float(cfg.get("free_run_repeat_cos_threshold", 0.98)),
         repeat_ban_threshold=float(cfg.get("free_run_repeat_ban_threshold", 0.995)),
         repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 2)),
-        oracle_guide=chains,
-        oracle_max_retries=int(cfg.get("oracle_max_retries", 4)),
+        oracle_guide=chains if oracle_enabled else None,
+        oracle_max_retries=int(cfg.get("oracle_max_retries", 0)) if oracle_enabled else 0,
+        oracle_prob=effective_oracle_prob,
         return_info=True,
     )
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
 
     # 4) In-batch contrastive ranking on final rollout answer.
     roll_final = _gather_last_valid(v_roll, valid_lens)
-    l_rank, rank_acc = _inbatch_contrastive_loss(
-        roll_final,
-        tgt_final,
-        temperature=float(cfg.get("contrastive_temperature", 0.07)),
-    )
+    roll_answer_all = v_roll[batch_idx, answer_pos]
+    if rank_enabled and has_answer.any():
+        l_rank, rank_acc = _inbatch_contrastive_loss(
+            roll_answer_all[has_answer],
+            tgt_answer_all[has_answer],
+            temperature=float(cfg.get("contrastive_temperature", 0.07)),
+        )
+    else:
+        l_rank = chains.new_zeros(())
+        with torch.no_grad():
+            if has_answer.any():
+                _, rank_acc = _inbatch_contrastive_loss(
+                    roll_answer_all[has_answer].detach(),
+                    tgt_answer_all[has_answer].detach(),
+                    temperature=float(cfg.get("contrastive_temperature", 0.07)),
+                )
+                if not torch.isfinite(rank_acc):
+                    rank_acc = chains.new_zeros(())
+            else:
+                rank_acc = chains.new_zeros(())
 
-    loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll + lambda_rank * l_rank
+    loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll
+    if rank_enabled:
+        loss = loss + lambda_rank * l_rank
+
+    if df_enabled:
+        l_df, df_metrics = _diffusion_forcing_objective(
+            model,
+            v_q,
+            chains,
+            chain_mask,
+            context_banks,
+            context_mask,
+            cfg,
+            eval_mode=eval_mode,
+        )
+        loss = loss + lambda_df * l_df
+    else:
+        l_df = chains.new_zeros(())
+        df_metrics = {
+            "loss_df": 0.0,
+            "df_cos": 0.0,
+            "df_cos_loss_raw": 0.0,
+            "df_mse_loss_raw": 0.0,
+            "df_noise_level_mean": 0.0,
+            "df_noise_level_max": 0.0,
+            "df_noisy_norm": 0.0,
+            "df_eps_norm": 0.0,
+            "df_pred_norm": 0.0,
+            "df_weight_mean": 0.0,
+        }
 
     with torch.no_grad():
         # Use FULL mask (incl. answer) for reporting metrics.
-        tf_cos = F.cosine_similarity(v_tf, chains, dim=-1)
-        roll_cos = F.cosine_similarity(v_roll, chains, dim=-1)
+        tf_cos = (_safe_normalize(v_tf.float(), dim=-1) * _safe_normalize(chains.float(), dim=-1)).sum(dim=-1)
+        roll_cos = (_safe_normalize(v_roll.float(), dim=-1) * _safe_normalize(chains.float(), dim=-1)).sum(dim=-1)
+        tf_cos_masked = torch.where(chain_mask, tf_cos, torch.zeros_like(tf_cos))
+        roll_cos_masked = torch.where(chain_mask, roll_cos, torch.zeros_like(roll_cos))
+        tf_norm = v_tf.norm(dim=-1)
+        roll_norm = v_roll.norm(dim=-1)
+        tf_norm_masked = torch.where(chain_mask, tf_norm, torch.zeros_like(tf_norm))
+        roll_norm_masked = torch.where(chain_mask, roll_norm, torch.zeros_like(roll_norm))
         maskf = chain_mask.to(dtype=chains.dtype)
         valid = maskf.sum().clamp(min=1.0)
 
-        tf_cos_mean = ((tf_cos * maskf).sum() / valid).item()
-        roll_cos_mean = ((roll_cos * maskf).sum() / valid).item()
+        tf_cos_mean = (tf_cos_masked.sum() / valid).item()
+        roll_cos_mean = (roll_cos_masked.sum() / valid).item()
 
-        tf_cos_last = F.cosine_similarity(tf_final, tgt_final, dim=-1).mean().item()
-        roll_cos_last = F.cosine_similarity(roll_final, tgt_final, dim=-1).mean().item()
+        tf_cos_last = (
+            _safe_normalize(tf_final.float(), dim=-1)
+            * _safe_normalize(tgt_final.float(), dim=-1)
+        ).sum(dim=-1).mean().item()
+        roll_cos_last = (
+            _safe_normalize(roll_final.float(), dim=-1)
+            * _safe_normalize(tgt_final.float(), dim=-1)
+        ).sum(dim=-1).mean().item()
+        if has_answer.any():
+            roll_answer_cos = (
+                _safe_normalize(roll_answer_all[has_answer].float(), dim=-1)
+                * _safe_normalize(tgt_answer_all[has_answer].float(), dim=-1)
+            ).sum(dim=-1).mean().item()
+            tf_answer_cos = (
+                _safe_normalize(tf_answer_all[has_answer].float(), dim=-1)
+                * _safe_normalize(tgt_answer_all[has_answer].float(), dim=-1)
+            ).sum(dim=-1).mean().item()
+        else:
+            roll_answer_cos = 0.0
+            tf_answer_cos = 0.0
 
         # Fix #1: Per-step cosine diagnostics.
         tf_cos_first = float(tf_cos[:, 0].mean().item()) if steps >= 1 else 0.0
@@ -391,23 +874,32 @@ def compute_composite_objective(
             "loss_ans": float(l_ans.item()),
             "loss_roll": float(l_roll.item()),
             "loss_rank": float(l_rank.item()),
+            "loss_df": float(l_df.item()),
             "tf_cos_mean": float(tf_cos_mean),
             "tf_cos_last": float(tf_cos_last),
+            "tf_cos_answer": float(tf_answer_cos),
             "tf_cos_first": float(tf_cos_first),
             "roll_cos_mean": float(roll_cos_mean),
             "roll_cos_last": float(roll_cos_last),
+            "roll_cos_answer": float(roll_answer_cos),
             "roll_cos_first": float(roll_cos_first),
             "rank_acc": float(rank_acc.item()),
-            "pred_norm_mean_tf": float((v_tf.norm(dim=-1) * maskf).sum().item() / valid.item()),
-            "pred_norm_mean_roll": float((v_roll.norm(dim=-1) * maskf).sum().item() / valid.item()),
+            "pred_norm_mean_tf": float(tf_norm_masked.sum().item() / valid.item()),
+            "pred_norm_mean_roll": float(roll_norm_masked.sum().item() / valid.item()),
             "valid_tokens": float(valid.item()),
             "valid_tokens_per_sample": float(valid_lens.float().mean().item()),
             "lambda_step": lambda_step,
             "lambda_ans": lambda_ans,
             "lambda_roll": lambda_roll,
             "lambda_rank": lambda_rank,
+            "lambda_df": lambda_df,
             "ss_prob": float(scheduled_sampling_prob),
             "free_run_noise_std": float(free_run_noise_std),
+            "tf_noise_std": float(tf_noise_std),
+            "df_enabled": 1.0 if df_enabled else 0.0,
+            "oracle_enabled": 1.0 if oracle_enabled else 0.0,
+            "oracle_prob": float(effective_oracle_prob),
+            "answer_coverage": float(has_answer.float().mean().item()),
             "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
         }
 
@@ -416,6 +908,7 @@ def compute_composite_objective(
         metrics["tf_mse_loss_raw"] = float(tf_stats["mse_loss"].item())
         metrics["roll_cos_loss_raw"] = float(roll_stats["cos_loss"].item())
         metrics["roll_mse_loss_raw"] = float(roll_stats["mse_loss"].item())
+        metrics.update(df_metrics)
 
     return loss, metrics
 
@@ -432,14 +925,19 @@ def train_step(
     target_steps: int,
     scheduled_sampling_prob: float = 0.0,
     free_run_noise_std: float = 0.0,
+    oracle_prob: float = 0.0,
+    tf_noise_std: float = 0.0,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
     chain_lens = batch["chain_lens"].to(device)
+    answer_pos = batch["answer_pos"].to(device)
     context_banks = batch["context_banks"].to(device)
     context_mask = batch["context_mask"].to(device)
 
-    chains_trunc, chain_mask = select_training_targets(chains, chain_lens, target_steps)
+    chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
+        chains, chain_lens, answer_pos, target_steps
+    )
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -450,23 +948,58 @@ def train_step(
             chains_trunc,
             chain_mask,
             chain_lens,
+            target_answer_pos,
+            target_has_answer,
             context_banks,
             context_mask,
             cfg,
             scheduled_sampling_prob=scheduled_sampling_prob,
             free_run_noise_std=free_run_noise_std,
+            oracle_prob=oracle_prob,
+            tf_noise_std=tf_noise_std,
         )
+
+    # NaN guard: if loss is NaN/Inf, skip this step entirely.
+    # This prevents a single bad batch from permanently corrupting all weights.
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        metrics["nan_skipped"] = 1.0
+        metrics["nan_loss_skipped"] = 1.0
+        metrics["nan_grad_skipped"] = 0.0
+        metrics["optimizer_stepped"] = 0.0
+        metrics["target_steps"] = float(target_steps)
+        metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
+        return metrics
 
     scaler.scale(loss).backward()
 
+    # Unscale once, then clip + check for NaN gradients.
+    scaler.unscale_(optimizer)
+
     clip_grad = float(cfg.get("clip_grad_norm", 1.0))
     if clip_grad > 0:
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        total_norm = nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        if not torch.isfinite(total_norm):
+            # NaN/Inf in gradients — must still call scaler.update() to
+            # keep its internal state consistent, then skip optimizer.step().
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            metrics["nan_skipped"] = 1.0
+            metrics["nan_loss_skipped"] = 0.0
+            metrics["nan_grad_skipped"] = 1.0
+            metrics["optimizer_stepped"] = 0.0
+            metrics["target_steps"] = float(target_steps)
+            metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
+            return metrics
 
     scaler.step(optimizer)
     scaler.update()
 
+    metrics["nan_skipped"] = 0.0
+    metrics["nan_loss_skipped"] = 0.0
+    metrics["nan_grad_skipped"] = 0.0
+    metrics["optimizer_stepped"] = 1.0
+    metrics["grad_norm"] = float(total_norm.item()) if clip_grad > 0 else 0.0
     metrics["target_steps"] = float(target_steps)
     metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
     return metrics
@@ -485,10 +1018,13 @@ def eval_step(
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
     chain_lens = batch["chain_lens"].to(device)
+    answer_pos = batch["answer_pos"].to(device)
     context_banks = batch["context_banks"].to(device)
     context_mask = batch["context_mask"].to(device)
 
-    chains_trunc, chain_mask = select_training_targets(chains, chain_lens, gen_steps)
+    chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
+        chains, chain_lens, answer_pos, gen_steps
+    )
 
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
         _, metrics = compute_composite_objective(
@@ -497,10 +1033,13 @@ def eval_step(
             chains_trunc,
             chain_mask,
             chain_lens,
+            target_answer_pos,
+            target_has_answer,
             context_banks,
             context_mask,
             cfg,
-            free_run_noise_std=float(cfg.get("free_run_noise_std", 0.0)),
+            free_run_noise_std=float(cfg.get("eval_free_run_noise_std", 0.0)),
+            eval_mode=True,
         )
 
     return {
@@ -509,14 +1048,369 @@ def eval_step(
         "val_loss_ans": metrics["loss_ans"],
         "val_loss_roll": metrics["loss_roll"],
         "val_loss_rank": metrics["loss_rank"],
+        "val_loss_df": metrics["loss_df"],
         "val_tf_cos": metrics["tf_cos_mean"],
         "val_tf_cos_last": metrics["tf_cos_last"],
+        "val_tf_cos_answer": metrics["tf_cos_answer"],
         "val_roll_cos": metrics["roll_cos_mean"],
         "val_roll_cos_last": metrics["roll_cos_last"],
+        "val_roll_cos_answer": metrics["roll_cos_answer"],
         "val_rank_acc": metrics["rank_acc"],
+        "val_df_cos": metrics["df_cos"],
+        "val_df_noise_level": metrics["df_noise_level_mean"],
+        "val_df_noisy_norm": metrics["df_noisy_norm"],
+        "val_df_eps_norm": metrics["df_eps_norm"],
+        "val_df_pred_norm": metrics["df_pred_norm"],
         "val_norm_tf": metrics["pred_norm_mean_tf"],
         "val_norm_roll": metrics["pred_norm_mean_roll"],
+        "val_answer_coverage": metrics["answer_coverage"],
     }
+
+
+def _fit_probe_projection_basis(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fit a deterministic 3D PCA basis on CPU for stable probe visualization."""
+    points = points.detach().float().cpu()
+    if points.dim() != 2:
+        points = points.reshape(-1, points.shape[-1])
+    if points.shape[0] == 0:
+        raise ValueError("Cannot fit projection basis on empty point set")
+
+    mean = points.mean(dim=0)
+    centered = points - mean
+    if points.shape[0] < 2:
+        basis = torch.eye(points.shape[1], dtype=torch.float32)[:3]
+        if basis.shape[0] < 3:
+            basis = F.pad(basis, (0, 0, 0, 3 - basis.shape[0]))
+        explained = torch.zeros(3, dtype=torch.float32)
+        return mean, basis, explained
+
+    try:
+        _, svals, vh = torch.linalg.svd(centered, full_matrices=False)
+        basis = vh[:3].contiguous()
+        denom = centered.shape[0] - 1
+        variance = (svals[:3].pow(2) / max(denom, 1)).float()
+    except RuntimeError:
+        cov = centered.t().matmul(centered) / max(centered.shape[0] - 1, 1)
+        evals, evecs = torch.linalg.eigh(cov)
+        idx = torch.argsort(evals, descending=True)[:3]
+        basis = evecs[:, idx].t().contiguous()
+        variance = evals[idx].float().clamp(min=0.0)
+
+    if basis.shape[0] < 3:
+        pad = torch.eye(points.shape[1], dtype=torch.float32)[: 3 - basis.shape[0]]
+        basis = torch.cat([basis, pad], dim=0)
+        variance = F.pad(variance, (0, 3 - variance.shape[0]))
+
+    # Fix sign ambiguity so projections do not flip between independent fits.
+    for i in range(basis.shape[0]):
+        max_idx = int(torch.argmax(basis[i].abs()).item())
+        if basis[i, max_idx] < 0:
+            basis[i] = -basis[i]
+
+    total_var = (centered.pow(2).sum() / max(centered.shape[0] - 1, 1)).clamp(min=1e-12)
+    explained = (variance / total_var).float()
+    return mean, basis[:3], explained[:3]
+
+
+def _project_probe_tensor(x: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    x_cpu = x.detach().float().cpu()
+    flat = x_cpu.reshape(-1, x_cpu.shape[-1])
+    proj = (flat - mean).matmul(basis.t())
+    return proj.reshape(*x_cpu.shape[:-1], 3).contiguous()
+
+
+def _masked_probe_points(*vectors: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_cpu = mask.detach().bool().cpu()
+    chunks: list[torch.Tensor] = []
+    for vec in vectors:
+        vec_cpu = vec.detach().float().cpu()
+        if vec_cpu.shape[:2] != mask_cpu.shape:
+            continue
+        chunks.append(vec_cpu[mask_cpu])
+    if not chunks:
+        raise ValueError("No valid probe vectors found for PCA basis")
+    return torch.cat(chunks, dim=0)
+
+
+@torch.no_grad()
+def _extract_probe_attention(
+    model: ChainGenerator,
+    x_input: torch.Tensor,
+    context: torch.Tensor,
+    context_mask: torch.Tensor | None,
+) -> list[dict[str, torch.Tensor]]:
+    """Extract self- and cross-attention maps from all decoder layers.
+
+    Uses forward hooks on q/k projections to reconstruct attention scores
+    without modifying the model's forward pass or using the slower
+    non-fused attention path.  Returns one dict per layer with keys
+    ``self_attn`` [H, L, L] and ``cross_attn`` [H, L, K].
+    """
+    from cebcm.models.chain_head import _apply_rope
+
+    hooks: list[torch.utils.hooks.RemovableHook] = []
+    captured: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
+
+    for layer_idx, layer in enumerate(model.layers):
+        sa = layer.self_attn
+        ca = layer.cross_attn
+        self_cap: dict[str, torch.Tensor] = {}
+        cross_cap: dict[str, torch.Tensor] = {}
+
+        def _make_hook(storage: dict[str, torch.Tensor], key: str):
+            def _hook(_mod, _inp, out):
+                storage[key] = out.detach()
+            return _hook
+
+        hooks.append(sa.q_proj.register_forward_hook(_make_hook(self_cap, "q")))
+        hooks.append(sa.k_proj.register_forward_hook(_make_hook(self_cap, "k")))
+        hooks.append(ca.q_proj.register_forward_hook(_make_hook(cross_cap, "q")))
+        hooks.append(ca.k_proj.register_forward_hook(_make_hook(cross_cap, "k")))
+        captured[layer_idx] = {"self": self_cap, "cross": cross_cap}
+
+    # Run the actual forward — hooks capture projections.
+    x = x_input
+    for layer in model.layers:
+        x = layer(x, context, context_mask=context_mask)
+
+    # Remove hooks immediately.
+    for h in hooks:
+        h.remove()
+
+    attention_maps: list[dict[str, torch.Tensor]] = []
+    for layer_idx in range(len(model.layers)):
+        sa = model.layers[layer_idx].self_attn
+        ca = model.layers[layer_idx].cross_attn
+        sc = captured[layer_idx]["self"]
+        cc = captured[layer_idx]["cross"]
+        layer_map: dict[str, torch.Tensor] = {}
+
+        if "q" in sc and "k" in sc:
+            n_h, h_d = sa.n_heads, sa.head_dim
+            q = sc["q"].view(-1, sc["q"].shape[1], n_h, h_d).transpose(1, 2)
+            k = sc["k"].view(-1, sc["k"].shape[1], n_h, h_d).transpose(1, 2)
+            rope = sa._get_rope(q.shape[2], q.device)
+            q = _apply_rope(q, rope)
+            k = _apply_rope(k, rope)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (h_d ** -0.5)
+            seq_len = scores.shape[-1]
+            causal = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            )
+            scores = scores + causal
+            layer_map["self_attn"] = F.softmax(scores, dim=-1).cpu()  # [B, H, L, L]
+
+        if "q" in cc and "k" in cc:
+            n_h, h_d = ca.n_heads, ca.head_dim
+            q = cc["q"].view(-1, cc["q"].shape[1], n_h, h_d).transpose(1, 2)
+            k = cc["k"].view(-1, cc["k"].shape[1], n_h, h_d).transpose(1, 2)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (h_d ** -0.5)
+            if context_mask is not None:
+                invalid = ~context_mask.to(dtype=torch.bool, device=scores.device)
+                scores = scores.masked_fill(invalid[:, None, None, :], float("-inf"))
+            layer_map["cross_attn"] = F.softmax(scores, dim=-1).cpu()  # [B, H, L, K]
+
+        attention_maps.append(layer_map)
+
+    return attention_maps
+
+
+@torch.no_grad()
+def write_training_probe_snapshot(
+    *,
+    model: ChainGenerator,
+    probe_batch: dict,
+    cfg: dict,
+    device: torch.device,
+    probe_dir: Path,
+    epoch: int,
+    batch_idx: int,
+    global_step: int,
+    target_steps: int,
+    projection_state: dict | None,
+) -> dict:
+    """Write a compact fixed-probe geometry snapshot for GUI inspection."""
+    was_training = model.training
+    model.eval()
+
+    try:
+        max_samples = max(1, int(cfg.get("probe_num_samples", 4)))
+        probe_steps_cfg = int(cfg.get("probe_steps", 0))
+        steps = target_steps if probe_steps_cfg <= 0 else min(
+            probe_steps_cfg,
+            int(cfg.get("max_chain_steps", target_steps)),
+        )
+
+        v_q = probe_batch["v_questions"][:max_samples].to(device)
+        chains = probe_batch["chains"][:max_samples].to(device)
+        chain_lens = probe_batch["chain_lens"][:max_samples].to(device)
+        answer_pos = probe_batch["answer_pos"][:max_samples].to(device)
+        context_banks = probe_batch["context_banks"][:max_samples].to(device)
+        context_mask = probe_batch["context_mask"][:max_samples].to(device)
+
+        chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
+            chains,
+            chain_lens,
+            answer_pos,
+            steps,
+        )
+        context_mask = context_mask[:, : context_banks.shape[1]]
+
+        levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=True)
+        noise = _make_diffusion_eval_noise_like(chains_trunc, cfg, model)
+        v_df, v_noisy, eps = model.forward_diffusion_forcing(
+            v_q,
+            chains_trunc,
+            levels,
+            v_context_bank=context_banks,
+            context_mask=context_mask,
+            noise=noise,
+            return_noisy=True,
+        )
+        v_tf = model.forward(
+            v_q,
+            chains_trunc,
+            v_context_bank=context_banks,
+            context_mask=context_mask,
+            scheduled_sampling_prob=0.0,
+            tf_noise_std=0.0,
+        )
+        v_roll, roll_info = model.generate(
+            v_q,
+            num_steps=chains_trunc.shape[1],
+            v_context_bank=context_banks,
+            context_mask=context_mask,
+            temperature=float(cfg.get("free_run_temperature", 1.0)),
+            latent_noise_std=float(cfg.get("eval_free_run_noise_std", 0.0)),
+            repeat_penalty=float(cfg.get("free_run_repeat_penalty", 0.0)),
+            repeat_cos_threshold=float(cfg.get("free_run_repeat_cos_threshold", 0.98)),
+            repeat_ban_threshold=float(cfg.get("free_run_repeat_ban_threshold", 0.995)),
+            repeat_ban_max_retries=int(cfg.get("free_run_repeat_ban_retries", 3)),
+            return_info=True,
+        )
+
+        # Extract attention maps on the DF (noised) input for overlay visualization.
+        df_context, df_ctx_mask = model._prepare_context(v_q, context_banks, context_mask)
+        df_input = model._to_residual_space(v_noisy)
+        t_emb = model._diffusion_timestep_embedding(levels).to(device=df_input.device, dtype=df_input.dtype)
+        df_input_conditioned = df_input + t_emb
+        attention_maps = _extract_probe_attention(
+            model, df_input_conditioned, df_context, df_ctx_mask,
+        )
+
+        if projection_state is None:
+            points = _masked_probe_points(chains_trunc, v_noisy, v_df, v_roll, v_tf, mask=chain_mask)
+            mean, basis, explained = _fit_probe_projection_basis(points)
+            projection_state = {
+                "mean": mean,
+                "basis": basis,
+                "explained": explained,
+            }
+        else:
+            mean = projection_state["mean"].detach().float().cpu()
+            basis = projection_state["basis"].detach().float().cpu()
+            explained = projection_state.get("explained", torch.zeros(3)).detach().float().cpu()
+
+        clean = chains_trunc.detach().float()
+        mask = chain_mask.detach().bool()
+
+        def cos_to_clean(x: torch.Tensor) -> torch.Tensor:
+            return (_safe_normalize(x.float(), dim=-1) * _safe_normalize(clean.float(), dim=-1)).sum(dim=-1)
+
+        def l2_to_clean(x: torch.Tensor) -> torch.Tensor:
+            return (x.float() - clean.float()).norm(dim=-1)
+
+        snapshot = {
+            "schema": "chain_generator_probe_v1",
+            "global_step": int(global_step),
+            "epoch": int(epoch),
+            "batch_idx": int(batch_idx),
+            "target_steps": int(steps),
+            "mode": "system1" if int(steps) == 1 else "system2",
+            "projection": {
+                "mean": mean,
+                "basis": basis,
+                "explained": explained,
+            },
+            "projected": {
+                "clean": _project_probe_tensor(clean, mean, basis),
+                "noisy": _project_probe_tensor(v_noisy, mean, basis),
+                "pred_x0": _project_probe_tensor(v_df, mean, basis),
+                "teacher_forced": _project_probe_tensor(v_tf, mean, basis),
+                "rollout": _project_probe_tensor(v_roll, mean, basis),
+            },
+            "arrays": {
+                "mask": mask.cpu(),
+                "noise_levels": levels.detach().cpu(),
+                "answer_pos": target_answer_pos.detach().cpu(),
+                "has_answer": target_has_answer.detach().cpu(),
+                "df_cos": torch.where(mask, cos_to_clean(v_df), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "noisy_cos": torch.where(mask, cos_to_clean(v_noisy), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "tf_cos": torch.where(mask, cos_to_clean(v_tf), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "roll_cos": torch.where(mask, cos_to_clean(v_roll), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "df_l2": torch.where(mask, l2_to_clean(v_df), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "noisy_l2": torch.where(mask, l2_to_clean(v_noisy), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "roll_l2": torch.where(mask, l2_to_clean(v_roll), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "clean_norm": torch.where(mask, clean.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "noisy_norm": torch.where(mask, v_noisy.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "pred_norm": torch.where(mask, v_df.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+                "roll_norm": torch.where(mask, v_roll.norm(dim=-1), torch.zeros_like(levels, dtype=torch.float32)).cpu(),
+            },
+            "metrics": {
+                "df_cos_mean": float(cos_to_clean(v_df)[mask].mean().item()) if mask.any() else 0.0,
+                "noisy_cos_mean": float(cos_to_clean(v_noisy)[mask].mean().item()) if mask.any() else 0.0,
+                "roll_cos_mean": float(cos_to_clean(v_roll)[mask].mean().item()) if mask.any() else 0.0,
+                "tf_cos_mean": float(cos_to_clean(v_tf)[mask].mean().item()) if mask.any() else 0.0,
+                "noise_level_mean": float(levels[mask].float().mean().item()) if mask.any() else 0.0,
+                "noise_level_max": float(levels[mask].float().max().item()) if mask.any() else 0.0,
+                "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
+            },
+        }
+
+        # Save attention maps: compact representation per layer.
+        # Each layer has self_attn [B, H, L, L] and cross_attn [B, H, L, K].
+        # We save only the first probe sample to limit file size.
+        attn_data: list[dict[str, torch.Tensor]] = []
+        for lm in attention_maps:
+            layer_out: dict[str, torch.Tensor] = {}
+            if "self_attn" in lm and lm["self_attn"].shape[0] > 0:
+                layer_out["self_attn"] = lm["self_attn"][0].cpu()    # [H, L, L]
+            if "cross_attn" in lm and lm["cross_attn"].shape[0] > 0:
+                layer_out["cross_attn"] = lm["cross_attn"][0].cpu()  # [H, L, K]
+            attn_data.append(layer_out)
+        snapshot["attention"] = attn_data
+        snapshot["attention_meta"] = {
+            "n_layers": len(attn_data),
+            "n_heads": int(model.cfg.n_heads),
+            "context_len": int(context_mask.shape[1]) if context_mask is not None else 1,
+        }
+
+        if bool(cfg.get("probe_save_raw_vectors", False)):
+            snapshot["raw"] = {
+                "clean": clean.detach().cpu(),
+                "noisy": v_noisy.detach().cpu(),
+                "pred_x0": v_df.detach().cpu(),
+                "teacher_forced": v_tf.detach().cpu(),
+                "rollout": v_roll.detach().cpu(),
+                "eps": eps.detach().cpu(),
+            }
+
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        out_path = probe_dir / f"probe_step_{int(global_step):010d}.pt"
+        torch.save(snapshot, out_path)
+
+        return {
+            "path": str(out_path),
+            "global_step": int(global_step),
+            "df_cos_mean": snapshot["metrics"]["df_cos_mean"],
+            "roll_cos_mean": snapshot["metrics"]["roll_cos_mean"],
+            "target_steps": int(steps),
+            "projection_state": projection_state,
+        }
+    finally:
+        if was_training:
+            model.train()
 
 
 def main() -> None:
@@ -583,6 +1477,23 @@ def main() -> None:
 
     print(f"Data: train={len(train_ds)}, val={len(val_ds)}, "
           f"context_bank_size={context_bank_size}, answer_repeat_pad={answer_repeat_pad}")
+    print("Dataset diagnostics:")
+    summarize_chain_dataset(
+        data["train"],
+        "train",
+        max_chain_len=gen_cfg.max_chain_len,
+        max_chain_steps=max_chain_steps,
+        answer_repeat_pad=answer_repeat_pad,
+        context_bank_size=context_bank_size,
+    )
+    summarize_chain_dataset(
+        data["val"],
+        "val",
+        max_chain_len=gen_cfg.max_chain_len,
+        max_chain_steps=max_chain_steps,
+        answer_repeat_pad=answer_repeat_pad,
+        context_bank_size=context_bank_size,
+    )
 
     batch_size = int(train_cfg.get("batch_size", 16))
     num_workers = int(data_cfg.get("num_workers", 4))
@@ -626,12 +1537,18 @@ def main() -> None:
 
     start_epoch = 0
     best_metric = float("-inf")
+    global_step = 0
     if args.finetune:
         ckpt = torch.load(args.finetune, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        load_result = model.load_state_dict(ckpt["model"], strict=False)
         src_epoch = ckpt.get("epoch", "?")
         src_metric = ckpt.get("best_metric", "?")
         print(f"Fine-tune from {args.finetune} (src epoch={src_epoch}, metric={src_metric})")
+        if load_result.missing_keys or load_result.unexpected_keys:
+            print(
+                f"  Compat load: missing={len(load_result.missing_keys)}, "
+                f"unexpected={len(load_result.unexpected_keys)}"
+            )
         print("  Fresh optimizer, scheduler, epoch counter.")
     elif args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -640,16 +1557,43 @@ def main() -> None:
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_metric = float(ckpt.get("best_metric", best_metric))
+        global_step = int(ckpt.get("global_step", 0))
         print(f"Resumed from {args.resume}: epoch={start_epoch}, best={best_metric:.4f}")
 
     log_every = int(train_cfg.get("log_every", 50))
     ckpt_every = int(train_cfg.get("checkpoint_every", 5))
     patience = int(train_cfg.get("early_stop_patience", 15))
     no_improve = 0
+    logs_dir = Path(out_cfg["logs_dir"])
+    metrics_log_path = logs_dir / str(train_cfg.get("metrics_log_name", "chain_generator_training.jsonl"))
+    probe_enabled = bool(train_cfg.get("enable_training_geometry_probe", True))
+    probe_every_steps = int(train_cfg.get("probe_every_steps", 200))
+    probe_dir = logs_dir / str(train_cfg.get("probe_dir_name", "geometry_probes"))
+    probe_state: dict | None = None
+    probe_batch = None
+    if probe_enabled and probe_every_steps > 0:
+        try:
+            probe_batch = next(iter(val_loader))
+        except StopIteration:
+            probe_enabled = False
+    _append_jsonl(
+        metrics_log_path,
+        {
+            "event": "run_start",
+            "global_step": int(global_step),
+            "start_epoch": int(start_epoch),
+            "config_path": str(args.config),
+            "probe_enabled": bool(probe_enabled),
+            "probe_every_steps": int(probe_every_steps),
+            "probe_dir": str(probe_dir),
+            "timestamp": time.time(),
+        },
+    )
 
     tracker = MetricTracker()
     
-    # Initialize SADT (Step-wise Adaptive DAgger-Throttling) state
+    # Initialize SADT (Step-wise Adaptive Dynamic Throttling) state.
+    # It changes LR only; oracle/DAger is disabled by default and not tied to SADT.
     sadt_tf_ema = None
     sadt_roll_ema = None
     sadt_events = {"throttle": 0, "turbo": 0}
@@ -661,7 +1605,8 @@ def main() -> None:
         f"step*{train_cfg.get('loss_lambda_step', 1.0)} + "
         f"ans*{train_cfg.get('loss_lambda_answer', 1.0)} + "
         f"roll*{train_cfg.get('loss_lambda_roll', 1.0)} + "
-        f"rank*{train_cfg.get('loss_lambda_rank', 0.1)}"
+        f"rank*{train_cfg.get('loss_lambda_rank', 0.1)} + "
+        f"df*{train_cfg.get('loss_lambda_diffusion', 0.0)}"
     )
     print(
         f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
@@ -671,18 +1616,55 @@ def main() -> None:
         f"  scheduled_sampling: max={train_cfg.get('scheduled_sampling_max', 0.5)}, "
         f"ramp_epochs={train_cfg.get('scheduled_sampling_ramp_epochs', 10)}"
     )
+    print(
+        f"  oracle_dagger: enabled={bool(train_cfg.get('enable_oracle_dagger', False))}, "
+        f"max_retries={train_cfg.get('oracle_max_retries', 0)}, "
+        f"prob_max={train_cfg.get('oracle_prob_max', 0.0)}"
+    )
+    print(
+        f"  diffusion_forcing: enabled={bool(train_cfg.get('enable_diffusion_forcing', False))}, "
+        f"K={gen_cfg.diffusion_timesteps}, schedule={gen_cfg.diffusion_beta_schedule}, "
+        f"levels=[{train_cfg.get('df_noise_level_min', 0)}, "
+        f"{train_cfg.get('df_noise_level_max', gen_cfg.diffusion_timesteps - 1)}], "
+        f"eval_level={train_cfg.get('df_eval_noise_level', (gen_cfg.diffusion_timesteps - 1) // 2)}"
+    )
+    print(
+        f"  training_geometry: enabled={probe_enabled}, every={probe_every_steps}, "
+        f"samples={train_cfg.get('probe_num_samples', 4)}, dir={probe_dir}"
+    )
     print("=" * 70)
+
+    prev_target_steps = 1  # Track for SADT cooldown
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
         target_steps = get_chain_steps(epoch, train_cfg)
         ss_prob = _get_scheduled_sampling_prob(epoch, train_cfg)
         noise_std = _get_scheduled_noise_std(epoch, train_cfg)
+        oracle_prob = _get_oracle_prob(epoch, train_cfg)
+        tf_noise = _get_tf_noise_std(epoch, train_cfg)
         epoch_start = time.time()
 
-        phase = "System1" if target_steps == 1 else f"System2({target_steps})"
-        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] ss_prob={ss_prob:.3f} noise_std={noise_std:.4f}")
+        # Reset SADT EMA at System2 transition to prevent false throttling.
+        # When target_steps increases, metrics naturally drop — this is NOT
+        # degradation, it's a harder task. SADT must not punish it.
+        if target_steps != prev_target_steps:
+            sadt_tf_ema = None
+            sadt_roll_ema = None
+            sadt_cooldown = int(train_cfg.get("sadt_cooldown_steps", 200))
+            print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
+                  f"EMA reset, cooldown={sadt_cooldown} steps")
+        else:
+            sadt_cooldown = 0
+        prev_target_steps = target_steps
 
+        phase = "System1" if target_steps == 1 else f"System2({target_steps})"
+        tf_noise_info = f" tf_noise={tf_noise:.4f}" if tf_noise > 0 else ""
+        print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] "
+              f"ss_prob={ss_prob:.3f} noise_std={noise_std:.4f} oracle_prob={oracle_prob:.3f}"
+              f"{tf_noise_info}")
+
+        nan_count = 0
         for step, batch in enumerate(train_loader):
             metrics = train_step(
                 model,
@@ -696,47 +1678,116 @@ def main() -> None:
                 target_steps=target_steps,
                 scheduled_sampling_prob=ss_prob,
                 free_run_noise_std=noise_std,
+                oracle_prob=oracle_prob,
+                tf_noise_std=tf_noise,
             )
-            scheduler.step()
+            if metrics.get("optimizer_stepped", 0.0) > 0.0:
+                scheduler.step()
+            global_step += 1
             tracker.update(metrics)
 
+            if metrics.get("nan_skipped", 0.0) > 0:
+                nan_count += 1
+
             # --- SADT Dynamic Throttle Logic ---
-            if train_cfg.get("dynamic_step_lr", False):
+            if train_cfg.get("dynamic_step_lr", False) and sadt_cooldown <= 0:
                 alpha = float(train_cfg.get("sadt_ema_alpha", 0.1))
                 tf_cur = metrics.get("tf_cos_mean", 0.0)
                 roll_cur = metrics.get("roll_cos_mean", 0.0)
-                
-                if sadt_tf_ema is None:
+
+                # Skip NaN-skipped steps in SADT
+                if metrics.get("nan_skipped", 0.0) > 0:
+                    pass  # Don't update EMA or adjust LR on NaN steps
+                elif sadt_tf_ema is None:
                     sadt_tf_ema = tf_cur
                     sadt_roll_ema = roll_cur
                 else:
                     sadt_tf_ema = (1 - alpha) * sadt_tf_ema + alpha * tf_cur
                     sadt_roll_ema = (1 - alpha) * sadt_roll_ema + alpha * roll_cur
-                
-                # Compare current to EMA to detect degradation
-                tolerance = float(train_cfg.get("sadt_tolerance", 0.05))
-                lr_now = optimizer.param_groups[0]["lr"]
-                min_lr = float(train_cfg.get("sadt_min_lr", 1e-6))
-                max_lr = float(train_cfg.get("sadt_max_lr", 5e-4))
-                
-                # Degradation (Throttle)
-                is_bad = tf_cur < (sadt_tf_ema * (1 - tolerance)) or roll_cur < (sadt_roll_ema * (1 - tolerance))
-                if is_bad:
-                    new_lr = max(min_lr, lr_now * float(train_cfg.get("sadt_throttle_factor", 0.5)))
-                    if new_lr < lr_now:
-                        optimizer.param_groups[0]["lr"] = new_lr
-                        sadt_events["throttle"] += 1
-                # Improvement (Turbo) - more conservative
-                elif tf_cur > (sadt_tf_ema * (1 + tolerance/2)) and roll_cur > (sadt_roll_ema * (1 + tolerance/2)):
-                    new_lr = min(max_lr, lr_now * float(train_cfg.get("sadt_turbo_factor", 1.02)))
-                    if new_lr > lr_now:
-                        optimizer.param_groups[0]["lr"] = new_lr
-                        sadt_events["turbo"] += 1
+
+                    # Compare current to EMA to detect degradation
+                    tolerance = float(train_cfg.get("sadt_tolerance", 0.05))
+                    lr_now = optimizer.param_groups[0]["lr"]
+                    min_lr = float(train_cfg.get("sadt_min_lr", 1e-6))
+                    max_lr = float(train_cfg.get("sadt_max_lr", 5e-4))
+
+                    # Degradation (Throttle) — use AND instead of OR to reduce
+                    # false positives from single-metric noise
+                    is_bad = (tf_cur < (sadt_tf_ema * (1 - tolerance))
+                              and roll_cur < (sadt_roll_ema * (1 - tolerance)))
+                    if is_bad:
+                        new_lr = max(min_lr, lr_now * float(train_cfg.get("sadt_throttle_factor", 0.5)))
+                        if new_lr < lr_now:
+                            optimizer.param_groups[0]["lr"] = new_lr
+                            sadt_events["throttle"] += 1
+                    # Improvement (Turbo) - more conservative
+                    elif (tf_cur > (sadt_tf_ema * (1 + tolerance/2))
+                          and roll_cur > (sadt_roll_ema * (1 + tolerance/2))):
+                        new_lr = min(max_lr, lr_now * float(train_cfg.get("sadt_turbo_factor", 1.02)))
+                        if new_lr > lr_now:
+                            optimizer.param_groups[0]["lr"] = new_lr
+                            sadt_events["turbo"] += 1
+            else:
+                sadt_cooldown -= 1
+
+            if (
+                probe_enabled
+                and probe_batch is not None
+                and probe_every_steps > 0
+                and global_step % probe_every_steps == 0
+            ):
+                try:
+                    probe_info = write_training_probe_snapshot(
+                        model=model,
+                        probe_batch=probe_batch,
+                        cfg=train_cfg,
+                        device=device,
+                        probe_dir=probe_dir,
+                        epoch=epoch,
+                        batch_idx=step + 1,
+                        global_step=global_step,
+                        target_steps=target_steps,
+                        projection_state=probe_state,
+                    )
+                    probe_state = probe_info.pop("projection_state")
+                    _append_jsonl(
+                        metrics_log_path,
+                        {
+                            "event": "probe_snapshot",
+                            "epoch": int(epoch),
+                            "batch_idx": int(step + 1),
+                            "global_step": int(global_step),
+                            "target_steps": int(target_steps),
+                            "phase": phase,
+                            "probe": probe_info,
+                            "timestamp": time.time(),
+                        },
+                    )
+                    print(
+                        f"  [PROBE] step={global_step} "
+                        f"df_cos={probe_info.get('df_cos_mean', 0.0):.4f} "
+                        f"roll_cos={probe_info.get('roll_cos_mean', 0.0):.4f} "
+                        f"path={probe_info.get('path')}"
+                    )
+                except Exception as exc:
+                    _append_jsonl(
+                        metrics_log_path,
+                        {
+                            "event": "probe_error",
+                            "epoch": int(epoch),
+                            "batch_idx": int(step + 1),
+                            "global_step": int(global_step),
+                            "error": str(exc),
+                            "timestamp": time.time(),
+                        },
+                    )
+                    print(f"  [PROBE ERROR] step={global_step}: {exc}")
 
             if (step + 1) % log_every == 0:
                 avg = tracker.get()
                 lr_now = optimizer.param_groups[0]["lr"]
                 sadt_info = f" [SADT T:{sadt_events['throttle']} U:{sadt_events['turbo']}]" if train_cfg.get("dynamic_step_lr") else ""
+                nan_info = f" [NaN:{nan_count}]" if nan_count > 0 else ""
                 print(
                     f"  [E{epoch} S{step+1}] "
                     f"loss={avg.get('loss', 0.0):.4f} "
@@ -744,11 +1795,37 @@ def main() -> None:
                     f"ans={avg.get('loss_ans', 0.0):.4f} "
                     f"roll={avg.get('loss_roll', 0.0):.4f} "
                     f"rank={avg.get('loss_rank', 0.0):.4f} "
+                    f"df={avg.get('loss_df', 0.0):.4f} "
                     f"tf_cos={avg.get('tf_cos_mean', 0.0):.4f} "
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
+                    f"roll_ans={avg.get('roll_cos_answer', 0.0):.4f} "
+                    f"df_cos={avg.get('df_cos', 0.0):.4f} "
+                    f"df_t={avg.get('df_noise_level_mean', 0.0):.1f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
+                    f"ans_cov={avg.get('answer_coverage', 0.0):.2f} "
                     f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
-                    f"lr={lr_now:.2e}{sadt_info}"
+                    f"grad={avg.get('grad_norm', 0.0):.4f} "
+                    f"lr={lr_now:.2e}{sadt_info}{nan_info}"
+                )
+                _append_jsonl(
+                    metrics_log_path,
+                    {
+                        "event": "train_step",
+                        "epoch": int(epoch),
+                        "batch_idx": int(step + 1),
+                        "global_step": int(global_step),
+                        "target_steps": int(target_steps),
+                        "phase": phase,
+                        "lr": float(lr_now),
+                        "scheduled_sampling_prob": float(ss_prob),
+                        "free_run_noise_std": float(noise_std),
+                        "tf_noise_std": float(tf_noise),
+                        "oracle_prob": float(oracle_prob),
+                        "nan_count_epoch": int(nan_count),
+                        "sadt": dict(sadt_events),
+                        "train_metrics": avg,
+                        "timestamp": time.time(),
+                    },
                 )
                 tracker.reset()
                 sadt_events = {"throttle": 0, "turbo": 0}
@@ -780,9 +1857,27 @@ def main() -> None:
             f"tf_cos={val.get('val_tf_cos', 0.0):.4f} "
             f"roll_cos={val.get('val_roll_cos', 0.0):.4f} "
             f"roll_cos_last={val.get('val_roll_cos_last', 0.0):.4f} "
+            f"roll_ans={val.get('val_roll_cos_answer', 0.0):.4f} "
+            f"df_cos={val.get('val_df_cos', 0.0):.4f} "
+            f"df_t={val.get('val_df_noise_level', 0.0):.1f} "
             f"rank_acc={val.get('val_rank_acc', 0.0):.3f} "
+            f"ans_cov={val.get('val_answer_coverage', 0.0):.2f} "
             f"norm_roll={val.get('val_norm_roll', 0.0):.4f} "
             f"({epoch_time:.1f}s)"
+        )
+        _append_jsonl(
+            metrics_log_path,
+            {
+                "event": "val_epoch",
+                "epoch": int(epoch),
+                "global_step": int(global_step),
+                "target_steps": int(target_steps),
+                "phase": phase,
+                "epoch_time_sec": float(epoch_time),
+                "val_metric": float(val_metric),
+                "val_metrics": val,
+                "timestamp": time.time(),
+            },
         )
 
         improved = val_metric > best_metric
@@ -798,6 +1893,7 @@ def main() -> None:
                     "scheduler": scheduler.state_dict(),
                     "config": config,
                     "best_metric": best_metric,
+                    "global_step": global_step,
                 },
             )
             print(f"  ** New best: val_roll_cos_last={best_metric:.4f}")
@@ -814,6 +1910,7 @@ def main() -> None:
                     "scheduler": scheduler.state_dict(),
                     "config": config,
                     "best_metric": best_metric,
+                    "global_step": global_step,
                 },
             )
 
@@ -824,6 +1921,15 @@ def main() -> None:
     print("\nTraining complete")
     print(f"Best val_roll_cos_last={best_metric:.4f}")
     print(f"Checkpoints: {out_cfg['checkpoint_dir']}")
+    _append_jsonl(
+        metrics_log_path,
+        {
+            "event": "run_complete",
+            "global_step": int(global_step),
+            "best_metric": float(best_metric),
+            "timestamp": time.time(),
+        },
+    )
 
 
 if __name__ == "__main__":

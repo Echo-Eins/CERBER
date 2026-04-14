@@ -1,5 +1,117 @@
 # Lessons
 
+## 2026-04-13 - Diffusion Forcing audit: Min-SNR weight formula inversion and grad_norm logging gap
+
+### Pattern
+Full code review of Diffusion Forcing implementation (1760 lines added across 8 files) found one mathematical bug and one monitoring gap.
+
+### Root Causes
+1. **Min-SNR weight formula inverted for x₀-prediction**: Code had `min(SNR, γ) / γ` which gives weight ~1 for clean tokens (high SNR) and ~0 for noisy tokens. For x₀-prediction, correct formula is `min(SNR, γ) / SNR` which downweights the trivially easy clean regime. Bug was latent (γ=0 = disabled by default).
+2. **grad_norm not logged**: Training dashboard couldn't show gradient norm over time, essential for diagnosing training instability.
+
+### Fixes
+1. Changed Min-SNR weights from `min(SNR, γ) / γ` to `min(SNR, γ) / SNR` in `_diffusion_forcing_weights`.
+2. Added `grad_norm` to train_step metrics, console output, JSONL log, and GUI dashboard.
+3. Fixed BOM (U+FEFF) in training_geometry.py.
+
+### Rules
+1. **For x₀-prediction diffusion, Min-SNR-γ weight = min(SNR, γ) / SNR**. For ε-prediction it's the same formula. The form `min(SNR, γ) / γ` is WRONG — it inverts the weighting.
+2. **Always log grad_norm** — it's the earliest indicator of training instability before loss NaN appears.
+3. **When reviewing latent bugs behind disabled features**: even if a flag is off, fix the underlying code. Someone will enable it later and get silent corruption.
+
+## 2026-04-13 - Noise calibration in high-dim continuous space and diffusion-inspired exposure bias fix
+
+### Pattern
+Training log analysis revealed TWO compounding causes for the val_roll_cos_last ceiling at 0.60:
+1. Oracle-assisted rollout inflated train_roll_cos (fixed in 5cced91)
+2. Eval generate() received `noise_std=0.01` which in d=1024 produces noise norm ≈ sqrt(1024)*0.01 ≈ 0.32, comparable to raw_next norm ≈ 0.4 (SNR=1.25). This destroyed eval cosine by ~0.16.
+
+Additionally, model has val_tf_cos=0.87 (single-step accuracy) but val_roll_cos=0.47 (multi-step accuracy) — classic exposure bias where the model never sees its own imperfect outputs during training.
+
+### Root Causes
+1. **Noise uncalibrated for dimensionality**: `noise_std` is per-dimension, but total noise norm scales as `sqrt(d) * std`. In d=1024, even small per-dim std=0.01 creates devastating total perturbation.
+2. **No noise robustness in teacher forcing**: forward() gives the model perfect GT prefix. At eval, generate() feeds back model's own errors, causing error accumulation over multi-step rollout.
+3. **Train generate() noise was pointless with oracle disabled**: Without oracle to select from noisy candidates, noise only degrades training quality and creates train/eval mismatch.
+
+### Fixes
+1. Set `free_run_noise_std=0.0` in both train and eval (no more noise in generate())
+2. Added **Noisy Teacher Forcing** (diffusion-inspired): forward() adds per-sample noise from U[0, tf_noise_std] to GT prefix during training. Model learns to predict from imperfect contexts.
+3. Noise calibration: tf_noise_std_max=0.005 in SONAR space (target_norm=0.2051). At max: noise_norm ≈ sqrt(1024)*0.005 ≈ 0.16, ratio=0.78, angular perturbation ≈ 38° — matches model's late-training error of arccos(0.87) ≈ 30°.
+4. Noisy TF also applies inside scheduled sampling (GT tokens get noised too).
+
+### Rules
+1. **ALWAYS scale noise by sqrt(d)** to understand its real magnitude. noise_std=0.01 in d=1024 is NOT "small noise".
+2. **If a noise mechanism exists only for a disabled feature (oracle), remove the noise too.**
+3. **Exposure bias in continuous AR = diffusion at noise level 0 only.** Fix by training at multiple noise levels (noisy teacher forcing = multi-level denoising training).
+4. **Calibrate noise to model error level**: tf_noise_std should produce angular perturbation ≈ arccos(current_tf_cos). Use tf_noise_std ≈ target_norm * tan(arccos(tf_cos)) / sqrt(d).
+
+## 2026-04-11 - Oracle/DAger can fake rollout quality and disabled rank loss can still create NaNs
+
+### Pattern
+Latest ChainGenerator run (`Arch(11-04-26) training log.txt`) reached train `tf_cos≈0.89` and train `roll_cos≈0.87`, while eval stayed near `roll_cos≈0.50` and `roll_cos_last≈0.47`. The best eval point remained early System1 (`val_roll_cos_last≈0.5993`). NaN-skipped batches also appeared across most epochs even after earlier guards.
+
+### Root Causes
+1. **Oracle-guided DAger train/eval mismatch**: train rollout used `oracle_guide=chains` with nonzero `oracle_prob`; eval had no oracle because `self.training=False`. Train rollout therefore measured an oracle-assisted trajectory, not the actual model policy.
+2. **Disabled rank loss was still computed**: `loss_lambda_rank=0.0`, but in-batch contrastive rank still ran through normalization. If it produced NaN, `0.0 * NaN` contaminated total loss.
+3. **Unsafe normalization in rank path**: rank loss used `F.normalize` default epsilon instead of the project safe-normalize rule.
+4. **Masked loss used multiplication by zero**: `NaN * 0` can stay NaN; masked losses must use `torch.where(mask, value, 0)` before reduction.
+5. **Repeat-ban in training reintroduced stochastic rollout mismatch**: repeat-ban is an inference safety mechanism and must not perturb the training prefix.
+6. **Scheduler advanced on skipped optimizer steps**: when NaN/Inf skipped a step, the LR scheduler still stepped, causing schedule drift and PyTorch warnings.
+
+### Fixes
+- Disable oracle/DAger by default with explicit `enable_oracle_dagger=false`, `oracle_max_retries=0`, `oracle_prob_max=0.0`.
+- Gate `oracle_guide` in the train objective; only pass it when explicitly enabled for ablations.
+- Compute rank loss lazily: if `loss_lambda_rank==0`, do not include it in the graph and never multiply zero by a possibly non-finite tensor.
+- Replace contrastive rank normalization with safe normalization.
+- Replace latent-vector cosine checks in generation with the same safe-normalize rule.
+- Compute masked cosine/MSE reductions with `torch.where`, not value-by-mask multiplication.
+- Disable repeat-ban during training.
+- Return `optimizer_stepped` from `train_step` and only advance the scheduler after a real optimizer step.
+- Add dataset/horizon diagnostics and explicit `ans_cov` / `roll_ans` metrics so `roll_cos_last` is not mistaken for answer quality when the current horizon has not reached the answer.
+
+### Rules
+1. If train rollout uses an expert/oracle and eval rollout does not, train rollout metrics are not valid quality metrics.
+2. Disabled loss terms must not execute unstable graph code; never rely on `0.0 * loss`.
+3. Masked losses must avoid `NaN * 0`; use `torch.where(mask, term, 0)`.
+4. Inference anti-loop mechanisms (`repeat_ban`, repeat penalty, stochastic rerolling) must be guarded out of training unless the same mechanism is explicitly part of the train objective and metric.
+5. LR schedulers should step only when the optimizer actually stepped.
+6. Always log answer coverage for curriculum horizons; `roll_cos_last` is only an answer metric when the answer is inside the selected training window.
+
+## 2026-04-10 - ChainGenerator NaN collapse at E13 and val roll_cos_last overfitting
+
+### Pattern
+Training collapses to all-NaN at E13 (target_steps=5, ss_prob=0.15) after sporadic NaN first seen at E7. Val roll_cos_last peaks at 0.5991 (E1) then DEGRADES to 0.5063 (E6) despite train tf_cos improving 0.29→0.85.
+
+### Root Causes
+
+**NaN collapse (3 coupled mechanisms):**
+1. **repeat_penalty pushes raw_next toward zero norm**: `raw_next -= penalty * over * repel` subtracts detached historical vectors (norm ~32) from raw logits, driving raw_norm from 0.28→0.15→0. When `F.normalize()` receives near-zero input in bfloat16, gradient through division explodes to NaN.
+2. **Oracle DAgger + repeat_ban compound the issue**: 5 oracle retries + 3 repeat_ban retries = 8 `F.normalize()` calls per step on increasingly corrupted vectors.
+3. **No NaN guard before backward()**: Single NaN in loss → NaN in all gradients → `clip_grad_norm(NaN)=NaN` (IEEE 754) → NaN weights forever.
+
+**SADT amplification**: At System2 transition, metrics naturally drop (harder task). SADT with tolerance=0.05 and OR-gate (`tf OR roll bad`) throttles LR repeatedly (halving by 0.5), masking symptoms without preventing NaN. EMA not reset at transition.
+
+**Val overfitting:**
+1. **Oracle-guided DAgger train/eval mismatch**: Oracle is gated by `self.training`, active during training, absent at eval. Model learns to depend on oracle crutch → val crashes when oracle is removed.
+2. **Weak regularization**: 101M params on ~90k samples with dropout=0.1, weight_decay=1e-4 → severe memorization.
+
+### Fixes
+1. **safe_normalize**: Replace `F.normalize(v)` with `v / v.norm().clamp(min=1e-6)` — prevents gradient explosion on near-zero vectors.
+2. **Disable repeat_penalty in training**: Guard with `not self.training`. It provides zero useful gradient (history detached) but destabilizes raw_next norm.
+3. **NaN guard in train_step**: Check `torch.isfinite(loss)` before backward; check `torch.isfinite(total_norm)` after unscale. Skip step on NaN.
+4. **NaN guard in generate()**: If generated vector is NaN, replace with previous valid vector.
+5. **Oracle probability decay**: New `oracle_prob` param decays from 1.0→0.0 over 20 epochs. Forces model to learn robust generation without oracle dependency.
+6. **SADT cooldown at horizon transition**: Reset EMA and add cooldown period when target_steps changes. Change OR→AND gate for degradation detection.
+7. **Increased regularization**: weight_decay 1e-4→5e-4, sadt_tolerance 0.05→0.10, noise_std_max 0.05→0.03, oracle_max_retries 5→3.
+
+### Rules
+1. **NEVER modify raw logits in-place during training** — repeat_penalty, repulsion, etc. can drive vectors to zero norm, causing F.normalize gradient explosion in low-precision (bf16).
+2. **Any F.normalize in training path must use safe normalization** with `clamp(min=1e-6)`.
+3. **Always guard backward() with NaN check** — a single NaN infects all weights permanently. Skip the step, don't try to clip NaN gradients.
+4. **Train-only mechanisms create eval mismatch** — if oracle/noise/etc. are gated by `self.training`, the model learns a different distribution than what it sees at eval. Decay such mechanisms to zero.
+5. **SADT must reset EMA at curriculum transitions** — metric drops from harder tasks are not degradation.
+6. **Use AND-gate (both metrics bad) for LR throttle, not OR-gate** — single-metric noise causes false throttling.
+
 ## 2026-04-09 - Inference pipeline missing convergence_cos → model never uses trained EOS
 
 ### Pattern
@@ -1930,3 +2042,45 @@ Teacher-forced-only chain supervision can look stable in logs but collapses in r
 2. If cross-attention key length is 1, do not treat attention plots as evidence of context reasoning.
 3. Reranker quality requires candidate diversity; deterministic best-of-N is a no-op.
 4. Train and inference horizons must be aligned or explicitly capped.
+
+## 2026-04-13 - Diffusion Forcing in SONAR space must use SONAR-scaled noise
+
+### Pattern
+Diffusion Forcing uses DDPM-style per-position noise levels, but raw DDPM epsilon `N(0, I)` is mathematically wrong for 1024D SONAR vectors with norm near 0.205. Raw epsilon has expected norm near 32 and recreates the same failure mode as uncalibrated rollout noise: the noise dominates semantic signal before attention can use it.
+
+### Rule
+1. In SONAR-space diffusion objectives, default epsilon scale must be `target_norm / sqrt(d_model)`, not 1.0 per dimension.
+2. Keep the AR/free-run objective active when adding Diffusion Forcing. DF is an additional robustness objective, not proof that rollout works.
+3. Train with independent per-position noise levels, but validate DF at a fixed noise level so diagnostics are comparable across epochs.
+4. Monitor `roll_cos`, `roll_ans`, and `ans_cov` as the real QA rollout metrics. `df_cos` only proves denoising skill at a chosen noise level.
+
+## 2026-04-13 - Diffusion timestep embeddings and Min-SNR weights must match objective type
+
+### Pattern
+A diffusion timestep embedding normalized to [0, 1] weakens sinusoidal conditioning for small K (e.g. K=64): most frequency channels become nearly constant, so the model can under-use the noise level. Also Min-SNR weights depend on the prediction target. `clipped_snr/snr` is for epsilon/pred-noise style objectives, not pred-x0.
+
+### Rule
+1. Use raw diffusion levels (0..K-1) for sinusoidal timestep embeddings unless the embedding implementation explicitly expects normalized continuous log-SNR.
+2. For pred-x0 DF loss, use clipped-SNR style weights (`min(snr, gamma)` optionally normalized by gamma), not `min(snr, gamma) / snr`.
+3. Keep Min-SNR disabled by default until an ablation proves it improves rollout metrics, not just DF denoising metrics.
+
+## 2026-04-13 - Diffusion eval must fix both timestep and epsilon noise for stable diagnostics
+
+### Pattern
+Fixing only `df_eval_noise_level` is not enough for stable validation metrics. If epsilon is still sampled from the global RNG, `val_df_cos` changes across epochs even when the model is unchanged, making DF diagnostics harder to interpret.
+
+### Rule
+1. For DF validation diagnostics, use a fixed noise level and deterministic Gaussian epsilon per validation batch.
+2. Do not use deterministic eval noise for training; train still needs independent stochastic noise levels and epsilon samples.
+3. Keep rollout metrics (`val_roll_cos_last`, `val_roll_ans`) as the selection metric; deterministic DF eval is a diagnostic, not the final QA metric.
+
+## 2026-04-13 - Answer-repeat padding must not drive System1/System2 answer supervision
+
+### Pattern
+`answer_repeat_pad` makes the last valid chain position an answer duplicate, not necessarily the first answer position. If answer coverage is inferred from `chain_len <= target_steps`, System2 can delay `L_ans`, rollout-answer metrics, and rank diagnostics until all repeated answer pads enter the horizon. That makes multi-step training misreport whether the actual answer is supervised.
+
+### Rule
+1. Store and propagate the first answer position (`answer_pos`) separately from `chain_len`.
+2. System1 (`target_steps=1`) must train directly on `chains[answer_pos]`, not on the first reasoning step or the final repeat pad.
+3. System2 should use prefix-aligned targets, but activate answer-specific losses and metrics as soon as `answer_pos < target_steps`.
+4. Rank diagnostics and answer metrics should compare rollout at `answer_pos` to the first answer vector, not to an arbitrary last valid repeat.
