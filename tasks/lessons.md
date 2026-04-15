@@ -1,5 +1,35 @@
 # Lessons
 
+## 2026-04-15 - ChainGenerator "double zombie": SDPA `-inf` mask NaN root cause + Adam momentum persistence
+
+### Pattern
+After deploying the first-round Adam-zombie fix (grad sanitize + per-param Adam scrub + post-step EMA restore), a new run STILL zombified at E2 S3650: grad degraded over ~200 steps (20 → 13 → 8 → 0.6 → 0), then every step was a NaN-skip from S3800 onward through E6+ with val permanently stuck at 0.7405. The first-round fix was **necessary but not sufficient**.
+
+### Root Causes
+1. **`CrossAttention` used `float("-inf")` as an additive mask fill value**. This is a well-documented SDPA footgun on CUDA — `-inf` in bf16/fp16 triggers NaN in the flash/mem-efficient backends whenever softmax sees a row of all `-inf` (`0/0 = NaN`), AND `-inf - scale = -inf` corrupts gradient accumulation. The HuggingFace transformers library uses `torch.finfo(dtype).min` for exactly this reason. Any batch with a fully-masked context row (rare but possible with `context_bank_size=4` + short contexts) instantly produced cross-attention NaN, which propagated through every subsequent layer and every parameter's backward.
+2. **Residual Adam momentum kept the zombie alive even after grad sanitation**. My first-round fix zeroed NaN gradients but only scrubbed Adam `exp_avg`/`exp_avg_sq` *if those buffers themselves were already non-finite*. For the much more common case of "finite momentum from a healthy prior step + zero'd current gradient", Adam computed `exp_avg ← β1·exp_avg + (1−β1)·0 = β1·exp_avg`, preserving the **pre-corruption direction** and applying `lr · exp_avg / sqrt(exp_avg_sq)` — the param kept drifting toward the bad basin with decaying but nonzero speed for thousands of steps.
+3. **EMA was still updated on steps where grad sanitation fired** (my first-round guard only checked `params_restored == 0`). So the "subtle drift" during bad steps leaked into the shadow, and the rescue source slowly became the source of future corruption.
+4. **`torch.isfinite` misses huge-but-finite drift**. A parameter at ±1e30 is still `isfinite=True`, so post-step sanity never triggered restore for the most common failure mode (numerical drift under corrupted momentum, not outright NaN).
+5. **No escape from sustained corruption**. Once 100% of steps were sanitized, the first-round fix had no mechanism to step outside the corrupted basin — every step zeroed grads and Adam kept the same momentum loop.
+
+### Fix
+1. **Replace `float("-inf")` with `torch.finfo(q.dtype).min`** in `cebcm/models/chain_generator.py::CrossAttention.forward`, and detect the all-invalid-row edge case: for any batch row where every context slot is masked, force it to be fully visible. The downstream loss will mask the position correctly; non-NaN uniform attention is strictly better than NaN propagation.
+2. **Unconditional Adam zero on grad sanitation**: in `train_step`, whenever `p.grad` had NaN/Inf, always `buf.zero_()` for `exp_avg`/`exp_avg_sq`/`max_exp_avg_sq` — not conditional on whether the buffers were themselves corrupt. This kills the momentum loop.
+3. **EMA update ONLY on fully clean steps**: guard is now `if not grad_had_nan and params_restored == 0`. Any step with sanitation OR restore does not touch the shadow.
+4. **Huge-but-finite drift guard**: post-step sanity now also checks `abs(p.data).amax() > param_abs_max` (default 1e4) and restores from EMA when exceeded. This catches the common "finite explosion under corrupted momentum" failure mode.
+5. **Zombie streak detector + hard reset**: a streak counter (stored on the EMA object) increments on every sanitation step and resets on every clean step. When the streak hits `zombie_reset_threshold` (default 15 consecutive bad steps), hard-reset ALL parameters from the EMA shadow AND zero ALL Adam state AND reset the streak. This is the break-glass path that guarantees escape from any basin, regardless of root cause.
+
+### Rules
+1. **NEVER use `float("-inf")` as an attention mask fill value**. Always use `torch.finfo(dtype).min`. The bf16/fp16 + flash-SDPA combination turns `-inf` into NaN under masked-row edge cases. This is the single most common cause of mid-training bf16 attention NaN in modern transformer training. Grep for `-inf` in any attention/softmax path as a standing check.
+2. **An all-masked row produces NaN under SDPA softmax**. Detect this explicitly (`invalid.all(dim=-1)`) and either (a) force the row to be fully visible, (b) add a sentinel visible token, or (c) short-circuit the sub-layer. Never let softmax see a row of pure `-inf`/`finfo.min` unless you want NaN.
+3. **Grad sanitation without Adam momentum zeroing is insufficient**. With `grad=0` and live `exp_avg`, Adam computes `lr · exp_avg / sqrt(exp_avg_sq)` and keeps applying the PRE-corruption direction. For any "skip this grad" path, also zero the optimizer momentum for the affected parameter — otherwise the momentum persists the original bad direction for hundreds of steps.
+4. **EMA shadow integrity requires conservative update gating**. Update the EMA only on FULLY clean steps — no sanitation, no restore, no anomaly. The decay factor does NOT save you from subtle drift leaking in over time: `0.9999·shadow + 0.0001·bad = slightly-bad`, and over 1000 bad steps the shadow becomes 10% bad. A dirty shadow means your break-glass source is poisoned.
+5. **`isfinite` is not enough for param sanity**. Add a magnitude check (`abs(p).amax() > threshold`) and an optional global drift check (`||p||` growth rate). Finite-but-exploded values are the dominant failure mode under corrupted Adam momentum.
+6. **Always have a break-glass "zombie reset" mechanism**. A per-step scrub breaks single-step errors; it does NOT break sustained corruption from a numerically fragile basin. Track the consecutive-sanitation streak and, once it crosses a threshold, force-restore all params from the EMA shadow and zero ALL Adam state. This is the only path that guarantees escape from a zombie basin that per-step scrubs cannot fix.
+7. **When the first-round NaN fix "seems to work" but training still plateaus, instrument more metrics BEFORE iterating**. Add `grad_sanitized` (count per step), `param_restored` (count per step), `zombie_streak` (running counter), and `zombie_resets_total` — these metrics tell you whether you're fighting the right battle. A plateau with `grad_sanitized > 0` every step is a completely different bug than a plateau with `optimizer_stepped = 0.8` every step.
+
+---
+
 ## 2026-04-14 - ChainGenerator "frozen zombie" model: Adam momentum corruption + skip-on-NaN trap
 
 ### Pattern

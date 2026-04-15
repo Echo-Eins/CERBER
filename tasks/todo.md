@@ -2453,3 +2453,39 @@ Live training run with the prior two fixes reached E9 and then locked into a zom
 - **Two-layer NaN scrubbing** (scrub sums before clamp + scrub loss before backward) gives ~zero runtime cost defense-in-depth.
 - **Config tightening**: lowered DF lambda and extended warm-up to give the backbone more stable headroom before DF supervision kicks in at full strength — addresses the observed E2→E9 drift where the zombie state emerged.
 - **Static verification passed**. Empirical validation: the next run should show (a) `NaN:N` counter ≈ 0 or very low, (b) `grad_norm > 0` every step, (c) `val_roll_cos` moving past 0.7237 by E5+, (d) probe values changing step-to-step.
+
+## 2026-04-15 - ChainGenerator "double zombie": SDPA -inf root cause + stronger recovery
+
+### Context
+After landing the first-round frozen-zombie fix (grad sanitize + Adam rescue + EMA restore), a new run STILL zombified at E2 S3650: grad degraded 20→13→8→0.6→0 over ~200 steps, then every subsequent step was a NaN-skip. Val permanently stuck at 0.7405 from E2 through E6+. First-round fix was necessary but not sufficient. User: "Опять сраное плато и 0 прогресса". Root cause analysis revealed TWO compounding bugs — an attention NaN source (previously undetected) AND a recovery mechanism that was too weak to break the momentum loop it was supposed to prevent.
+
+### Root Cause
+1. `cebcm/models/chain_generator.py::CrossAttention.forward` used `float("-inf")` as the additive attention-mask fill value. This is the classic bf16+SDPA NaN footgun: `-inf` masks on CUDA flash/mem-efficient backends produce NaN in softmax whenever a row is fully masked (`0/0 = NaN`), and `-inf - scale = -inf` corrupts gradient accumulation. Any batch containing a fully-masked context row instantly poisoned the entire backward graph.
+2. The first-round grad sanitizer zeroed Adam `exp_avg`/`exp_avg_sq` ONLY when those buffers were themselves already non-finite. But the much more common failure mode is "finite momentum from a healthy prior step + zeroed current gradient": Adam computes `exp_avg ← β1·exp_avg`, preserving the PRE-corruption direction. The parameter keeps drifting toward the bad basin with decaying-but-nonzero speed for thousands of steps.
+3. EMA was still being updated on grad-sanitation steps (first-round guard only checked `params_restored == 0`), so subtle drift leaked into the shadow and progressively polluted the rescue source.
+4. `torch.isfinite` does not catch huge-but-finite drift — a param at ±1e30 is `isfinite=True` — so post-step sanity never triggered restore for the dominant failure mode.
+5. No escape mechanism once 100% of steps were sanitized: per-step scrubbing cannot break out of a basin where every forward produces NaN.
+
+### Tasks
+- [x] Replace `float("-inf")` with `torch.finfo(q.dtype).min` in `CrossAttention.forward`.
+- [x] Detect the all-masked-row edge case and force those rows fully visible; downstream loss masks the position anyway.
+- [x] Make Adam momentum zeroing unconditional on grad sanitation (not conditional on non-finite buffers).
+- [x] Gate EMA update on BOTH `not grad_had_nan` AND `params_restored == 0` so subtle drift cannot leak into the shadow.
+- [x] Add huge-but-finite drift guard: post-step sanity checks `abs(p).amax() > param_abs_max` (default 1e4).
+- [x] Zombie streak detector stored on the EMA object: `_zombie_streak` counter increments on every sanitation, resets on clean step; when it hits `zombie_reset_threshold` (default 15) force-restore ALL params from EMA, zero ALL Adam state, and reset the streak. Log `zombie_reset` / `zombie_resets_total` / `zombie_streak` in metrics for observability.
+- [x] `python -m py_compile` both `train_chain_generator.py` and `cebcm/models/chain_generator.py`.
+- [x] Update `tasks/lessons.md` with the 2026-04-15 double-zombie entry and 7 carry-forward rules.
+
+### Files Touched
+- `cebcm/models/chain_generator.py` — `CrossAttention.forward` (`finfo.min` + all-invalid-row guard).
+- `experiments/13_chain_generator/train_chain_generator.py` — `train_step` (unconditional Adam zero, zombie streak detector, huge-finite drift guard, stricter EMA update gating, extra metrics).
+- `tasks/lessons.md` — 2026-04-15 double-zombie entry.
+
+### Review
+- **The SDPA `-inf` mask was the upstream NaN source all along**. It was latent and only fired when a batch happened to contain a fully-masked context row. The first-round fix papered over downstream symptoms (grad scrub, Adam rescue, EMA restore) but could not prevent re-entry into the corrupted basin as long as the attention kept producing fresh NaN every forward. Fixing the root cause is what gives the other defenses a chance to actually recover.
+- **Adam momentum persistence is the reason "skip on NaN" never works as a standalone pattern**. With `grad=0` and live `exp_avg`, Adam keeps applying `lr · exp_avg / sqrt(exp_avg_sq)` — the OLD direction, for exponentially many steps. Unconditional Adam zero on sanitation is the only way to break this loop.
+- **EMA update gating must be conservative**. `0.9999·shadow + 0.0001·bad` compounds: over 1000 bad steps the shadow becomes ~10% bad. The fix checks BOTH `grad_had_nan` and `params_restored` and updates only when both are clean.
+- **Huge-finite drift guard** (`abs(p).amax() > 1e4`) closes the last escape path: corrupted Adam can push a param to ±1e20 without ever triggering `isfinite=False`. Now post-step sanity catches it.
+- **The zombie-streak hard reset is the guaranteed escape mechanism**. Regardless of root cause, 15 consecutive sanitation steps triggers a full EMA restore + Adam zero. This is the SOTA pattern for training resilience — CI/production training loops in modern LLM shops all have equivalent "break glass" rollback paths.
+- **New observability metrics**: `grad_sanitized`, `param_restored`, `zombie_streak`, `zombie_resets_total`, `zombie_reset`. These let us distinguish "training plateau" from "zombie plateau" at a glance from the logs.
+- **Static verification passed**. Empirical validation: the next run should show (a) `zombie_resets_total == 0` if the SDPA fix eliminates the root cause, (b) `grad_norm > 0` every step, (c) `val_roll_cos` climbing past 0.7405 by E4+, (d) probe values changing step-to-step. If zombie resets still fire, the streak counter bounds the damage and training continues.

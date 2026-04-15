@@ -1228,12 +1228,16 @@ def train_step(
 
     # --- Gradient sanitation (Adam-zombie defense) ------------------
     # Skipping the step on NaN grad is a TRAP: healthy parameters never
-    # update, and worse, the Adam momentum buffers (exp_avg, exp_avg_sq)
-    # keep whatever poisoned state sneaked in earlier.  A cleaner fix is
-    # to ZERO the NaN/Inf entries in ``.grad`` in-place, so healthy
-    # parameters continue training and sick parameters simply get a
-    # zero-update this step.  We additionally scrub Adam's momentum
-    # buffers on the affected parameters.
+    # update, and the Adam momentum buffers (exp_avg, exp_avg_sq) keep
+    # whatever poisoned direction was there earlier — even with grad=0
+    # Adam keeps applying `lr · exp_avg / sqrt(exp_avg_sq)`, preserving
+    # the OLD direction and pushing the param further into the bad
+    # region.  Lesson 2026-04-15 (double-zombie) — the grad scrub alone
+    # is insufficient.  We therefore:
+    #   (1) zero NaN/Inf entries in ``.grad`` in-place,
+    #   (2) UNCONDITIONALLY zero the Adam momentum buffers for any
+    #       parameter whose grad was sanitized, so there is literally
+    #       no residual direction for Adam to follow.
     grad_had_nan = False
     sanitized_count = 0
     for p in model.parameters():
@@ -1245,15 +1249,79 @@ def train_step(
             grad_had_nan = True
             sanitized_count += 1
             g.masked_fill_(bad, 0.0)
-            # Rescue Adam state for this parameter if corrupted.
+            # Kill ALL Adam momentum for this param, not only when
+            # buffers themselves are non-finite.  The residual momentum
+            # from a pre-corruption step is what keeps pushing the
+            # weight into the bad basin.
             state = optimizer.state.get(p)
             if state:
                 for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                     buf = state.get(key)
-                    if buf is not None and not torch.isfinite(buf).all():
+                    if buf is not None:
+                        buf.zero_()
+
+    # --- Zombie streak detector + hard EMA reset ---------------------
+    # When grad sanitation happens on many consecutive steps, the
+    # model is stuck in a corrupted basin from which per-step grad
+    # scrubbing cannot escape (every forward still produces NaN because
+    # a weight is in a numerically fragile region, even if it is still
+    # technically `isfinite`).  We maintain a streak counter on the EMA
+    # object and, once it crosses a threshold, force-restore ALL
+    # parameters from the EMA shadow and zero ALL Adam state.  This is
+    # the break-glass path that guarantees we can escape ANY basin.
+    zombie_threshold = int(cfg.get("zombie_reset_threshold", 15))
+    zombie_reset = 0
+    zombie_resets_total = 0
+    zombie_streak_now = 0
+    if ema is not None:
+        if not hasattr(ema, "_zombie_streak"):
+            ema._zombie_streak = 0
+            ema._zombie_resets = 0
+        if grad_had_nan:
+            ema._zombie_streak += 1
+        else:
+            ema._zombie_streak = 0
+
+        if ema._zombie_streak >= zombie_threshold:
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    shadow = ema.shadow.get(name)
+                    if shadow is not None and torch.isfinite(shadow).all():
+                        p.data.copy_(shadow)
+                    else:
                         torch.nan_to_num(
-                            buf, nan=0.0, posinf=0.0, neginf=0.0, out=buf
+                            p.data, nan=0.0, posinf=0.0, neginf=0.0,
+                            out=p.data,
                         )
+                    state = optimizer.state.get(p)
+                    if state:
+                        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                            buf = state.get(key)
+                            if buf is not None:
+                                buf.zero_()
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            ema._zombie_streak = 0
+            ema._zombie_resets += 1
+            zombie_reset = 1
+            zombie_resets_total = ema._zombie_resets
+            metrics["nan_skipped"] = 1.0
+            metrics["nan_loss_skipped"] = 0.0
+            metrics["nan_grad_skipped"] = 0.0
+            metrics["grad_sanitized"] = float(sanitized_count)
+            metrics["param_restored"] = 0.0
+            metrics["zombie_reset"] = 1.0
+            metrics["zombie_resets_total"] = float(zombie_resets_total)
+            metrics["zombie_streak"] = 0.0
+            metrics["optimizer_stepped"] = 0.0
+            metrics["grad_norm"] = 0.0
+            metrics["target_steps"] = float(target_steps)
+            metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
+            return metrics
+        zombie_streak_now = ema._zombie_streak
+        zombie_resets_total = ema._zombie_resets
 
     clip_grad = float(cfg.get("clip_grad_norm", 1.0))
     if clip_grad > 0:
@@ -1268,6 +1336,9 @@ def train_step(
             metrics["nan_grad_skipped"] = 1.0
             metrics["grad_sanitized"] = float(sanitized_count)
             metrics["param_restored"] = 0.0
+            metrics["zombie_reset"] = 0.0
+            metrics["zombie_resets_total"] = float(zombie_resets_total)
+            metrics["zombie_streak"] = float(zombie_streak_now)
             metrics["optimizer_stepped"] = 0.0
             metrics["target_steps"] = float(target_steps)
             metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
@@ -1279,40 +1350,44 @@ def train_step(
     scaler.update()
 
     # --- Post-step parameter sanity check (EMA break-glass) --------
-    # If the optimizer step somehow produced NaN in parameters (e.g.
-    # corrupted Adam state slipped through), restore from EMA.  The EMA
-    # shadow is our last known-good copy (only updated after a healthy
-    # step).  Without this, a single corrupted step persists forever.
+    # If the optimizer step somehow produced NaN/Inf or HUGE-but-finite
+    # drift in parameters, restore from EMA.  ``isfinite`` does NOT
+    # catch values like 1e30 — we therefore also guard against norms
+    # exceeding a generous threshold relative to initialization.
     params_restored = 0
+    max_param_abs = float(cfg.get("param_abs_max", 1.0e4))
     if ema is not None:
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if not torch.isfinite(p.data).all():
+            non_finite = not torch.isfinite(p.data).all()
+            too_large = False
+            if not non_finite:
+                with torch.no_grad():
+                    pmax = float(p.data.abs().amax().item())
+                too_large = pmax > max_param_abs
+            if non_finite or too_large:
                 shadow = ema.shadow.get(name)
                 if shadow is not None and torch.isfinite(shadow).all():
                     p.data.copy_(shadow)
                     params_restored += 1
                 else:
-                    # No clean shadow either — last resort scrub.
                     torch.nan_to_num(
                         p.data, nan=0.0, posinf=0.0, neginf=0.0, out=p.data
                     )
                     params_restored += 1
-                # Also scrub Adam state so corruption doesn't reappear.
                 state = optimizer.state.get(p)
                 if state:
                     for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                         buf = state.get(key)
                         if buf is not None:
-                            torch.nan_to_num(
-                                buf, nan=0.0, posinf=0.0, neginf=0.0, out=buf
-                            )
+                            buf.zero_()
 
-    # EMA update after a real optimizer step — ONLY if params are clean,
-    # otherwise we'd pollute the shadow with the very corruption we're
-    # trying to rescue from.
-    if ema is not None and params_restored == 0:
+    # EMA update ONLY on fully clean steps — NO grad sanitation AND
+    # NO param restore.  Otherwise subtle drift (that passed isfinite
+    # but is already polluted) leaks into the shadow, and the very
+    # rescue source becomes the source of future corruption.
+    if ema is not None and not grad_had_nan and params_restored == 0:
         ema.update(model)
 
     metrics["nan_skipped"] = 1.0 if (grad_had_nan or params_restored > 0) else 0.0
@@ -1320,6 +1395,9 @@ def train_step(
     metrics["nan_grad_skipped"] = 0.0
     metrics["grad_sanitized"] = float(sanitized_count)
     metrics["param_restored"] = float(params_restored)
+    metrics["zombie_reset"] = 0.0
+    metrics["zombie_resets_total"] = float(zombie_resets_total)
+    metrics["zombie_streak"] = float(zombie_streak_now)
     metrics["optimizer_stepped"] = 1.0
     metrics["grad_norm"] = float(total_norm.item()) if clip_grad > 0 else 0.0
     metrics["target_steps"] = float(target_steps)

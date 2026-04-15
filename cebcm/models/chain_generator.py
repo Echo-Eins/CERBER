@@ -144,10 +144,31 @@ class CrossAttention(nn.Module):
                 raise ValueError(
                     f"context_mask shape {tuple(cm.shape)} does not match context shape {(bsz, ctx_len)}"
                 )
-            # SDPA additive mask: 0 for valid, -inf for invalid.
+            # SDPA additive mask.  CRITICAL: using ``float("-inf")`` in
+            # bfloat16 triggers NaN in SDPA on CUDA (flash / mem-efficient
+            # backends) — softmax over a row of all ``-inf`` produces
+            # ``0/0 = NaN`` and ``-inf + -inf = -inf`` poisons gradients.
+            # The standard safe pattern (HuggingFace transformers) is to
+            # use ``finfo(dtype).min``: ~-3.4e38 in fp32, ~-3.4e38 cast to
+            # bf16 clips to ~-3.3e38 — large enough that ``exp(logit + min)``
+            # underflows to 0, but never produces ``inf - inf = NaN``.
             invalid = cm <= 0
-            attn_mask = torch.zeros((bsz, self.n_heads, seq_len, ctx_len), device=x.device, dtype=q.dtype)
-            attn_mask = attn_mask.masked_fill(invalid[:, None, None, :], float("-inf"))
+            # Additionally, if an ENTIRE row is masked out (rare but not
+            # impossible with context_bank_size=4), SDPA still NaNs.  Force
+            # such rows to be fully visible: they'll attend uniformly to
+            # whatever is there, which is strictly better than NaN and the
+            # downstream loss will correctly mask the position anyway.
+            all_invalid = invalid.all(dim=-1, keepdim=True)  # [B, 1]
+            invalid = invalid & ~all_invalid
+            mask_min = torch.finfo(q.dtype).min
+            attn_mask = torch.zeros(
+                (bsz, self.n_heads, seq_len, ctx_len),
+                device=x.device,
+                dtype=q.dtype,
+            )
+            attn_mask = attn_mask.masked_fill(
+                invalid[:, None, None, :], mask_min
+            )
 
         dropout_p = self.dropout_p if self.training else 0.0
         out = F.scaled_dot_product_attention(
