@@ -17,7 +17,10 @@
         "prediction_type": "v",
         "cfg_dropout_prob": 0.1,
         "ffn_type": "swiglu",
-        "norm_type": "ada_rmsnorm"
+        "norm_type": "ada_rmsnorm",
+        "zero_init_residual": true,
+        "use_layerscale": true,
+        "layerscale_init": 1e-4
     },
 
     "critic": {

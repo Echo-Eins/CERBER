@@ -50,6 +50,21 @@ class ChainGeneratorConfig:
     # "layernorm" = original LayerNorm (backward compatible).
     norm_type: str = "ada_rmsnorm"
 
+    # ── ResNet / DiT stabilization practices ──
+    # Zero-init the final projector of every residual sublayer (self-attn
+    # out_proj, cross-attn out_proj, FFN down-projection).  At init each
+    # block is a perfect identity, which creates a clean gradient highway
+    # from the loss down to layer 0 (FixUp / DeepNet / DiT).
+    zero_init_residual: bool = True
+    # Per-residual learnable gate γ_l (CaiT LayerScale).  Each sublayer
+    # output is multiplied by a [D]-shaped parameter initialized to
+    # ``layerscale_init`` before the residual add.  With a small init the
+    # block starts near-identity and "opens up" as training progresses,
+    # dampening the early-training chaos that Diffusion Forcing is
+    # particularly prone to.
+    use_layerscale: bool = True
+    layerscale_init: float = 1e-4
+
 
 # ---------------------------------------------------------------------------
 # Normalization & FFN building blocks
@@ -258,6 +273,20 @@ class DecoderBlock(nn.Module):
     FFN type:
     - ``"silu"``: ``Linear → SiLU → Linear`` (original)
     - ``"swiglu"``: ``SwiGLUFFN`` with gated activation (LLaMA-style)
+
+    Stabilization (enabled by default):
+    - **Zero-init residual projectors**: the final projection of every
+      sublayer (``self_attn.out_proj``, ``cross_attn.out_proj``, the FFN
+      down-projection) is zeroed at init so each block starts as an exact
+      identity — the "gradient highway" trick from FixUp / DeepNet / DiT.
+    - **LayerScale** (CaiT, Touvron et al. 2021): each sublayer's output is
+      scaled by a learnable per-channel gate γ_l initialized to ``1e-4``
+      before the residual add, preventing early-training blow-ups in
+      Diffusion Forcing.
+
+    The actual zeroing of residual projectors is applied by the parent
+    ``ChainGenerator._init_weights`` *after* its xavier sweep; doing it
+    here in ``__init__`` would be silently overwritten.
     """
 
     def __init__(
@@ -269,10 +298,13 @@ class DecoderBlock(nn.Module):
         max_seq_len: int = 32,
         norm_type: str = "ada_rmsnorm",
         ffn_type: str = "swiglu",
+        use_layerscale: bool = True,
+        layerscale_init: float = 1e-4,
     ):
         super().__init__()
         self._norm_type = norm_type
         self._ffn_type = ffn_type
+        self._use_layerscale = bool(use_layerscale)
 
         # ── Normalization ──
         if norm_type == "ada_rmsnorm":
@@ -280,12 +312,18 @@ class DecoderBlock(nn.Module):
             self.norm_cross = AdaRMSNorm(d_model)
             self.norm_ffn = AdaRMSNorm(d_model)
             # AdaLN modulation: 6 vectors (scale+shift for each of 3 norms).
+            # NOTE on init: we ask for zero-weight + zero-bias here so the
+            # block is identity-through-norm (scale=0→γ=1, shift=0→β=0) at
+            # start.  But ``ChainGenerator._init_weights`` runs a xavier
+            # sweep over every ``nn.Linear`` *after* construction, which
+            # silently overwrites this.  The parent's ``_init_weights``
+            # explicitly re-zeros ``adaln_modulation[-1]`` after the sweep;
+            # do NOT remove that call — otherwise we train with xavier
+            # adaLN and lose the AdaLN-Zero property entirely.
             self.adaln_modulation = nn.Sequential(
                 nn.SiLU(),
                 nn.Linear(d_model, 6 * d_model, bias=True),
             )
-            # Zero-init so that at start the block is identity-through-norm
-            # (γ=0→multiply by 1, β=0→add 0), preserving backward compat.
             nn.init.zeros_(self.adaln_modulation[-1].weight)
             nn.init.zeros_(self.adaln_modulation[-1].bias)
         else:
@@ -319,6 +357,48 @@ class DecoderBlock(nn.Module):
                 nn.Dropout(dropout),
             )
 
+        # ── LayerScale (CaiT) ──
+        # One per-channel gate γ_l per sublayer, initialized to a small
+        # constant so each residual branch contributes ~0 at start and the
+        # identity path from zero-init residual dominates.
+        if self._use_layerscale:
+            init_val = float(layerscale_init)
+            self.ls_self = nn.Parameter(torch.full((d_model,), init_val))
+            self.ls_cross = nn.Parameter(torch.full((d_model,), init_val))
+            self.ls_ffn = nn.Parameter(torch.full((d_model,), init_val))
+        else:
+            self.register_parameter("ls_self", None)
+            self.register_parameter("ls_cross", None)
+            self.register_parameter("ls_ffn", None)
+
+    def _scale(self, y: Tensor, gamma: Tensor | None) -> Tensor:
+        """Apply LayerScale gate if enabled."""
+        return y * gamma if gamma is not None else y
+
+    def _zero_init_residual_projectors(self) -> None:
+        """Zero the final projector weight of every residual sublayer.
+
+        After this call the block is an **exact identity** at initialization:
+        ``self_attn(norm(x)) = 0``, ``cross_attn(norm(x)) = 0``, ``ffn(norm(x)) = 0``,
+        so ``x → x + 0 + 0 + 0 = x`` through every layer.  This is the
+        "zero-init residual" trick from FixUp / DeepNet / DiT and is what
+        allows deep residual networks to receive a clean, full-magnitude
+        gradient on every parameter from the very first step.
+        """
+        nn.init.zeros_(self.self_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        if self._ffn_type == "swiglu":
+            nn.init.zeros_(self.ffn.w_down.weight)
+        else:
+            # nn.Sequential: [Linear, SiLU, Dropout, Linear, Dropout].
+            # Zero the last Linear (the down-projection).
+            for m in reversed(list(self.ffn)):
+                if isinstance(m, nn.Linear):
+                    nn.init.zeros_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                    break
+
     def forward(
         self,
         x: Tensor,
@@ -339,18 +419,30 @@ class DecoderBlock(nn.Module):
             # AdaLN-Zero: produce per-position scale/shift for each norm.
             mod = self.adaln_modulation(t_emb)  # [B, L, 6D]
             s_sa, sh_sa, s_ca, sh_ca, s_ff, sh_ff = mod.chunk(6, dim=-1)
-            x = x + self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa))
-            x = x + self.cross_attn(
-                self.norm_cross(x, scale=s_ca, shift=sh_ca),
-                context,
-                context_mask=context_mask,
+            x = x + self._scale(
+                self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa)),
+                self.ls_self,
             )
-            x = x + self.ffn(self.norm_ffn(x, scale=s_ff, shift=sh_ff))
+            x = x + self._scale(
+                self.cross_attn(
+                    self.norm_cross(x, scale=s_ca, shift=sh_ca),
+                    context,
+                    context_mask=context_mask,
+                ),
+                self.ls_cross,
+            )
+            x = x + self._scale(
+                self.ffn(self.norm_ffn(x, scale=s_ff, shift=sh_ff)),
+                self.ls_ffn,
+            )
         else:
             # Standard pre-norm (no conditioning).
-            x = x + self.self_attn(self.norm_self(x))
-            x = x + self.cross_attn(self.norm_cross(x), context, context_mask=context_mask)
-            x = x + self.ffn(self.norm_ffn(x))
+            x = x + self._scale(self.self_attn(self.norm_self(x)), self.ls_self)
+            x = x + self._scale(
+                self.cross_attn(self.norm_cross(x), context, context_mask=context_mask),
+                self.ls_cross,
+            )
+            x = x + self._scale(self.ffn(self.norm_ffn(x)), self.ls_ffn)
         return x
 
 
@@ -381,6 +473,8 @@ class ChainGenerator(nn.Module):
                     max_seq_len=max_seq,
                     norm_type=self.cfg.norm_type,
                     ffn_type=self.cfg.ffn_type,
+                    use_layerscale=self.cfg.use_layerscale,
+                    layerscale_init=self.cfg.layerscale_init,
                 )
                 for _ in range(self.cfg.n_layers)
             ]
@@ -406,12 +500,47 @@ class ChainGenerator(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
+        """Initialize parameters for a deep, diffusion-stable transformer.
+
+        Order matters — we first do a global xavier sweep over every
+        ``nn.Linear``, then selectively re-initialize a handful of projectors
+        to enforce the three "ResNet for diffusion" stabilization tricks:
+
+        1. **Zero-init residual projectors** (FixUp / DeepNet / DiT): the
+           final projection of every residual sublayer is zeroed, making
+           each ``DecoderBlock`` start as an exact identity.  Combined with
+           LayerScale (initialized tiny), this guarantees a clean gradient
+           highway from the loss straight to layer 0 at step 0.
+        2. **AdaLN-Zero**: the final Linear of every block's timestep
+           modulation MLP is zeroed so the AdaRMSNorm layers start as plain
+           RMSNorm (scale=0 → γ=1, shift=0 → β=0).  Without the re-zeroing
+           below, the xavier sweep overwrites the zeros set inside
+           ``DecoderBlock.__init__``, silently breaking AdaLN-Zero.
+        3. **Small output head**: ``output_proj`` uses xavier with gain
+           0.01 so initial predictions are small in SONAR space (compatible
+           with the 0.2051 target norm).
+        """
+        # ── 1. Global xavier sweep ──
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
+        # ── 2. Re-enforce AdaLN-Zero on every block ──
+        for block in self.layers:
+            if getattr(block, "adaln_modulation", None) is not None:
+                final = block.adaln_modulation[-1]
+                nn.init.zeros_(final.weight)
+                if final.bias is not None:
+                    nn.init.zeros_(final.bias)
+
+        # ── 3. Zero-init residual projectors (FixUp / DeepNet / DiT) ──
+        if self.cfg.zero_init_residual:
+            for block in self.layers:
+                block._zero_init_residual_projectors()
+
+        # ── 4. Small output head ──
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.01)
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
