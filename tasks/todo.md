@@ -2489,3 +2489,57 @@ After landing the first-round frozen-zombie fix (grad sanitize + Adam rescue + E
 - **The zombie-streak hard reset is the guaranteed escape mechanism**. Regardless of root cause, 15 consecutive sanitation steps triggers a full EMA restore + Adam zero. This is the SOTA pattern for training resilience — CI/production training loops in modern LLM shops all have equivalent "break glass" rollback paths.
 - **New observability metrics**: `grad_sanitized`, `param_restored`, `zombie_streak`, `zombie_resets_total`, `zombie_reset`. These let us distinguish "training plateau" from "zombie plateau" at a glance from the logs.
 - **Static verification passed**. Empirical validation: the next run should show (a) `zombie_resets_total == 0` if the SDPA fix eliminates the root cause, (b) `grad_norm > 0` every step, (c) `val_roll_cos` climbing past 0.7405 by E4+, (d) probe values changing step-to-step. If zombie resets still fire, the streak counter bounds the damage and training continues.
+
+## 2026-04-15 - 0.70 Ceiling Diagnosis: Cosine Loss Saturation Hypothesis
+
+### Context
+Arch 15-04-26 run (самый дальний прогон на текущей архитектуре) снова упёрся в потолок val_roll_cos_last≈0.7126 на E2, после чего 12 эпох замороженного плато с `grad=0.0000` и катастрофический коллапс на переходе System1→System2 (E15). **Ноль событий `zombie_reset` в логе** — recovery-система, добавленная в e5f01fa, не триггернулась, хотя код был последний. Это значит: grad=0 возникает НЕ из-за NaN, который ловит санитация, а из-за **настоящего нулевого градиента** от саттурации лосса.
+
+User feedback: модель до добавления DF стабильно выдавала 0.75 (train близко к 0.90, eval 0.60). Потолок ~0.70 не пробивается **абсолютно непонятно почему**, хотя рецепт известен работающим. Гипотеза пользователя: grad=0 возникает когда модель "попадает на 100 процентов или при каких-то приколах косинуса". **Эта гипотеза математически подтверждается:**
+
+### Root Cause (Mathematical)
+- `loss = 1.0 · (1 - cos(p, t)) + 0.1 · MSE(p, t)` — **cosine-dominant**.
+- Градиент `∂(1 − cos)/∂p = −(1/‖p‖)(I − pp⊤/‖p‖²) · t/‖t‖` — проекция цели на плоскость ⊥ p. При `p ∥ t` (cos=1) — **аналитически ноль**, не численно.
+- `1 − cos ≈ ½·||p̂ − t̂||²` — квадратичная окрестность → градиент O(угол). При cos≥0.99 градиент ~1e-3 или меньше.
+- bf16 mantissa = 7 бит, underflow ~8e-3. Всё что меньше → **backward cast обнуляет градиент**.
+- `mse_weight=0.1` в 10× слабее — не компенсирует underflow.
+- System1 с `target_steps=1` быстро загоняет модель в эту плоскую зону на лёгких one-step таргетах → зомби-плато.
+- `cebcm/models/chain_generator.py:1441-1448` — confirmed в коде.
+
+### Minimal Experiment (Active)
+- [x] **Flip loss weights**: `loss_cosine_weight: 1.0 → 0.1`, `loss_mse_weight: 0.1 → 1.0` in `configs/chain_generator_config.json`. MSE имеет нулевой градиент **только при точном совпадении** (включая норму), поэтому не саттурируется. Это **единственный минимальный структурный фикс** для проверки гипотезы.
+- [ ] Запустить прогон без других изменений. Acceptance:
+  - (a) `val_roll_cos_last` пробивает 0.7405 (прошлый потолок) по E5+
+  - (b) `grad_norm` остаётся > 0 на всех эпохах, включая E2–E15
+  - (c) `ans_cov` не падает до нуля на System1→System2 transition
+  - (d) `zombie_resets_total == 0` (подтверждение что grad=0 был от саттурации, а не от NaN)
+
+### Deferred (если минимальный эксперимент не пробьёт потолок)
+
+#### Recipe changes
+- [ ] **Disable System1 entirely**: `system1_epochs: 15 → 0`, старт сразу с `target_steps=2`. Single-step — это ложный оптимум, который не композируется в rollout.
+- [ ] **Disable Diffusion Forcing entirely**: `enable_diffusion_forcing: false`, `loss_lambda_diffusion: 0.0`, `df_warmup_epochs: 0`. Критично: проверить что `train_step` корректно скипает DF-ветку и что probe (`experiments/13_chain_generator/train_chain_generator.py` probe rendering) не падает на DF-плашках, либо рисует заглушки "DF disabled".
+- [ ] **Switch `prediction_type: "v" → "x0"`**: с отключенным DF v-prediction теряет смысл. Проверить что `chain_generator.py` поддерживает `x0` ветку без регрессий (grep по `prediction_type`, `v_target`, `v_pred`).
+- [ ] **Lower LR**: `lr: 1e-4 → 5e-5` если MSE-dominant даёт более резкие градиенты. Эмпирический критерий: наблюдать за `grad_norm`, если >> 1.0 — снижать.
+
+#### Architectural fixes (для пробития реального потолка)
+- [ ] **Attention sink mitigation**: в layer 0 все 8 голов коллапсируют в BOS (см. `Arch 15-04-26/Attention heads (epoch 17).png`). Добавить register tokens (Darcet et al. 2023) или attention softmax offset.
+- [ ] **Per-layer grad norm logging**: инструментировать `train_step` чтобы видеть какой модуль схлопывается первым (cross-attn? FFN? output head?) — сейчас мы видим только total grad_norm.
+- [ ] **Gradient clip in fp32**: unscale + cast в fp32 до `clip_grad_norm_`, чтобы clip не underflow'ился в bf16.
+
+#### Verification & observability
+- [ ] **Sentinel-log recovery activation**: добавить безусловный `log.info("grad_sanitation_enabled=True, zombie_threshold=15")` в начало training loop, чтобы было видно что e5f01fa код реально активен (в Arch 15-04-26 логе ноль событий — надо убедиться что это не silent disable).
+- [ ] **Cosine saturation monitor**: метрика `steps_with_cos_mean_above_0.95` в логе каждые `log_every`. Индикатор саттурации до того как grad схлопнется.
+- [ ] **Train/eval gap monitor**: явная метрика `train_cos_last - val_cos_last`, алерт при >0.15 (в Arch 15-04-26 гэп был 0.30).
+- [ ] **Min-SNR γ validation**: при отключенном DF не нужна, при включённом — проверить что γ=5 не давит high-noise steps до нуля.
+
+### Decision Rule
+- Если flip весов пробивает потолок 0.7405 → корневая причина подтверждена, остальные deferred пункты (кроме verification) — не срочные.
+- Если потолок остаётся → включать deferred пункты по одному, начиная с disable System1 + DF.
+- Если вторая итерация тоже не пробивает → архитектурные фиксы (register tokens, per-layer grads).
+
+### Files Touched (minimal experiment)
+- `configs/chain_generator_config.json` — flipped loss weights only.
+
+### Review
+_Pending run results._
