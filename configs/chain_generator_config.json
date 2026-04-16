@@ -21,7 +21,7 @@
         "zero_init_residual": true,
         "use_layerscale": true,
         "layerscale_init": 1e-4,
-        "aux_head_layers": [2, 4],
+        "aux_head_layers": [],
         "aux_head_hidden_dim": 1024,
         "aux_head_dropout": 0.0
     },
@@ -75,9 +75,9 @@
         "loss_lambda_answer": 1.0,
         "loss_lambda_roll": 1.0,
         "loss_lambda_rank": 0.0,
-        "loss_lambda_aux": 0.1,
-        "loss_lambda_aux_df": 0.03,
-        "aux_loss_answer_weight": 1.0,
+        "loss_lambda_aux": 0.0,
+        "loss_lambda_aux_df": 0.00,
+        "aux_loss_answer_weight": 0.0,
         "enable_diffusion_forcing": true,
         "loss_lambda_diffusion": 0.15,
         "df_warmup_epochs": 0,
@@ -134,8 +134,8 @@
         "probe_steps": 0,
         "probe_dir_name": "geometry_probes",
         "probe_save_raw_vectors": false,
-        "checkpoint_every": 5,
-        "early_stop_patience": 15
+        "checkpoint_every": 3,
+        "early_stop_patience": 20
     },
 
     "reranking": {
