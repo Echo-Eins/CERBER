@@ -1352,6 +1352,7 @@ def compute_composite_objective(
             "oracle_prob": float(effective_oracle_prob),
             "answer_coverage": float(has_answer.float().mean().item()),
             "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
+            "nan_gate_count": float(getattr(model, "_nan_gate_count", 0)),
         }
 
         # Additional raw components for debugging.
@@ -2301,6 +2302,14 @@ def main() -> None:
     print("=" * 70)
 
     prev_target_steps = 1  # Track for SADT cooldown
+    # Horizon transition LR warmup state.
+    horizon_warmup_remaining = 0
+    horizon_warmup_total = 0
+    horizon_warmup_factor = 0.1
+    # NaN cascade detector state.
+    nan_gate_window_size = int(train_cfg.get("nan_gate_window_size", 50))
+    nan_gate_window: list[int] = []
+    nan_gate_lr_halved = False
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -2329,8 +2338,23 @@ def main() -> None:
             sadt_tf_ema = None
             sadt_roll_ema = None
             sadt_cooldown = int(train_cfg.get("sadt_cooldown_steps", 200))
-            print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
-                  f"EMA reset, cooldown={sadt_cooldown} steps")
+            # ── Horizon transition LR warmup ──────────────────────
+            # The System1→System2 jump causes a ~50x gradient norm
+            # spike (e.g. 0.39→19.67) which pushes parameters into
+            # bfloat16-fragile zones and triggers NaN cascades.
+            # Temporarily reduce LR and linearly ramp back up.
+            hw_steps = int(train_cfg.get("horizon_warmup_steps", 0))
+            hw_factor = float(train_cfg.get("horizon_warmup_factor", 0.1))
+            if hw_steps > 0 and prev_target_steps > 0:
+                horizon_warmup_remaining = hw_steps
+                horizon_warmup_total = hw_steps
+                horizon_warmup_factor = hw_factor
+                print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
+                      f"EMA reset, cooldown={sadt_cooldown} steps, "
+                      f"LR warmup={hw_steps} steps (factor={hw_factor})")
+            else:
+                print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
+                      f"EMA reset, cooldown={sadt_cooldown} steps")
         else:
             sadt_cooldown = 0
         prev_target_steps = target_steps
@@ -2361,11 +2385,53 @@ def main() -> None:
             )
             if metrics.get("optimizer_stepped", 0.0) > 0.0:
                 scheduler.step()
+            # ── Horizon transition LR warmup ──────────────────────
+            # After scheduler sets the base LR, apply a warmup
+            # multiplier that linearly ramps from horizon_warmup_factor
+            # to 1.0 over horizon_warmup_total steps.  This prevents
+            # the ~50x gradient norm spike at System1→System2 transition
+            # from pushing parameters into bfloat16-fragile zones.
+            if horizon_warmup_remaining > 0:
+                progress = 1.0 - (horizon_warmup_remaining / horizon_warmup_total)
+                factor = horizon_warmup_factor + (1.0 - horizon_warmup_factor) * progress
+                for pg in optimizer.param_groups:
+                    pg["lr"] = pg["lr"] * factor
+                horizon_warmup_remaining -= 1
             global_step += 1
             tracker.update(metrics)
 
             if metrics.get("nan_skipped", 0.0) > 0:
                 nan_count += 1
+
+            # ── NaN cascade detector ──────────────────────────────
+            # Track NaN gate activations (samples with NaN output
+            # replaced by GT in the model's forward).  When the rate
+            # accelerates, halve LR to prevent parameters from
+            # drifting further into bfloat16-fragile zones.
+            nan_gate_now = int(metrics.get("nan_gate_count", 0))
+            if nan_gate_now > 0:
+                nan_gate_window.append(nan_gate_now)
+            else:
+                nan_gate_window.append(0)
+            if len(nan_gate_window) > nan_gate_window_size:
+                nan_gate_window.pop(0)
+            nan_gate_window_total = sum(nan_gate_window)
+            nan_gate_max_rate = int(train_cfg.get("nan_gate_max_rate", 0))
+            if (
+                nan_gate_max_rate > 0
+                and len(nan_gate_window) >= nan_gate_window_size
+                and nan_gate_window_total > nan_gate_max_rate
+                and not nan_gate_lr_halved
+            ):
+                old_lr = optimizer.param_groups[0]["lr"]
+                new_lr = old_lr * 0.5
+                for pg in optimizer.param_groups:
+                    pg["lr"] = new_lr
+                nan_gate_lr_halved = True
+                print(f"  [NaN-CASCADE] {nan_gate_window_total} NaN gates "
+                      f"in {nan_gate_window_size} steps → LR {old_lr:.2e}→{new_lr:.2e}")
+            elif nan_gate_window_total == 0 and nan_gate_lr_halved:
+                nan_gate_lr_halved = False  # reset when window is clean
 
             bad_step = (
                 metrics.get("nan_skipped", 0.0) > 0.0
@@ -2517,7 +2583,9 @@ def main() -> None:
                 avg = tracker.get()
                 lr_now = optimizer.param_groups[0]["lr"]
                 sadt_info = f" [SADT T:{sadt_events['throttle']} U:{sadt_events['turbo']}]" if train_cfg.get("dynamic_step_lr") else ""
+                nan_gate_total = sum(nan_gate_window)
                 nan_info = f" [NaN:{nan_count}]" if nan_count > 0 else ""
+                nan_info += f" [gate:{nan_gate_total}]" if nan_gate_total > 0 else ""
                 print(
                     f"  [E{epoch} S{step+1}] "
                     f"loss={avg.get('loss', 0.0):.4f} "

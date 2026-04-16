@@ -940,11 +940,33 @@ class ChainGenerator(nn.Module):
 
             x = self.final_norm(x)
             v_pred = self.output_proj(x)
+
+            # ── NaN gate for teacher-forcing path ─────────────────
+            # Mirror the scheduled-sampling NaN gate (line ~975).
+            # Replace non-finite predictions with ground truth so
+            # the loss sees 0 (pred == target) instead of the
+            # nan_to_num(0) artifact that gives cos_loss=1.0 with
+            # zero gradient — the root cause of the NaN cascade
+            # where the unstable parameter region silently expands
+            # until every output is NaN (lesson 2026-04-16).
+            if self.training:
+                bad = ~torch.isfinite(v_pred)
+                if bad.any():
+                    # Count samples (not elements) with any NaN.
+                    n_bad = int(bad.any(dim=-1).any(dim=-1).sum().item())
+                    self._nan_gate_count = n_bad
+                    v_pred = torch.where(bad, v_target_chain, v_pred)
+                else:
+                    self._nan_gate_count = 0
+            else:
+                self._nan_gate_count = 0
+
             if aux is not None:
                 return v_pred, aux
             return v_pred
 
         # ── Scheduled sampling: step-by-step with token mixing ──
+        self._nan_gate_count = 0  # reset before rollout
         seq = self.start_token.expand(bsz, -1, -1)  # [B, 1, D]
         preds: list[Tensor] = []
         use_tf_noise = self.training and tf_noise_std > 0.0
@@ -974,6 +996,8 @@ class ChainGenerator(nn.Module):
             # broken forward pass).  Detach-free: GT has no grad path.
             has_bad = ~torch.isfinite(raw).all(dim=-1, keepdim=True)  # [B, 1, 1]
             if has_bad.any():
+                n_bad = int(has_bad.sum().item())
+                self._nan_gate_count = getattr(self, "_nan_gate_count", 0) + n_bad
                 gt_t = v_target_chain[:, t : t + 1, :]
                 raw = torch.where(has_bad.expand_as(raw), gt_t, raw)
 

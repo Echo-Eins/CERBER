@@ -111,6 +111,12 @@
         "sadt_tolerance": 0.10,
         "sadt_cooldown_steps": 200,
 
+        "horizon_warmup_steps": 200,
+        "horizon_warmup_factor": 0.1,
+
+        "nan_gate_window_size": 50,
+        "nan_gate_max_rate": 10,
+
         "free_run_temperature": 1.0,
         "free_run_noise_std": 0.0,
         "free_run_noise_std_max": 0.0,

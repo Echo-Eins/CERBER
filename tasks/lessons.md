@@ -1,5 +1,29 @@
 # Lessons
 
+## 2026-04-16 - NaN cascade in pure teacher-forcing path + System2 gradient shock
+
+### Pattern
+Clean experiment (no SADT, no DF, no EMA, soft SS=0.15) showed excellent System1 training (val=0.7511, best ever), genuine System2 learning (tf_cos recovering 0.46→0.63), but NaN cascade killed training at E3 S3000: NaN count exploded 5→6→8→11→22→33→crash (zero_grad_streak=25).
+
+### Root Causes
+1. **NaN gate only existed in the scheduled-sampling path** (lines 968-978 in chain_generator.py). The pure teacher-forcing path (lines 914-945, used when `ss_prob=0.0`) had ZERO NaN protection. When output contained NaN, `nan_to_num(v_tf, nan=0.0)` at line 1147 replaced with 0, giving cos_loss=1.0 but zero gradient through nan_to_num. Parameters in NaN-producing zones received no corrective signal, silently expanding the unstable region until every output was NaN.
+2. **System1→System2 gradient shock**: Transition from 1-step to 4-step chains caused a ~50x gradient norm spike (0.39→19.67), pushing parameters into bfloat16-fragile zones. Even with clip_grad_norm=1.0, the initial batches at extreme gradient scale damaged the parameter landscape. The 5 initial NaN events at E3 S50 were the seed that later grew into the full cascade.
+3. **`0 × NaN = NaN` in PyTorch autograd**: Even with output-level NaN gates (either nan_to_num or torch.where), the backward pass through shared parameters computes `∂L/∂W = grad_output × activations^T`. When activations stored in the graph are NaN and grad_output is 0 for those positions, IEEE 754 gives `0 × NaN = NaN`, contaminating parameter gradients. The NaN gate cleans the loss but cannot prevent NaN gradients from the computation graph.
+
+### Fix
+1. **NaN gate in TF path**: After `output_proj(x)`, replace non-finite predictions with ground truth via `torch.where(bad, v_target_chain, v_pred)`. Loss for NaN positions = 0 (pred==target), no inflated cos_loss=1.0 artifact.
+2. **Horizon transition LR warmup**: When target_steps changes, multiply LR by a factor (default 0.1) that linearly ramps to 1.0 over N steps (default 200). Config: `horizon_warmup_steps`, `horizon_warmup_factor`. Prevents the gradient shock from pushing parameters into fragile zones.
+3. **NaN cascade detector**: Track NaN gate activations per step in a rolling window. When rate exceeds threshold (`nan_gate_max_rate` events in `nan_gate_window_size` steps), halve LR to slow parameter drift. Logged as `[gate:N]` in training output.
+4. **Model-side NaN counter**: `model._nan_gate_count` attribute updated each forward pass, consumed by training loop for metrics and cascade detection.
+
+### Rules
+1. **NaN gates must cover ALL forward paths, not just the fancy one**. The teacher-forcing path is the "simple" default — it must have the same NaN protection as the scheduled-sampling path. When adding a safety mechanism to one code path, grep for all paths that produce the same output and apply the same guard.
+2. **`nan_to_num(x, nan=0.0)` is a loss bomb, not a fix**. Replacing NaN with 0 gives cos(0, target) = 0 → cos_loss = 1.0, inflating the loss. Replacing with GT gives cos(GT, GT) = 1.0 → cos_loss = 0.0, which is the correct "no signal" response. Always replace with GT, never with 0.
+3. **Phase transitions need LR warmup**. System1→System2 is a task-complexity discontinuity that causes gradient norm spikes. Without LR dampening, the spike pushes parameters into numerically fragile regions. Apply the same principle to any training phase transition (curriculum steps, loss function changes, etc.).
+4. **NaN cascades are exponential, not linear**. Once started, the NaN region expands because corrupted parameters don't receive corrective gradient (0 × NaN = NaN in backward). Detection must look at RATE of NaN increase, not just count. A constant low rate (3 in 5000 steps) is fine; an accelerating rate (22 in 250 steps) is catastrophic.
+
+---
+
 ## 2026-04-15 - ChainGenerator "double zombie": SDPA `-inf` mask NaN root cause + Adam momentum persistence
 
 ### Pattern
