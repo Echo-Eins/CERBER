@@ -2232,3 +2232,8 @@ Fixing only `df_eval_noise_level` is not enough for stable validation metrics. I
 2. System1 (`target_steps=1`) must train directly on `chains[answer_pos]`, not on the first reasoning step or the final repeat pad.
 3. System2 should use prefix-aligned targets, but activate answer-specific losses and metrics as soon as `answer_pos < target_steps`.
 4. Rank diagnostics and answer metrics should compare rollout at `answer_pos` to the first answer vector, not to an arbitrary last valid repeat.
+
+## 2026-04-15 - Adam state reset is not neutral
+- Do not treat Adam/AdamW moment zeroing as a harmless recovery action. After `exp_avg` and `exp_avg_sq` are cleared, the next finite micro-gradient can produce an almost sign-like full-LR update because Adam normalizes by the freshly tiny second moment (with bias correction, `g / (|g| + eps)`). This can create NaN -> dead -> wake -> NaN oscillations.
+- Always verify recovery conclusions against JSONL metrics, not only terminal logs. Terminal logs may omit `zombie_reset`, `grad_sanitized`, or cumulative recovery counters.
+- If answer coverage recovers only when horizon reaches a minimum length, do not start System2 below that horizon; too-short prefixes can make QA answer supervision mathematically absent.

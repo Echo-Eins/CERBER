@@ -2543,3 +2543,54 @@ User feedback: модель до добавления DF стабильно вы
 
 ### Review
 _Pending run results._
+
+## 2026-04-15 - Full analysis of `Analysis` + Arch 15-04-26/1 artifacts
+
+### Objective
+- [ ] Read the user-provided dialogue/log file `C:\Users\EchoEins\Downloads\Analysis`.
+- [ ] Inspect `Arch 15-04-26/1` screenshots/log artifacts and compare them with the attached GUI screenshots.
+- [ ] Diagnose whether current training failure is caused by numeric instability, metric mismatch, objective saturation, architecture/curriculum mismatch, dataset issues, or GUI/probe misinterpretation.
+- [ ] Produce a concise but complete report: observed facts, root-cause ranking, mathematical checks, and next verification steps.
+
+### Review
+_Pending._
+
+### Review - analysis completed
+- Parsed `C:\Users\EchoEins\Downloads\Analysis` and compared its conclusions with local artifacts in `Arch 15-04-26/1` plus current JSONL training metrics.
+- Important correction: the text log/dialogue reports `zombie_reset=0`, but `experiments/13_chain_generator/output/logs/chain_generator_training.jsonl` shows `zombie_resets_total` rising to ~401 by epoch 11. The recovery mechanism did fire; the terminal log simply did not expose it.
+- Main failure mode is not a single attention-mask bug: the run enters a finite zero-gradient zombie state after massive reset/sanitization events. From epoch 10 onward `grad_norm` is effectively zero on 100% of logged steps while losses and metrics remain finite.
+- Eval peaks around epoch 6 (`val_metric≈0.724`, `val_DF_cos≈0.805`) and then collapses/degrades; by the System2 transition the answer supervision/curriculum is misaligned (`val_answer_coverage` drops to 0 at System2(2)).
+- Diffusion Forcing becomes actively harmful after the instability window: noisy vectors remain closer to clean targets than `pred_x0`/rollout on the provided screenshots, and JSONL shows `val_DF_cos` collapsing from ~0.80 to ~0.07/-0.03 while prediction norms drift.
+- Screens confirm the scalar/log diagnosis: attention develops strong start-token/sink patterns, rollout does not follow the target path, and denoising geometry often moves away from the clean chain instead of toward it.
+- Next required step before any long training run: one-batch forensic gradient probe with per-layer grad norms, activation finite checks, DF x0/v norms, and before/after optimizer state inspection around the first instability window.
+
+## 2026-04-15 - Continue unfinished Analysis section: Adam zero + ResNet proposal
+
+### Objective
+- [x] Continue the `(НЕ ЗАВЕРШЕНО)` analysis from `C:\Users\EchoEins\Downloads\Analysis`.
+- [x] Reconcile the unconditional Adam zero hypothesis with current `train_step` implementation.
+- [x] Evaluate whether ResNet-style practices are relevant to the observed gradient/collapse issue.
+- [x] Apply only the requested schedule/config changes: no warmups, 3 System1 epochs, System2 starts at 4 steps.
+
+### Review
+- The Adam-zero hypothesis is directionally correct but needs the Adam bias-correction nuance: after clearing `exp_avg`/`exp_avg_sq`, AdamW behaves close to a sign-step for any gradient magnitude above `eps`; tiny residual gradients can therefore produce full-LR directional updates instead of safely tiny updates.
+- The current code zeroes Adam buffers for sanitized params and also zeroes all Adam buffers on zombie EMA reset. That removes stale momentum but can create a cold-start Adam epsilon/sign-step regime on the next finite micro-gradient.
+- This explains the observed NaN -> dead -> wake -> NaN oscillation better than a pure vanishing-gradient diagnosis.
+- ResNet practices are useful only as secondary architecture stabilization: pre-norm residuals already exist; future candidates are residual branch scaling / LayerScale / ReZero-style gates / fp32 residual accumulation. They will not fix optimizer-state singularity by themselves.
+- New runtime observation from the user (`ans_cov` jumps to 0.95+ after 4-step System2) supports skipping too-short System2 horizons. Config now starts System2 at 4 steps after 3 System1 epochs.
+- Updated `configs/chain_generator_config.json`: `warmup_epochs=0`, `df_warmup_epochs=0`, `scheduled_sampling_ramp_epochs=0`, `tf_noise_ramp_epochs=0`, `system1_epochs=3`, `system2_start_steps=4`.
+
+## 2026-04-15 - Review external analyses: BP alternatives + ResNet/DiT stabilization
+
+### Objective
+- [x] Compare Forward-Forward / Feedback Alignment / Target Propagation / Local Loss suggestions against the current ChainGenerator failure mode.
+- [x] Compare ResNet/DiT stabilization suggestions against the current ChainGenerator architecture.
+- [x] Classify which ideas are already implemented, which are useful ablations, and which should not be prioritized.
+
+### Review
+- Forward-Forward / Feedback Alignment / Target Propagation are research directions, not immediate fixes for the current failure. They would require a separate training formulation and should not be mixed into the current BP-based DF generator while the optimizer/recovery issue is unresolved.
+- Local auxiliary losses are the most practical idea from the BP-alternative list. They could give layer 2/4 direct denoising/answer supervision and help detect where the gradient path collapses. Candidate ablation, not a first fix.
+- ResNet basics are already present in ChainGenerator: pre-norm residual self-attn, residual cross-attn, residual FFN, RMS/AdaRMSNorm, SwiGLU, timestep MLP conditioning, EMA, global grad clipping, and zero-init AdaLN modulation/output-proj small init.
+- Not yet present: explicit LayerScale/ReZero/residual-branch scalar gates and auxiliary heads. These are reasonable stabilization ablations after the Adam recovery/curriculum issue is isolated.
+- Spectral normalization is appropriate for energy critics, but risky for the generator/decoder because it can restrict representation capacity and does not solve Adam cold-start sign-step behavior.
+- The current instability is more consistent with optimizer-state/recovery oscillation plus horizon/curriculum issues than with a plain 6-layer vanishing-gradient problem.
