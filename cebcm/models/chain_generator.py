@@ -65,6 +65,12 @@ class ChainGeneratorConfig:
     use_layerscale: bool = True
     layerscale_init: float = 1e-4
 
+    # Deep supervision / auxiliary heads. Layer numbers are 1-based to match
+    # human-facing configs ("layer 2", "layer 4"). Empty disables the feature.
+    aux_head_layers: tuple[int, ...] = ()
+    aux_head_hidden_dim: int = 1024
+    aux_head_dropout: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Normalization & FFN building blocks
@@ -119,6 +125,49 @@ class SwiGLUFFN(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+
+
+class AuxiliaryPredictionHead(nn.Module):
+    """Small per-layer prediction head for deep supervision.
+
+    The head maps an intermediate residual-stream state back to SONAR-vector
+    space. It is intentionally independent from the main output projection:
+    auxiliary losses should diagnose and regularize intermediate layers, not
+    silently couple them to the final decoder head.
+    """
+
+    def __init__(
+            self,
+            d_model: int,
+            hidden_dim: int = 1024,
+            dropout: float = 0.0,
+            norm_type: str = "ada_rmsnorm",
+    ) -> None:
+        super().__init__()
+        self.norm = AdaRMSNorm(d_model) if norm_type == "ada_rmsnorm" else nn.LayerNorm(d_model)
+        hidden = int(hidden_dim)
+        if hidden > 0:
+            self.net = nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.SiLU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(hidden, d_model),
+            )
+        else:
+            self.net = nn.Linear(d_model, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(self.norm(x))
+
+    def init_output(self, gain: float = 0.01) -> None:
+        """Initialize the final projection small, matching the main head."""
+        modules = list(self.net.modules()) if isinstance(self.net, nn.Module) else []
+        for module in reversed(modules):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=gain)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                return
 
 
 class CrossAttention(nn.Module):
@@ -488,6 +537,19 @@ class ChainGenerator(nn.Module):
 
         self.output_proj = nn.Linear(self.cfg.d_model, self.cfg.d_model)
 
+        self._aux_layer_numbers = self._normalize_aux_layers(self.cfg.aux_head_layers)
+        self.aux_heads = nn.ModuleDict(
+            {
+                str(layer_num): AuxiliaryPredictionHead(
+                    d_model=self.cfg.d_model,
+                    hidden_dim=self.cfg.aux_head_hidden_dim,
+                    dropout=self.cfg.aux_head_dropout,
+                    norm_type=self.cfg.norm_type,
+                )
+                for layer_num in self._aux_layer_numbers
+            }
+        )
+
         # Timestep MLP for diffusion noise-level conditioning.
         self.diffusion_time_mlp = nn.Sequential(
             nn.Linear(self.cfg.d_model, self.cfg.d_model),
@@ -544,6 +606,34 @@ class ChainGenerator(nn.Module):
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.01)
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
+        for head in self.aux_heads.values():
+            head.init_output(gain=0.01)
+
+    def _normalize_aux_layers(self, layers: tuple[int, ...] | list[int] | int | None) -> tuple[int, ...]:
+        """Return sorted unique 1-based layer numbers that are valid."""
+        if layers is None:
+            return ()
+        if isinstance(layers, int):
+            raw = [layers]
+        else:
+            raw = list(layers)
+        out: list[int] = []
+        for value in raw:
+            layer_num = int(value)
+            if layer_num < 1 or layer_num > int(self.cfg.n_layers):
+                raise ValueError(
+                    f"aux_head layer {layer_num} is outside valid range 1..{self.cfg.n_layers}"
+                )
+            if layer_num not in out:
+                out.append(layer_num)
+        return tuple(sorted(out))
+
+    def _maybe_aux_predict(self, layer_num: int, x: Tensor, aux: dict[str, Tensor] | None) -> None:
+        if aux is None:
+            return
+        key = str(layer_num)
+        if key in self.aux_heads:
+            aux[key] = self.aux_heads[key](x)
 
     def _build_diffusion_schedule(self) -> None:
         """Register DDPM schedule buffers used by Diffusion Forcing.
@@ -797,7 +887,8 @@ class ChainGenerator(nn.Module):
         context_mask: Tensor | None = None,
         scheduled_sampling_prob: float = 0.0,
         tf_noise_std: float = 0.0,
-    ) -> Tensor:
+        return_aux: bool = False,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """Teacher-forced forward pass with optional scheduled sampling.
 
         When scheduled_sampling_prob > 0 and training, each position (except
@@ -842,11 +933,15 @@ class ChainGenerator(nn.Module):
                 decoder_input = torch.cat([start, scaled_target[:, :-1, :]], dim=1)
 
             x = decoder_input
-            for layer in self.layers:
+            aux: dict[str, Tensor] | None = {} if return_aux and len(self.aux_heads) > 0 else None
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask)
+                self._maybe_aux_predict(layer_idx, x, aux)
 
             x = self.final_norm(x)
             v_pred = self.output_proj(x)
+            if aux is not None:
+                return v_pred, aux
             return v_pred
 
         # ── Scheduled sampling: step-by-step with token mixing ──
@@ -854,10 +949,18 @@ class ChainGenerator(nn.Module):
         preds: list[Tensor] = []
         use_tf_noise = self.training and tf_noise_std > 0.0
 
+        aux_steps: dict[str, list[Tensor]] | None = (
+            {str(layer_num): [] for layer_num in self._aux_layer_numbers}
+            if return_aux and len(self.aux_heads) > 0
+            else None
+        )
+
         for t in range(num_steps):
             x = seq
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask)
+                if aux_steps is not None and str(layer_idx) in aux_steps:
+                    aux_steps[str(layer_idx)].append(self.aux_heads[str(layer_idx)](x[:, -1:, :]))
 
             x = self.final_norm(x)
             raw = self.output_proj(x[:, -1:, :])  # [B, 1, D]
@@ -881,8 +984,11 @@ class ChainGenerator(nn.Module):
                 next_vec = torch.where(use_pred, scaled_noisy_pred, scaled_gt)
 
                 seq = torch.cat([seq, next_vec], dim=1)
-
-        return torch.cat(preds, dim=1)
+        v_pred = torch.cat(preds, dim=1)
+        if aux_steps is not None:
+            aux = {k: torch.cat(v, dim=1) for k, v in aux_steps.items() if v}
+            return v_pred, aux
+        return v_pred
 
     def diffusion_snr(self, noise_levels: Tensor) -> Tensor:
         """Return schedule SNR for each noise level."""
@@ -925,7 +1031,8 @@ class ChainGenerator(nn.Module):
             context_mask: Tensor | None = None,
             noise: Tensor | None = None,
             return_noisy: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
+            return_aux: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, dict[str, Tensor]] | tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         """Diffusion Forcing denoising pass over the whole chain.
 
         Each valid position receives its own diffusion noise level.  Unlike
@@ -955,23 +1062,31 @@ class ChainGenerator(nn.Module):
         x = self._to_residual_space(v_noisy)
         t_emb = self._diffusion_timestep_embedding(noise_levels).to(device=x.device, dtype=x.dtype)
 
+        aux: dict[str, Tensor] | None = {} if return_aux and len(self.aux_heads) > 0 else None
+
         if self.cfg.norm_type == "ada_rmsnorm":
             # AdaLN path: pass t_emb through each layer for per-norm modulation.
             # The input still gets a residual addition for backward compat and
             # to provide a strong initial signal before the first norm.
             x = x + t_emb
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
+                self._maybe_aux_predict(layer_idx, x, aux)
         else:
             # Legacy: simple additive conditioning.
             x = x + t_emb
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask)
+                self._maybe_aux_predict(layer_idx, x, aux)
 
         x = self.final_norm(x)
         v_pred = self.output_proj(x)
+        if return_noisy and aux is not None:
+            return v_pred, v_noisy, eps, aux
         if return_noisy:
             return v_pred, v_noisy, eps
+        if aux is not None:
+            return v_pred, aux
         return v_pred
 
     def generate(

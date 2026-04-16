@@ -7,6 +7,8 @@ Objective:
       + lambda_ans  * L_final_answer
       + lambda_roll * L_free_run
       + lambda_rank * L_inbatch_contrastive
+      + lambda_aux  * L_auxiliary_heads
+      + lambda_aux_df * L_auxiliary_df_x0
 """
 
 from __future__ import annotations
@@ -331,6 +333,110 @@ def _masked_step_losses(
         "mse_loss": mse_loss,
         "mask_sum": mask_sum,
     }
+
+
+def _answer_loss(
+    pred_answer_all: torch.Tensor,
+    target_answer_all: torch.Tensor,
+    has_answer: torch.Tensor,
+    cosine_weight: float,
+    mse_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Answer-vector loss on samples whose selected window contains answer."""
+    if has_answer.any():
+        pred = pred_answer_all[has_answer].float()
+        target = target_answer_all[has_answer].float()
+        cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+        cos_sim = torch.nan_to_num(cos_sim.clamp(min=-1.0, max=1.0), nan=0.0)
+        cos_loss = (1.0 - cos_sim).mean()
+        mse_loss = (pred - target).pow(2).sum(dim=-1).mean()
+        loss = cosine_weight * cos_loss + mse_weight * mse_loss
+        cos_mean = cos_sim.mean()
+    else:
+        loss = pred_answer_all.new_zeros(())
+        cos_loss = pred_answer_all.new_zeros(())
+        mse_loss = pred_answer_all.new_zeros(())
+        cos_mean = pred_answer_all.new_zeros(())
+    return loss, {
+        "cos_loss": cos_loss,
+        "mse_loss": mse_loss,
+        "cos_mean": cos_mean,
+    }
+
+
+def _auxiliary_heads_loss(
+    aux_preds: dict[str, torch.Tensor] | None,
+    target: torch.Tensor,
+    step_mask: torch.Tensor,
+    answer_pos: torch.Tensor,
+    has_answer: torch.Tensor,
+    *,
+    d_model: int,
+    cosine_weight: float,
+    mse_weight: float,
+    answer_weight: float = 1.0,
+    prefix: str = "aux",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Deep-supervision loss for intermediate decoder heads.
+
+    The loss is averaged across aux heads, so the effective lambda does not
+    change when we add/remove diagnostic heads. Each head gets the same
+    masked step objective plus the selected answer-vector objective.
+    """
+    if not aux_preds:
+        return target.new_zeros(()), {
+            f"loss_{prefix}": 0.0,
+            f"{prefix}_cos_mean": 0.0,
+            f"{prefix}_cos_answer": 0.0,
+        }
+
+    batch_idx = torch.arange(target.shape[0], device=target.device)
+    target_answer_all = target[batch_idx, answer_pos]
+    losses: list[torch.Tensor] = []
+    cos_means: list[float] = []
+    ans_cos_means: list[float] = []
+    metrics: dict[str, float] = {}
+
+    for layer_name, pred_raw in sorted(aux_preds.items(), key=lambda kv: int(kv[0])):
+        pred = torch.nan_to_num(pred_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        l_step, step_stats = _masked_step_losses(
+            pred,
+            target,
+            step_mask,
+            d_model,
+            cosine_weight,
+            mse_weight,
+        )
+        pred_answer_all = pred[batch_idx, answer_pos]
+        l_ans, ans_stats = _answer_loss(
+            pred_answer_all,
+            target_answer_all,
+            has_answer,
+            cosine_weight,
+            mse_weight,
+        )
+        layer_loss = l_step + float(answer_weight) * l_ans
+        losses.append(layer_loss)
+
+        mask_bool = step_mask.to(device=pred.device, dtype=torch.bool)
+        maskf = mask_bool.to(dtype=pred.dtype)
+        valid = maskf.sum().clamp(min=1.0)
+        cos_masked = torch.where(mask_bool, step_stats["cos_sim"], torch.zeros_like(step_stats["cos_sim"]))
+        layer_cos = float((cos_masked.sum() / valid).detach().item())
+        layer_ans_cos = float(ans_stats["cos_mean"].detach().item())
+        cos_means.append(layer_cos)
+        ans_cos_means.append(layer_ans_cos)
+        metrics[f"{prefix}_l{layer_name}_loss"] = float(layer_loss.detach().item())
+        metrics[f"{prefix}_l{layer_name}_step_loss"] = float(l_step.detach().item())
+        metrics[f"{prefix}_l{layer_name}_ans_loss"] = float(l_ans.detach().item())
+        metrics[f"{prefix}_l{layer_name}_cos_mean"] = layer_cos
+        metrics[f"{prefix}_l{layer_name}_cos_answer"] = layer_ans_cos
+
+    loss = torch.stack(losses).mean() if losses else target.new_zeros(())
+    metrics[f"loss_{prefix}"] = float(loss.detach().item())
+    metrics[f"{prefix}_cos_mean"] = float(sum(cos_means) / max(len(cos_means), 1))
+    metrics[f"{prefix}_cos_answer"] = float(sum(ans_cos_means) / max(len(ans_cos_means), 1))
+    return loss, metrics
 
 
 class ModelEMA:
@@ -825,8 +931,9 @@ def _diffusion_forcing_objective(
     cfg: dict,
     *,
     answer_pos: torch.Tensor | None = None,
+    has_answer: torch.Tensor | None = None,
     eval_mode: bool = False,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """Masked Diffusion Forcing loss in SONAR space.
 
     Correctly handles ``prediction_type`` (x0 / eps / v) by computing the
@@ -843,7 +950,8 @@ def _diffusion_forcing_objective(
     if eval_mode and bool(cfg.get("df_eval_deterministic_noise", True)):
         noise = _make_diffusion_eval_noise_like(chains, cfg, model)
 
-    model_out, v_noisy, eps = model.forward_diffusion_forcing(
+    aux_df_enabled = len(getattr(model, "aux_heads", {})) > 0 and float(cfg.get("loss_lambda_aux_df", 0.0)) > 0.0
+    df_out = model.forward_diffusion_forcing(
         v_q,
         chains,
         levels,
@@ -851,7 +959,13 @@ def _diffusion_forcing_objective(
         context_mask=context_mask,
         noise=noise,
         return_noisy=True,
+        return_aux=aux_df_enabled,
     )
+    if aux_df_enabled:
+        model_out, v_noisy, eps, aux_df_preds = df_out
+    else:
+        model_out, v_noisy, eps = df_out
+        aux_df_preds = None
     # Defense-in-depth: scrub any non-finite values from the decoder
     # output before they enter the masked cosine/MSE reduction.  Without
     # this, a single bf16 overflow anywhere in the 6-layer AdaLN stack
@@ -872,6 +986,31 @@ def _diffusion_forcing_objective(
         float(model.cfg.loss_cosine_weight),
         float(model.cfg.loss_mse_weight),
     )
+    if aux_df_preds:
+        # Aux DF heads predict clean x0 directly from noisy intermediate states.
+        # This gives a layer-local denoising canary independent of pred_type.
+        l_aux_df, aux_df_metrics = _auxiliary_heads_loss(
+            aux_df_preds,
+            chains,
+            chain_mask,
+            answer_pos if answer_pos is not None else (chain_mask.sum(dim=1).long().clamp(min=1) - 1),
+            has_answer.to(device=chains.device, dtype=torch.bool)
+            if has_answer is not None
+            else torch.ones(chains.shape[0], device=chains.device, dtype=torch.bool),
+            d_model=d_model,
+            cosine_weight=float(model.cfg.loss_cosine_weight),
+            mse_weight=float(model.cfg.loss_mse_weight),
+            answer_weight=0.0,
+            prefix="aux_df",
+        )
+    else:
+        l_aux_df = chains.new_zeros(())
+        aux_df_metrics = {
+            "loss_aux_df": 0.0,
+            "aux_df_cos_mean": 0.0,
+            "aux_df_cos_answer": 0.0,
+        }
+
     with torch.no_grad():
         maskf = chain_mask.to(dtype=torch.float32)
         valid = maskf.sum().clamp(min=1.0)
@@ -894,6 +1033,7 @@ def _diffusion_forcing_objective(
 
         metrics = {
             "loss_df": float(loss.item()),
+            "loss_aux_df": float(l_aux_df.detach().item()),
             "df_cos": float(cos_x0_mean.item()),  # x0-space (interpretable across pred_type)
             "df_cos_target": float(cos_mean_pred.item()),  # raw target-space cos (pred_type dep.)
             "df_cos_loss_raw": float(stats["cos_loss"].item()),
@@ -906,8 +1046,9 @@ def _diffusion_forcing_objective(
             "df_weight_mean": float((weights * maskf).sum().item() / valid.item()),
             "df_pos_weight_mean": float((pos_weights * maskf).sum().item() / valid.item()),
         }
+        metrics.update(aux_df_metrics)
 
-    return loss, metrics
+    return loss, l_aux_df, metrics
 
 
 def compute_composite_objective(
@@ -939,8 +1080,12 @@ def compute_composite_objective(
     lambda_roll = float(cfg.get("loss_lambda_roll", 1.0))
     lambda_rank = float(cfg.get("loss_lambda_rank", 0.1))
     lambda_df = float(cfg.get("loss_lambda_diffusion", 0.0))
+    lambda_aux = float(cfg.get("loss_lambda_aux", 0.0))
+    lambda_aux_df = float(cfg.get("loss_lambda_aux_df", 0.0))
+    aux_answer_weight = float(cfg.get("aux_loss_answer_weight", 1.0))
     rank_enabled = lambda_rank > 0.0
     df_enabled = bool(cfg.get("enable_diffusion_forcing", False)) and lambda_df > 0.0
+    aux_enabled = len(getattr(model, "aux_heads", {})) > 0 and lambda_aux > 0.0
     oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
     effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
 
@@ -951,14 +1096,20 @@ def compute_composite_objective(
     # 1) Teacher-forced masked step loss (with optional scheduled sampling).
     # Noisy TF: inject noise into the teacher-forced prefix so the model
     # learns to predict from imperfect contexts (diffusion-inspired).
-    v_tf = model.forward(
+    tf_out = model.forward(
         v_q,
         chains,
         v_context_bank=context_banks,
         context_mask=context_mask,
         scheduled_sampling_prob=scheduled_sampling_prob,
         tf_noise_std=tf_noise_std,
+        return_aux=aux_enabled,
     )
+    if aux_enabled:
+        v_tf, aux_tf_preds = tf_out
+    else:
+        v_tf = tf_out
+        aux_tf_preds = None
     # Defense-in-depth: sanitize decoder output so a single corrupted
     # row (bf16 overflow, AMP edge-case) cannot poison the masked loss
     # via NaN propagation. See tasks/lessons.md 2026-04-11 rule #3.
@@ -974,6 +1125,19 @@ def compute_composite_objective(
                 step_mask[i, ans_idx] = False
 
     l_step, tf_stats = _masked_step_losses(v_tf, chains, step_mask, d_model, w_cos, w_mse)
+
+    l_aux, aux_metrics = _auxiliary_heads_loss(
+        aux_tf_preds,
+        chains,
+        step_mask,
+        answer_pos,
+        has_answer,
+        d_model=d_model,
+        cosine_weight=w_cos,
+        mse_weight=w_mse,
+        answer_weight=aux_answer_weight,
+        prefix="aux",
+    )
 
     # 2) Final-answer supervised loss — only on samples that reached the answer.
     tf_final = _gather_last_valid(v_tf, valid_lens)
@@ -1041,9 +1205,11 @@ def compute_composite_objective(
     loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll
     if rank_enabled:
         loss = loss + lambda_rank * l_rank
+    if aux_enabled:
+        loss = loss + lambda_aux * l_aux
 
     if df_enabled:
-        l_df, df_metrics = _diffusion_forcing_objective(
+        l_df, l_aux_df, df_metrics = _diffusion_forcing_objective(
             model,
             v_q,
             chains,
@@ -1052,14 +1218,20 @@ def compute_composite_objective(
             context_mask,
             cfg,
             answer_pos=answer_pos,
+            has_answer=has_answer,
             eval_mode=eval_mode,
         )
         loss = loss + lambda_df * l_df
+        if lambda_aux_df > 0.0:
+            loss = loss + lambda_aux_df * l_aux_df
     else:
         l_df = chains.new_zeros(())
+        l_aux_df = chains.new_zeros(())
         df_metrics = {
             "loss_df": 0.0,
+            "loss_aux_df": 0.0,
             "df_cos": 0.0,
+            "df_cos_target": 0.0,
             "df_cos_loss_raw": 0.0,
             "df_mse_loss_raw": 0.0,
             "df_noise_level_mean": 0.0,
@@ -1068,6 +1240,9 @@ def compute_composite_objective(
             "df_eps_norm": 0.0,
             "df_pred_norm": 0.0,
             "df_weight_mean": 0.0,
+            "df_pos_weight_mean": 0.0,
+            "aux_df_cos_mean": 0.0,
+            "aux_df_cos_answer": 0.0,
         }
 
     with torch.no_grad():
@@ -1136,6 +1311,8 @@ def compute_composite_objective(
             "lambda_roll": lambda_roll,
             "lambda_rank": lambda_rank,
             "lambda_df": lambda_df,
+            "lambda_aux": lambda_aux,
+            "lambda_aux_df": lambda_aux_df,
             "ss_prob": float(scheduled_sampling_prob),
             "free_run_noise_std": float(free_run_noise_std),
             "tf_noise_std": float(tf_noise_std),
@@ -1151,6 +1328,7 @@ def compute_composite_objective(
         metrics["tf_mse_loss_raw"] = float(tf_stats["mse_loss"].item())
         metrics["roll_cos_loss_raw"] = float(roll_stats["cos_loss"].item())
         metrics["roll_mse_loss_raw"] = float(roll_stats["mse_loss"].item())
+        metrics.update(aux_metrics)
         metrics.update(df_metrics)
 
     return loss, metrics
@@ -1449,6 +1627,8 @@ def eval_step(
         "val_loss_roll": metrics["loss_roll"],
         "val_loss_rank": metrics["loss_rank"],
         "val_loss_df": metrics["loss_df"],
+        "val_loss_aux": metrics.get("loss_aux", 0.0),
+        "val_loss_aux_df": metrics.get("loss_aux_df", 0.0),
         "val_tf_cos": metrics["tf_cos_mean"],
         "val_tf_cos_last": metrics["tf_cos_last"],
         "val_tf_cos_answer": metrics["tf_cos_answer"],
@@ -1457,6 +1637,9 @@ def eval_step(
         "val_roll_cos_answer": metrics["roll_cos_answer"],
         "val_rank_acc": metrics["rank_acc"],
         "val_df_cos": metrics["df_cos"],
+        "val_aux_cos": metrics.get("aux_cos_mean", 0.0),
+        "val_aux_cos_answer": metrics.get("aux_cos_answer", 0.0),
+        "val_aux_df_cos": metrics.get("aux_df_cos_mean", 0.0),
         "val_df_noise_level": metrics["df_noise_level_mean"],
         "val_df_noisy_norm": metrics["df_noisy_norm"],
         "val_df_eps_norm": metrics["df_eps_norm"],
@@ -2030,7 +2213,9 @@ def main() -> None:
         f"ans*{train_cfg.get('loss_lambda_answer', 1.0)} + "
         f"roll*{train_cfg.get('loss_lambda_roll', 1.0)} + "
         f"rank*{train_cfg.get('loss_lambda_rank', 0.1)} + "
-        f"df*{train_cfg.get('loss_lambda_diffusion', 0.0)}"
+        f"df*{train_cfg.get('loss_lambda_diffusion', 0.0)} + "
+        f"aux*{train_cfg.get('loss_lambda_aux', 0.0)} + "
+        f"aux_df*{train_cfg.get('loss_lambda_aux_df', 0.0)}"
     )
     print(
         f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
@@ -2232,10 +2417,12 @@ def main() -> None:
                     f"roll={avg.get('loss_roll', 0.0):.4f} "
                     f"rank={avg.get('loss_rank', 0.0):.4f} "
                     f"df={avg.get('loss_df', 0.0):.4f} "
+                    f"aux={avg.get('loss_aux', 0.0):.4f} "
                     f"df_lam={effective_df_lambda:.3f} "
                     f"tf_cos={avg.get('tf_cos_mean', 0.0):.4f} "
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
                     f"roll_ans={avg.get('roll_cos_answer', 0.0):.4f} "
+                    f"aux_cos={avg.get('aux_cos_mean', 0.0):.4f} "
                     f"df_cos={avg.get('df_cos', 0.0):.4f} "
                     f"df_t={avg.get('df_noise_level_mean', 0.0):.1f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
@@ -2301,6 +2488,7 @@ def main() -> None:
             f"roll_cos={val.get('val_roll_cos', 0.0):.4f} "
             f"roll_cos_last={val.get('val_roll_cos_last', 0.0):.4f} "
             f"roll_ans={val.get('val_roll_cos_answer', 0.0):.4f} "
+            f"aux_cos={val.get('val_aux_cos', 0.0):.4f} "
             f"df_cos={val.get('val_df_cos', 0.0):.4f} "
             f"df_t={val.get('val_df_noise_level', 0.0):.1f} "
             f"rank_acc={val.get('val_rank_acc', 0.0):.3f} "

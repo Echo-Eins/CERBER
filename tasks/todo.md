@@ -2594,3 +2594,75 @@ _Pending._
 - Not yet present: explicit LayerScale/ReZero/residual-branch scalar gates and auxiliary heads. These are reasonable stabilization ablations after the Adam recovery/curriculum issue is isolated.
 - Spectral normalization is appropriate for energy critics, but risky for the generator/decoder because it can restrict representation capacity and does not solve Adam cold-start sign-step behavior.
 - The current instability is more consistent with optimizer-state/recovery oscillation plus horizon/curriculum issues than with a plain 6-layer vanishing-gradient problem.
+
+## 2026-04-16 - Architecture points 1-4 implementation review
+
+### Objective
+- [ ] Verify implemented architectural stabilizers 1-4 against current `ChainGenerator` code and project lessons.
+- [ ] Check whether the implementation preserves SONAR geometry, DF timestep conditioning, residual highways, and train/eval consistency.
+- [ ] Classify remaining options, explicitly including Forward-Forward and auxiliary heads.
+- [ ] Report correctness issues and recommended next steps without changing architecture.
+
+### Review
+_Pending._
+
+### Review - architecture points 1-4 checked
+- Pre-Norm residual order is implemented correctly: each decoder sublayer uses `x + sublayer(norm(x))`, including AdaRMSNorm-conditioned DF path.
+- Zero-init residual projectors are implemented after the global Xavier sweep, so the initialization is not overwritten. Self-attn `out_proj`, cross-attn `out_proj`, and SwiGLU `w_down` are zeroed when `zero_init_residual=true`.
+- AdaRMSNorm/AdaLN-Zero is implemented with a second re-zeroing of `adaln_modulation[-1]` after global init. This preserves scale=0/shift=0 at initialization.
+- LayerScale is implemented as per-channel gates on self-attn/cross-attn/FFN residual branches and is configured with `layerscale_init=1e-4`.
+- Caveat: zero-init residual projectors plus LayerScale=1e-4 makes early residual-branch learning very damped. It stabilizes but can slow branch opening; monitor residual projector grad norms and LayerScale parameter growth.
+- Caveat: the DF path still adds `t_emb` directly to the residual stream before AdaLN-conditioned blocks. This is not a pure DiT adaLN-Zero path, but it is intentional/backward-compatible and gives an initial noise-level signal.
+- Static checks passed: `chain_generator.py` and `train_chain_generator.py` py-compile; `chain_generator_config.json` parses. Runtime torch forward test could not run in the Windows-side environment because the available `uv` env has no `torch` and no local `.venv` exists there.
+- Additional backlog now explicitly includes Forward-Forward as a research-only EBM/critic branch and auxiliary heads as the highest-value practical deep-supervision ablation.
+
+### Review - implementation checked
+- Static checks passed: `cebcm/models/chain_generator.py` and `experiments/13_chain_generator/train_chain_generator.py` compile; `configs/chain_generator_config.json` is valid JSON.
+- Runtime torch smoke-test was not available from this Windows shell: `uv run python` cannot import torch and no local `.venv` exists here. Run the one-batch CUDA/venv smoke test before a long training run.
+- Point 1, Pre-Norm residual order: implemented correctly in `DecoderBlock.forward`. Self-attention, cross-attention, and FFN are each called on normalized input and then added back as residual branches.
+- Point 2, zero-init residual projectors: implemented correctly and applied after global Xavier init. It zeros self-attn out projection, cross-attn out projection, and FFN down/final projection, so each block starts close to identity.
+- Caveat for zero-init: at the first optimizer steps gradients mainly open the final residual projectors; inner attention/FFN weights receive useful gradients only after those projectors leave exact zero. This is expected for DiT-style zero init, but monitor projector grad norms and branch output norms.
+- Point 3, AdaRMSNorm / adaLN-Zero direction: base norm starts with weight=1, modulation MLP final layers are zeroed, and modulation is applied before sublayers. This is mathematically aligned with adaLN-zero behavior.
+- Caveat for AdaRMSNorm: diffusion path still adds `t_emb` directly into token states before decoder layers. That is not pure DiT adaLN-zero conditioning. Keep it only if ablation proves it helps; otherwise prefer gated/adaptive norm conditioning only.
+- Point 4, LayerScale: implemented correctly as per-branch vectors initialized from config and excluded from weight decay by the existing ndim<=1 optimizer grouping.
+- Caveat for LayerScale: `zero_init_residual=true` plus `layerscale_init=1e-4` can make branch opening slow. If gradients are finite but learning stalls, run ablations at 1e-3 and 1e-2.
+- Spectral normalization remains intentionally rejected for generator/residual transformer because project lessons show hard Lipschitz normalization can destroy ranking/geometry. If revisited, isolate it to critic-only ablation.
+- Next additions worth testing: forensic probe, hard-fail zombie guard, AR-only/DF-only/combined isolation, auxiliary heads on intermediate layers, self-conditioning, and Forward-Forward only as a separate research branch rather than a replacement for BP.
+
+### Forward-Forward experimental note
+- FF should be tested as an isolated experimental branch, not as a replacement for the main BP/DF generator until it proves value on the same one-batch and short-run diagnostics.
+- Current ChainGenerator already has ResNet-style additive residuals: `x = x + scaled_sublayer(norm(x))` for self-attn, cross-attn, and FFN. This preserves the raw residual stream across layers.
+- Standard Transformers do not use XOR mixing. They mix information by self-attention weighted sums across tokens, MLP channel mixing, and additive residual connections.
+- A full FF experiment needs local per-layer goodness heads/losses, positive/negative chain construction, post-goodness activation normalization before passing to the next FF-trained layer, and no dropout/batchnorm in the FF path.
+- Practical FF candidate: pretrain layer/block representations with positives = real target chains and negatives = corrupted/generated chains, then initialize the BP generator or critic from those weights.
+- Safer near-term alternative: auxiliary heads on layers 2/4 with supervised `pred_x0`/answer losses. This keeps BP but gives local gradients and layer canaries.
+
+## 2026-04-16 - Auxiliary heads implementation
+- [ ] Inspect ChainGenerator forward/loss and training loop integration points.
+- [ ] Add optional auxiliary prediction heads on intermediate decoder layers without changing inference behavior when disabled.
+- [ ] Add masked auxiliary losses for pred_x0/chain targets and answer target where valid.
+- [ ] Log train/val aux metrics so intermediate-layer learning can be diagnosed.
+- [ ] Update config defaults and review notes.
+- [ ] Run syntax/config checks and any available smoke tests.
+
+### Review - Auxiliary heads implemented
+- [x] Inspected ChainGenerator forward/loss and training loop integration points.
+- [x] Added optional auxiliary prediction heads on 1-based decoder layers from config; default config enables layers 2 and 4.
+- [x] Main inference/generation path is unchanged unless `return_aux=True`; `generate()` does not use aux heads.
+- [x] Teacher-forced/scheduled-sampling path can return aux predictions and trains them with masked step loss plus answer-vector loss.
+- [x] Diffusion Forcing path can return aux predictions and trains them as clean-x0 denoising canaries with `loss_lambda_aux_df`.
+- [x] Aux losses are averaged across heads so adding heads does not silently multiply the effective lambda.
+- [x] Train/val metrics now expose `loss_aux`, `aux_cos_mean`, `aux_cos_answer`, `loss_aux_df`, and `aux_df_cos_mean`.
+- [x] Config updated: `aux_head_layers=[2,4]`, `loss_lambda_aux=0.1`, `loss_lambda_aux_df=0.03`.
+- [x] Static verification passed: py_compile for model/training and JSON parse for config.
+- [ ] Runtime torch smoke-test remains to be run in the actual CUDA `.venv`; Windows-side `uv` cannot import torch in this shell.
+
+### Monitoring rules
+- If `aux_l2_cos_mean` rises but final/rollout metrics stay flat, the lower representation learns and the failure is likely in upper layers, rollout, or final head.
+- If `aux_l2_cos_mean` also stays low, inspect input scale, noise schedule, memory bank, and target construction before touching architecture.
+- If `aux_df_cos_mean < noisy_cos_mean` for sustained steps, DF is still a degrader and must be isolated with DF-only short runs.
+
+### Review - Web GUI aux metrics support
+- [x] Training Geometry JSONL loader already flattens new train/val aux scalar metrics.
+- [x] Step-Level Training Metrics plot now explicitly displays aux losses and aux cosine metrics: train/val aux, aux answer, and aux DF.
+- [x] Syntax check passed for `cerber_gui/training_geometry.py`.
