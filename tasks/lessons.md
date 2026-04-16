@@ -2237,3 +2237,23 @@ Fixing only `df_eval_noise_level` is not enough for stable validation metrics. I
 - Do not treat Adam/AdamW moment zeroing as a harmless recovery action. After `exp_avg` and `exp_avg_sq` are cleared, the next finite micro-gradient can produce an almost sign-like full-LR update because Adam normalizes by the freshly tiny second moment (with bias correction, `g / (|g| + eps)`). This can create NaN -> dead -> wake -> NaN oscillations.
 - Always verify recovery conclusions against JSONL metrics, not only terminal logs. Terminal logs may omit `zombie_reset`, `grad_sanitized`, or cumulative recovery counters.
 - If answer coverage recovers only when horizon reaches a minimum length, do not start System2 below that horizon; too-short prefixes can make QA answer supervision mathematically absent.
+
+## 2026-04-16 - Adam-zombie root cause: momentum zeroing, not NaN itself
+### Context
+NaN in gradients is a transient numerical event (bf16 overflow, bad batch).
+The real damage comes from the RESPONSE to NaN, not NaN itself.
+### Problem
+Zeroing Adam exp_avg/exp_avg_sq on NaN grad creates a catastrophic state:
+- Next non-zero gradient produces update ≈ lr · g / √(ε) ≈ lr · g · 1e4
+- This 10000× amplified step destabilizes the model
+- val metrics freeze at exact values because EMA shadow stops receiving updates
+- Model enters "zombie" state: finite loss, finite params, but grad_norm=0
+### Rule
+1. On NaN grad: scrub grad to zero, but NEVER touch Adam momentum buffers.
+   Zero grad → Adam decays momentum by β₁/β₂ → natural "no signal" handling.
+2. Only zero Adam buffers that are themselves non-finite (defense-in-depth).
+3. Zombie reset (restore from EMA shadow) should preserve healthy momentum.
+4. For fixed-horizon curriculum: use `horizon_schedule` config key with
+   `[[steps, epochs], ...]` to train at each horizon for a fixed duration,
+   instead of continuously incrementing (which doesn't let the model converge
+   at any single horizon before moving to a harder one).

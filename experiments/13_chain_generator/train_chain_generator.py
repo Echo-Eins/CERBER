@@ -235,16 +235,40 @@ def summarize_chain_dataset(
 def get_chain_steps(epoch: int, cfg: dict) -> int:
     """Curriculum for chain horizon growth.
 
-    Fix #8: Linear ramp — each epoch adds exactly 1 step (not 2→4→6 jumps).
-    Supports system2_start_steps for fine-tuning (skip ramp, start at N).
+    Supports two modes controlled by the ``horizon_schedule`` config key:
+
+    1. **Fixed-horizon schedule** (``horizon_schedule`` is set):
+       A list of ``[steps, duration_epochs]`` pairs.  Each pair trains at
+       the given horizon for the specified number of epochs.  After the
+       schedule is exhausted, the model stays at the last horizon.
+
+       Example: ``[[4, 10], [5, 10]]`` — 10 epochs at 4 steps, then 10
+       epochs at 5 steps.
+
+    2. **Legacy linear ramp** (``horizon_schedule`` is absent):
+       Each epoch after System-1 adds +1 step, starting from
+       ``system2_start_steps``.  Original Fix #8 behaviour.
     """
     s1_epochs = int(cfg.get("system1_epochs", 10))
     max_steps = int(cfg.get("max_chain_steps", 20))
-    start_steps = int(cfg.get("system2_start_steps", 2))
 
     if epoch < s1_epochs:
         return 1
-    # Linear: epoch s1 → start_steps, epoch s1+1 → start_steps+1, ...
+
+    # ── Fixed-horizon schedule ──
+    schedule = cfg.get("horizon_schedule")
+    if schedule:
+        elapsed = epoch - s1_epochs
+        for entry in schedule:
+            steps_val, duration = int(entry[0]), int(entry[1])
+            if elapsed < duration:
+                return min(max_steps, steps_val)
+            elapsed -= duration
+        # After schedule exhausted: stay at last scheduled horizon.
+        return min(max_steps, int(schedule[-1][0]))
+
+    # ── Legacy: linear ramp ──
+    start_steps = int(cfg.get("system2_start_steps", 2))
     return min(max_steps, start_steps + (epoch - s1_epochs))
 
 
@@ -1411,18 +1435,15 @@ def train_step(
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
 
-    # --- Gradient sanitation (Adam-zombie defense) ------------------
-    # Skipping the step on NaN grad is a TRAP: healthy parameters never
-    # update, and the Adam momentum buffers (exp_avg, exp_avg_sq) keep
-    # whatever poisoned direction was there earlier — even with grad=0
-    # Adam keeps applying `lr · exp_avg / sqrt(exp_avg_sq)`, preserving
-    # the OLD direction and pushing the param further into the bad
-    # region.  Lesson 2026-04-15 (double-zombie) — the grad scrub alone
-    # is insufficient.  We therefore:
-    #   (1) zero NaN/Inf entries in ``.grad`` in-place,
-    #   (2) UNCONDITIONALLY zero the Adam momentum buffers for any
-    #       parameter whose grad was sanitized, so there is literally
-    #       no residual direction for Adam to follow.
+    # --- Gradient sanitation (preserve-momentum policy) --------------
+    # Zero only the NaN/Inf entries in ``.grad``.  Adam sees a zero
+    # gradient for those params → exp_avg decays by β₁, exp_avg_sq
+    # decays by β₂ (natural "forget" signal).  We PRESERVE healthy
+    # momentum buffers.  Lesson 2026-04-16: unconditionally zeroing
+    # momentum created the Adam-zombie — after a reset the first
+    # non-zero gradient produces an update of magnitude lr/√ε ≈ 1e4,
+    # which instantly destabilizes the model and locks val metrics.
+    # The only buffers we zero are those that are themselves non-finite.
     grad_had_nan = False
     sanitized_count = 0
     for p in model.parameters():
@@ -1434,15 +1455,19 @@ def train_step(
             grad_had_nan = True
             sanitized_count += 1
             g.masked_fill_(bad, 0.0)
-            # Kill ALL Adam momentum for this param, not only when
-            # buffers themselves are non-finite.  The residual momentum
-            # from a pre-corruption step is what keeps pushing the
-            # weight into the bad basin.
+            # DO NOT zero Adam momentum here.  With zero grad, Adam
+            # naturally decays exp_avg by β₁ and exp_avg_sq by β₂ —
+            # effectively "this step had no signal, slowly forget the
+            # old direction".  Zeroing momentum instead creates the
+            # Adam-zombie: after reset, Adam's update is dominated by
+            # lr / sqrt(ε) ≈ 1e4, which produces a huge destabilizing
+            # step on the next non-zero gradient (lesson 2026-04-16).
+            # Only sanitize buffers that are themselves non-finite.
             state = optimizer.state.get(p)
             if state:
                 for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                     buf = state.get(key)
-                    if buf is not None:
+                    if buf is not None and not torch.isfinite(buf).all():
                         buf.zero_()
 
     # --- Zombie streak detector + hard EMA reset ---------------------
@@ -1480,11 +1505,17 @@ def train_step(
                             p.data, nan=0.0, posinf=0.0, neginf=0.0,
                             out=p.data,
                         )
+                    # Only sanitize non-finite Adam buffers.  Zeroing
+                    # healthy momentum is what created the Adam-zombie:
+                    # after full reset, update ≈ lr/√ε ≈ 1e4 on the
+                    # first non-zero gradient, destabilizing the model.
+                    # With preserved momentum, Adam continues from the
+                    # restored shadow weights with working dynamics.
                     state = optimizer.state.get(p)
                     if state:
                         for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                             buf = state.get(key)
-                            if buf is not None:
+                            if buf is not None and not torch.isfinite(buf).all():
                                 buf.zero_()
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
@@ -1561,11 +1592,14 @@ def train_step(
                         p.data, nan=0.0, posinf=0.0, neginf=0.0, out=p.data
                     )
                     params_restored += 1
+                # Only sanitize non-finite Adam buffers — preserve
+                # healthy momentum so Adam can continue learning
+                # after the parameter restore (lesson 2026-04-16).
                 state = optimizer.state.get(p)
                 if state:
                     for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                         buf = state.get(key)
-                        if buf is not None:
+                        if buf is not None and not torch.isfinite(buf).all():
                             buf.zero_()
 
     # EMA update ONLY on fully clean steps — NO grad sanitation AND
@@ -2234,10 +2268,16 @@ def main() -> None:
         f"aux*{train_cfg.get('loss_lambda_aux', 0.0)} + "
         f"aux_df*{train_cfg.get('loss_lambda_aux_df', 0.0)}"
     )
-    print(
-        f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
-        f"linear_ramp, max_steps={max_chain_steps}"
-    )
+    horizon_schedule = train_cfg.get("horizon_schedule")
+    if horizon_schedule:
+        sched_desc = " → ".join(f"{s}×{d}ep" for s, d in horizon_schedule)
+        print(f"  horizon: system1={train_cfg.get('system1_epochs', 10)}ep, "
+              f"schedule=[{sched_desc}]")
+    else:
+        print(
+            f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
+            f"linear_ramp, max_steps={max_chain_steps}"
+        )
     print(
         f"  scheduled_sampling: max={train_cfg.get('scheduled_sampling_max', 0.5)}, "
         f"ramp_epochs={train_cfg.get('scheduled_sampling_ramp_epochs', 10)}"

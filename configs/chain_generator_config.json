@@ -66,6 +66,7 @@
         "system1_epochs": 3,
         "system2_start_steps": 4,
         "max_chain_steps": 20,
+        "horizon_schedule": [[4, 10], [5, 10]],
 
         "scheduled_sampling_max": 0.5,
         "scheduled_sampling_ramp_epochs": 0,

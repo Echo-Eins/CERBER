@@ -964,6 +964,19 @@ class ChainGenerator(nn.Module):
 
             x = self.final_norm(x)
             raw = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+
+            # ── Per-sample NaN gate ──────────────────────────────────
+            # If any dimension is non-finite for a sample, replace that
+            # sample's raw output with ground truth.  This prevents a
+            # corrupted prediction from being fed back as context in
+            # subsequent rollout steps.  The loss sees GT for that
+            # sample (≈ zero loss, correct: no training signal from a
+            # broken forward pass).  Detach-free: GT has no grad path.
+            has_bad = ~torch.isfinite(raw).all(dim=-1, keepdim=True)  # [B, 1, 1]
+            if has_bad.any():
+                gt_t = v_target_chain[:, t : t + 1, :]
+                raw = torch.where(has_bad.expand_as(raw), gt_t, raw)
+
             pred_t = self._sphere_project(raw)
             preds.append(raw)
 
