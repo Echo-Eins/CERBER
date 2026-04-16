@@ -2666,3 +2666,10 @@ _Pending._
 - [x] Training Geometry JSONL loader already flattens new train/val aux scalar metrics.
 - [x] Step-Level Training Metrics plot now explicitly displays aux losses and aux cosine metrics: train/val aux, aux answer, and aux DF.
 - [x] Syntax check passed for `cerber_gui/training_geometry.py`.
+
+### Review - first aux run diagnostics
+- Current log confirms the old zombie failure still occurs: training is healthy until about step 1900, then NaN/skip count explodes and `grad_norm` collapses to 0 while finite-looking metrics continue.
+- `aux_cos=0.0` in System1 is a reporting artifact: direct-answer mode masks the answer out of `L_step`, so there are no non-answer step tokens for aux step cosine. Code now falls back to aux answer cosine when the step mask is empty.
+- Added hard-fail zombie guard in the main training loop. A run now stops and writes `hard_fail_zombie` JSONL event after configurable bad-step/zero-grad streaks instead of continuing over a dead network.
+- Config defaults added: `hard_fail_bad_step_streak=25`, `hard_fail_zero_grad_streak=25`, `zero_grad_threshold=1e-8`.
+- Static checks passed after the fix.

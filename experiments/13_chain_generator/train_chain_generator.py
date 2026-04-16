@@ -420,10 +420,17 @@ def _auxiliary_heads_loss(
 
         mask_bool = step_mask.to(device=pred.device, dtype=torch.bool)
         maskf = mask_bool.to(dtype=pred.dtype)
-        valid = maskf.sum().clamp(min=1.0)
-        cos_masked = torch.where(mask_bool, step_stats["cos_sim"], torch.zeros_like(step_stats["cos_sim"]))
-        layer_cos = float((cos_masked.sum() / valid).detach().item())
         layer_ans_cos = float(ans_stats["cos_mean"].detach().item())
+        valid_count = float(maskf.sum().detach().item())
+        if valid_count > 0.0:
+            valid = maskf.sum().clamp(min=1.0)
+            cos_masked = torch.where(mask_bool, step_stats["cos_sim"], torch.zeros_like(step_stats["cos_sim"]))
+            layer_cos = float((cos_masked.sum() / valid).detach().item())
+        else:
+            # System1 direct-answer training masks the answer out of L_step,
+            # leaving no non-answer step positions. In that phase the aux
+            # answer cosine is the only meaningful aux quality metric.
+            layer_cos = layer_ans_cos
         cos_means.append(layer_cos)
         ans_cos_means.append(layer_ans_cos)
         metrics[f"{prefix}_l{layer_name}_loss"] = float(layer_loss.detach().item())
@@ -2205,6 +2212,16 @@ def main() -> None:
     sadt_roll_ema = None
     sadt_events = {"throttle": 0, "turbo": 0}
 
+    # Hard-fail guards: do not keep training after the model enters a
+    # finite-metric / zero-gradient zombie state. Recovery may attempt EMA
+    # restores inside train_step, but a repeated bad-step streak means the
+    # run is no longer scientifically valid.
+    bad_step_streak = 0
+    zero_grad_streak = 0
+    hard_fail_bad_step_streak = int(train_cfg.get("hard_fail_bad_step_streak", 25))
+    hard_fail_zero_grad_streak = int(train_cfg.get("hard_fail_zero_grad_streak", 25))
+    zero_grad_threshold = float(train_cfg.get("zero_grad_threshold", 1e-8))
+
     print("\nTraining settings")
     print(f"  epochs={num_epochs}, batch={batch_size}, lr={lr:.2e}")
     print(
@@ -2309,6 +2326,58 @@ def main() -> None:
 
             if metrics.get("nan_skipped", 0.0) > 0:
                 nan_count += 1
+
+            bad_step = (
+                metrics.get("nan_skipped", 0.0) > 0.0
+                or metrics.get("optimizer_stepped", 0.0) <= 0.0
+                or metrics.get("zombie_reset", 0.0) > 0.0
+            )
+            if bad_step:
+                bad_step_streak += 1
+            else:
+                bad_step_streak = 0
+
+            grad_now = float(metrics.get("grad_norm", 0.0))
+            zero_grad_step = (
+                metrics.get("optimizer_stepped", 0.0) > 0.0
+                and abs(grad_now) <= zero_grad_threshold
+                and float(metrics.get("loss", 0.0)) > 0.0
+            )
+            if zero_grad_step:
+                zero_grad_streak += 1
+            else:
+                zero_grad_streak = 0
+
+            metrics["bad_step_streak"] = float(bad_step_streak)
+            metrics["zero_grad_streak"] = float(zero_grad_streak)
+
+            if (
+                (hard_fail_bad_step_streak > 0 and bad_step_streak >= hard_fail_bad_step_streak)
+                or (
+                    hard_fail_zero_grad_streak > 0
+                    and zero_grad_streak >= hard_fail_zero_grad_streak
+                )
+            ):
+                reason = (
+                    f"bad_step_streak={bad_step_streak}, "
+                    f"zero_grad_streak={zero_grad_streak}, "
+                    f"grad_norm={grad_now:.3e}, nan_count_epoch={nan_count}"
+                )
+                _append_jsonl(
+                    metrics_log_path,
+                    {
+                        "event": "hard_fail_zombie",
+                        "epoch": int(epoch),
+                        "batch_idx": int(step + 1),
+                        "global_step": int(global_step),
+                        "target_steps": int(target_steps),
+                        "phase": phase,
+                        "reason": reason,
+                        "metrics": metrics,
+                        "timestamp": time.time(),
+                    },
+                )
+                raise RuntimeError(f"Hard-fail zombie guard triggered: {reason}")
 
             # --- SADT Dynamic Throttle Logic ---
             if train_cfg.get("dynamic_step_lr", False) and sadt_cooldown <= 0:

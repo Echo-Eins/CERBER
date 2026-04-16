@@ -59,6 +59,9 @@
         "warmup_epochs": 0,
         "lr_min_factor": 0.01,
         "clip_grad_norm": 1.0,
+        "hard_fail_bad_step_streak": 25,
+        "hard_fail_zero_grad_streak": 25,
+        "zero_grad_threshold": 1e-8,
 
         "system1_epochs": 3,
         "system2_start_steps": 4,
