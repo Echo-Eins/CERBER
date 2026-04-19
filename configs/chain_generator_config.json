@@ -52,15 +52,15 @@
     },
 
     "training": {
-        "batch_size": 16,
+        "batch_size": 32,
         "num_epochs": 50,
         "lr": 1e-4,
         "weight_decay": 5e-4,
-        "warmup_epochs": 0,
+        "warmup_epochs": 2,
         "lr_min_factor": 0.01,
         "clip_grad_norm": 1.0,
-        "hard_fail_bad_step_streak": 25,
-        "hard_fail_zero_grad_streak": 25,
+        "hard_fail_bad_step_streak": 250,
+        "hard_fail_zero_grad_streak": 250,
         "zero_grad_threshold": 1e-8,
 
         "system1_epochs": 3,
