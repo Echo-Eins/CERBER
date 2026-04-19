@@ -1,5 +1,79 @@
 # Lessons
 
+## 2026-04-19 - Architecture audit: 10 bugs found across GB10_1 / GB10_2 experiments
+
+### Pattern
+Full architecture audit triggered by GB10_1 (no-SADT/DF/EMA/softSS exp_conf) and GB10_2 (orig_conf) training runs. GB10_1 showed excellent System2 learning (tf_cos 0.46→0.63 over 3200 steps) before zombie guard killed it. GB10_2 catastrophically collapsed in <200 System2 steps due to norm explosion. Deep code review found 10 issues.
+
+### Root Causes & Bugs Found
+
+**BUG 1 (CRITICAL): `beam_generate()` appended SONAR-scale vectors to residual-scale chain**
+- Lines 1671-1679: chain was built as [start_token(residual, norm~32), cand_vecs(SONAR, norm~0.2051), ...]
+- 156x scale mismatch caused degenerate attention weights across beam steps
+- FIX: scale candidates via `_to_residual_space(cand_vecs)` before `torch.cat`.
+
+**BUG 2: Dead code in `generate()` DDIM path**
+- Line 1238: `raw_next = ddim_result / target_norm * output_proj.weight.data.norm()` was immediately overwritten on line 1240 by `raw_next = ddim_result`
+- Dead computation with side effect of calling `.data.norm()` (breaks autograd assumptions)
+- FIX: removed the dead line.
+
+**BUG 3: Zombie guard killed genuine learning (GB10_1 crash)**
+- `hard_fail_zero_grad_streak=25` fired at E3 S3200 while `tf_cos=0.63` was still improving (from 0.46 at epoch start)
+- NaN gate was correctly handling the NaN outputs; zero_grad_streak accumulated from NaN-gated batches where all outputs were replaced with GT → loss≈0 → grad≈0 but model state was fine
+- FIX: added `enable_zombie_guard` config flag (default `true` = old behavior). Set to `false` in exp_conf to allow survival through NaN cascades that the NaN gates are already handling.
+
+**ISSUE 4: `preds.append(raw)` in SS path stores pre-projection outputs**
+- Loss computed as MSE(raw_output, sonar_GT) where raw_output norm >> sonar_GT norm
+- NaN gate replaces some `raw` entries with GT (norm~0.2051) but other entries are raw (norm~0.1-5)
+- MSE penalizes the scale difference, creating an implicit "scale penalty" that conflicts with the training objective. Cosine loss is scale-invariant and correct; MSE should either be disabled or computed on sphere-projected predictions.
+
+**ISSUE 5: MSE loss is geometrically wrong for hypersphere targets**
+- Targets live on S^(d-1) (radius 0.2051). MSE measures chord (Euclidean) distance, not arc distance.
+- Correct geometry: cosine loss = 1 - cos_sim = chord²/2 (at fixed radius) = monotone with geodesic arc distance
+- MSE combines with cosine gives mixed metric that is neither spherical nor Euclidean consistently
+- Mitigation: reduce MSE weight to near-zero and rely primarily on cosine loss, OR project predictions to sphere before MSE.
+
+**ISSUE 6: Double timestep conditioning in DF forward pass**
+- Line 1108 (`x = x + t_emb`): additive injection before transformer layers
+- Lines 1110-1111 (`layer(x, ..., t_emb=t_emb)`): AdaLN modulation in each layer
+- Result: timestep info applied twice — once as additive bias to noisy vectors AND once as per-layer scale+shift
+- AdaLN alone is sufficient (DiT design). The additive injection is redundant and adds a timestep-dependent bias the AdaLN must fight against. Potential source of instability at high noise levels.
+
+**ISSUE 7: Horizon warmup missing from exp_conf → [NaN:6] at System2 first step**
+- GB10_1 exp_conf lacked `horizon_warmup_steps` and `nan_gate_window_size` configs
+- Going from target_steps=1 to target_steps=4 with NO LR warmup → [NaN:6] at S50 from cold transformer positions 2-3-4 never seen before
+- NaN gate contained it, but the absence of NaN cascade detector meant no LR response either
+- FIX: added these fields to exp_conf with values from orig_conf.
+
+**ISSUE 8: `_safe_normalize` uses `nan_to_num(x, nan=0.0)` → arbitrary direction from near-zero inputs**
+- When input norm → 0 (after nan_to_num zeros out NaN dims), division by `clamp(min=eps)` gives a direction from numerical noise
+- Semantically: the "normalized" vector has random direction, not a meaningful direction
+- For NaN-gated inputs this is moot (NaN gate replaced them with GT before _sphere_project), but for near-zero legitimate outputs it produces garbage directions
+- Better: use the `nan_to_num` only as a last-resort safety net and rely on NaN gates upstream.
+
+**ISSUE 9: `null_context_token` learns large residual-scale norms**
+- Initialized to zeros, then `_to_residual_space(null_ctx)` scales by 156x at inference
+- As null_context_token trains away from zero, it gets amplified 156x, making it much louder in cross-attention than SONAR query embeddings (norm~0.2051 scaled to ~32)
+- CFG interpolation between conditional (SONAR scale) and unconditional (potentially 156x larger) predictions is numerically asymmetric
+- Watch for: null_ctx.norm() growing >> target_norm during training.
+
+**ISSUE 10: Constant [NaN:6] in GB10_1 System2 is the "cold position" problem**
+- System1 only trains positions [0] of the chain. Positions [1,2,3] are never in the autoregressive context.
+- When System2 starts with target_steps=4, the transformer processes sequence length 4 for the first time
+- Positions 1,2,3 have never had gradient flow through their RoPE/attention weights at those offsets
+- bfloat16 + LayerScale + AdaLN at untrained positions → NaN on first pass
+- NaN gate handles the outputs, but parameter gradients are still NaN-contaminated (0 × NaN = NaN in backward)
+- A curriculum of [1→2→3→4 steps, 1 epoch each] would prevent this cold-position shock
+
+### Rules
+1. **Zombie guard should be disableable**. If the NaN gates are handling NaN outputs correctly (loss→0, not loss→NaN), the zero_grad_streak is an artifact of gated batches, not a sign of model death. Add `enable_zombie_guard=false` when genuine learning is observed through NaN streaks. NaN gates always stay enabled.
+2. **`beam_generate()` must scale vectors to residual space before chain concatenation**. `_sphere_project` returns SONAR scale; `_to_residual_space` must be called before `torch.cat([chain, next_vec], dim=1)`. Failing to do so creates a 156x scale mismatch in attention.
+3. **MSE on hypersphere targets is geometrically inconsistent**. Use cosine loss as primary, set MSE weight low or compute MSE on sphere-projected outputs. Do not mix raw-output-scale MSE with SONAR-scale targets.
+4. **Double timestep conditioning is redundant and potentially harmful**. AdaLN-Zero modulation per layer is sufficient. The additive `x = x + t_emb` before layers creates a conflicting signal the AdaLN must overcome.
+5. **System2 first steps see positions 1..N-1 for the first time**. These "cold positions" have untrained RoPE offsets and LayerScale values, causing NaN on first pass. Mitigate with: (a) curriculum [1,2,3,4] steps, (b) horizon warmup LR, (c) NaN gates + enable_zombie_guard=false.
+
+---
+
 ## 2026-04-16 - NaN cascade in pure teacher-forcing path + System2 gradient shock
 
 ### Pattern

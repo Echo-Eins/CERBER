@@ -62,6 +62,7 @@
         "hard_fail_bad_step_streak": 250,
         "hard_fail_zero_grad_streak": 250,
         "zero_grad_threshold": 1e-8,
+        "enable_zombie_guard": true,
 
         "system1_epochs": 3,
         "system2_start_steps": 4,

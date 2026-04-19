@@ -2251,6 +2251,16 @@ def main() -> None:
     # finite-metric / zero-gradient zombie state. Recovery may attempt EMA
     # restores inside train_step, but a repeated bad-step streak means the
     # run is no longer scientifically valid.
+    #
+    # enable_zombie_guard=false disables the hard-fail raise entirely, so
+    # training can survive NaN cascades that the NaN gates are already
+    # handling. NaN gates (model._nan_gate_count) stay active regardless —
+    # they prevent NaN from entering the loss and gradients.  The zombie
+    # guard only controls whether a persistent zero-grad or bad-step streak
+    # terminates the run.  Disable when you observe genuine learning
+    # continuing through a streak (e.g. GB10_1 tf_cos 0.46→0.63 while
+    # zero_grad_streak was accumulating from NaN-gated batches).
+    enable_zombie_guard = bool(train_cfg.get("enable_zombie_guard", True))
     bad_step_streak = 0
     zero_grad_streak = 0
     hard_fail_bad_step_streak = int(train_cfg.get("hard_fail_bad_step_streak", 25))
@@ -2457,13 +2467,14 @@ def main() -> None:
             metrics["bad_step_streak"] = float(bad_step_streak)
             metrics["zero_grad_streak"] = float(zero_grad_streak)
 
-            if (
+            zombie_triggered = (
                 (hard_fail_bad_step_streak > 0 and bad_step_streak >= hard_fail_bad_step_streak)
                 or (
                     hard_fail_zero_grad_streak > 0
                     and zero_grad_streak >= hard_fail_zero_grad_streak
                 )
-            ):
+            )
+            if zombie_triggered:
                 reason = (
                     f"bad_step_streak={bad_step_streak}, "
                     f"zero_grad_streak={zero_grad_streak}, "
@@ -2483,7 +2494,13 @@ def main() -> None:
                         "timestamp": time.time(),
                     },
                 )
-                raise RuntimeError(f"Hard-fail zombie guard triggered: {reason}")
+                if enable_zombie_guard:
+                    raise RuntimeError(f"Hard-fail zombie guard triggered: {reason}")
+                else:
+                    print(f"  [ZOMBIE-WARN] Zombie guard suppressed (enable_zombie_guard=false): {reason}")
+                    # Reset streaks so the warning doesn't repeat every step.
+                    bad_step_streak = 0
+                    zero_grad_streak = 0
 
             # --- SADT Dynamic Throttle Logic ---
             if train_cfg.get("dynamic_step_lr", False) and sadt_cooldown <= 0:

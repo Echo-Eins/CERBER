@@ -1234,9 +1234,6 @@ class ChainGenerator(nn.Module):
                     cfg_scale=cfg_scale,
                 )
                 # ddim_result is [B, 1, D] in SONAR space, already sphere-projected.
-                # Convert to residual-space "raw" for the rest of the loop.
-                raw_next = ddim_result / self.cfg.target_norm * self.output_proj.weight.data.norm()
-                # But for consistency, just use the SONAR prediction directly:
                 raw_next = ddim_result
             else:
                 x = chain
@@ -1641,33 +1638,39 @@ class ChainGenerator(nn.Module):
 
             new_W = W * K
             raw_k = raw_next.reshape(bsz, W, 1, self.cfg.d_model).unsqueeze(2).expand(-1, -1, K, -1, -1).clone()
-            
+
             if n_std > 0.0:
                 raw_k_noisy = raw_k + n_std * torch.randn_like(raw_k)
             else:
                 raw_k_noisy = raw_k
-                
-            cand_vecs = self._sphere_project(raw_k_noisy)  # [B, W, K, 1, D]
+
+            # Sphere-project to SONAR space for energy scoring and output.
+            cand_vecs = self._sphere_project(raw_k_noisy)  # [B, W, K, 1, D] — SONAR scale
 
             flat_cands = cand_vecs.reshape(bsz * new_W, self.cfg.d_model)
             flat_qs = v_query.repeat_interleave(new_W, dim=0)
-            
+
             with torch.no_grad():
                 step_energies = energy_fn(flat_qs, flat_cands)  # [B*W*K]
-            
+
             step_energies = step_energies.reshape(bsz, W, K)
-            
+
             # Cumulative energy over the chain path
             cum_energies = active_energies.unsqueeze(2) + step_energies  # [B, W, K]
             cum_energies_flat = cum_energies.reshape(bsz, new_W)
-            
+
             next_W = min(int(beam_width), new_W)
             top_energies, top_indices = torch.topk(cum_energies_flat, next_W, dim=1, largest=False)  # [B, next_W]
-            
-            reconstructed_cands = cand_vecs.reshape(bsz, new_W, 1, self.cfg.d_model)
+
+            # Scale candidates to residual space BEFORE appending to the chain.
+            # The chain is built in residual space (norm~32). SONAR-scale vectors
+            # (norm~0.2051) would be 156x smaller than the start_token and produce
+            # degenerate attention weights across beam steps.
+            cand_vecs_res = self._to_residual_space(cand_vecs)  # [B, W, K, 1, D] — residual scale
+            reconstructed_cands = cand_vecs_res.reshape(bsz, new_W, 1, self.cfg.d_model)
             t = active_chains.shape[2]
             history = active_chains.unsqueeze(2).expand(-1, -1, K, -1, -1).reshape(bsz, new_W, t, self.cfg.d_model)
-            
+
             next_chains = []
             for b in range(bsz):
                 idx = top_indices[b]

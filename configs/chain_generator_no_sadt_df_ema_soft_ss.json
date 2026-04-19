@@ -62,6 +62,7 @@
         "hard_fail_bad_step_streak": 25,
         "hard_fail_zero_grad_streak": 25,
         "zero_grad_threshold": 1e-8,
+        "enable_zombie_guard": false,
 
         "system1_epochs": 3,
         "system2_start_steps": 4,
@@ -110,6 +111,12 @@
         "sadt_max_lr": 5e-4,
         "sadt_tolerance": 0.10,
         "sadt_cooldown_steps": 200,
+
+        "horizon_warmup_steps": 200,
+        "horizon_warmup_factor": 0.1,
+
+        "nan_gate_window_size": 50,
+        "nan_gate_max_rate": 10,
 
         "free_run_temperature": 1.0,
         "free_run_noise_std": 0.0,
