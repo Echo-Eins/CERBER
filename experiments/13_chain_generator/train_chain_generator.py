@@ -1232,17 +1232,9 @@ def compute_composite_objective(
     tf_answer_all = v_tf[batch_idx, answer_pos]
     tgt_answer_all = chains[batch_idx, answer_pos]
     
-    if has_answer.any():
-        tf_ans = tf_answer_all[has_answer].float()
-        tgt_ans = tgt_answer_all[has_answer].float()
-        ans_cos_sim = (_safe_normalize(tf_ans, dim=-1) * _safe_normalize(tgt_ans, dim=-1)).sum(dim=-1)
-        ans_cos = (1.0 - ans_cos_sim).mean()
-        ans_mse = (tf_ans - tgt_ans).pow(2).sum(dim=-1).mean()
-        l_ans = w_cos * ans_cos + w_mse * ans_mse
-    else:
-        # System2: No sample reached the answer in this window.
-        l_ans = torch.zeros((), device=chains.device, dtype=chains.dtype)
-
+    l_ans, _ans_stats = _answer_loss(
+        tf_answer_all, tgt_answer_all, has_answer, w_cos, w_mse,
+    )
 
     # 3) Free-run rollout loss (exposure-bias correction).
     v_roll, roll_info = model.generate(
@@ -1267,7 +1259,13 @@ def compute_composite_objective(
     _bad_roll = ~torch.isfinite(v_roll)
     if _bad_roll.any():
         v_roll = torch.where(_bad_roll, chains, v_roll)
-    l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
+    # Use step_mask (not chain_mask) so the answer position is excluded from
+    # the rollout step loss — same as the TF step loss.  Without this, the
+    # answer position gets gradient from BOTH l_ans and l_roll, creating a
+    # ~3.4× gradient imbalance vs reasoning positions that destabilises FFN
+    # output norms at the horizon transition where answers first enter the
+    # training window (lessons 2026-04-20 night).
+    l_roll, roll_stats = _masked_step_losses(v_roll, chains, step_mask, d_model, w_cos, w_mse)
 
     # 4) In-batch contrastive ranking on final rollout answer.
     roll_final = _gather_last_valid(v_roll, valid_lens)
@@ -2299,10 +2297,10 @@ def main() -> None:
 
     tracker = MetricTracker()
 
-    # Preserve base lambda_df so warm-up schedule can scale it each epoch
-    # without cumulative drift from in-place overwrites.
+    # Preserve base lambdas so warm-up schedules can scale without drift.
     base_df_lambda = float(train_cfg.get("loss_lambda_diffusion", 0.0))
     df_warmup_epochs = int(train_cfg.get("df_warmup_epochs", 0))
+    base_ans_lambda = float(train_cfg.get("loss_lambda_answer", 1.0))
 
     # Rolling ans_coverage history for collapse-warning heuristic.
     ans_cov_history: list[float] = []
@@ -2384,6 +2382,9 @@ def main() -> None:
     horizon_warmup_remaining = 0
     horizon_warmup_total = 0
     horizon_warmup_factor = 0.1
+    # Answer loss warmup state (ramps lambda_ans 0→base at horizon transitions).
+    answer_warmup_remaining = 0
+    answer_warmup_total = 0
     # NaN cascade detector state.
     nan_gate_window_size = int(train_cfg.get("nan_gate_window_size", 50))
     nan_gate_window: list[int] = []
@@ -2423,13 +2424,28 @@ def main() -> None:
             # Temporarily reduce LR and linearly ramp back up.
             hw_steps = int(train_cfg.get("horizon_warmup_steps", 0))
             hw_factor = float(train_cfg.get("horizon_warmup_factor", 0.1))
+            # ── Answer loss warmup ─────────────────────────────
+            # When target_steps increases, the answer embedding may
+            # enter the training window for the first time.  l_ans
+            # jumping from 0→full creates a gradient shock that
+            # destabilises FFN output norms (lessons 2026-04-20 night).
+            # Ramp lambda_ans from 0→base over answer_warmup_steps.
+            aw_steps = int(train_cfg.get("answer_warmup_steps", hw_steps))
+            if aw_steps > 0 and target_steps > prev_target_steps:
+                answer_warmup_remaining = aw_steps
+                answer_warmup_total = aw_steps
+                train_cfg["loss_lambda_answer"] = 0.0
+            else:
+                train_cfg["loss_lambda_answer"] = base_ans_lambda
+
             if hw_steps > 0 and prev_target_steps > 0:
                 horizon_warmup_remaining = hw_steps
                 horizon_warmup_total = hw_steps
                 horizon_warmup_factor = hw_factor
                 print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
                       f"EMA reset, cooldown={sadt_cooldown} steps, "
-                      f"LR warmup={hw_steps} steps (factor={hw_factor})")
+                      f"LR warmup={hw_steps} steps (factor={hw_factor}), "
+                      f"answer warmup={aw_steps} steps")
             else:
                 print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
                       f"EMA reset, cooldown={sadt_cooldown} steps")
@@ -2502,6 +2518,13 @@ def main() -> None:
                 for pg in optimizer.param_groups:
                     pg["lr"] = pg["lr"] * factor
                 horizon_warmup_remaining -= 1
+            # ── Answer loss warmup (parallel to LR warmup) ────────
+            if answer_warmup_remaining > 0:
+                aw_progress = 1.0 - (answer_warmup_remaining / answer_warmup_total)
+                train_cfg["loss_lambda_answer"] = base_ans_lambda * aw_progress
+                answer_warmup_remaining -= 1
+                if answer_warmup_remaining == 0:
+                    train_cfg["loss_lambda_answer"] = base_ans_lambda
             global_step += 1
             tracker.update(metrics)
 

@@ -1,5 +1,73 @@
 # Lessons
 
+## 2026-04-20 (night) — Answer-triggered NaN cascade: 3 bugs at the horizon transition
+
+### Achievements (Session Cumulative)
+- **System1 val_roll_cos_last = 0.7481** (best ever, from scratch)
+- **System2(2) tf_cos = 0.85, roll_cos = 0.83** (best ever, no NaN cascade!)
+- Broke through the 0.73 ceiling that blocked all prior runs
+- AdaRMSNorm FP32 + SwiGLU orthogonal init + soft Adam reset = stable 2-step chains
+- First time the model survived the System1→System2 transition cleanly
+
+### Symptom
+With ALL previous fixes applied (AdaRMSNorm FP32, SwiGLU ortho init, soft Adam reset), the model produces best-ever results through E0–E4. At E5, when `target_steps` increases from 2→3 and the answer embedding enters the training window for the first time (`ans_cov` 0.00→0.70):
+- `ffn_out` norms explode: 2819→3492→3822→4105 (vs ~1500–2000 at E4)
+- `raw_norm` = NaN at step 350
+- Gradients → 0 by step 550. Model dead.
+
+### Root Cause Analysis
+
+**Why does the answer entering the window crash the model?**
+
+For 99% of the dataset, chains are 4 steps: `[step0, step1, answer, answer_pad]`. At `target_steps=2`, `answer_pos=2` is OUTSIDE the 2-step window → `has_answer=False` → `l_ans=0`. At `target_steps=3`, `answer_pos=2` is INSIDE → `has_answer=True` → `l_ans` activates.
+
+Three bugs combined to create a gradient shock that the 200-step LR warmup couldn't absorb:
+
+**Bug 1: Inline answer loss lacked NaN guards.**
+`compute_composite_objective` lines 1235–1241 computed the answer loss inline instead of using `_answer_loss()`. The dedicated function has `nan_to_num(cos_sim.clamp(-1, 1), nan=0.0)` — the inline code had none. Any fp-rounding or poisoned row would propagate NaN unchecked through `l_ans` into the final loss.
+
+**Bug 2: Rollout step loss double-supervised the answer position.**
+`l_roll` used `chain_mask` (includes answer position) while `l_step` used `step_mask` (excludes answer). The answer position received gradient from both `l_ans` (averaged over ~40% of batch → 2.5/bsz coefficient) and `l_roll` (0.33/bsz coefficient). Total: **3.4× more gradient than a reasoning position** (0.83/bsz). This imbalance drove FFN output norms into a positive feedback loop: large gradient → larger weights → larger FFN outputs → even larger gradient.
+
+**Bug 3: No answer loss warmup.**
+When `has_answer` transitioned from False→True at the horizon change, `l_ans` jumped from 0 to full strength in one step. The 200-step LR warmup (0.1×→1.0×) was insufficient because: (a) the gradient shock peaked at the answer position specifically, not uniformly, and (b) the warmup completed at step 200 but NaN hit at step 350 — the accumulated damage from 200 steps of imbalanced gradients was already fatal.
+
+### Fixes Applied
+
+1. **Replaced inline answer loss with `_answer_loss()` call** (`train_chain_generator.py` ~line 1235):
+   ```python
+   # Before: inline code without NaN guards
+   # After:
+   l_ans, _ans_stats = _answer_loss(tf_answer_all, tgt_answer_all, has_answer, w_cos, w_mse)
+   ```
+   Adds `nan_to_num(cos_sim.clamp(-1, 1), nan=0.0)` and consistent error handling.
+
+2. **Changed `l_roll` to use `step_mask`** (`train_chain_generator.py` ~line 1262):
+   ```python
+   # Before: l_roll = _masked_step_losses(v_roll, chains, chain_mask, ...)
+   # After:
+   l_roll = _masked_step_losses(v_roll, chains, step_mask, ...)
+   ```
+   Answer position now excluded from rollout step loss, same as TF step loss. Eliminates the 3.4× gradient imbalance. The answer is supervised solely through `l_ans` (TF), while the rollout learns to reach the answer through step-by-step chain quality.
+
+3. **Answer loss warmup at horizon transitions** (`train_chain_generator.py` ~line 2430):
+   ```python
+   # At horizon change: ramp lambda_ans from 0→base over answer_warmup_steps
+   answer_warmup_remaining = aw_steps
+   train_cfg["loss_lambda_answer"] = 0.0
+   # Per-step: linear ramp
+   train_cfg["loss_lambda_answer"] = base_ans_lambda * progress
+   ```
+   Runs in parallel with the existing LR warmup. Config key: `answer_warmup_steps` (defaults to `horizon_warmup_steps`).
+
+### Rules
+1. **Never compute loss inline when a guarded helper exists.** Code duplication in loss paths is a NaN vector. The `_answer_loss` function exists precisely for this — use it.
+2. **The answer position must have the same total gradient weight as reasoning positions.** If the TF step loss excludes the answer (via `step_mask`), the rollout step loss must too. Otherwise the answer gets `l_ans + l_roll` while reasoning positions get only `l_step + l_roll` — an imbalance that compounds into FFN norm explosion.
+3. **Any new loss term entering the training objective needs its own warmup.** LR warmup is necessary but not sufficient — it scales ALL gradients equally, while the shock is concentrated at specific positions. A per-lambda warmup targets the actual source of instability.
+4. **The 99th-percentile dataset property determines the failure mode.** 99% of chains are 4-step, so `answer_pos=2`. This means the answer enters the window at exactly `target_steps=3` for nearly all samples simultaneously — a synchronized gradient shock that no per-sample guard can smooth.
+
+---
+
 ## 2026-04-20 (evening) — AdaLN gate annihilation, SwiGLU dead zone, soft Adam reset
 
 ### Pattern
