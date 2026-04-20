@@ -1102,10 +1102,7 @@ class ChainGenerator(nn.Module):
         aux: dict[str, Tensor] | None = {} if return_aux and len(self.aux_heads) > 0 else None
 
         if self.cfg.norm_type == "ada_rmsnorm":
-            # AdaLN path: pass t_emb through each layer for per-norm modulation.
-            # The input still gets a residual addition for backward compat and
-            # to provide a strong initial signal before the first norm.
-            x = x + t_emb
+            # AdaLN path: per-layer modulation only (DiT design).
             for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
                 self._maybe_aux_predict(layer_idx, x, aux)
