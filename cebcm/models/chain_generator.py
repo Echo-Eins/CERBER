@@ -830,7 +830,28 @@ class ChainGenerator(nn.Module):
         return (v_float / norms).to(dtype=v.dtype)
 
     def _sphere_project(self, v: Tensor) -> Tensor:
-        return self._safe_normalize(v, dim=-1) * self.cfg.target_norm
+        """Project ``v`` onto the SONAR hypersphere of radius ``target_norm``.
+
+        Critically, the output is **guaranteed** to lie on the sphere — even
+        when the input is non-finite or zero-norm.  Without this guarantee,
+        ``_safe_normalize`` would produce a zero vector for a degenerate row
+        (NaN → nan_to_num(0) → norm clamped to eps → 0/eps = 0), and that
+        off-manifold zero would feed back as the next step's history,
+        skewing attention statistics and triggering a NaN cascade across
+        the chain.  We detect collapsed rows and substitute the canonical
+        e₀ basis vector scaled to ``target_norm``.
+        """
+        v_safe = self._safe_normalize(v, dim=-1)  # unit-norm or ~0 for degenerate rows
+        # Detect rows that collapsed to ~0 (norm < 0.5 means we lost the unit
+        # constraint — under normal conditions safe_normalize returns norm=1).
+        with torch.no_grad():
+            row_norm = v_safe.float().norm(dim=-1, keepdim=True)
+            collapsed = row_norm < 0.5  # broadcast over last dim
+        if collapsed.any():
+            fallback = torch.zeros_like(v_safe)
+            fallback[..., 0] = 1.0  # canonical e₀ direction, on the unit sphere
+            v_safe = torch.where(collapsed, fallback, v_safe)
+        return v_safe * self.cfg.target_norm
 
     def _to_residual_space(self, sonar_vectors: Tensor) -> Tensor:
         """

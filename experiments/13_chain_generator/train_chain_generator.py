@@ -1003,16 +1003,25 @@ def _diffusion_forcing_objective(
     else:
         model_out, v_noisy, eps = df_out
         aux_df_preds = None
-    # Defense-in-depth: scrub any non-finite values from the decoder
-    # output before they enter the masked cosine/MSE reduction.  Without
-    # this, a single bf16 overflow anywhere in the 6-layer AdaLN stack
-    # leaks NaN into `cos_sim`, which then poisons the whole batch via
-    # the NaN*0 trap even though the position is masked out.
-    model_out = torch.nan_to_num(model_out, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Compute prediction-type-aware target.
+    # Compute prediction-type-aware target FIRST so we can use it as the
+    # NaN-replacement for poisoned decoder outputs (lessons.md 2026-04-20).
+    # Replacing NaN with 0 here was a "loss bomb": cos(0, target) = 0 →
+    # cos_loss = 1.0 on every poisoned position, drowning the masked
+    # reduction even though the downstream guard expects NaN, not zeros.
     target = model.diffusion_target(chains, eps, levels)
-    target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+    # `target` itself should never be NaN; if it is, we have a bug in
+    # diffusion_target (e.g. v-target with NaN eps).  Surface it loudly
+    # rather than silently replacing — but still keep training alive.
+    if not torch.isfinite(target).all():
+        target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Defense-in-depth: replace any non-finite decoder output with the
+    # supervision target.  This makes the per-position loss on poisoned
+    # positions exactly 0 (cos_sim=1, mse=0) — a true no-op — instead of
+    # the cos_sim=0, mse>0 "loss bomb" that nan_to_num(0) produced.
+    _bad_out = ~torch.isfinite(model_out)
+    if _bad_out.any():
+        model_out = torch.where(_bad_out, target, model_out)
 
     loss, stats = _masked_weighted_step_losses(
         model_out,

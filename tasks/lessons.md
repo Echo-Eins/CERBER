@@ -1,5 +1,30 @@
 # Lessons
 
+## 2026-04-20 (afternoon) — Two more loss-bomb sites + the curriculum-not-applied gotcha
+
+### Pattern
+The morning fix-pack landed (commit `76ad7bd`) but the user's next training run reproduced the *exact same* cold-position cascade. Two failures happened simultaneously:
+
+**A. The curriculum fix was committed but never executed.**
+Both `chain_generator_config.json` and `chain_generator_no_sadt_df_ema_soft_ss.json` had been updated with `horizon_schedule: [[2,2],[3,2],[4,10],[5,10]]`, yet the run log showed `[SADT] Horizon changed 1→4` at E3 (the old schedule). The user had run the trainer before pulling the commit. **Always confirm the operator pulled before claiming a fix is "applied".** The commit-vs-run gap is invisible to us.
+
+**B. Two more nan_to_num(0) loss-bomb sites survived the first audit.**
+- `train_chain_generator.py:1011` — `model_out = nan_to_num(model_out, 0.0)` in the diffusion-forcing path. The downstream `_masked_weighted_step_losses` GT-replacement guard never fired because `model_out` was no longer NaN by the time it reached the guard — it was zeros. `cos(0, target) = 0 → cos_loss = 1.0` per poisoned position. Same loss-bomb topology as the morning's six fixes, just one frame upstream.
+- `chain_generator.py:_sphere_project` produced **off-manifold zeros** when the input was NaN/zero. `_safe_normalize` cleans NaN to zero, the norm clamps to `eps`, division yields zero, and `* target_norm` keeps it at zero. That zero then fed back as the next step's history → attention statistics collapsed → next position produced NaN → cascade. The fallback in `generate()` (`generated[-2]`) inherited the zero.
+
+### Fixes Applied
+1. **DF model-out scrub now uses target-replacement** (`train_chain_generator.py` ~line 1010): compute `target` first, then `model_out = where(~isfinite(model_out), target, model_out)`. Also surfaces upstream `target` NaN via an `isfinite` gate before scrubbing — diffusion_target should never produce NaN, so silently scrubbing it hides real bugs.
+2. **`_sphere_project` is now manifold-stable** (`chain_generator.py` ~line 832): after `_safe_normalize`, detect rows whose norm collapsed below 0.5 (i.e. lost the unit constraint) and substitute the canonical e₀ basis vector before the `* target_norm` scale. The output is **guaranteed** to lie on the sphere — even for all-NaN inputs — so a single bad position cannot poison the next step's history.
+3. **Did NOT touch `_safe_normalize` itself** — it is also used to compute pairwise cosine similarities (lines 1253–1421, 1717–1718) where zero-output for zero-input is semantically correct ("no similarity"). Only `_sphere_project` needed manifold guarantees.
+
+### Rules
+1. **A fix isn't applied until the trainer log proves it.** Look for the schedule banner / first-epoch curriculum prints and verify they match the new config before declaring success.
+2. **`nan_to_num(x, 0.0)` is *always* suspect anywhere the result feeds a loss.** Audit every such site, even ones added "as defense-in-depth" — they erase the NaN signal that downstream guards rely on.
+3. **`_sphere_project` must produce on-manifold output unconditionally.** Anything used as autoregressive history must satisfy the manifold invariant — otherwise position t+1 sees an off-distribution input that the model was never trained on, and the cascade is back.
+4. **Distinguish two roles of normalization:** (a) projection-to-manifold needs an on-sphere guarantee; (b) similarity-via-dot-product wants zero-on-zero. Don't conflate them in one helper.
+
+---
+
 ## 2026-04-20 - TRUE root cause: nan_to_num(0) "loss bomb" in 6 code paths
 
 ### Pattern
