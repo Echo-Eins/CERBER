@@ -1,5 +1,47 @@
 # Lessons
 
+## 2026-04-20 - TRUE root cause: nan_to_num(0) "loss bomb" in 6 code paths
+
+### Pattern
+Deep re-verification (Opus re-audit) found that the documented "nan_to_num(x, nan=0.0) is a loss bomb" rule from 2026-04-11 was NEVER applied to the actual loss computation code. The same anti-pattern existed in 6 places, creating a positive feedback loop that accelerated the NaN cascade in both GB10_1 and GB10_2.
+
+### Root Cause: The NaN Cascade Positive Feedback Loop
+
+**Exact mechanism (traced line-by-line):**
+1. `generate()` line 1244: `raw_next = output_proj(x[:,-1:,:])` — can contain NaN (bfloat16 overflow at cold positions)
+2. `generate()` line 1268: `_sphere_project(raw_next)` calls `_safe_normalize` which does `nan_to_num(x, nan=0.0)` BEFORE normalizing — output is ALWAYS finite
+3. `generate()` line 1373 (OLD): NaN guard checked `next_vec_for_chain` (post-projection, already clean) — **DEAD CODE, never fired**
+4. `generate()` line 1365 (OLD): `generated.append(raw_next)` stored NaN-contaminated raw vector
+5. `compute_composite_objective` line 1210 (OLD): `nan_to_num(v_roll, nan=0.0)` replaced NaN with **zero vector**
+6. `_masked_step_losses` line 332 (OLD): `nan_to_num(pred, nan=0.0)` — second layer of same bug
+7. Loss computation: `cos_sim(0-vector, GT) = 0` → `cos_loss = 1 - 0 = 1.0` per NaN position — the **"loss bomb"**
+8. Gradient: `nan_to_num` backward = 0 for NaN entries → NaN-producing parameters get **zero gradient** → they **never self-heal**
+9. Shared parameters updated from healthy positions → **worsens cold positions** → MORE NaN → positive feedback
+
+**Contrast with forward() (which was CORRECT all along):**
+- `forward()` NaN gate: NaN → replace with GT → loss ≈ 0 → grad ≈ 0 ✓ (no training signal from broken step)
+- `generate()` path: NaN → replace with 0 → cos_loss = 1.0 → inflated loss metric ✗
+
+**The same nan_to_num(0) anti-pattern existed in 6 places:**
+1. `train_chain_generator.py:1147` — `v_tf` sanitization
+2. `train_chain_generator.py:1210` — `v_roll` sanitization
+3. `train_chain_generator.py:332` — `_masked_step_losses` pred sanitization
+4. `train_chain_generator.py:580` — `_masked_weighted_step_losses` pred sanitization
+5. `chain_generator.py:1373` — dead NaN guard (checked already-clean vec)
+6. `chain_generator.py:1365` — stored NaN-contaminated raw_next in generated[]
+
+### Fixes Applied
+1. **v_tf / v_roll**: `nan_to_num(x, nan=0.0)` → `torch.where(~isfinite(x), chains_GT, x)` — loss ≈ 0 not 1.0
+2. **_masked_step_losses / _masked_weighted_step_losses**: `nan_to_num(pred, nan=0.0)` → `torch.where(~isfinite(pred), target, pred)`
+3. **generate() NaN guard**: now checks `raw_next` (pre-projection), stores `clean_next_vec` when NaN detected instead of NaN-contaminated `raw_next`
+
+### Rules
+1. **NEVER replace NaN predictions with zero vectors.** Always replace with GT (target). `cos_sim(0, GT) = 0 → cos_loss = 1.0` is a loss bomb. `cos_sim(GT, GT) = 1.0 → cos_loss = 0` is correct (no signal from broken step).
+2. **Check for NaN BEFORE `_sphere_project` / `_safe_normalize`.** These functions silently clean NaN via `nan_to_num(x, nan=0.0)` before normalizing. Checking the output never detects the original NaN.
+3. **Every nan_to_num in the loss path must be audited.** If the replacement value participates in loss computation, it MUST match the supervision target, not be 0.
+
+---
+
 ## 2026-04-19 - Architecture audit: 10 bugs found across GB10_1 / GB10_2 experiments
 
 ### Pattern

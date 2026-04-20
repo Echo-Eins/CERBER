@@ -329,7 +329,10 @@ def _masked_step_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     pred = pred.float()
     target = target.float()
-    pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    # Replace non-finite pred with target (loss≈0) instead of 0 (cos_loss=1.0).
+    _bad_pred = ~torch.isfinite(pred)
+    if _bad_pred.any():
+        pred = torch.where(_bad_pred, target, pred)
     target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     mask_bool = mask.to(device=pred.device, dtype=torch.bool)
     maskf = mask_bool.to(dtype=pred.dtype)
@@ -577,7 +580,10 @@ def _masked_weighted_step_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     pred = pred.float()
     target = target.float()
-    pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    # Replace non-finite pred with target (loss≈0) instead of 0 (cos_loss=1.0).
+    _bad_pred = ~torch.isfinite(pred)
+    if _bad_pred.any():
+        pred = torch.where(_bad_pred, target, pred)
     target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     mask_bool = mask.to(device=pred.device, dtype=torch.bool)
     weights = weights.to(device=pred.device, dtype=pred.dtype)
@@ -1141,10 +1147,12 @@ def compute_composite_objective(
     else:
         v_tf = tf_out
         aux_tf_preds = None
-    # Defense-in-depth: sanitize decoder output so a single corrupted
-    # row (bf16 overflow, AMP edge-case) cannot poison the masked loss
-    # via NaN propagation. See tasks/lessons.md 2026-04-11 rule #3.
-    v_tf = torch.nan_to_num(v_tf, nan=0.0, posinf=0.0, neginf=0.0)
+    # Defense-in-depth: replace non-finite predictions with GT so the
+    # loss sees ≈0 (pred==target) instead of the nan_to_num(0) artifact
+    # that gives cos_loss=1.0 — the "loss bomb" pattern (lessons 2026-04-19).
+    _bad_tf = ~torch.isfinite(v_tf)
+    if _bad_tf.any():
+        v_tf = torch.where(_bad_tf, chains, v_tf)
 
     # Fix #7: Only exclude last position from L_step when L_ans is active
     # for that specific sample (i.e., when the window contains the answer).
@@ -1206,8 +1214,12 @@ def compute_composite_objective(
         oracle_prob=effective_oracle_prob,
         return_info=True,
     )
-    # Defense-in-depth sanitisation on rollout output (same reasoning as v_tf).
-    v_roll = torch.nan_to_num(v_roll, nan=0.0, posinf=0.0, neginf=0.0)
+    # Replace non-finite rollout predictions with GT (same fix as v_tf above).
+    # nan_to_num(0) was the "loss bomb": cos_sim(0,GT)=0 → cos_loss=1.0 per
+    # NaN position, inflating rollout loss and accelerating NaN cascade.
+    _bad_roll = ~torch.isfinite(v_roll)
+    if _bad_roll.any():
+        v_roll = torch.where(_bad_roll, chains, v_roll)
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
 
     # 4) In-batch contrastive ranking on final rollout answer.

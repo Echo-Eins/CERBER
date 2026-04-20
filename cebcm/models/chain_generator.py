@@ -1355,33 +1355,31 @@ class ChainGenerator(nn.Module):
                     next_vec_for_chain = torch.where(mask3, candidate, next_vec_for_chain)
                     repeat_resamples += int(repeat_mask.sum().item())
 
-            # Mathematical Fix: The model's TRUE prediction is the clean vector.
-            # We must evaluate the loss (and report metrics) on the clean vector.
-            # In contrast, the context chain gets the NOISY / RE-ROLLED vector.
-            # If we evaluated the noisy vector during training, we'd penalize random
-            # noise it couldn't predict.
+            # NaN guard: check raw_next BEFORE storing.  _sphere_project
+            # silently cleans NaN via nan_to_num(0) inside _safe_normalize,
+            # so checking next_vec_for_chain (post-projection) never fires.
+            # We must check raw_next (pre-projection) to catch the actual NaN.
+            raw_has_nan = not torch.isfinite(raw_next).all()
+
             if self.training:
-                # Training: track the raw unprojected logit to compute MSE gradients.
-                generated.append(raw_next)
+                if raw_has_nan:
+                    # Store clean sphere-projected vec instead of NaN-contaminated raw.
+                    # Downstream loss sees clean_pred ≈ GT direction → loss ≈ 0.
+                    generated.append(clean_next_vec)
+                else:
+                    generated.append(raw_next)
             else:
-                # Inference: track the ACTUAL vector chosen by the Critic/Repeat-Ban!
                 generated.append(next_vec_for_chain)
 
-            # NaN guard: if generated vector contains NaN, replace with the
-            # previous valid vector (or start_token projection). This prevents
-            # a single NaN from cascading through the entire chain.
-            if torch.isnan(next_vec_for_chain).any():
+            if raw_has_nan:
                 if len(generated) >= 2:
-                    next_vec_for_chain = generated[-2].detach().clone()
-                    next_vec_for_chain = self._sphere_project(next_vec_for_chain)
+                    fallback = generated[-2].detach().clone()
+                    next_vec_for_chain = self._sphere_project(fallback)
                 else:
                     next_vec_for_chain = self._sphere_project(
                         torch.randn(bsz, 1, self.cfg.d_model, device=v_query.device)
                     )
-                # Also fix the recorded generated vector
-                if self.training:
-                    generated[-1] = next_vec_for_chain / self.cfg.target_norm  # undo sphere project for raw logit scale
-                else:
+                if not self.training:
                     generated[-1] = next_vec_for_chain
 
             # Fix #3: Detach before appending so backward() through L_roll
