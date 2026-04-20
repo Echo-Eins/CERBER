@@ -80,12 +80,32 @@ class AdaRMSNorm(nn.Module):
     """RMSNorm with optional Adaptive Layer Normalization (AdaLN) conditioning.
 
     Base: ``RMSNorm(x) = x / RMS(x) * γ``  (Zhang & Sennrich 2019)
-    AdaLN: ``AdaRMSN(x, s, b) = RMSNorm(x) * (1 + s) + b``
-    where *s* (scale) and *b* (shift) are produced by a timestep MLP.
+    AdaLN: ``AdaRMSN(x, s, b) = RMSNorm(x) * gate + b``
+    where *gate = (1 + s)* and *s, b* are produced by a timestep MLP.
+
+    Two numerical-stability mechanisms (lessons.md 2026-04-20 evening):
+
+    1. **Full FP32 modulation chain.**  bf16 has only ~7 bits of mantissa,
+       which becomes catastrophically coarse when the modulation gate
+       ``(1 + scale)`` drifts close to zero (a known AdaLN failure mode).
+       We keep the entire normalize → gain → modulate → shift pipeline
+       in FP32 and only down-cast at the final return.
+
+    2. **Soft floor on the AdaLN gate.**  ``(1 + scale)`` is unbounded
+       below in vanilla AdaLN, and the user's GB10 runs showed catastrophic
+       gradient suppression when it dipped near 0 (signal annihilation).
+       We clamp the gate to a strictly-positive floor so the residual
+       branch can be strongly suppressed but never inverted or zeroed out.
 
     When *scale* and *shift* are ``None`` the layer is a standard RMSNorm,
     so teacher-forcing (no timestep) works unchanged.
     """
+
+    # Gate floor: (1 + scale) is clamped to >= GATE_MIN.  At GATE_MIN=1e-3
+    # the model can still attenuate the signal by 1000x — plenty for any
+    # real "suppress this position" use case — without ever hitting the
+    # NaN-prone 0 region or flipping sign.
+    GATE_MIN: float = 1e-3
 
     def __init__(self, d: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -98,14 +118,18 @@ class AdaRMSNorm(nn.Module):
             scale: Tensor | None = None,
             shift: Tensor | None = None,
     ) -> Tensor:
+        in_dtype = x.dtype
         x_f = x.float()
         rms = x_f.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        out = (x_f * rms).to(x.dtype) * self.weight
+        # Stay in FP32 through γ-multiplication; bf16 here loses precision
+        # whenever the post-norm signal's per-channel scale is small.
+        out = x_f * rms * self.weight.float()
         if scale is not None:
-            out = out * (1.0 + scale)
+            gate = (1.0 + scale.float()).clamp(min=self.GATE_MIN)
+            out = out * gate
         if shift is not None:
-            out = out + shift
-        return out
+            out = out + shift.float()
+        return out.to(in_dtype)
 
 
 class SwiGLUFFN(nn.Module):
@@ -114,6 +138,22 @@ class SwiGLUFFN(nn.Module):
     ``SwiGLU(x) = W_down( SiLU(W_gate(x)) ⊙ W_up(x) )``
 
     Three projections instead of two; no biases (standard practice).
+
+    Two anti-collapse mechanisms (lessons.md 2026-04-20 evening):
+
+    1. **Orthogonal init for W_gate / W_up.**  Xavier-uniform tends to
+       cluster gate inputs around zero, so ``SiLU(gate)`` lives in the
+       near-linear regime — exactly the "dead zone" the third-party
+       analysis warned about, where the gradient through the gate path
+       is ~0.5 and any drift toward the saturating tail kills training.
+       Orthogonal init spreads the gate inputs across the SiLU non-linear
+       region, preserving signal entropy and gradient flow at start.
+
+    2. **In-band activation telemetry.**  We record gate-input mean/std
+       and post-down output norm as non-persistent buffers, so the
+       training loop can poll them every ``probe_every_steps`` and
+       detect dead-zone drift before it kills training.  No per-step
+       cost beyond a single ``.detach().mean()`` when tracking is on.
     """
 
     def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1) -> None:
@@ -122,9 +162,34 @@ class SwiGLUFFN(nn.Module):
         self.w_up = nn.Linear(d_model, d_hidden, bias=False)
         self.w_down = nn.Linear(d_hidden, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
+        # Activation telemetry — populated when ``track_stats`` is True.
+        self.track_stats: bool = False
+        self.register_buffer("_gate_in_abs_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_gate_in_std", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_silu_kurtosis", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_out_norm_mean", torch.tensor(0.0), persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+        gate_in = self.w_gate(x)
+        silu_gate = F.silu(gate_in)
+        out = self.dropout(self.w_down(silu_gate * self.w_up(x)))
+        if self.track_stats and self.training:
+            # Stay on-device: copy_ keeps the values as tensors so we do
+            # NOT trigger a GPU→CPU sync on every forward.  The training
+            # loop pays the .item() cost only when polling at probe time.
+            with torch.no_grad():
+                gi = gate_in.detach().float()
+                self._gate_in_abs_mean.copy_(gi.abs().mean())
+                self._gate_in_std.copy_(gi.std())
+                # Excess kurtosis of post-SiLU values: high → spiky/dead,
+                # ~0 → Gaussian-like (healthy).  Detects the "лес из нулей
+                # и редких пиков" failure mode the analysis warned about.
+                sg = silu_gate.detach().float()
+                centered = sg - sg.mean()
+                var = centered.pow(2).mean().clamp(min=1e-12)
+                self._silu_kurtosis.copy_(centered.pow(4).mean() / var.pow(2) - 3.0)
+                self._out_norm_mean.copy_(out.detach().float().norm(dim=-1).mean())
+        return out
 
 
 class AuxiliaryPredictionHead(nn.Module):
@@ -608,6 +673,20 @@ class ChainGenerator(nn.Module):
             nn.init.zeros_(self.output_proj.bias)
         for head in self.aux_heads.values():
             head.init_output(gain=0.01)
+
+        # ── 5. Orthogonal init for SwiGLU gate / up projections ──
+        # Xavier-uniform clusters gate inputs near zero (where SiLU is
+        # near-linear, gradient ~0.5), creating a "dead zone" that the
+        # third-party scale-collapse analysis flagged.  Orthogonal
+        # weights spread the gate inputs across SiLU's non-linear
+        # region, preserving signal entropy and gradient flow at start.
+        # Skip ``w_down`` — it's zero-initialized just above by
+        # _zero_init_residual_projectors() and we must NOT overwrite it.
+        for block in self.layers:
+            ffn = getattr(block, "ffn", None)
+            if isinstance(ffn, SwiGLUFFN):
+                nn.init.orthogonal_(ffn.w_gate.weight, gain=1.0)
+                nn.init.orthogonal_(ffn.w_up.weight, gain=1.0)
 
     def _normalize_aux_layers(self, layers: tuple[int, ...] | list[int] | int | None) -> tuple[int, ...]:
         """Return sorted unique 1-based layer numbers that are valid."""

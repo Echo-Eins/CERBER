@@ -27,7 +27,12 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cebcm.models.chain_generator import ChainGenerator, ChainGeneratorConfig, _apply_rope
+from cebcm.models.chain_generator import (
+    ChainGenerator,
+    ChainGeneratorConfig,
+    SwiGLUFFN,
+    _apply_rope,
+)
 from cebcm.training.stage2_utils import (
     MetricTracker,
     get_cosine_schedule_with_warmup,
@@ -154,6 +159,39 @@ def _percentile(values: list[float], q: float) -> float:
 
 def _mean(values: list[float]) -> float:
     return float(sum(values) / max(len(values), 1))
+
+
+def _collect_swiglu_stats(model: torch.nn.Module) -> dict:
+    """Aggregate per-layer SwiGLU activation health stats.
+
+    Returns mean across layers of:
+      - gate_in_abs_mean: how far from zero the SiLU input lives.
+        Tiny → SiLU near-linear → gradient ~0.5 → "dead zone" the third-
+        party scale-collapse analysis warned about.
+      - gate_in_std: spread of SiLU inputs.  Collapsing toward 0 means
+        the gate is being squashed onto a single point.
+      - silu_kurtosis: excess kurtosis of post-SiLU values.  ~0 is healthy
+        (Gaussian-like); ≫0 is the "лес из нулей и редких пиков" failure
+        mode where a few channels carry all the signal.
+      - out_norm_mean: mean L2 norm of FFN output.  Collapsing → FFN is
+        contributing nothing to the residual stream.
+    """
+    gate_means, gate_stds, kurts, out_norms = [], [], [], []
+    for module in model.modules():
+        if isinstance(module, SwiGLUFFN) and module.track_stats:
+            gate_means.append(float(module._gate_in_abs_mean.item()))
+            gate_stds.append(float(module._gate_in_std.item()))
+            kurts.append(float(module._silu_kurtosis.item()))
+            out_norms.append(float(module._out_norm_mean.item()))
+    if not gate_means:
+        return {}
+    return {
+        "ffn_gate_in_abs_mean": _mean(gate_means),
+        "ffn_gate_in_std": _mean(gate_stds),
+        "ffn_silu_kurtosis": _mean(kurts),
+        "ffn_out_norm_mean": _mean(out_norms),
+        "ffn_silu_kurtosis_max": max(kurts),
+    }
 
 
 def summarize_chain_dataset(
@@ -2099,6 +2137,15 @@ def main() -> None:
     print(f"Layers={gen_cfg.n_layers}, Heads={gen_cfg.n_heads}, FFN={gen_cfg.dim_feedforward}")
     print(f"target_norm={gen_cfg.target_norm}, max_chain_len={gen_cfg.max_chain_len}")
 
+    # Enable SwiGLU activation telemetry (dead-zone / kurtosis tracking).
+    # Cost is ~4 reductions per FFN call when training; off when eval'ing.
+    enable_ffn_stats = bool(config.get("training", {}).get("enable_ffn_stats", True))
+    if enable_ffn_stats:
+        for module in model.modules():
+            if isinstance(module, SwiGLUFFN):
+                module.track_stats = True
+        print(f"  ffn_stats: enabled (gate-input mean/std, SiLU kurtosis, out-norm)")
+
     data_cfg = config["data"]
     data_path = data_cfg["path"]
     data = torch.load(data_path, map_location="cpu", weights_only=False)
@@ -2386,6 +2433,33 @@ def main() -> None:
             else:
                 print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
                       f"EMA reset, cooldown={sadt_cooldown} steps")
+
+            # ── Soft Adam momentum reset (lessons.md 2026-04-20 evening) ──
+            # Adam's exp_avg_sq accumulates the gradient-magnitude statistics
+            # of System1.  When System2 starts, the gradient scale jumps
+            # ~50x but Adam's denominator (sqrt(exp_avg_sq) + eps) is still
+            # tiny, so a single new gradient drives a huge update — into
+            # bfloat16-fragile zones — which the existing LR warmup only
+            # partially compensates.  We *scale down* (don't zero) the
+            # second moment so Adam becomes more sensitive to the new
+            # gradient magnitude without inducing the lr/sqrt(eps) ≈ 1e4
+            # update spike of a hard reset.  exp_avg (first moment, the
+            # "momentum direction") is left untouched — direction is still
+            # informative across the transition.
+            sq_scale = float(train_cfg.get("horizon_adam_sq_scale", 0.0))
+            if sq_scale > 0.0 and sq_scale < 1.0 and prev_target_steps > 0:
+                with torch.no_grad():
+                    n_scaled = 0
+                    for group in optimizer.param_groups:
+                        for p in group["params"]:
+                            state = optimizer.state.get(p)
+                            if state and "exp_avg_sq" in state:
+                                state["exp_avg_sq"].mul_(sq_scale)
+                                n_scaled += 1
+                                if "max_exp_avg_sq" in state:
+                                    state["max_exp_avg_sq"].mul_(sq_scale)
+                    print(f"  [SADT] Soft Adam reset: exp_avg_sq *= {sq_scale} "
+                          f"on {n_scaled} param tensors (exp_avg unchanged)")
         else:
             sadt_cooldown = 0
         prev_target_steps = target_steps
@@ -2584,6 +2658,9 @@ def main() -> None:
                         projection_state=probe_state,
                     )
                     probe_state = probe_info.pop("projection_state")
+                    ffn_stats = _collect_swiglu_stats(model)
+                    if ffn_stats:
+                        probe_info["ffn_health"] = ffn_stats
                     _append_jsonl(
                         metrics_log_path,
                         {
@@ -2597,10 +2674,18 @@ def main() -> None:
                             "timestamp": time.time(),
                         },
                     )
+                    ffn_log = ""
+                    if ffn_stats:
+                        ffn_log = (
+                            f" ffn_gate_std={ffn_stats['ffn_gate_in_std']:.3f}"
+                            f" silu_kurt={ffn_stats['ffn_silu_kurtosis']:+.2f}"
+                            f" ffn_out={ffn_stats['ffn_out_norm_mean']:.2f}"
+                        )
                     print(
                         f"  [PROBE] step={global_step} "
                         f"df_cos={probe_info.get('df_cos_mean', 0.0):.4f} "
-                        f"roll_cos={probe_info.get('roll_cos_mean', 0.0):.4f} "
+                        f"roll_cos={probe_info.get('roll_cos_mean', 0.0):.4f}"
+                        f"{ffn_log} "
                         f"path={probe_info.get('path')}"
                     )
                 except Exception as exc:

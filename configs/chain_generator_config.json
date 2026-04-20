@@ -114,6 +114,8 @@
 
         "horizon_warmup_steps": 200,
         "horizon_warmup_factor": 0.1,
+        "horizon_adam_sq_scale": 0.1,
+        "enable_ffn_stats": true,
 
         "nan_gate_window_size": 50,
         "nan_gate_max_rate": 10,

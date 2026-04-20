@@ -1,5 +1,40 @@
 # Lessons
 
+## 2026-04-20 (evening) — AdaLN gate annihilation, SwiGLU dead zone, soft Adam reset
+
+### Pattern
+Third-party scale-collapse / gradient-starvation analysis flagged four concrete failure modes that map directly onto our symptoms (gradient decaying as inverted-sqrt, weak reaction to loss spikes at System1→System2):
+
+1. **AdaLN gate annihilation.** `out * (1 + scale)` is unbounded below; nothing prevents `scale → -1` (signal zeroed) or worse (sign flip).
+2. **bf16 in the modulation chain.** Vanilla AdaRMSNorm casts back to bf16 *before* multiplying by γ, scale, shift. With ~7 mantissa bits, any modulation factor close to 0 loses all precision — and *that's exactly the regime annihilation drives the gate into*.
+3. **SwiGLU dead zone.** Xavier init clusters gate inputs near zero where `SiLU` is near-linear (gradient ~0.5). If weights drift toward the saturating tail, gradient through the gate path collapses and the FFN goes dormant ("лес из нулей и редких пиков").
+4. **Adam momentum ghosting at horizon transition.** `exp_avg_sq` accumulates the gradient-magnitude statistics of System1 (small grads).  When System2 starts, the new gradient is ~50× larger but Adam's denominator is still tiny, so the first update is huge → bf16-fragile zone → NaN cascade.  The existing LR warmup (`factor=0.1`, `steps=200`) only partially compensates because Adam *itself* doesn't see the rescale.
+
+### Fixes Applied
+
+1. **`AdaRMSNorm` rewritten** (`chain_generator.py`):
+   - Full FP32 chain: `x_f * rms * weight.float() * (1+scale.float()).clamp(min=GATE_MIN)` then `+ shift.float()`, only `.to(in_dtype)` at return.  No more bf16 inside the modulation.
+   - `GATE_MIN = 1e-3` floor on `(1 + scale)`: model can still attenuate 1000× but cannot zero or invert.  This is a strictly-positive smooth lower bound; the model retains full upward modulation freedom.
+
+2. **`SwiGLUFFN` hardened** (`chain_generator.py`):
+   - Orthogonal init for `w_gate` and `w_up` in `_init_weights` (after the global xavier sweep, so it overrides; placed *after* `_zero_init_residual_projectors()` so it does NOT touch `w_down`).  Spreads gate inputs across SiLU's nonlinear region, raises gradient through the gate path at start.
+   - Activation telemetry buffers populated when `track_stats=True`: `_gate_in_abs_mean`, `_gate_in_std`, `_silu_kurtosis` (excess), `_out_norm_mean`.  All `copy_(tensor)` — no `.item()` per forward, so no GPU↔CPU sync cost.  Training loop polls at `probe_every_steps`.
+
+3. **Soft Adam momentum reset** (`train_chain_generator.py:~2390`):
+   - On horizon transition, scale `exp_avg_sq *= horizon_adam_sq_scale` (default 0.1) for every parameter.
+   - **Do NOT touch `exp_avg`.** The first moment encodes the momentum *direction*, which is still informative across the transition.
+   - **Do NOT zero `exp_avg_sq`.** A full reset would make Adam's update `lr / sqrt(eps) ≈ 1e4` on the first new gradient — way worse than what we're trying to fix.
+   - Combined with the existing 200-step LR warmup (factor 0.1), Adam now both (a) sees a smaller LR ramp and (b) reacts proportionally to the new gradient magnitude instead of being numbed by old statistics.
+
+### Rules
+1. **Never let the AdaLN gate cross zero.** `(1 + scale).clamp(min=ε)` should be the default in any DiT-style modulation.  The smooth lower bound costs nothing and removes a known annihilation vector.
+2. **Modulation math stays in FP32, period.**  bf16's mantissa is too coarse for the regime where modulation factors are small — exactly the regime where stability matters most.
+3. **Orthogonal init for any gated-linear FFN** (SwiGLU, GeGLU, etc.).  Xavier-uniform is fine for plain Linear, but multiplicative gates need spread inputs to escape the near-linear regime.
+4. **Adam at distribution shift: scale `exp_avg_sq` down, never zero it, never touch `exp_avg`.** The hard reset cure is worse than the disease.
+5. **Telemetry as on-device tensors** (`copy_`, not `fill_(.item())`).  Triggering a sync per forward turns a "free" diagnostic into a 5–10% perf tax.
+
+---
+
 ## 2026-04-20 (afternoon) — Two more loss-bomb sites + the curriculum-not-applied gotcha
 
 ### Pattern
