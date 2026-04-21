@@ -7,6 +7,8 @@ Objective:
       + lambda_ans  * L_final_answer
       + lambda_roll * L_free_run
       + lambda_rank * L_inbatch_contrastive
+      + lambda_aux  * L_auxiliary_heads
+      + lambda_aux_df * L_auxiliary_df_x0
 """
 
 from __future__ import annotations
@@ -25,7 +27,12 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from cebcm.models.chain_generator import ChainGenerator, ChainGeneratorConfig, _apply_rope
+from cebcm.models.chain_generator import (
+    ChainGenerator,
+    ChainGeneratorConfig,
+    SwiGLUFFN,
+    _apply_rope,
+)
 from cebcm.training.stage2_utils import (
     MetricTracker,
     get_cosine_schedule_with_warmup,
@@ -154,6 +161,39 @@ def _mean(values: list[float]) -> float:
     return float(sum(values) / max(len(values), 1))
 
 
+def _collect_swiglu_stats(model: torch.nn.Module) -> dict:
+    """Aggregate per-layer SwiGLU activation health stats.
+
+    Returns mean across layers of:
+      - gate_in_abs_mean: how far from zero the SiLU input lives.
+        Tiny → SiLU near-linear → gradient ~0.5 → "dead zone" the third-
+        party scale-collapse analysis warned about.
+      - gate_in_std: spread of SiLU inputs.  Collapsing toward 0 means
+        the gate is being squashed onto a single point.
+      - silu_kurtosis: excess kurtosis of post-SiLU values.  ~0 is healthy
+        (Gaussian-like); ≫0 is the "лес из нулей и редких пиков" failure
+        mode where a few channels carry all the signal.
+      - out_norm_mean: mean L2 norm of FFN output.  Collapsing → FFN is
+        contributing nothing to the residual stream.
+    """
+    gate_means, gate_stds, kurts, out_norms = [], [], [], []
+    for module in model.modules():
+        if isinstance(module, SwiGLUFFN) and module.track_stats:
+            gate_means.append(float(module._gate_in_abs_mean.item()))
+            gate_stds.append(float(module._gate_in_std.item()))
+            kurts.append(float(module._silu_kurtosis.item()))
+            out_norms.append(float(module._out_norm_mean.item()))
+    if not gate_means:
+        return {}
+    return {
+        "ffn_gate_in_abs_mean": _mean(gate_means),
+        "ffn_gate_in_std": _mean(gate_stds),
+        "ffn_silu_kurtosis": _mean(kurts),
+        "ffn_out_norm_mean": _mean(out_norms),
+        "ffn_silu_kurtosis_max": max(kurts),
+    }
+
+
 def summarize_chain_dataset(
     samples: list[dict],
     label: str,
@@ -233,16 +273,40 @@ def summarize_chain_dataset(
 def get_chain_steps(epoch: int, cfg: dict) -> int:
     """Curriculum for chain horizon growth.
 
-    Fix #8: Linear ramp — each epoch adds exactly 1 step (not 2→4→6 jumps).
-    Supports system2_start_steps for fine-tuning (skip ramp, start at N).
+    Supports two modes controlled by the ``horizon_schedule`` config key:
+
+    1. **Fixed-horizon schedule** (``horizon_schedule`` is set):
+       A list of ``[steps, duration_epochs]`` pairs.  Each pair trains at
+       the given horizon for the specified number of epochs.  After the
+       schedule is exhausted, the model stays at the last horizon.
+
+       Example: ``[[4, 10], [5, 10]]`` — 10 epochs at 4 steps, then 10
+       epochs at 5 steps.
+
+    2. **Legacy linear ramp** (``horizon_schedule`` is absent):
+       Each epoch after System-1 adds +1 step, starting from
+       ``system2_start_steps``.  Original Fix #8 behaviour.
     """
     s1_epochs = int(cfg.get("system1_epochs", 10))
     max_steps = int(cfg.get("max_chain_steps", 20))
-    start_steps = int(cfg.get("system2_start_steps", 2))
 
     if epoch < s1_epochs:
         return 1
-    # Linear: epoch s1 → start_steps, epoch s1+1 → start_steps+1, ...
+
+    # ── Fixed-horizon schedule ──
+    schedule = cfg.get("horizon_schedule")
+    if schedule:
+        elapsed = epoch - s1_epochs
+        for entry in schedule:
+            steps_val, duration = int(entry[0]), int(entry[1])
+            if elapsed < duration:
+                return min(max_steps, steps_val)
+            elapsed -= duration
+        # After schedule exhausted: stay at last scheduled horizon.
+        return min(max_steps, int(schedule[-1][0]))
+
+    # ── Legacy: linear ramp ──
+    start_steps = int(cfg.get("system2_start_steps", 2))
     return min(max_steps, start_steps + (epoch - s1_epochs))
 
 
@@ -303,25 +367,248 @@ def _masked_step_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     pred = pred.float()
     target = target.float()
+    # Replace non-finite pred with target (loss≈0) instead of 0 (cos_loss=1.0).
+    _bad_pred = ~torch.isfinite(pred)
+    if _bad_pred.any():
+        pred = torch.where(_bad_pred, target, pred)
+    target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     mask_bool = mask.to(device=pred.device, dtype=torch.bool)
     maskf = mask_bool.to(dtype=pred.dtype)
-    mask_sum = maskf.sum().clamp(min=1.0)
+    # NaN×0 trap: clamp(min=1.0) does NOT fix NaN; NaN passes through
+    # clamp unchanged.  Must scrub BEFORE clamping (lesson 2026-04-14).
+    mask_sum = torch.nan_to_num(maskf.sum(), nan=1.0, posinf=1.0, neginf=1.0).clamp(min=1.0)
 
     cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+    # Clamp to valid cosine range and scrub NaN (fp-rounding or poisoned
+    # rows can push values slightly outside [-1, 1] and break (1 - cos)).
+    cos_sim = torch.nan_to_num(cos_sim.clamp(min=-1.0, max=1.0), nan=0.0)
     cos_term = torch.where(mask_bool, 1.0 - cos_sim, torch.zeros_like(cos_sim))
     cos_loss = cos_term.sum() / mask_sum
 
     mse_per = (pred - target).pow(2).sum(dim=-1)
+    mse_per = torch.nan_to_num(mse_per, nan=0.0, posinf=1e6, neginf=0.0)
     mse_term = torch.where(mask_bool, mse_per, torch.zeros_like(mse_per))
     mse_loss = mse_term.sum() / mask_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
     return loss, {
         "cos_sim": cos_sim,
         "cos_loss": cos_loss,
         "mse_loss": mse_loss,
         "mask_sum": mask_sum,
     }
+
+
+def _answer_loss(
+    pred_answer_all: torch.Tensor,
+    target_answer_all: torch.Tensor,
+    has_answer: torch.Tensor,
+    cosine_weight: float,
+    mse_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Answer-vector loss on samples whose selected window contains answer."""
+    if has_answer.any():
+        pred = pred_answer_all[has_answer].float()
+        target = target_answer_all[has_answer].float()
+        cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
+        cos_sim = torch.nan_to_num(cos_sim.clamp(min=-1.0, max=1.0), nan=0.0)
+        cos_loss = (1.0 - cos_sim).mean()
+        mse_loss = (pred - target).pow(2).sum(dim=-1).mean()
+        loss = cosine_weight * cos_loss + mse_weight * mse_loss
+        cos_mean = cos_sim.mean()
+    else:
+        loss = pred_answer_all.new_zeros(())
+        cos_loss = pred_answer_all.new_zeros(())
+        mse_loss = pred_answer_all.new_zeros(())
+        cos_mean = pred_answer_all.new_zeros(())
+    return loss, {
+        "cos_loss": cos_loss,
+        "mse_loss": mse_loss,
+        "cos_mean": cos_mean,
+    }
+
+
+def _auxiliary_heads_loss(
+    aux_preds: dict[str, torch.Tensor] | None,
+    target: torch.Tensor,
+    step_mask: torch.Tensor,
+    answer_pos: torch.Tensor,
+    has_answer: torch.Tensor,
+    *,
+    d_model: int,
+    cosine_weight: float,
+    mse_weight: float,
+    answer_weight: float = 1.0,
+    prefix: str = "aux",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Deep-supervision loss for intermediate decoder heads.
+
+    The loss is averaged across aux heads, so the effective lambda does not
+    change when we add/remove diagnostic heads. Each head gets the same
+    masked step objective plus the selected answer-vector objective.
+    """
+    if not aux_preds:
+        return target.new_zeros(()), {
+            f"loss_{prefix}": 0.0,
+            f"{prefix}_cos_mean": 0.0,
+            f"{prefix}_cos_answer": 0.0,
+        }
+
+    batch_idx = torch.arange(target.shape[0], device=target.device)
+    target_answer_all = target[batch_idx, answer_pos]
+    losses: list[torch.Tensor] = []
+    cos_means: list[float] = []
+    ans_cos_means: list[float] = []
+    metrics: dict[str, float] = {}
+
+    for layer_name, pred_raw in sorted(aux_preds.items(), key=lambda kv: int(kv[0])):
+        pred = torch.nan_to_num(pred_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        l_step, step_stats = _masked_step_losses(
+            pred,
+            target,
+            step_mask,
+            d_model,
+            cosine_weight,
+            mse_weight,
+        )
+        pred_answer_all = pred[batch_idx, answer_pos]
+        l_ans, ans_stats = _answer_loss(
+            pred_answer_all,
+            target_answer_all,
+            has_answer,
+            cosine_weight,
+            mse_weight,
+        )
+        layer_loss = l_step + float(answer_weight) * l_ans
+        losses.append(layer_loss)
+
+        mask_bool = step_mask.to(device=pred.device, dtype=torch.bool)
+        maskf = mask_bool.to(dtype=pred.dtype)
+        layer_ans_cos = float(ans_stats["cos_mean"].detach().item())
+        valid_count = float(maskf.sum().detach().item())
+        if valid_count > 0.0:
+            valid = maskf.sum().clamp(min=1.0)
+            cos_masked = torch.where(mask_bool, step_stats["cos_sim"], torch.zeros_like(step_stats["cos_sim"]))
+            layer_cos = float((cos_masked.sum() / valid).detach().item())
+        else:
+            # System1 direct-answer training masks the answer out of L_step,
+            # leaving no non-answer step positions. In that phase the aux
+            # answer cosine is the only meaningful aux quality metric.
+            layer_cos = layer_ans_cos
+        cos_means.append(layer_cos)
+        ans_cos_means.append(layer_ans_cos)
+        metrics[f"{prefix}_l{layer_name}_loss"] = float(layer_loss.detach().item())
+        metrics[f"{prefix}_l{layer_name}_step_loss"] = float(l_step.detach().item())
+        metrics[f"{prefix}_l{layer_name}_ans_loss"] = float(l_ans.detach().item())
+        metrics[f"{prefix}_l{layer_name}_cos_mean"] = layer_cos
+        metrics[f"{prefix}_l{layer_name}_cos_answer"] = layer_ans_cos
+
+    loss = torch.stack(losses).mean() if losses else target.new_zeros(())
+    metrics[f"loss_{prefix}"] = float(loss.detach().item())
+    metrics[f"{prefix}_cos_mean"] = float(sum(cos_means) / max(len(cos_means), 1))
+    metrics[f"{prefix}_cos_answer"] = float(sum(ans_cos_means) / max(len(ans_cos_means), 1))
+    return loss, metrics
+
+
+class ModelEMA:
+    """Exponential Moving Average of model parameters (Arch-1).
+
+    Maintains a shadow copy of the model weights updated after every
+    optimizer step as ``ema = decay · ema + (1 − decay) · live``.
+    At eval time we swap the live weights with the EMA shadow to get a
+    smoother, less noisy prediction — standard in modern diffusion training.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999) -> None:
+        self.decay = float(decay)
+        # Store shadow on the same device as the model.
+        self.shadow: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+        # Also track buffers so norm running_mean/var stay consistent.
+        self.buffers: dict[str, torch.Tensor] = {
+            n: b.detach().clone() for n, b in model.named_buffers()
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        d = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            s = self.shadow.get(name)
+            if s is None:
+                self.shadow[name] = p.detach().clone()
+                continue
+            s.mul_(d).add_(p.detach(), alpha=1.0 - d)
+        # Buffers: just copy (they're not part of SGD anyway).
+        for name, b in model.named_buffers():
+            self.buffers[name] = b.detach().clone()
+
+    @torch.no_grad()
+    def apply_to(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """Swap model params with EMA shadow; return original weights for restore."""
+        backup: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = p.detach().clone()
+                p.data.copy_(self.shadow[name])
+        return backup
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        for name, p in model.named_parameters():
+            if name in backup:
+                p.data.copy_(backup[name])
+
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "shadow": {k: v.detach().cpu() for k, v in self.shadow.items()},
+            "buffers": {k: v.detach().cpu() for k, v in self.buffers.items()},
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.decay = float(sd.get("decay", self.decay))
+        for k, v in sd.get("shadow", {}).items():
+            self.shadow[k] = v
+        for k, v in sd.get("buffers", {}).items():
+            self.buffers[k] = v
+
+
+def _build_wd_param_groups(
+    model: torch.nn.Module,
+    weight_decay: float,
+) -> list[dict]:
+    """Split parameters into decayed / non-decayed groups (Arch-6).
+
+    Non-decayed: biases, norm layers (LayerNorm/AdaRMSNorm weights),
+    start_token, null_context_token. Everything else gets weight decay.
+    Standard recipe from transformer training (Loshchilov 2019).
+    """
+    decay, no_decay = [], []
+    no_decay_names: set[str] = set()
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_special_token = name.endswith("start_token") or name.endswith("null_context_token")
+        # LayerScale gates (ls_self, ls_cross, ls_ffn) are 1-D but are NOT
+        # biases or norm gains — they are learnable residual-branch gates
+        # that can grow unboundedly without weight decay, amplifying FFN
+        # output norms toward NaN at horizon transitions.
+        is_layerscale = ".ls_" in name
+        is_bias_or_norm = p.ndim <= 1 and not is_layerscale
+        if is_bias_or_norm or is_special_token:
+            no_decay.append(p)
+            no_decay_names.add(name)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": float(weight_decay)},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
 
 def _masked_weighted_step_losses(
@@ -335,18 +622,43 @@ def _masked_weighted_step_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     pred = pred.float()
     target = target.float()
+    # Replace non-finite pred with target (loss≈0) instead of 0 (cos_loss=1.0).
+    _bad_pred = ~torch.isfinite(pred)
+    if _bad_pred.any():
+        pred = torch.where(_bad_pred, target, pred)
+    target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
     mask_bool = mask.to(device=pred.device, dtype=torch.bool)
     weights = weights.to(device=pred.device, dtype=pred.dtype)
+    # Guard against non-finite weights from an upstream SNR overflow BEFORE
+    # masking, so torch.where never has to choose between NaN and zero.
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     weights = torch.where(mask_bool, weights, torch.zeros_like(weights))
-    weight_sum = weights.sum().clamp(min=1.0)
+    # NaN×0 trap: clamp(min=1.0) does NOT fix NaN, it passes through.
+    # Must scrub BEFORE clamping (lesson 2026-04-14 Adam-zombie).
+    weight_sum = torch.nan_to_num(
+        weights.sum(), nan=1.0, posinf=1.0, neginf=1.0
+    ).clamp(min=1.0)
 
     cos_sim = (_safe_normalize(pred, dim=-1) * _safe_normalize(target, dim=-1)).sum(dim=-1)
-    cos_loss = ((1.0 - cos_sim) * weights).sum() / weight_sum
+    cos_sim = torch.nan_to_num(cos_sim.clamp(min=-1.0, max=1.0), nan=0.0)
+    # CRITICAL: avoid ``NaN * 0`` by zeroing inside ``torch.where`` BEFORE
+    # multiplying by ``weights``.  Direct ``(1 - cos) * weights`` is the
+    # exact footgun flagged in tasks/lessons.md (2026-04-11, rule #3):
+    # a single NaN at a masked position pollutes the entire reduction.
+    cos_term = torch.where(
+        mask_bool, (1.0 - cos_sim) * weights, torch.zeros_like(cos_sim)
+    )
+    cos_loss = cos_term.sum() / weight_sum
 
     mse_per = (pred - target).pow(2).sum(dim=-1)
-    mse_loss = (mse_per * weights).sum() / weight_sum
+    mse_per = torch.nan_to_num(mse_per, nan=0.0, posinf=1e6, neginf=0.0)
+    mse_term = torch.where(
+        mask_bool, mse_per * weights, torch.zeros_like(mse_per)
+    )
+    mse_loss = mse_term.sum() / weight_sum
 
     loss = cosine_weight * cos_loss + mse_weight * mse_loss
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
     return loss, {
         "cos_sim": cos_sim,
         "cos_loss": cos_loss,
@@ -361,8 +673,19 @@ def _gather_last_valid(x: torch.Tensor, valid_lens: torch.Tensor) -> torch.Tenso
 
 
 def _safe_normalize(v: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """Numerically safe normalization that prevents NaN gradients.
+
+    Mirrors ``ChainGenerator._safe_normalize``: (1) scrubs any non-finite
+    values from the input so downstream division never sees NaN/Inf, and
+    (2) clamps the norm BEFORE division.  Without the NaN scrub, a single
+    corrupted element (e.g. from a bfloat16 overflow in AMP) would poison
+    the entire masked-reduce — the classic ``NaN * 0 = NaN`` trap flagged
+    in ``tasks/lessons.md`` (2026-04-11).
+    """
     v_float = v.float()
-    return v_float / v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
+    v_float = torch.nan_to_num(v_float, nan=0.0, posinf=0.0, neginf=0.0)
+    norms = v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
+    return v_float / norms
 
 
 def _inbatch_contrastive_loss(
@@ -527,10 +850,16 @@ def _diffusion_forcing_weights(
 ) -> torch.Tensor:
     """Min-SNR-γ weights for DF loss (Hang et al. 2023).
 
-        Weight formula depends on ``prediction_type`` (Table 1 of Min-SNR paper):
-          - x₀-prediction: ``min(SNR, γ) / SNR``
-          - ε-prediction:  ``min(SNR, γ)``
+        Weight formula depends on ``prediction_type`` (Table 1 of Min-SNR paper,
+        confirmed by tasks/lessons.md 2026-04-13 rule #2):
+          - x₀-prediction: ``min(SNR, γ)``           (lesson L2064 correction)
+          - ε-prediction:  ``min(SNR, γ) / SNR``     (lesson L13 derivation)
           - v-prediction:  ``min(SNR, γ) / (SNR + 1)``
+
+        The x0 / eps formulas were previously swapped.  v-prediction (the
+        default in this config) was always correct, so existing runs with
+        ``prediction_type="v"`` are unaffected — but we now fix the latent
+        bugs behind the disabled branches per lesson L20.
 
         Default gamma=5.0 (recommended by Hang et al.).  Set to 0 to disable.
         """
@@ -538,20 +867,35 @@ def _diffusion_forcing_weights(
     if gamma <= 0.0:
         return torch.ones_like(noise_levels, dtype=torch.float32)
 
-    snr = model.diffusion_snr(noise_levels).to(device=noise_levels.device).float().clamp(min=1e-8)
-    gamma_t = torch.full_like(snr, gamma)
-    clipped = torch.minimum(snr, gamma_t)
+    # SNR must be computed entirely in float32: bf16 has no denormals and
+    # ``clamp(min=1e-8)`` is a no-op when the value underflows to 0, which
+    # then produces div-by-zero → Inf → NaN downstream.  Lesson 2026-04-14
+    # (frozen-model zombie): keep ENTIRE min-SNR pipeline in fp32, scrub
+    # NaN/Inf at every stage, only cast to fp32 output at the end.
+    with torch.autocast(device_type=noise_levels.device.type, enabled=False):
+        snr_raw = model.diffusion_snr(noise_levels).to(
+            device=noise_levels.device, dtype=torch.float32
+        )
+        snr_raw = torch.nan_to_num(snr_raw, nan=0.0, posinf=1e4, neginf=0.0)
+        # Both-sides clamp: min to avoid div-by-0, max to avoid numerical
+        # blow-up at the cleanest timesteps where SNR can reach 1e8+.
+        snr = snr_raw.clamp(min=1e-6, max=1e4)
+        gamma_t = torch.full_like(snr, gamma)
+        clipped = torch.minimum(snr, gamma_t)
 
-    pt = getattr(model.cfg, "prediction_type", "x0")
-    if pt == "x0":
-        weights = clipped / snr
-    elif pt == "eps":
-        weights = clipped
-    elif pt == "v":
-        weights = clipped / (snr + 1.0)
-    else:
-        weights = clipped / snr  # fallback
-    return torch.where(mask.to(dtype=torch.bool), weights, torch.zeros_like(weights))
+        pt = getattr(model.cfg, "prediction_type", "x0")
+        if pt == "x0":
+            weights = clipped  # Fixed: was clipped/snr
+        elif pt == "eps":
+            weights = clipped / snr  # Fixed: was clipped
+        elif pt == "v":
+            weights = clipped / (snr + 1.0)
+        else:
+            weights = clipped / (snr + 1.0)  # safe fallback matching v-pred
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.where(
+        mask.to(dtype=torch.bool), weights, torch.zeros_like(weights)
+    )
 
 
 def _make_diffusion_eval_noise_like(
@@ -610,6 +954,52 @@ def _append_jsonl(path: Path, payload: dict) -> None:
         f.write(json.dumps(_to_jsonable(payload), ensure_ascii=False) + "\n")
 
 
+def _positional_df_weights(
+    chain_mask: torch.Tensor,
+    answer_pos: torch.Tensor | None,
+    cfg: dict,
+) -> torch.Tensor:
+    """Per-position multiplier emphasizing positions near the answer.
+
+    DF-6: exponential ramp — later positions (closer to answer_pos) receive
+    higher weight, because the autoregressive error compounds toward the
+    answer and the answer position is the primary supervision target.
+
+    Returns a [B, T] float tensor.  Identity (all-ones) when disabled.
+    """
+    weight_type = str(cfg.get("positional_weight_type", "none")).lower()
+    if weight_type == "none":
+        return torch.ones_like(chain_mask, dtype=torch.float32)
+
+    bsz, steps = chain_mask.shape
+    device = chain_mask.device
+    pos = torch.arange(steps, device=device, dtype=torch.float32).unsqueeze(0).expand(bsz, -1)
+
+    if answer_pos is None:
+        # Fall back to last valid position per row.
+        ap = chain_mask.sum(dim=1).clamp(min=1).long() - 1
+    else:
+        ap = answer_pos.to(device=device).long().clamp(min=0, max=max(steps - 1, 0))
+    ap_f = ap.to(dtype=torch.float32).unsqueeze(-1)  # [B, 1]
+
+    if weight_type == "exponential":
+        # w(i) = base^(-(ap - i)), clipped at 0..ap; base > 1.
+        base = float(cfg.get("positional_weight_base", 1.15))
+        dist = (ap_f - pos).clamp(min=0.0)
+        w = torch.pow(torch.tensor(base, device=device), -dist)
+    elif weight_type == "linear":
+        # w(i) = 1 + alpha * (i / ap); at i=ap weight is 1+alpha.
+        alpha = float(cfg.get("positional_weight_alpha", 1.0))
+        denom = ap_f.clamp(min=1.0)
+        w = 1.0 + alpha * (pos / denom).clamp(min=0.0, max=1.0)
+    else:
+        raise ValueError(f"Unsupported positional_weight_type={weight_type}")
+
+    # Zero-out padded positions so the mask still dominates.
+    w = torch.where(chain_mask, w, torch.zeros_like(w))
+    return w
+
+
 def _diffusion_forcing_objective(
     model: ChainGenerator,
     v_q: torch.Tensor,
@@ -619,17 +1009,28 @@ def _diffusion_forcing_objective(
     context_mask: torch.Tensor,
     cfg: dict,
     *,
+    answer_pos: torch.Tensor | None = None,
+    has_answer: torch.Tensor | None = None,
     eval_mode: bool = False,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Masked Diffusion Forcing loss in SONAR space."""
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Masked Diffusion Forcing loss in SONAR space.
+
+    Correctly handles ``prediction_type`` (x0 / eps / v) by computing the
+    proper supervision target and DF-6 positional reweighting.
+    """
     bsz, steps, d_model = chains.shape
     levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=eval_mode)
-    weights = _diffusion_forcing_weights(model, levels, cfg, chain_mask)
+    snr_weights = _diffusion_forcing_weights(model, levels, cfg, chain_mask)
+    pos_weights = _positional_df_weights(chain_mask, answer_pos, cfg).to(
+        device=snr_weights.device, dtype=snr_weights.dtype,
+    )
+    weights = snr_weights * pos_weights
     noise = None
     if eval_mode and bool(cfg.get("df_eval_deterministic_noise", True)):
         noise = _make_diffusion_eval_noise_like(chains, cfg, model)
 
-    v_df, v_noisy, eps = model.forward_diffusion_forcing(
+    aux_df_enabled = len(getattr(model, "aux_heads", {})) > 0 and float(cfg.get("loss_lambda_aux_df", 0.0)) > 0.0
+    df_out = model.forward_diffusion_forcing(
         v_q,
         chains,
         levels,
@@ -637,30 +1038,92 @@ def _diffusion_forcing_objective(
         context_mask=context_mask,
         noise=noise,
         return_noisy=True,
+        return_aux=aux_df_enabled,
     )
+    if aux_df_enabled:
+        model_out, v_noisy, eps, aux_df_preds = df_out
+    else:
+        model_out, v_noisy, eps = df_out
+        aux_df_preds = None
+    # Compute prediction-type-aware target FIRST so we can use it as the
+    # NaN-replacement for poisoned decoder outputs (lessons.md 2026-04-20).
+    # Replacing NaN with 0 here was a "loss bomb": cos(0, target) = 0 →
+    # cos_loss = 1.0 on every poisoned position, drowning the masked
+    # reduction even though the downstream guard expects NaN, not zeros.
+    target = model.diffusion_target(chains, eps, levels)
+    # `target` itself should never be NaN; if it is, we have a bug in
+    # diffusion_target (e.g. v-target with NaN eps).  Surface it loudly
+    # rather than silently replacing — but still keep training alive.
+    if not torch.isfinite(target).all():
+        target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Defense-in-depth: replace any non-finite decoder output with the
+    # supervision target.  This makes the per-position loss on poisoned
+    # positions exactly 0 (cos_sim=1, mse=0) — a true no-op — instead of
+    # the cos_sim=0, mse>0 "loss bomb" that nan_to_num(0) produced.
+    _bad_out = ~torch.isfinite(model_out)
+    if _bad_out.any():
+        model_out = torch.where(_bad_out, target, model_out)
+
     loss, stats = _masked_weighted_step_losses(
-        v_df,
-        chains,
+        model_out,
+        target,
         chain_mask,
         weights,
         d_model,
         float(model.cfg.loss_cosine_weight),
         float(model.cfg.loss_mse_weight),
     )
+    if aux_df_preds:
+        # Aux DF heads predict clean x0 directly from noisy intermediate states.
+        # This gives a layer-local denoising canary independent of pred_type.
+        l_aux_df, aux_df_metrics = _auxiliary_heads_loss(
+            aux_df_preds,
+            chains,
+            chain_mask,
+            answer_pos if answer_pos is not None else (chain_mask.sum(dim=1).long().clamp(min=1) - 1),
+            has_answer.to(device=chains.device, dtype=torch.bool)
+            if has_answer is not None
+            else torch.ones(chains.shape[0], device=chains.device, dtype=torch.bool),
+            d_model=d_model,
+            cosine_weight=float(model.cfg.loss_cosine_weight),
+            mse_weight=float(model.cfg.loss_mse_weight),
+            answer_weight=0.0,
+            prefix="aux_df",
+        )
+    else:
+        l_aux_df = chains.new_zeros(())
+        aux_df_metrics = {
+            "loss_aux_df": 0.0,
+            "aux_df_cos_mean": 0.0,
+            "aux_df_cos_answer": 0.0,
+        }
 
     with torch.no_grad():
         maskf = chain_mask.to(dtype=torch.float32)
         valid = maskf.sum().clamp(min=1.0)
-        cos_sim = stats["cos_sim"]
-        cos_mean = torch.where(chain_mask, cos_sim, torch.zeros_like(cos_sim)).sum() / valid
+
+        # Prediction-type-space cosine (v vs v_target, or x0 vs x0, etc.).
+        cos_sim_pred = stats["cos_sim"]
+        cos_mean_pred = torch.where(chain_mask, cos_sim_pred, torch.zeros_like(cos_sim_pred)).sum() / valid
+
+        # Diagnostic: decode model output to x0 space and report cos vs clean chain.
+        x0_pred = model.predict_x0(v_noisy, model_out, levels).float()
+        cos_x0 = (
+            _safe_normalize(x0_pred, dim=-1) * _safe_normalize(chains.float(), dim=-1)
+        ).sum(dim=-1)
+        cos_x0_mean = torch.where(chain_mask, cos_x0, torch.zeros_like(cos_x0)).sum() / valid
+
         valid_levels = torch.where(chain_mask, levels.float(), torch.zeros_like(levels.float()))
         noisy_norm = torch.where(chain_mask, v_noisy.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
         eps_norm = torch.where(chain_mask, eps.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
-        pred_norm = torch.where(chain_mask, v_df.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
+        pred_norm = torch.where(chain_mask, model_out.norm(dim=-1), torch.zeros_like(maskf)).sum() / valid
 
         metrics = {
             "loss_df": float(loss.item()),
-            "df_cos": float(cos_mean.item()),
+            "loss_aux_df": float(l_aux_df.detach().item()),
+            "df_cos": float(cos_x0_mean.item()),  # x0-space (interpretable across pred_type)
+            "df_cos_target": float(cos_mean_pred.item()),  # raw target-space cos (pred_type dep.)
             "df_cos_loss_raw": float(stats["cos_loss"].item()),
             "df_mse_loss_raw": float(stats["mse_loss"].item()),
             "df_noise_level_mean": float((valid_levels.sum() / valid).item()),
@@ -669,9 +1132,11 @@ def _diffusion_forcing_objective(
             "df_eps_norm": float(eps_norm.item()),
             "df_pred_norm": float(pred_norm.item()),
             "df_weight_mean": float((weights * maskf).sum().item() / valid.item()),
+            "df_pos_weight_mean": float((pos_weights * maskf).sum().item() / valid.item()),
         }
+        metrics.update(aux_df_metrics)
 
-    return loss, metrics
+    return loss, l_aux_df, metrics
 
 
 def compute_composite_objective(
@@ -703,8 +1168,12 @@ def compute_composite_objective(
     lambda_roll = float(cfg.get("loss_lambda_roll", 1.0))
     lambda_rank = float(cfg.get("loss_lambda_rank", 0.1))
     lambda_df = float(cfg.get("loss_lambda_diffusion", 0.0))
+    lambda_aux = float(cfg.get("loss_lambda_aux", 0.0))
+    lambda_aux_df = float(cfg.get("loss_lambda_aux_df", 0.0))
+    aux_answer_weight = float(cfg.get("aux_loss_answer_weight", 1.0))
     rank_enabled = lambda_rank > 0.0
     df_enabled = bool(cfg.get("enable_diffusion_forcing", False)) and lambda_df > 0.0
+    aux_enabled = len(getattr(model, "aux_heads", {})) > 0 and lambda_aux > 0.0
     oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
     effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
 
@@ -715,14 +1184,26 @@ def compute_composite_objective(
     # 1) Teacher-forced masked step loss (with optional scheduled sampling).
     # Noisy TF: inject noise into the teacher-forced prefix so the model
     # learns to predict from imperfect contexts (diffusion-inspired).
-    v_tf = model.forward(
+    tf_out = model.forward(
         v_q,
         chains,
         v_context_bank=context_banks,
         context_mask=context_mask,
         scheduled_sampling_prob=scheduled_sampling_prob,
         tf_noise_std=tf_noise_std,
+        return_aux=aux_enabled,
     )
+    if aux_enabled:
+        v_tf, aux_tf_preds = tf_out
+    else:
+        v_tf = tf_out
+        aux_tf_preds = None
+    # Defense-in-depth: replace non-finite predictions with GT so the
+    # loss sees ≈0 (pred==target) instead of the nan_to_num(0) artifact
+    # that gives cos_loss=1.0 — the "loss bomb" pattern (lessons 2026-04-19).
+    _bad_tf = ~torch.isfinite(v_tf)
+    if _bad_tf.any():
+        v_tf = torch.where(_bad_tf, chains, v_tf)
 
     # Fix #7: Only exclude last position from L_step when L_ans is active
     # for that specific sample (i.e., when the window contains the answer).
@@ -735,6 +1216,19 @@ def compute_composite_objective(
 
     l_step, tf_stats = _masked_step_losses(v_tf, chains, step_mask, d_model, w_cos, w_mse)
 
+    l_aux, aux_metrics = _auxiliary_heads_loss(
+        aux_tf_preds,
+        chains,
+        step_mask,
+        answer_pos,
+        has_answer,
+        d_model=d_model,
+        cosine_weight=w_cos,
+        mse_weight=w_mse,
+        answer_weight=aux_answer_weight,
+        prefix="aux",
+    )
+
     # 2) Final-answer supervised loss — only on samples that reached the answer.
     tf_final = _gather_last_valid(v_tf, valid_lens)
     tgt_final = _gather_last_valid(chains, valid_lens)
@@ -742,17 +1236,9 @@ def compute_composite_objective(
     tf_answer_all = v_tf[batch_idx, answer_pos]
     tgt_answer_all = chains[batch_idx, answer_pos]
     
-    if has_answer.any():
-        tf_ans = tf_answer_all[has_answer].float()
-        tgt_ans = tgt_answer_all[has_answer].float()
-        ans_cos_sim = (_safe_normalize(tf_ans, dim=-1) * _safe_normalize(tgt_ans, dim=-1)).sum(dim=-1)
-        ans_cos = (1.0 - ans_cos_sim).mean()
-        ans_mse = (tf_ans - tgt_ans).pow(2).sum(dim=-1).mean()
-        l_ans = w_cos * ans_cos + w_mse * ans_mse
-    else:
-        # System2: No sample reached the answer in this window.
-        l_ans = torch.zeros((), device=chains.device, dtype=chains.dtype)
-
+    l_ans, _ans_stats = _answer_loss(
+        tf_answer_all, tgt_answer_all, has_answer, w_cos, w_mse,
+    )
 
     # 3) Free-run rollout loss (exposure-bias correction).
     v_roll, roll_info = model.generate(
@@ -771,6 +1257,12 @@ def compute_composite_objective(
         oracle_prob=effective_oracle_prob,
         return_info=True,
     )
+    # Replace non-finite rollout predictions with GT (same fix as v_tf above).
+    # nan_to_num(0) was the "loss bomb": cos_sim(0,GT)=0 → cos_loss=1.0 per
+    # NaN position, inflating rollout loss and accelerating NaN cascade.
+    _bad_roll = ~torch.isfinite(v_roll)
+    if _bad_roll.any():
+        v_roll = torch.where(_bad_roll, chains, v_roll)
     l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
 
     # 4) In-batch contrastive ranking on final rollout answer.
@@ -799,9 +1291,11 @@ def compute_composite_objective(
     loss = lambda_step * l_step + lambda_ans * l_ans + lambda_roll * l_roll
     if rank_enabled:
         loss = loss + lambda_rank * l_rank
+    if aux_enabled:
+        loss = loss + lambda_aux * l_aux
 
     if df_enabled:
-        l_df, df_metrics = _diffusion_forcing_objective(
+        l_df, l_aux_df, df_metrics = _diffusion_forcing_objective(
             model,
             v_q,
             chains,
@@ -809,14 +1303,21 @@ def compute_composite_objective(
             context_banks,
             context_mask,
             cfg,
+            answer_pos=answer_pos,
+            has_answer=has_answer,
             eval_mode=eval_mode,
         )
         loss = loss + lambda_df * l_df
+        if lambda_aux_df > 0.0:
+            loss = loss + lambda_aux_df * l_aux_df
     else:
         l_df = chains.new_zeros(())
+        l_aux_df = chains.new_zeros(())
         df_metrics = {
             "loss_df": 0.0,
+            "loss_aux_df": 0.0,
             "df_cos": 0.0,
+            "df_cos_target": 0.0,
             "df_cos_loss_raw": 0.0,
             "df_mse_loss_raw": 0.0,
             "df_noise_level_mean": 0.0,
@@ -825,6 +1326,9 @@ def compute_composite_objective(
             "df_eps_norm": 0.0,
             "df_pred_norm": 0.0,
             "df_weight_mean": 0.0,
+            "df_pos_weight_mean": 0.0,
+            "aux_df_cos_mean": 0.0,
+            "aux_df_cos_answer": 0.0,
         }
 
     with torch.no_grad():
@@ -893,6 +1397,8 @@ def compute_composite_objective(
             "lambda_roll": lambda_roll,
             "lambda_rank": lambda_rank,
             "lambda_df": lambda_df,
+            "lambda_aux": lambda_aux,
+            "lambda_aux_df": lambda_aux_df,
             "ss_prob": float(scheduled_sampling_prob),
             "free_run_noise_std": float(free_run_noise_std),
             "tf_noise_std": float(tf_noise_std),
@@ -901,6 +1407,7 @@ def compute_composite_objective(
             "oracle_prob": float(effective_oracle_prob),
             "answer_coverage": float(has_answer.float().mean().item()),
             "raw_norm_mean": float(roll_info.get("raw_norm_mean", 0.0)),
+            "nan_gate_count": float(getattr(model, "_nan_gate_count", 0)),
         }
 
         # Additional raw components for debugging.
@@ -908,6 +1415,7 @@ def compute_composite_objective(
         metrics["tf_mse_loss_raw"] = float(tf_stats["mse_loss"].item())
         metrics["roll_cos_loss_raw"] = float(roll_stats["cos_loss"].item())
         metrics["roll_mse_loss_raw"] = float(roll_stats["mse_loss"].item())
+        metrics.update(aux_metrics)
         metrics.update(df_metrics)
 
     return loss, metrics
@@ -927,6 +1435,7 @@ def train_step(
     free_run_noise_std: float = 0.0,
     oracle_prob: float = 0.0,
     tf_noise_std: float = 0.0,
+    ema: "ModelEMA | None" = None,
 ) -> dict[str, float]:
     v_q = batch["v_questions"].to(device)
     chains = batch["chains"].to(device)
@@ -959,45 +1468,211 @@ def train_step(
             tf_noise_std=tf_noise_std,
         )
 
-    # NaN guard: if loss is NaN/Inf, skip this step entirely.
-    # This prevents a single bad batch from permanently corrupting all weights.
-    if not torch.isfinite(loss):
+    # Defense-in-depth: scrub any residual NaN/Inf in the final loss scalar
+    # before backward.  Even if upstream guards catch most issues, a single
+    # poisoned element elsewhere in the graph can still propagate; we must
+    # never hand NaN to autograd (lesson 2026-04-14 Adam-zombie).
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+    # A completely scrubbed-to-zero loss has no signal — skip the backward
+    # so we don't waste compute on a no-op step, but crucially keep the
+    # optimizer / scaler state clean.
+    if not torch.isfinite(loss) or float(loss.detach()) == 0.0:
         optimizer.zero_grad(set_to_none=True)
         metrics["nan_skipped"] = 1.0
         metrics["nan_loss_skipped"] = 1.0
         metrics["nan_grad_skipped"] = 0.0
+        metrics["grad_sanitized"] = 0.0
+        metrics["param_restored"] = 0.0
         metrics["optimizer_stepped"] = 0.0
         metrics["target_steps"] = float(target_steps)
         metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
         return metrics
 
     scaler.scale(loss).backward()
-
-    # Unscale once, then clip + check for NaN gradients.
     scaler.unscale_(optimizer)
+
+    # --- Gradient sanitation (preserve-momentum policy) --------------
+    # Zero only the NaN/Inf entries in ``.grad``.  Adam sees a zero
+    # gradient for those params → exp_avg decays by β₁, exp_avg_sq
+    # decays by β₂ (natural "forget" signal).  We PRESERVE healthy
+    # momentum buffers.  Lesson 2026-04-16: unconditionally zeroing
+    # momentum created the Adam-zombie — after a reset the first
+    # non-zero gradient produces an update of magnitude lr/√ε ≈ 1e4,
+    # which instantly destabilizes the model and locks val metrics.
+    # The only buffers we zero are those that are themselves non-finite.
+    grad_had_nan = False
+    sanitized_count = 0
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad
+        bad = ~torch.isfinite(g)
+        if bad.any():
+            grad_had_nan = True
+            sanitized_count += 1
+            g.masked_fill_(bad, 0.0)
+            # DO NOT zero Adam momentum here.  With zero grad, Adam
+            # naturally decays exp_avg by β₁ and exp_avg_sq by β₂ —
+            # effectively "this step had no signal, slowly forget the
+            # old direction".  Zeroing momentum instead creates the
+            # Adam-zombie: after reset, Adam's update is dominated by
+            # lr / sqrt(ε) ≈ 1e4, which produces a huge destabilizing
+            # step on the next non-zero gradient (lesson 2026-04-16).
+            # Only sanitize buffers that are themselves non-finite.
+            state = optimizer.state.get(p)
+            if state:
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    buf = state.get(key)
+                    if buf is not None and not torch.isfinite(buf).all():
+                        buf.zero_()
+
+    # --- Zombie streak detector + hard EMA reset ---------------------
+    # When grad sanitation happens on many consecutive steps, the
+    # model is stuck in a corrupted basin from which per-step grad
+    # scrubbing cannot escape (every forward still produces NaN because
+    # a weight is in a numerically fragile region, even if it is still
+    # technically `isfinite`).  We maintain a streak counter on the EMA
+    # object and, once it crosses a threshold, force-restore ALL
+    # parameters from the EMA shadow and zero ALL Adam state.  This is
+    # the break-glass path that guarantees we can escape ANY basin.
+    zombie_threshold = int(cfg.get("zombie_reset_threshold", 15))
+    zombie_reset = 0
+    zombie_resets_total = 0
+    zombie_streak_now = 0
+    if ema is not None:
+        if not hasattr(ema, "_zombie_streak"):
+            ema._zombie_streak = 0
+            ema._zombie_resets = 0
+        if grad_had_nan:
+            ema._zombie_streak += 1
+        else:
+            ema._zombie_streak = 0
+
+        if ema._zombie_streak >= zombie_threshold:
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    shadow = ema.shadow.get(name)
+                    if shadow is not None and torch.isfinite(shadow).all():
+                        p.data.copy_(shadow)
+                    else:
+                        torch.nan_to_num(
+                            p.data, nan=0.0, posinf=0.0, neginf=0.0,
+                            out=p.data,
+                        )
+                    # Only sanitize non-finite Adam buffers.  Zeroing
+                    # healthy momentum is what created the Adam-zombie:
+                    # after full reset, update ≈ lr/√ε ≈ 1e4 on the
+                    # first non-zero gradient, destabilizing the model.
+                    # With preserved momentum, Adam continues from the
+                    # restored shadow weights with working dynamics.
+                    state = optimizer.state.get(p)
+                    if state:
+                        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                            buf = state.get(key)
+                            if buf is not None and not torch.isfinite(buf).all():
+                                buf.zero_()
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            ema._zombie_streak = 0
+            ema._zombie_resets += 1
+            zombie_reset = 1
+            zombie_resets_total = ema._zombie_resets
+            metrics["nan_skipped"] = 1.0
+            metrics["nan_loss_skipped"] = 0.0
+            metrics["nan_grad_skipped"] = 0.0
+            metrics["grad_sanitized"] = float(sanitized_count)
+            metrics["param_restored"] = 0.0
+            metrics["zombie_reset"] = 1.0
+            metrics["zombie_resets_total"] = float(zombie_resets_total)
+            metrics["zombie_streak"] = 0.0
+            metrics["optimizer_stepped"] = 0.0
+            metrics["grad_norm"] = 0.0
+            metrics["target_steps"] = float(target_steps)
+            metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
+            return metrics
+        zombie_streak_now = ema._zombie_streak
+        zombie_resets_total = ema._zombie_resets
 
     clip_grad = float(cfg.get("clip_grad_norm", 1.0))
     if clip_grad > 0:
         total_norm = nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         if not torch.isfinite(total_norm):
-            # NaN/Inf in gradients — must still call scaler.update() to
-            # keep its internal state consistent, then skip optimizer.step().
+            # Defensive: extremely unlikely after the sanitation above,
+            # but if it still happens, zero grads and skip the step.
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
             metrics["nan_skipped"] = 1.0
             metrics["nan_loss_skipped"] = 0.0
             metrics["nan_grad_skipped"] = 1.0
+            metrics["grad_sanitized"] = float(sanitized_count)
+            metrics["param_restored"] = 0.0
+            metrics["zombie_reset"] = 0.0
+            metrics["zombie_resets_total"] = float(zombie_resets_total)
+            metrics["zombie_streak"] = float(zombie_streak_now)
             metrics["optimizer_stepped"] = 0.0
             metrics["target_steps"] = float(target_steps)
             metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
             return metrics
+    else:
+        total_norm = torch.tensor(0.0, device=device)
 
     scaler.step(optimizer)
     scaler.update()
 
-    metrics["nan_skipped"] = 0.0
+    # --- Post-step parameter sanity check (EMA break-glass) --------
+    # If the optimizer step somehow produced NaN/Inf or HUGE-but-finite
+    # drift in parameters, restore from EMA.  ``isfinite`` does NOT
+    # catch values like 1e30 — we therefore also guard against norms
+    # exceeding a generous threshold relative to initialization.
+    params_restored = 0
+    max_param_abs = float(cfg.get("param_abs_max", 1.0e4))
+    if ema is not None:
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            non_finite = not torch.isfinite(p.data).all()
+            too_large = False
+            if not non_finite:
+                with torch.no_grad():
+                    pmax = float(p.data.abs().amax().item())
+                too_large = pmax > max_param_abs
+            if non_finite or too_large:
+                shadow = ema.shadow.get(name)
+                if shadow is not None and torch.isfinite(shadow).all():
+                    p.data.copy_(shadow)
+                    params_restored += 1
+                else:
+                    torch.nan_to_num(
+                        p.data, nan=0.0, posinf=0.0, neginf=0.0, out=p.data
+                    )
+                    params_restored += 1
+                # Only sanitize non-finite Adam buffers — preserve
+                # healthy momentum so Adam can continue learning
+                # after the parameter restore (lesson 2026-04-16).
+                state = optimizer.state.get(p)
+                if state:
+                    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                        buf = state.get(key)
+                        if buf is not None and not torch.isfinite(buf).all():
+                            buf.zero_()
+
+    # EMA update ONLY on fully clean steps — NO grad sanitation AND
+    # NO param restore.  Otherwise subtle drift (that passed isfinite
+    # but is already polluted) leaks into the shadow, and the very
+    # rescue source becomes the source of future corruption.
+    if ema is not None and not grad_had_nan and params_restored == 0:
+        ema.update(model)
+
+    metrics["nan_skipped"] = 1.0 if (grad_had_nan or params_restored > 0) else 0.0
     metrics["nan_loss_skipped"] = 0.0
     metrics["nan_grad_skipped"] = 0.0
+    metrics["grad_sanitized"] = float(sanitized_count)
+    metrics["param_restored"] = float(params_restored)
+    metrics["zombie_reset"] = 0.0
+    metrics["zombie_resets_total"] = float(zombie_resets_total)
+    metrics["zombie_streak"] = float(zombie_streak_now)
     metrics["optimizer_stepped"] = 1.0
     metrics["grad_norm"] = float(total_norm.item()) if clip_grad > 0 else 0.0
     metrics["target_steps"] = float(target_steps)
@@ -1049,6 +1724,8 @@ def eval_step(
         "val_loss_roll": metrics["loss_roll"],
         "val_loss_rank": metrics["loss_rank"],
         "val_loss_df": metrics["loss_df"],
+        "val_loss_aux": metrics.get("loss_aux", 0.0),
+        "val_loss_aux_df": metrics.get("loss_aux_df", 0.0),
         "val_tf_cos": metrics["tf_cos_mean"],
         "val_tf_cos_last": metrics["tf_cos_last"],
         "val_tf_cos_answer": metrics["tf_cos_answer"],
@@ -1057,6 +1734,9 @@ def eval_step(
         "val_roll_cos_answer": metrics["roll_cos_answer"],
         "val_rank_acc": metrics["rank_acc"],
         "val_df_cos": metrics["df_cos"],
+        "val_aux_cos": metrics.get("aux_cos_mean", 0.0),
+        "val_aux_cos_answer": metrics.get("aux_cos_answer", 0.0),
+        "val_aux_df_cos": metrics.get("aux_df_cos_mean", 0.0),
         "val_df_noise_level": metrics["df_noise_level_mean"],
         "val_df_noisy_norm": metrics["df_noisy_norm"],
         "val_df_eps_norm": metrics["df_eps_norm"],
@@ -1259,7 +1939,7 @@ def write_training_probe_snapshot(
 
         levels = _sample_diffusion_noise_levels(chain_mask, cfg, model, eval_mode=True)
         noise = _make_diffusion_eval_noise_like(chains_trunc, cfg, model)
-        v_df, v_noisy, eps = model.forward_diffusion_forcing(
+        v_df_raw, v_noisy, eps = model.forward_diffusion_forcing(
             v_q,
             chains_trunc,
             levels,
@@ -1268,6 +1948,13 @@ def write_training_probe_snapshot(
             noise=noise,
             return_noisy=True,
         )
+        # ``forward_diffusion_forcing`` returns the raw model output which under
+        # ``prediction_type="v"`` (or "eps") is NOT the clean x0 — comparing it
+        # directly to the clean target yields an antipodal cosine (v ≈ −σ·x0
+        # at mid noise, so cos(v, x0) → −√(1−α̅_t)). Decode to pred_x0 first so
+        # every downstream cosine/L2 and the exported "pred_x0" field live in
+        # the same space as the clean target.
+        v_df = model.predict_x0(v_noisy, v_df_raw, levels).to(dtype=v_df_raw.dtype)
         v_tf = model.forward(
             v_q,
             chains_trunc,
@@ -1446,6 +2133,15 @@ def main() -> None:
     print(f"Layers={gen_cfg.n_layers}, Heads={gen_cfg.n_heads}, FFN={gen_cfg.dim_feedforward}")
     print(f"target_norm={gen_cfg.target_norm}, max_chain_len={gen_cfg.max_chain_len}")
 
+    # Enable SwiGLU activation telemetry (dead-zone / kurtosis tracking).
+    # Cost is ~4 reductions per FFN call when training; off when eval'ing.
+    enable_ffn_stats = bool(config.get("training", {}).get("enable_ffn_stats", True))
+    if enable_ffn_stats:
+        for module in model.modules():
+            if isinstance(module, SwiGLUFFN):
+                module.track_stats = True
+        print(f"  ffn_stats: enabled (gate-input mean/std, SiLU kurtosis, out-norm)")
+
     data_cfg = config["data"]
     data_path = data_cfg["path"]
     data = torch.load(data_path, map_location="cpu", weights_only=False)
@@ -1517,11 +2213,16 @@ def main() -> None:
     )
 
     lr = float(train_cfg.get("lr", 1e-4))
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
-    )
+    wd = float(train_cfg.get("weight_decay", 1e-4))
+    param_groups = _build_wd_param_groups(model, wd)
+    optimizer = torch.optim.AdamW(param_groups, lr=lr)
+
+    # EMA (Arch-1).  Decay=0 disables.
+    ema_decay = float(train_cfg.get("model_ema_decay", 0.0))
+    ema: ModelEMA | None = None
+    if ema_decay > 0.0:
+        ema = ModelEMA(model, decay=ema_decay)
+        print(f"EMA enabled with decay={ema_decay}")
 
     num_epochs = int(args.max_epochs or train_cfg.get("num_epochs", 50))
     total_steps = num_epochs * len(train_loader)
@@ -1558,6 +2259,8 @@ def main() -> None:
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_metric = float(ckpt.get("best_metric", best_metric))
         global_step = int(ckpt.get("global_step", 0))
+        if ema is not None and ckpt.get("ema") is not None:
+            ema.load_state_dict(ckpt["ema"])
         print(f"Resumed from {args.resume}: epoch={start_epoch}, best={best_metric:.4f}")
 
     log_every = int(train_cfg.get("log_every", 50))
@@ -1591,12 +2294,42 @@ def main() -> None:
     )
 
     tracker = MetricTracker()
-    
+
+    # Preserve base lambdas so warm-up schedules can scale without drift.
+    base_df_lambda = float(train_cfg.get("loss_lambda_diffusion", 0.0))
+    df_warmup_epochs = int(train_cfg.get("df_warmup_epochs", 0))
+    base_ans_lambda = float(train_cfg.get("loss_lambda_answer", 1.0))
+
+    # Rolling ans_coverage history for collapse-warning heuristic.
+    ans_cov_history: list[float] = []
+    ans_cov_warn_threshold = float(train_cfg.get("ans_cov_warn_threshold", 0.10))
+    ans_cov_warn_window = int(train_cfg.get("ans_cov_warn_window", 3))
+
     # Initialize SADT (Step-wise Adaptive Dynamic Throttling) state.
     # It changes LR only; oracle/DAger is disabled by default and not tied to SADT.
     sadt_tf_ema = None
     sadt_roll_ema = None
     sadt_events = {"throttle": 0, "turbo": 0}
+
+    # Hard-fail guards: do not keep training after the model enters a
+    # finite-metric / zero-gradient zombie state. Recovery may attempt EMA
+    # restores inside train_step, but a repeated bad-step streak means the
+    # run is no longer scientifically valid.
+    #
+    # enable_zombie_guard=false disables the hard-fail raise entirely, so
+    # training can survive NaN cascades that the NaN gates are already
+    # handling. NaN gates (model._nan_gate_count) stay active regardless —
+    # they prevent NaN from entering the loss and gradients.  The zombie
+    # guard only controls whether a persistent zero-grad or bad-step streak
+    # terminates the run.  Disable when you observe genuine learning
+    # continuing through a streak (e.g. GB10_1 tf_cos 0.46→0.63 while
+    # zero_grad_streak was accumulating from NaN-gated batches).
+    enable_zombie_guard = bool(train_cfg.get("enable_zombie_guard", True))
+    bad_step_streak = 0
+    zero_grad_streak = 0
+    hard_fail_bad_step_streak = int(train_cfg.get("hard_fail_bad_step_streak", 25))
+    hard_fail_zero_grad_streak = int(train_cfg.get("hard_fail_zero_grad_streak", 25))
+    zero_grad_threshold = float(train_cfg.get("zero_grad_threshold", 1e-8))
 
     print("\nTraining settings")
     print(f"  epochs={num_epochs}, batch={batch_size}, lr={lr:.2e}")
@@ -1606,12 +2339,20 @@ def main() -> None:
         f"ans*{train_cfg.get('loss_lambda_answer', 1.0)} + "
         f"roll*{train_cfg.get('loss_lambda_roll', 1.0)} + "
         f"rank*{train_cfg.get('loss_lambda_rank', 0.1)} + "
-        f"df*{train_cfg.get('loss_lambda_diffusion', 0.0)}"
+        f"df*{train_cfg.get('loss_lambda_diffusion', 0.0)} + "
+        f"aux*{train_cfg.get('loss_lambda_aux', 0.0)} + "
+        f"aux_df*{train_cfg.get('loss_lambda_aux_df', 0.0)}"
     )
-    print(
-        f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
-        f"linear_ramp, max_steps={max_chain_steps}"
-    )
+    horizon_schedule = train_cfg.get("horizon_schedule")
+    if horizon_schedule:
+        sched_desc = " → ".join(f"{s}×{d}ep" for s, d in horizon_schedule)
+        print(f"  horizon: system1={train_cfg.get('system1_epochs', 10)}ep, "
+              f"schedule=[{sched_desc}]")
+    else:
+        print(
+            f"  horizon: system1_epochs={train_cfg.get('system1_epochs', 10)}, "
+            f"linear_ramp, max_steps={max_chain_steps}"
+        )
     print(
         f"  scheduled_sampling: max={train_cfg.get('scheduled_sampling_max', 0.5)}, "
         f"ramp_epochs={train_cfg.get('scheduled_sampling_ramp_epochs', 10)}"
@@ -1635,6 +2376,17 @@ def main() -> None:
     print("=" * 70)
 
     prev_target_steps = 1  # Track for SADT cooldown
+    # Horizon transition LR warmup state.
+    horizon_warmup_remaining = 0
+    horizon_warmup_total = 0
+    horizon_warmup_factor = 0.1
+    # Answer loss warmup state (ramps lambda_ans 0→base at horizon transitions).
+    answer_warmup_remaining = 0
+    answer_warmup_total = 0
+    # NaN cascade detector state.
+    nan_gate_window_size = int(train_cfg.get("nan_gate_window_size", 50))
+    nan_gate_window: list[int] = []
+    nan_gate_lr_halved = False
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -1643,6 +2395,17 @@ def main() -> None:
         noise_std = _get_scheduled_noise_std(epoch, train_cfg)
         oracle_prob = _get_oracle_prob(epoch, train_cfg)
         tf_noise = _get_tf_noise_std(epoch, train_cfg)
+
+        # Diffusion Forcing lambda warm-up: ramp from 0 to base over the first
+        # df_warmup_epochs. Prevents the high-variance DF gradient from
+        # dominating early training while the backbone is still warming up
+        # and the geometry has not stabilised.
+        if df_warmup_epochs > 0 and epoch < df_warmup_epochs:
+            effective_df_lambda = base_df_lambda * (float(epoch + 1) / float(df_warmup_epochs))
+        else:
+            effective_df_lambda = base_df_lambda
+        train_cfg["loss_lambda_diffusion"] = effective_df_lambda
+
         epoch_start = time.time()
 
         # Reset SADT EMA at System2 transition to prevent false throttling.
@@ -1652,8 +2415,65 @@ def main() -> None:
             sadt_tf_ema = None
             sadt_roll_ema = None
             sadt_cooldown = int(train_cfg.get("sadt_cooldown_steps", 200))
-            print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
-                  f"EMA reset, cooldown={sadt_cooldown} steps")
+            # ── Horizon transition LR warmup ──────────────────────
+            # The System1→System2 jump causes a ~50x gradient norm
+            # spike (e.g. 0.39→19.67) which pushes parameters into
+            # bfloat16-fragile zones and triggers NaN cascades.
+            # Temporarily reduce LR and linearly ramp back up.
+            hw_steps = int(train_cfg.get("horizon_warmup_steps", 0))
+            hw_factor = float(train_cfg.get("horizon_warmup_factor", 0.1))
+            # ── Answer loss warmup ─────────────────────────────
+            # When target_steps increases, the answer embedding may
+            # enter the training window for the first time.  l_ans
+            # jumping from 0→full creates a gradient shock that
+            # destabilises FFN output norms (lessons 2026-04-20 night).
+            # Ramp lambda_ans from 0→base over answer_warmup_steps.
+            aw_steps = int(train_cfg.get("answer_warmup_steps", hw_steps))
+            if aw_steps > 0 and target_steps > prev_target_steps:
+                answer_warmup_remaining = aw_steps
+                answer_warmup_total = aw_steps
+                train_cfg["loss_lambda_answer"] = 0.0
+            else:
+                train_cfg["loss_lambda_answer"] = base_ans_lambda
+
+            if hw_steps > 0 and prev_target_steps > 0:
+                horizon_warmup_remaining = hw_steps
+                horizon_warmup_total = hw_steps
+                horizon_warmup_factor = hw_factor
+                print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
+                      f"EMA reset, cooldown={sadt_cooldown} steps, "
+                      f"LR warmup={hw_steps} steps (factor={hw_factor}), "
+                      f"answer warmup={aw_steps} steps")
+            else:
+                print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
+                      f"EMA reset, cooldown={sadt_cooldown} steps")
+
+            # ── Soft Adam momentum reset (lessons.md 2026-04-20 evening) ──
+            # Adam's exp_avg_sq accumulates the gradient-magnitude statistics
+            # of System1.  When System2 starts, the gradient scale jumps
+            # ~50x but Adam's denominator (sqrt(exp_avg_sq) + eps) is still
+            # tiny, so a single new gradient drives a huge update — into
+            # bfloat16-fragile zones — which the existing LR warmup only
+            # partially compensates.  We *scale down* (don't zero) the
+            # second moment so Adam becomes more sensitive to the new
+            # gradient magnitude without inducing the lr/sqrt(eps) ≈ 1e4
+            # update spike of a hard reset.  exp_avg (first moment, the
+            # "momentum direction") is left untouched — direction is still
+            # informative across the transition.
+            sq_scale = float(train_cfg.get("horizon_adam_sq_scale", 0.0))
+            if sq_scale > 0.0 and sq_scale < 1.0 and prev_target_steps > 0:
+                with torch.no_grad():
+                    n_scaled = 0
+                    for group in optimizer.param_groups:
+                        for p in group["params"]:
+                            state = optimizer.state.get(p)
+                            if state and "exp_avg_sq" in state:
+                                state["exp_avg_sq"].mul_(sq_scale)
+                                n_scaled += 1
+                                if "max_exp_avg_sq" in state:
+                                    state["max_exp_avg_sq"].mul_(sq_scale)
+                    print(f"  [SADT] Soft Adam reset: exp_avg_sq *= {sq_scale} "
+                          f"on {n_scaled} param tensors (exp_avg unchanged)")
         else:
             sadt_cooldown = 0
         prev_target_steps = target_steps
@@ -1680,14 +2500,123 @@ def main() -> None:
                 free_run_noise_std=noise_std,
                 oracle_prob=oracle_prob,
                 tf_noise_std=tf_noise,
+                ema=ema,
             )
             if metrics.get("optimizer_stepped", 0.0) > 0.0:
                 scheduler.step()
+            # ── Horizon transition LR warmup ──────────────────────
+            # After scheduler sets the base LR, apply a warmup
+            # multiplier that linearly ramps from horizon_warmup_factor
+            # to 1.0 over horizon_warmup_total steps.  This prevents
+            # the ~50x gradient norm spike at System1→System2 transition
+            # from pushing parameters into bfloat16-fragile zones.
+            if horizon_warmup_remaining > 0:
+                progress = 1.0 - (horizon_warmup_remaining / horizon_warmup_total)
+                factor = horizon_warmup_factor + (1.0 - horizon_warmup_factor) * progress
+                for pg in optimizer.param_groups:
+                    pg["lr"] = pg["lr"] * factor
+                horizon_warmup_remaining -= 1
+            # ── Answer loss warmup (parallel to LR warmup) ────────
+            if answer_warmup_remaining > 0:
+                aw_progress = 1.0 - (answer_warmup_remaining / answer_warmup_total)
+                train_cfg["loss_lambda_answer"] = base_ans_lambda * aw_progress
+                answer_warmup_remaining -= 1
+                if answer_warmup_remaining == 0:
+                    train_cfg["loss_lambda_answer"] = base_ans_lambda
             global_step += 1
             tracker.update(metrics)
 
             if metrics.get("nan_skipped", 0.0) > 0:
                 nan_count += 1
+
+            # ── NaN cascade detector ──────────────────────────────
+            # Track NaN gate activations (samples with NaN output
+            # replaced by GT in the model's forward).  When the rate
+            # accelerates, halve LR to prevent parameters from
+            # drifting further into bfloat16-fragile zones.
+            nan_gate_now = int(metrics.get("nan_gate_count", 0))
+            if nan_gate_now > 0:
+                nan_gate_window.append(nan_gate_now)
+            else:
+                nan_gate_window.append(0)
+            if len(nan_gate_window) > nan_gate_window_size:
+                nan_gate_window.pop(0)
+            nan_gate_window_total = sum(nan_gate_window)
+            nan_gate_max_rate = int(train_cfg.get("nan_gate_max_rate", 0))
+            if (
+                nan_gate_max_rate > 0
+                and len(nan_gate_window) >= nan_gate_window_size
+                and nan_gate_window_total > nan_gate_max_rate
+                and not nan_gate_lr_halved
+            ):
+                old_lr = optimizer.param_groups[0]["lr"]
+                new_lr = old_lr * 0.5
+                for pg in optimizer.param_groups:
+                    pg["lr"] = new_lr
+                nan_gate_lr_halved = True
+                print(f"  [NaN-CASCADE] {nan_gate_window_total} NaN gates "
+                      f"in {nan_gate_window_size} steps → LR {old_lr:.2e}→{new_lr:.2e}")
+            elif nan_gate_window_total == 0 and nan_gate_lr_halved:
+                nan_gate_lr_halved = False  # reset when window is clean
+
+            bad_step = (
+                metrics.get("nan_skipped", 0.0) > 0.0
+                or metrics.get("optimizer_stepped", 0.0) <= 0.0
+                or metrics.get("zombie_reset", 0.0) > 0.0
+            )
+            if bad_step:
+                bad_step_streak += 1
+            else:
+                bad_step_streak = 0
+
+            grad_now = float(metrics.get("grad_norm", 0.0))
+            zero_grad_step = (
+                metrics.get("optimizer_stepped", 0.0) > 0.0
+                and abs(grad_now) <= zero_grad_threshold
+                and float(metrics.get("loss", 0.0)) > 0.0
+            )
+            if zero_grad_step:
+                zero_grad_streak += 1
+            else:
+                zero_grad_streak = 0
+
+            metrics["bad_step_streak"] = float(bad_step_streak)
+            metrics["zero_grad_streak"] = float(zero_grad_streak)
+
+            zombie_triggered = (
+                (hard_fail_bad_step_streak > 0 and bad_step_streak >= hard_fail_bad_step_streak)
+                or (
+                    hard_fail_zero_grad_streak > 0
+                    and zero_grad_streak >= hard_fail_zero_grad_streak
+                )
+            )
+            if zombie_triggered:
+                reason = (
+                    f"bad_step_streak={bad_step_streak}, "
+                    f"zero_grad_streak={zero_grad_streak}, "
+                    f"grad_norm={grad_now:.3e}, nan_count_epoch={nan_count}"
+                )
+                _append_jsonl(
+                    metrics_log_path,
+                    {
+                        "event": "hard_fail_zombie",
+                        "epoch": int(epoch),
+                        "batch_idx": int(step + 1),
+                        "global_step": int(global_step),
+                        "target_steps": int(target_steps),
+                        "phase": phase,
+                        "reason": reason,
+                        "metrics": metrics,
+                        "timestamp": time.time(),
+                    },
+                )
+                if enable_zombie_guard:
+                    raise RuntimeError(f"Hard-fail zombie guard triggered: {reason}")
+                else:
+                    print(f"  [ZOMBIE-WARN] Zombie guard suppressed (enable_zombie_guard=false): {reason}")
+                    # Reset streaks so the warning doesn't repeat every step.
+                    bad_step_streak = 0
+                    zero_grad_streak = 0
 
             # --- SADT Dynamic Throttle Logic ---
             if train_cfg.get("dynamic_step_lr", False) and sadt_cooldown <= 0:
@@ -1750,6 +2679,9 @@ def main() -> None:
                         projection_state=probe_state,
                     )
                     probe_state = probe_info.pop("projection_state")
+                    ffn_stats = _collect_swiglu_stats(model)
+                    if ffn_stats:
+                        probe_info["ffn_health"] = ffn_stats
                     _append_jsonl(
                         metrics_log_path,
                         {
@@ -1763,10 +2695,18 @@ def main() -> None:
                             "timestamp": time.time(),
                         },
                     )
+                    ffn_log = ""
+                    if ffn_stats:
+                        ffn_log = (
+                            f" ffn_gate_std={ffn_stats['ffn_gate_in_std']:.3f}"
+                            f" silu_kurt={ffn_stats['ffn_silu_kurtosis']:+.2f}"
+                            f" ffn_out={ffn_stats['ffn_out_norm_mean']:.2f}"
+                        )
                     print(
                         f"  [PROBE] step={global_step} "
                         f"df_cos={probe_info.get('df_cos_mean', 0.0):.4f} "
-                        f"roll_cos={probe_info.get('roll_cos_mean', 0.0):.4f} "
+                        f"roll_cos={probe_info.get('roll_cos_mean', 0.0):.4f}"
+                        f"{ffn_log} "
                         f"path={probe_info.get('path')}"
                     )
                 except Exception as exc:
@@ -1787,7 +2727,9 @@ def main() -> None:
                 avg = tracker.get()
                 lr_now = optimizer.param_groups[0]["lr"]
                 sadt_info = f" [SADT T:{sadt_events['throttle']} U:{sadt_events['turbo']}]" if train_cfg.get("dynamic_step_lr") else ""
+                nan_gate_total = sum(nan_gate_window)
                 nan_info = f" [NaN:{nan_count}]" if nan_count > 0 else ""
+                nan_info += f" [gate:{nan_gate_total}]" if nan_gate_total > 0 else ""
                 print(
                     f"  [E{epoch} S{step+1}] "
                     f"loss={avg.get('loss', 0.0):.4f} "
@@ -1796,9 +2738,12 @@ def main() -> None:
                     f"roll={avg.get('loss_roll', 0.0):.4f} "
                     f"rank={avg.get('loss_rank', 0.0):.4f} "
                     f"df={avg.get('loss_df', 0.0):.4f} "
+                    f"aux={avg.get('loss_aux', 0.0):.4f} "
+                    f"df_lam={effective_df_lambda:.3f} "
                     f"tf_cos={avg.get('tf_cos_mean', 0.0):.4f} "
                     f"roll_cos={avg.get('roll_cos_mean', 0.0):.4f} "
                     f"roll_ans={avg.get('roll_cos_answer', 0.0):.4f} "
+                    f"aux_cos={avg.get('aux_cos_mean', 0.0):.4f} "
                     f"df_cos={avg.get('df_cos', 0.0):.4f} "
                     f"df_t={avg.get('df_noise_level_mean', 0.0):.1f} "
                     f"rank_acc={avg.get('rank_acc', 0.0):.3f} "
@@ -1831,6 +2776,10 @@ def main() -> None:
                 sadt_events = {"throttle": 0, "turbo": 0}
 
         model.eval()
+        # Swap in EMA weights for evaluation (Arch-1).
+        ema_backup: dict[str, torch.Tensor] | None = None
+        if ema is not None:
+            ema_backup = ema.apply_to(model)
         val_tracker = MetricTracker()
         eval_steps = target_steps
         for batch in val_loader:
@@ -1844,6 +2793,8 @@ def main() -> None:
                 gen_steps=eval_steps,
             )
             val_tracker.update(vm)
+        if ema is not None and ema_backup is not None:
+            ema.restore(model, ema_backup)
 
         val = val_tracker.get()
         epoch_time = time.time() - epoch_start
@@ -1858,6 +2809,7 @@ def main() -> None:
             f"roll_cos={val.get('val_roll_cos', 0.0):.4f} "
             f"roll_cos_last={val.get('val_roll_cos_last', 0.0):.4f} "
             f"roll_ans={val.get('val_roll_cos_answer', 0.0):.4f} "
+            f"aux_cos={val.get('val_aux_cos', 0.0):.4f} "
             f"df_cos={val.get('val_df_cos', 0.0):.4f} "
             f"df_t={val.get('val_df_noise_level', 0.0):.1f} "
             f"rank_acc={val.get('val_rank_acc', 0.0):.3f} "
@@ -1880,6 +2832,23 @@ def main() -> None:
             },
         )
 
+        # Rolling ans_coverage collapse warning: often the first visible
+        # signal of the System1→System2 transition going wrong.
+        cur_ans_cov = float(val.get("val_answer_coverage", 0.0))
+        ans_cov_history.append(cur_ans_cov)
+        if len(ans_cov_history) > ans_cov_warn_window:
+            ans_cov_history = ans_cov_history[-ans_cov_warn_window:]
+        if (
+            len(ans_cov_history) >= ans_cov_warn_window
+            and (sum(ans_cov_history) / len(ans_cov_history)) < ans_cov_warn_threshold
+        ):
+            rolling = sum(ans_cov_history) / len(ans_cov_history)
+            print(
+                f"  [WARN] val_answer_coverage rolling-mean={rolling:.3f} "
+                f"< {ans_cov_warn_threshold:.2f} over last {ans_cov_warn_window} epochs "
+                f"(target_steps={target_steps}). Possible System1→System2 collapse."
+            )
+
         improved = val_metric > best_metric
         if improved:
             best_metric = val_metric
@@ -1894,6 +2863,7 @@ def main() -> None:
                     "config": config,
                     "best_metric": best_metric,
                     "global_step": global_step,
+                    "ema": ema.state_dict() if ema is not None else None,
                 },
             )
             print(f"  ** New best: val_roll_cos_last={best_metric:.4f}")
@@ -1911,6 +2881,7 @@ def main() -> None:
                     "config": config,
                     "best_metric": best_metric,
                     "global_step": global_step,
+                    "ema": ema.state_dict() if ema is not None else None,
                 },
             )
 

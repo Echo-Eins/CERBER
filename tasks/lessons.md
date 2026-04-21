@@ -1,5 +1,385 @@
 # Lessons
 
+## 2026-04-21 — Corrected root-cause: soft Adam reset + missing LayerScale decay, NOT "answer double supervision"
+
+### Context
+Previous analysis (2026-04-20 night) identified 3 "bugs" at the horizon transition. After applying all 3 fixes, training REGRESSED (System2(2) 0.8144→0.8127) and the NaN cascade at E5 S350 persisted. Post-mortem revealed the analysis was partially wrong.
+
+### What was wrong in the 2026-04-20 night analysis
+
+**"Bug 2" was incorrect.** The claim that `l_roll` using `chain_mask` creates "3.4× double supervision" on the answer was a reasoning error. `l_ans` operates on `v_tf` (teacher-forced prediction) while `l_roll` operates on `v_roll` (free-run rollout). They supervise DIFFERENT forward passes. The answer position in rollout NEEDS supervision — removing it (changing to `step_mask`) loses 50% of answer learning signal, explaining the 0.8144→0.8127 regression.
+
+**Reverted**: `l_roll` back to `chain_mask`. The answer position receives gradient from `l_roll` (rollout quality) and `l_ans` (TF quality) — these are complementary signals on different predictions, not redundant.
+
+### Actual root causes found
+
+**Root cause 1: Soft Adam reset amplifies transition instability.**
+`horizon_adam_sq_scale=0.1` multiplies `exp_avg_sq` by 0.1 at horizon transitions. This makes Adam's effective step size sqrt(1/0.1)=3.16× larger immediately after the transition, UNDERMINING the 200-step LR warmup (which starts at 0.1× base). Net effect at transition: effective LR = 0.1 × 3.16 = 0.316× base, vs 0.1× without the reset. The previous working run (0.8144) had NO Adam reset. **Fix**: `horizon_adam_sq_scale=1.0` (disabled).
+
+**Root cause 2: LayerScale params had zero weight decay.**
+`_build_wd_param_groups` used `p.ndim <= 1` to identify biases/norms for the no-decay group. LayerScale gates (`ls_self`, `ls_cross`, `ls_ffn`) are 1D `nn.Parameter` tensors, so they got zero weight decay. Without any regularization pressure, they can grow unboundedly, amplifying FFN output norms. Combined with the inflated effective step size from root cause 1, this drives a positive feedback loop: large FFN output → large gradient → LayerScale grows → even larger output. **Fix**: exclude `".ls_"` params from the 1D no-decay heuristic.
+
+### Fixes that were CORRECT from 2026-04-20 night (kept)
+1. **_answer_loss() wrapper** (Bug 1 fix): Inline → function call with NaN guards. Strictly safer.
+2. **Answer warmup** (Bug 3 fix): Ramps lambda_ans from 0→base at horizon transitions. Soft curriculum.
+
+### Rules (corrected)
+1. **Never compute loss inline when a guarded helper exists.** (Unchanged — still valid.)
+2. ~~Answer position must have same gradient weight~~ **WRONG. Rollout loss MUST include the answer position.** `l_ans` supervises v_tf, `l_roll` supervises v_roll — they are complementary. Removing either loses signal.
+3. **Do not reduce Adam's second-moment accumulator at transitions.** Reducing `exp_avg_sq` inflates effective step size, which AMPLIFIES gradient shocks rather than dampening them. The existing LR warmup is the correct mechanism.
+4. **LayerScale parameters need weight decay.** They are learnable gates, not biases or norm gains. The `ndim <= 1` heuristic misclassifies them. Check every 1D param by name to distinguish gate/scale params from biases/norms.
+5. **Verify fixes by comparing with the previous working run's config.** If the working run lacked a feature (e.g., Adam reset), adding that feature and seeing regression means the feature is the problem, not the solution.
+
+---
+
+## 2026-04-20 (evening) — AdaLN gate annihilation, SwiGLU dead zone, soft Adam reset
+
+### Pattern
+Third-party scale-collapse / gradient-starvation analysis flagged four concrete failure modes that map directly onto our symptoms (gradient decaying as inverted-sqrt, weak reaction to loss spikes at System1→System2):
+
+1. **AdaLN gate annihilation.** `out * (1 + scale)` is unbounded below; nothing prevents `scale → -1` (signal zeroed) or worse (sign flip).
+2. **bf16 in the modulation chain.** Vanilla AdaRMSNorm casts back to bf16 *before* multiplying by γ, scale, shift. With ~7 mantissa bits, any modulation factor close to 0 loses all precision — and *that's exactly the regime annihilation drives the gate into*.
+3. **SwiGLU dead zone.** Xavier init clusters gate inputs near zero where `SiLU` is near-linear (gradient ~0.5). If weights drift toward the saturating tail, gradient through the gate path collapses and the FFN goes dormant ("лес из нулей и редких пиков").
+4. **Adam momentum ghosting at horizon transition.** `exp_avg_sq` accumulates the gradient-magnitude statistics of System1 (small grads).  When System2 starts, the new gradient is ~50× larger but Adam's denominator is still tiny, so the first update is huge → bf16-fragile zone → NaN cascade.  The existing LR warmup (`factor=0.1`, `steps=200`) only partially compensates because Adam *itself* doesn't see the rescale.
+
+### Fixes Applied
+
+1. **`AdaRMSNorm` rewritten** (`chain_generator.py`):
+   - Full FP32 chain: `x_f * rms * weight.float() * (1+scale.float()).clamp(min=GATE_MIN)` then `+ shift.float()`, only `.to(in_dtype)` at return.  No more bf16 inside the modulation.
+   - `GATE_MIN = 1e-3` floor on `(1 + scale)`: model can still attenuate 1000× but cannot zero or invert.  This is a strictly-positive smooth lower bound; the model retains full upward modulation freedom.
+
+2. **`SwiGLUFFN` hardened** (`chain_generator.py`):
+   - Orthogonal init for `w_gate` and `w_up` in `_init_weights` (after the global xavier sweep, so it overrides; placed *after* `_zero_init_residual_projectors()` so it does NOT touch `w_down`).  Spreads gate inputs across SiLU's nonlinear region, raises gradient through the gate path at start.
+   - Activation telemetry buffers populated when `track_stats=True`: `_gate_in_abs_mean`, `_gate_in_std`, `_silu_kurtosis` (excess), `_out_norm_mean`.  All `copy_(tensor)` — no `.item()` per forward, so no GPU↔CPU sync cost.  Training loop polls at `probe_every_steps`.
+
+3. **Soft Adam momentum reset** (`train_chain_generator.py:~2390`):
+   - On horizon transition, scale `exp_avg_sq *= horizon_adam_sq_scale` (default 0.1) for every parameter.
+   - **Do NOT touch `exp_avg`.** The first moment encodes the momentum *direction*, which is still informative across the transition.
+   - **Do NOT zero `exp_avg_sq`.** A full reset would make Adam's update `lr / sqrt(eps) ≈ 1e4` on the first new gradient — way worse than what we're trying to fix.
+   - Combined with the existing 200-step LR warmup (factor 0.1), Adam now both (a) sees a smaller LR ramp and (b) reacts proportionally to the new gradient magnitude instead of being numbed by old statistics.
+
+### Rules
+1. **Never let the AdaLN gate cross zero.** `(1 + scale).clamp(min=ε)` should be the default in any DiT-style modulation.  The smooth lower bound costs nothing and removes a known annihilation vector.
+2. **Modulation math stays in FP32, period.**  bf16's mantissa is too coarse for the regime where modulation factors are small — exactly the regime where stability matters most.
+3. **Orthogonal init for any gated-linear FFN** (SwiGLU, GeGLU, etc.).  Xavier-uniform is fine for plain Linear, but multiplicative gates need spread inputs to escape the near-linear regime.
+4. ~~**Adam at distribution shift: scale `exp_avg_sq` down.**~~ **RETRACTED (2026-04-21).** Scaling `exp_avg_sq` DOWN by 0.1 inflates effective step size by sqrt(10)=3.16×, which UNDERMINES the LR warmup (net protection drops from 0.1× to 0.316×). The previous working run had NO Adam reset and survived transitions fine. Set `horizon_adam_sq_scale=1.0` (disabled). Do NOT reduce `exp_avg_sq` at transitions.
+5. **Telemetry as on-device tensors** (`copy_`, not `fill_(.item())`).  Triggering a sync per forward turns a "free" diagnostic into a 5–10% perf tax.
+
+---
+
+## 2026-04-20 (afternoon) — Two more loss-bomb sites + the curriculum-not-applied gotcha
+
+### Pattern
+The morning fix-pack landed (commit `76ad7bd`) but the user's next training run reproduced the *exact same* cold-position cascade. Two failures happened simultaneously:
+
+**A. The curriculum fix was committed but never executed.**
+Both `chain_generator_config.json` and `chain_generator_no_sadt_df_ema_soft_ss.json` had been updated with `horizon_schedule: [[2,2],[3,2],[4,10],[5,10]]`, yet the run log showed `[SADT] Horizon changed 1→4` at E3 (the old schedule). The user had run the trainer before pulling the commit. **Always confirm the operator pulled before claiming a fix is "applied".** The commit-vs-run gap is invisible to us.
+
+**B. Two more nan_to_num(0) loss-bomb sites survived the first audit.**
+- `train_chain_generator.py:1011` — `model_out = nan_to_num(model_out, 0.0)` in the diffusion-forcing path. The downstream `_masked_weighted_step_losses` GT-replacement guard never fired because `model_out` was no longer NaN by the time it reached the guard — it was zeros. `cos(0, target) = 0 → cos_loss = 1.0` per poisoned position. Same loss-bomb topology as the morning's six fixes, just one frame upstream.
+- `chain_generator.py:_sphere_project` produced **off-manifold zeros** when the input was NaN/zero. `_safe_normalize` cleans NaN to zero, the norm clamps to `eps`, division yields zero, and `* target_norm` keeps it at zero. That zero then fed back as the next step's history → attention statistics collapsed → next position produced NaN → cascade. The fallback in `generate()` (`generated[-2]`) inherited the zero.
+
+### Fixes Applied
+1. **DF model-out scrub now uses target-replacement** (`train_chain_generator.py` ~line 1010): compute `target` first, then `model_out = where(~isfinite(model_out), target, model_out)`. Also surfaces upstream `target` NaN via an `isfinite` gate before scrubbing — diffusion_target should never produce NaN, so silently scrubbing it hides real bugs.
+2. **`_sphere_project` is now manifold-stable** (`chain_generator.py` ~line 832): after `_safe_normalize`, detect rows whose norm collapsed below 0.5 (i.e. lost the unit constraint) and substitute the canonical e₀ basis vector before the `* target_norm` scale. The output is **guaranteed** to lie on the sphere — even for all-NaN inputs — so a single bad position cannot poison the next step's history.
+3. **Did NOT touch `_safe_normalize` itself** — it is also used to compute pairwise cosine similarities (lines 1253–1421, 1717–1718) where zero-output for zero-input is semantically correct ("no similarity"). Only `_sphere_project` needed manifold guarantees.
+
+### Rules
+1. **A fix isn't applied until the trainer log proves it.** Look for the schedule banner / first-epoch curriculum prints and verify they match the new config before declaring success.
+2. **`nan_to_num(x, 0.0)` is *always* suspect anywhere the result feeds a loss.** Audit every such site, even ones added "as defense-in-depth" — they erase the NaN signal that downstream guards rely on.
+3. **`_sphere_project` must produce on-manifold output unconditionally.** Anything used as autoregressive history must satisfy the manifold invariant — otherwise position t+1 sees an off-distribution input that the model was never trained on, and the cascade is back.
+4. **Distinguish two roles of normalization:** (a) projection-to-manifold needs an on-sphere guarantee; (b) similarity-via-dot-product wants zero-on-zero. Don't conflate them in one helper.
+
+---
+
+## 2026-04-20 - TRUE root cause: nan_to_num(0) "loss bomb" in 6 code paths
+
+### Pattern
+Deep re-verification (Opus re-audit) found that the documented "nan_to_num(x, nan=0.0) is a loss bomb" rule from 2026-04-11 was NEVER applied to the actual loss computation code. The same anti-pattern existed in 6 places, creating a positive feedback loop that accelerated the NaN cascade in both GB10_1 and GB10_2.
+
+### Root Cause: The NaN Cascade Positive Feedback Loop
+
+**Exact mechanism (traced line-by-line):**
+1. `generate()` line 1244: `raw_next = output_proj(x[:,-1:,:])` — can contain NaN (bfloat16 overflow at cold positions)
+2. `generate()` line 1268: `_sphere_project(raw_next)` calls `_safe_normalize` which does `nan_to_num(x, nan=0.0)` BEFORE normalizing — output is ALWAYS finite
+3. `generate()` line 1373 (OLD): NaN guard checked `next_vec_for_chain` (post-projection, already clean) — **DEAD CODE, never fired**
+4. `generate()` line 1365 (OLD): `generated.append(raw_next)` stored NaN-contaminated raw vector
+5. `compute_composite_objective` line 1210 (OLD): `nan_to_num(v_roll, nan=0.0)` replaced NaN with **zero vector**
+6. `_masked_step_losses` line 332 (OLD): `nan_to_num(pred, nan=0.0)` — second layer of same bug
+7. Loss computation: `cos_sim(0-vector, GT) = 0` → `cos_loss = 1 - 0 = 1.0` per NaN position — the **"loss bomb"**
+8. Gradient: `nan_to_num` backward = 0 for NaN entries → NaN-producing parameters get **zero gradient** → they **never self-heal**
+9. Shared parameters updated from healthy positions → **worsens cold positions** → MORE NaN → positive feedback
+
+**Contrast with forward() (which was CORRECT all along):**
+- `forward()` NaN gate: NaN → replace with GT → loss ≈ 0 → grad ≈ 0 ✓ (no training signal from broken step)
+- `generate()` path: NaN → replace with 0 → cos_loss = 1.0 → inflated loss metric ✗
+
+**The same nan_to_num(0) anti-pattern existed in 6 places:**
+1. `train_chain_generator.py:1147` — `v_tf` sanitization
+2. `train_chain_generator.py:1210` — `v_roll` sanitization
+3. `train_chain_generator.py:332` — `_masked_step_losses` pred sanitization
+4. `train_chain_generator.py:580` — `_masked_weighted_step_losses` pred sanitization
+5. `chain_generator.py:1373` — dead NaN guard (checked already-clean vec)
+6. `chain_generator.py:1365` — stored NaN-contaminated raw_next in generated[]
+
+### Fixes Applied
+1. **v_tf / v_roll**: `nan_to_num(x, nan=0.0)` → `torch.where(~isfinite(x), chains_GT, x)` — loss ≈ 0 not 1.0
+2. **_masked_step_losses / _masked_weighted_step_losses**: `nan_to_num(pred, nan=0.0)` → `torch.where(~isfinite(pred), target, pred)`
+3. **generate() NaN guard**: now checks `raw_next` (pre-projection), stores `clean_next_vec` when NaN detected instead of NaN-contaminated `raw_next`
+
+### Rules
+1. **NEVER replace NaN predictions with zero vectors.** Always replace with GT (target). `cos_sim(0, GT) = 0 → cos_loss = 1.0` is a loss bomb. `cos_sim(GT, GT) = 1.0 → cos_loss = 0` is correct (no signal from broken step).
+2. **Check for NaN BEFORE `_sphere_project` / `_safe_normalize`.** These functions silently clean NaN via `nan_to_num(x, nan=0.0)` before normalizing. Checking the output never detects the original NaN.
+3. **Every nan_to_num in the loss path must be audited.** If the replacement value participates in loss computation, it MUST match the supervision target, not be 0.
+
+---
+
+## 2026-04-19 - Architecture audit: 10 bugs found across GB10_1 / GB10_2 experiments
+
+### Pattern
+Full architecture audit triggered by GB10_1 (no-SADT/DF/EMA/softSS exp_conf) and GB10_2 (orig_conf) training runs. GB10_1 showed excellent System2 learning (tf_cos 0.46→0.63 over 3200 steps) before zombie guard killed it. GB10_2 catastrophically collapsed in <200 System2 steps due to norm explosion. Deep code review found 10 issues.
+
+### Root Causes & Bugs Found
+
+**BUG 1 (CRITICAL): `beam_generate()` appended SONAR-scale vectors to residual-scale chain**
+- Lines 1671-1679: chain was built as [start_token(residual, norm~32), cand_vecs(SONAR, norm~0.2051), ...]
+- 156x scale mismatch caused degenerate attention weights across beam steps
+- FIX: scale candidates via `_to_residual_space(cand_vecs)` before `torch.cat`.
+
+**BUG 2: Dead code in `generate()` DDIM path**
+- Line 1238: `raw_next = ddim_result / target_norm * output_proj.weight.data.norm()` was immediately overwritten on line 1240 by `raw_next = ddim_result`
+- Dead computation with side effect of calling `.data.norm()` (breaks autograd assumptions)
+- FIX: removed the dead line.
+
+**BUG 3: Zombie guard killed genuine learning (GB10_1 crash)**
+- `hard_fail_zero_grad_streak=25` fired at E3 S3200 while `tf_cos=0.63` was still improving (from 0.46 at epoch start)
+- NaN gate was correctly handling the NaN outputs; zero_grad_streak accumulated from NaN-gated batches where all outputs were replaced with GT → loss≈0 → grad≈0 but model state was fine
+- FIX: added `enable_zombie_guard` config flag (default `true` = old behavior). Set to `false` in exp_conf to allow survival through NaN cascades that the NaN gates are already handling.
+
+**ISSUE 4: `preds.append(raw)` in SS path stores pre-projection outputs**
+- Loss computed as MSE(raw_output, sonar_GT) where raw_output norm >> sonar_GT norm
+- NaN gate replaces some `raw` entries with GT (norm~0.2051) but other entries are raw (norm~0.1-5)
+- MSE penalizes the scale difference, creating an implicit "scale penalty" that conflicts with the training objective. Cosine loss is scale-invariant and correct; MSE should either be disabled or computed on sphere-projected predictions.
+
+**ISSUE 5: MSE loss is geometrically wrong for hypersphere targets**
+- Targets live on S^(d-1) (radius 0.2051). MSE measures chord (Euclidean) distance, not arc distance.
+- Correct geometry: cosine loss = 1 - cos_sim = chord²/2 (at fixed radius) = monotone with geodesic arc distance
+- MSE combines with cosine gives mixed metric that is neither spherical nor Euclidean consistently
+- Mitigation: reduce MSE weight to near-zero and rely primarily on cosine loss, OR project predictions to sphere before MSE.
+
+**ISSUE 6: Double timestep conditioning in DF forward pass**
+- Line 1108 (`x = x + t_emb`): additive injection before transformer layers
+- Lines 1110-1111 (`layer(x, ..., t_emb=t_emb)`): AdaLN modulation in each layer
+- Result: timestep info applied twice — once as additive bias to noisy vectors AND once as per-layer scale+shift
+- AdaLN alone is sufficient (DiT design). The additive injection is redundant and adds a timestep-dependent bias the AdaLN must fight against. Potential source of instability at high noise levels.
+
+**ISSUE 7: Horizon warmup missing from exp_conf → [NaN:6] at System2 first step**
+- GB10_1 exp_conf lacked `horizon_warmup_steps` and `nan_gate_window_size` configs
+- Going from target_steps=1 to target_steps=4 with NO LR warmup → [NaN:6] at S50 from cold transformer positions 2-3-4 never seen before
+- NaN gate contained it, but the absence of NaN cascade detector meant no LR response either
+- FIX: added these fields to exp_conf with values from orig_conf.
+
+**ISSUE 8: `_safe_normalize` uses `nan_to_num(x, nan=0.0)` → arbitrary direction from near-zero inputs**
+- When input norm → 0 (after nan_to_num zeros out NaN dims), division by `clamp(min=eps)` gives a direction from numerical noise
+- Semantically: the "normalized" vector has random direction, not a meaningful direction
+- For NaN-gated inputs this is moot (NaN gate replaced them with GT before _sphere_project), but for near-zero legitimate outputs it produces garbage directions
+- Better: use the `nan_to_num` only as a last-resort safety net and rely on NaN gates upstream.
+
+**ISSUE 9: `null_context_token` learns large residual-scale norms**
+- Initialized to zeros, then `_to_residual_space(null_ctx)` scales by 156x at inference
+- As null_context_token trains away from zero, it gets amplified 156x, making it much louder in cross-attention than SONAR query embeddings (norm~0.2051 scaled to ~32)
+- CFG interpolation between conditional (SONAR scale) and unconditional (potentially 156x larger) predictions is numerically asymmetric
+- Watch for: null_ctx.norm() growing >> target_norm during training.
+
+**ISSUE 10: Constant [NaN:6] in GB10_1 System2 is the "cold position" problem**
+- System1 only trains positions [0] of the chain. Positions [1,2,3] are never in the autoregressive context.
+- When System2 starts with target_steps=4, the transformer processes sequence length 4 for the first time
+- Positions 1,2,3 have never had gradient flow through their RoPE/attention weights at those offsets
+- bfloat16 + LayerScale + AdaLN at untrained positions → NaN on first pass
+- NaN gate handles the outputs, but parameter gradients are still NaN-contaminated (0 × NaN = NaN in backward)
+- A curriculum of [1→2→3→4 steps, 1 epoch each] would prevent this cold-position shock
+
+### Rules
+1. **Zombie guard should be disableable**. If the NaN gates are handling NaN outputs correctly (loss→0, not loss→NaN), the zero_grad_streak is an artifact of gated batches, not a sign of model death. Add `enable_zombie_guard=false` when genuine learning is observed through NaN streaks. NaN gates always stay enabled.
+2. **`beam_generate()` must scale vectors to residual space before chain concatenation**. `_sphere_project` returns SONAR scale; `_to_residual_space` must be called before `torch.cat([chain, next_vec], dim=1)`. Failing to do so creates a 156x scale mismatch in attention.
+3. **MSE on hypersphere targets is geometrically inconsistent**. Use cosine loss as primary, set MSE weight low or compute MSE on sphere-projected outputs. Do not mix raw-output-scale MSE with SONAR-scale targets.
+4. **Double timestep conditioning is redundant and potentially harmful**. AdaLN-Zero modulation per layer is sufficient. The additive `x = x + t_emb` before layers creates a conflicting signal the AdaLN must overcome.
+5. **System2 first steps see positions 1..N-1 for the first time**. These "cold positions" have untrained RoPE offsets and LayerScale values, causing NaN on first pass. Mitigate with: (a) curriculum [1,2,3,4] steps, (b) horizon warmup LR, (c) NaN gates + enable_zombie_guard=false.
+
+---
+
+## 2026-04-16 - NaN cascade in pure teacher-forcing path + System2 gradient shock
+
+### Pattern
+Clean experiment (no SADT, no DF, no EMA, soft SS=0.15) showed excellent System1 training (val=0.7511, best ever), genuine System2 learning (tf_cos recovering 0.46→0.63), but NaN cascade killed training at E3 S3000: NaN count exploded 5→6→8→11→22→33→crash (zero_grad_streak=25).
+
+### Root Causes
+1. **NaN gate only existed in the scheduled-sampling path** (lines 968-978 in chain_generator.py). The pure teacher-forcing path (lines 914-945, used when `ss_prob=0.0`) had ZERO NaN protection. When output contained NaN, `nan_to_num(v_tf, nan=0.0)` at line 1147 replaced with 0, giving cos_loss=1.0 but zero gradient through nan_to_num. Parameters in NaN-producing zones received no corrective signal, silently expanding the unstable region until every output was NaN.
+2. **System1→System2 gradient shock**: Transition from 1-step to 4-step chains caused a ~50x gradient norm spike (0.39→19.67), pushing parameters into bfloat16-fragile zones. Even with clip_grad_norm=1.0, the initial batches at extreme gradient scale damaged the parameter landscape. The 5 initial NaN events at E3 S50 were the seed that later grew into the full cascade.
+3. **`0 × NaN = NaN` in PyTorch autograd**: Even with output-level NaN gates (either nan_to_num or torch.where), the backward pass through shared parameters computes `∂L/∂W = grad_output × activations^T`. When activations stored in the graph are NaN and grad_output is 0 for those positions, IEEE 754 gives `0 × NaN = NaN`, contaminating parameter gradients. The NaN gate cleans the loss but cannot prevent NaN gradients from the computation graph.
+
+### Fix
+1. **NaN gate in TF path**: After `output_proj(x)`, replace non-finite predictions with ground truth via `torch.where(bad, v_target_chain, v_pred)`. Loss for NaN positions = 0 (pred==target), no inflated cos_loss=1.0 artifact.
+2. **Horizon transition LR warmup**: When target_steps changes, multiply LR by a factor (default 0.1) that linearly ramps to 1.0 over N steps (default 200). Config: `horizon_warmup_steps`, `horizon_warmup_factor`. Prevents the gradient shock from pushing parameters into fragile zones.
+3. **NaN cascade detector**: Track NaN gate activations per step in a rolling window. When rate exceeds threshold (`nan_gate_max_rate` events in `nan_gate_window_size` steps), halve LR to slow parameter drift. Logged as `[gate:N]` in training output.
+4. **Model-side NaN counter**: `model._nan_gate_count` attribute updated each forward pass, consumed by training loop for metrics and cascade detection.
+
+### Rules
+1. **NaN gates must cover ALL forward paths, not just the fancy one**. The teacher-forcing path is the "simple" default — it must have the same NaN protection as the scheduled-sampling path. When adding a safety mechanism to one code path, grep for all paths that produce the same output and apply the same guard.
+2. **`nan_to_num(x, nan=0.0)` is a loss bomb, not a fix**. Replacing NaN with 0 gives cos(0, target) = 0 → cos_loss = 1.0, inflating the loss. Replacing with GT gives cos(GT, GT) = 1.0 → cos_loss = 0.0, which is the correct "no signal" response. Always replace with GT, never with 0.
+3. **Phase transitions need LR warmup**. System1→System2 is a task-complexity discontinuity that causes gradient norm spikes. Without LR dampening, the spike pushes parameters into numerically fragile regions. Apply the same principle to any training phase transition (curriculum steps, loss function changes, etc.).
+4. **NaN cascades are exponential, not linear**. Once started, the NaN region expands because corrupted parameters don't receive corrective gradient (0 × NaN = NaN in backward). Detection must look at RATE of NaN increase, not just count. A constant low rate (3 in 5000 steps) is fine; an accelerating rate (22 in 250 steps) is catastrophic.
+
+---
+
+## 2026-04-15 - ChainGenerator "double zombie": SDPA `-inf` mask NaN root cause + Adam momentum persistence
+
+### Pattern
+After deploying the first-round Adam-zombie fix (grad sanitize + per-param Adam scrub + post-step EMA restore), a new run STILL zombified at E2 S3650: grad degraded over ~200 steps (20 → 13 → 8 → 0.6 → 0), then every step was a NaN-skip from S3800 onward through E6+ with val permanently stuck at 0.7405. The first-round fix was **necessary but not sufficient**.
+
+### Root Causes
+1. **`CrossAttention` used `float("-inf")` as an additive mask fill value**. This is a well-documented SDPA footgun on CUDA — `-inf` in bf16/fp16 triggers NaN in the flash/mem-efficient backends whenever softmax sees a row of all `-inf` (`0/0 = NaN`), AND `-inf - scale = -inf` corrupts gradient accumulation. The HuggingFace transformers library uses `torch.finfo(dtype).min` for exactly this reason. Any batch with a fully-masked context row (rare but possible with `context_bank_size=4` + short contexts) instantly produced cross-attention NaN, which propagated through every subsequent layer and every parameter's backward.
+2. **Residual Adam momentum kept the zombie alive even after grad sanitation**. My first-round fix zeroed NaN gradients but only scrubbed Adam `exp_avg`/`exp_avg_sq` *if those buffers themselves were already non-finite*. For the much more common case of "finite momentum from a healthy prior step + zero'd current gradient", Adam computed `exp_avg ← β1·exp_avg + (1−β1)·0 = β1·exp_avg`, preserving the **pre-corruption direction** and applying `lr · exp_avg / sqrt(exp_avg_sq)` — the param kept drifting toward the bad basin with decaying but nonzero speed for thousands of steps.
+3. **EMA was still updated on steps where grad sanitation fired** (my first-round guard only checked `params_restored == 0`). So the "subtle drift" during bad steps leaked into the shadow, and the rescue source slowly became the source of future corruption.
+4. **`torch.isfinite` misses huge-but-finite drift**. A parameter at ±1e30 is still `isfinite=True`, so post-step sanity never triggered restore for the most common failure mode (numerical drift under corrupted momentum, not outright NaN).
+5. **No escape from sustained corruption**. Once 100% of steps were sanitized, the first-round fix had no mechanism to step outside the corrupted basin — every step zeroed grads and Adam kept the same momentum loop.
+
+### Fix
+1. **Replace `float("-inf")` with `torch.finfo(q.dtype).min`** in `cebcm/models/chain_generator.py::CrossAttention.forward`, and detect the all-invalid-row edge case: for any batch row where every context slot is masked, force it to be fully visible. The downstream loss will mask the position correctly; non-NaN uniform attention is strictly better than NaN propagation.
+2. **Unconditional Adam zero on grad sanitation**: in `train_step`, whenever `p.grad` had NaN/Inf, always `buf.zero_()` for `exp_avg`/`exp_avg_sq`/`max_exp_avg_sq` — not conditional on whether the buffers were themselves corrupt. This kills the momentum loop.
+3. **EMA update ONLY on fully clean steps**: guard is now `if not grad_had_nan and params_restored == 0`. Any step with sanitation OR restore does not touch the shadow.
+4. **Huge-but-finite drift guard**: post-step sanity now also checks `abs(p.data).amax() > param_abs_max` (default 1e4) and restores from EMA when exceeded. This catches the common "finite explosion under corrupted momentum" failure mode.
+5. **Zombie streak detector + hard reset**: a streak counter (stored on the EMA object) increments on every sanitation step and resets on every clean step. When the streak hits `zombie_reset_threshold` (default 15 consecutive bad steps), hard-reset ALL parameters from the EMA shadow AND zero ALL Adam state AND reset the streak. This is the break-glass path that guarantees escape from any basin, regardless of root cause.
+
+### Rules
+1. **NEVER use `float("-inf")` as an attention mask fill value**. Always use `torch.finfo(dtype).min`. The bf16/fp16 + flash-SDPA combination turns `-inf` into NaN under masked-row edge cases. This is the single most common cause of mid-training bf16 attention NaN in modern transformer training. Grep for `-inf` in any attention/softmax path as a standing check.
+2. **An all-masked row produces NaN under SDPA softmax**. Detect this explicitly (`invalid.all(dim=-1)`) and either (a) force the row to be fully visible, (b) add a sentinel visible token, or (c) short-circuit the sub-layer. Never let softmax see a row of pure `-inf`/`finfo.min` unless you want NaN.
+3. **Grad sanitation without Adam momentum zeroing is insufficient**. With `grad=0` and live `exp_avg`, Adam computes `lr · exp_avg / sqrt(exp_avg_sq)` and keeps applying the PRE-corruption direction. For any "skip this grad" path, also zero the optimizer momentum for the affected parameter — otherwise the momentum persists the original bad direction for hundreds of steps.
+4. **EMA shadow integrity requires conservative update gating**. Update the EMA only on FULLY clean steps — no sanitation, no restore, no anomaly. The decay factor does NOT save you from subtle drift leaking in over time: `0.9999·shadow + 0.0001·bad = slightly-bad`, and over 1000 bad steps the shadow becomes 10% bad. A dirty shadow means your break-glass source is poisoned.
+5. **`isfinite` is not enough for param sanity**. Add a magnitude check (`abs(p).amax() > threshold`) and an optional global drift check (`||p||` growth rate). Finite-but-exploded values are the dominant failure mode under corrupted Adam momentum.
+6. **Always have a break-glass "zombie reset" mechanism**. A per-step scrub breaks single-step errors; it does NOT break sustained corruption from a numerically fragile basin. Track the consecutive-sanitation streak and, once it crosses a threshold, force-restore all params from the EMA shadow and zero ALL Adam state. This is the only path that guarantees escape from a zombie basin that per-step scrubs cannot fix.
+7. **When the first-round NaN fix "seems to work" but training still plateaus, instrument more metrics BEFORE iterating**. Add `grad_sanitized` (count per step), `param_restored` (count per step), `zombie_streak` (running counter), and `zombie_resets_total` — these metrics tell you whether you're fighting the right battle. A plateau with `grad_sanitized > 0` every step is a completely different bug than a plateau with `optimizer_stepped = 0.8` every step.
+
+---
+
+## 2026-04-14 - ChainGenerator "frozen zombie" model: Adam momentum corruption + skip-on-NaN trap
+
+### Pattern
+After the first round of NaN-collapse fixes, training reached E9 and then locked into a "zombie" state:
+- `loss=0.73` (finite), `grad=0.0000` **every step**,
+- `NaN:N` counter incrementing `+1` each step (100% NaN-skip rate),
+- `lr` frozen, geometry probe values **byte-identical** across hundreds of steps,
+- `val_roll_cos` plateaued at `0.7237` from E2 onward.
+
+Training appeared to run (forward produced finite loss via defensive `nan_to_num` scrubs) but NO parameter updates occurred. Fresh corruption on every batch, perpetually skipped.
+
+### Root Causes
+1. **Skip-on-NaN-grad is a trap**. `train_step` pattern `if not torch.isfinite(total_norm): optimizer.zero_grad(); return` means HEALTHY parameters never update either — any batch that has one sick gradient poisons ALL updates that step. Over time: 100% skip rate, zero progress.
+2. **Adam momentum state is sticky**. `optimizer.zero_grad()` only clears `.grad`; it does NOT touch `exp_avg` and `exp_avg_sq`. A single NaN that made it into Adam buffers persists forever. On the next step Adam computes `new_exp_avg = β1·old_exp_avg + (1−β1)·grad` → still NaN → output param becomes NaN → next forward uses `nan_to_num` to scrub the value but **the parameter is still NaN in memory**, and its gradient will be NaN again. Self-propagating.
+3. **`nan_to_num` is NOT a gradient barrier**. Scrubbing `model_out` after forward only fixes the forward value, not the backward graph. If any weight in the graph is NaN, d(loss)/d(weight) is still NaN even though `loss` itself became `0.0` via scrubbing.
+4. **`clamp(min=1e-8)` is a no-op on NaN**. NaN passes through `clamp` unchanged. `weight_sum = weights.sum().clamp(min=1.0)` still yields NaN when `weights.sum()` is NaN, which then makes `loss = cos_term.sum() / NaN → NaN`.
+5. **bf16 denormal underflow**. `snr.to(bf16).clamp(min=1e-8)` is ineffective: bf16 has no denormals, so any value `< ~1.17e-38` silently underflows to 0 BEFORE clamp sees it. Then `1/snr → Inf → NaN`. Min-SNR must be computed entirely in fp32.
+
+### Fix
+In `experiments/13_chain_generator/train_chain_generator.py`:
+
+1. **Sanitize gradients, don't skip the step**: in `train_step`, replace `if NaN: skip` with an in-place `.grad.masked_fill_(bad, 0.0)` scrub for each parameter whose gradient contains NaN/Inf. Healthy parameters keep training, sick ones get a zero-update this step. Log `grad_sanitized` count.
+2. **Rescue Adam state on corruption**: for every parameter whose `.grad` was sanitized, walk `optimizer.state[p]` and `torch.nan_to_num(buf, out=buf)` for `exp_avg`, `exp_avg_sq`, `max_exp_avg_sq`. This breaks the self-propagation loop.
+3. **Post-step parameter sanity + EMA rescue**: after `optimizer.step()`, scan `model.named_parameters()`. For any parameter with non-finite values, `copy_(ema.shadow[name])` as a break-glass restore. EMA is our last known-good copy. Skip `ema.update(model)` on the step where a param was restored, so we don't pollute the shadow.
+4. **SNR entirely in fp32 with autocast disabled**: wrap `model.diffusion_snr(...)` in `torch.autocast(device_type=..., enabled=False)`, cast output `.to(dtype=torch.float32)`, `nan_to_num` with `posinf=1e4` BEFORE clamp, then `clamp(min=1e-6, max=1e4)`. Never allow bf16 to see SNR numerics.
+5. **Scrub `.sum()` before `.clamp()`**: replace `weights.sum().clamp(min=1.0)` with `torch.nan_to_num(weights.sum(), nan=1.0, posinf=1.0, neginf=1.0).clamp(min=1.0)` in both `_masked_step_losses` and `_masked_weighted_step_losses`.
+6. **Scrub loss before backward**: final `loss = torch.nan_to_num(loss)` in `train_step`, and skip backward only when the sanitized value is exactly zero (no signal to propagate).
+7. **Config**: bump `df_warmup_epochs` 3→5 and lower `loss_lambda_diffusion` 0.25→0.15 to give the critic more headroom before DF supervision kicks in at full strength.
+
+### Rules
+1. **NEVER `skip step` on NaN gradient**. Sanitize in place, log the count, let healthy params train. The skip-pattern is an anti-pattern that converts transient errors into permanent plateaus.
+2. **Optimizer state must be scrubbed alongside grads**. `optimizer.zero_grad()` does NOT touch momentum buffers. Any NaN protection that only scrubs `.grad` is incomplete — Adam's `exp_avg`/`exp_avg_sq` must be scrubbed too, otherwise the next step recreates the NaN.
+3. **Clamp is not NaN-safe**. `clamp(min=ε)` passes NaN through unchanged. ALWAYS `nan_to_num` before `clamp` when the input could be non-finite. Same for `clip_grad_norm_` — check the returned norm for `isfinite`, don't assume clipping sanitized it.
+4. **Keep Min-SNR / any numerics-sensitive math in fp32**. Use `torch.autocast(..., enabled=False)` inside the helper. bf16 has no denormals → silent underflow → div-by-zero → NaN.
+5. **EMA is break-glass recovery, not just "nicer eval weights"**. Maintain it, check parameter finiteness after every `optimizer.step()`, restore from shadow on corruption. A single corrupt step without rescue means the run is dead.
+6. **`nan_to_num` is a forward-only value scrub, not a gradient barrier**. If a weight is NaN, its gradient is NaN regardless of downstream scrubs. Fix at the source (the parameter/optimizer state) not just at the loss.
+7. **When every step reports `grad=0` and `NaN:N` climbs linearly, it is not a plateau — it is a zombie model**. Distinguish this from genuine convergence by checking: (a) probe values byte-identical across steps, (b) `optimizer_stepped` metric → 0, (c) `nan_grad_skipped` metric → step count. If all three are true, parameters are frozen / corrupt, not converged.
+
+---
+
+## 2026-04-14 - ChainGenerator probe: v-prediction misread as x₀ caused antipodal `df_cos_mean` in GUI
+
+### Pattern
+After the NaN-collapse fixes, the GUI showed:
+- `train df_cos = 0.72` (training metric — positive, climbing)
+- `probe df_cos_mean = −0.68` (geometry probe — negative, "going more wrong")
+- 3D view: "DF pred_x0" marker antipodal to the clean target along PC1
+
+User reported "модель идёт в обратную сторону". In reality the model was learning correctly; the probe was lying.
+
+### Root Cause
+`write_training_probe_snapshot` took the raw output of `model.forward_diffusion_forcing(...)` and stored/compared it as `pred_x0`. Under `prediction_type="v"` the raw output is the velocity `v = √ᾱ_t · ε − √(1−ᾱ_t) · x₀`, not x₀. At mid-range noise levels (`t≈32` with cosine schedule, √ᾱ ≈ √(1−ᾱ) ≈ 0.707) the expectation of `cos(v_pred, x₀_clean)` when the model is *perfect* is approximately `−√(1−ᾱ_t) ≈ −0.707`. The observed `−0.64 → −0.68` was converging toward that asymptote — i.e. evidence of correct learning, not regression.
+
+Meanwhile the per-step `df_cos` logged by `_diffusion_forcing_objective` is computed AFTER `predict_x0` decoding in x₀-space, so it reads positive. The probe and the training metric were literally in different spaces.
+
+### Fix
+In `experiments/13_chain_generator/train_chain_generator.py::write_training_probe_snapshot`:
+```python
+v_df_raw, v_noisy, eps = model.forward_diffusion_forcing(..., return_noisy=True)
+v_df = model.predict_x0(v_noisy, v_df_raw, levels).to(dtype=v_df_raw.dtype)
+```
+All downstream uses (`projected["pred_x0"]`, `df_cos`, `df_l2`, `pred_norm`, PCA basis fitting in `_masked_probe_points`, `raw["pred_x0"]`, metric `df_cos_mean`) now consume the x₀-decoded tensor, consistent with the clean target and with the training-side `df_cos` metric.
+
+`v_noisy` stays untouched — it already lives in the clean/x_t space, which is what `noisy_cos_mean` and the `Clean → Noisy → Pred x₀` trajectory actually want.
+
+### Rules
+1. **Every "cos to clean" in training/probe code must live in x₀-space**. Whenever `prediction_type ∈ {"v", "eps"}`, route the raw model output through `predict_x0(x_t, model_out, t)` *before* any cosine/L2/projection comparison against `x₀`. Grep for `forward_diffusion_forcing` call sites every time you touch the diffusion math.
+2. **When the training metric and the probe metric diverge in sign, the bug is in the one that is not the training metric** (usually). Training metrics have been debugged across many runs; probe code is newer and drifts. Start suspicion there.
+3. **Probe export names are load-bearing**. If a field is called `pred_x0`, it MUST be in x₀-space. Mislabelled fields become silent time bombs for downstream GUI math (heatmaps, PCA basis, distance metrics) and confuse the user into thinking the model is broken.
+4. **Expected asymptotes for a correct v-prediction model** (cosine schedule, `d_model=1024`, `T=64`):
+   - At `t≈0`: `cos(v_pred, x₀) → 0` (v ≈ ε, orthogonal to x₀ in expectation)
+   - At `t≈T/2`: `cos(v_pred, x₀) → −√(1−ᾱ_t) ≈ −0.707`
+   - At `t≈T`: `cos(v_pred, x₀) → −1`
+   If you see any of these numbers where you expected `+1`, you forgot to decode v.
+
+---
+
+## 2026-04-14 - ChainGenerator NaN collapse (E3→E4): NaN×0 trap recurrence, Min-SNR x₀/ε swap, defense-in-depth
+
+### Pattern
+Training log `Arch 14_01_26 full training log.txt` showed healthy convergence through E3 (val_roll_cos_last=0.7554), then a single NaN in `loss_df` at the end of E3, complete loss collapse from E4 (grad_norm=0.0000 for 20 consecutive epochs), plus a secondary `ans_coverage→0` collapse at System1→System2 transition (E10+). Early-stopped at E24 vs planned E50.
+
+### Root Causes
+1. **NaN × 0 = NaN recurrence in `_masked_weighted_step_losses`**. The lessons entry from the original NaN bug (L57 pattern) says "masked losses must use `torch.where(mask, term, 0)`, never multiplication by mask". When the positionally-weighted variant was added for Diffusion Forcing, it reintroduced the exact same bug: `cos_loss = ((1 - cos) * weights * mask).sum() / denom`. Any single token with NaN in `cos_sim`/`mse_per` (e.g. `target=0` row) poisoned the entire batch loss and every downstream gradient.
+2. **Min-SNR x₀/ε formulas were swapped** in `_diffusion_forcing_weights`. Correct derivations:
+   - x₀-prediction: `w = clipped` (NOT `clipped/snr` — that double-counts the 1/SNR already in the loss)
+   - ε-prediction: `w = clipped/snr`
+   - v-prediction: `w = clipped/(snr+1)`
+   Code had x₀ and ε inverted. Latent because v-prediction is the default, but a footgun for anyone switching.
+3. **`_safe_normalize` divergence**: train-side helper used unguarded `v/v.norm().clamp(1e-6)` without first scrubbing inf/NaN. A single inf-slot propagated through every downstream normalization.
+4. **No nan_to_num at forward-pass boundaries** (`v_tf`, `v_roll`, `model_out`, `target`, `weights`). Bfloat16 + high-SNR regime at `t≈0` occasionally produced inf SNR and NaN model outputs that were not caught until they had already been masked-multiplied into the loss.
+5. **DF lambda=0.5 applied from step 0** against an un-warmed backbone, combined with `df_noise_level_min=0` allowing trivially-clean samples where SNR→∞.
+6. **System1 phase too short**: with `system1_epochs=10`, the model did not see enough single-step coverage before the much harder System2 phase, and positional weights amplified the answer-slot loss past the backbone's ability to keep up, collapsing `ans_coverage` to zero.
+
+### Fixes (applied in this session)
+- **Defense-in-depth `nan_to_num` scrub** at every boundary: `_safe_normalize` input, `cos_sim`, `mse_per`, `weights`, `v_tf`, `v_roll`, `model_out`, `target`, SNR clamp `max=1e4`.
+- **`_masked_weighted_step_losses` rewritten** to use `torch.where(mask_bool, term, zeros)` for both cosine and MSE terms — no more `* mask` multiplication on potentially-NaN tensors.
+- **Min-SNR x₀/ε formulas corrected** in `_diffusion_forcing_weights` per derivation above; `pt="v"` branch unchanged.
+- **DF lambda warm-up ramp**: added `df_warmup_epochs=3` config + training-loop logic that scales `loss_lambda_diffusion` from `0 → base` over the first N epochs. Base lowered from `0.5 → 0.25`.
+- **`df_noise_level_min: 0 → 2`** — skip the near-clean regime where SNR is numerically unstable and the objective is trivial.
+- **`system1_epochs: 10 → 15`** — longer single-step phase so the backbone stabilizes before the System1→System2 transition.
+- **Rolling `ans_coverage` warning** log: prints an explicit `[WARN]` when `val_answer_coverage` rolling-mean over last N epochs drops below threshold — early signal of the collapse pattern.
+- **`df_lam` added to per-step training log** so the warm-up is visible in logs.
+
+### Rules (carry forward)
+1. **NaN × 0 = NaN is recurrent**. Every time a new masked/weighted loss is added, grep for `* mask` / `* weights` patterns and force them through `torch.where`. Add this to the PR checklist.
+2. **Min-SNR-γ cheat sheet** (for the ChainGenerator DF loss formulation):
+   - x₀ → `w = clip(snr, γ)`
+   - ε  → `w = clip(snr, γ) / snr`
+   - v  → `w = clip(snr, γ) / (snr + 1)`
+   Do NOT memorise from papers written against a different parameterisation; re-derive against OUR loss every time.
+3. **Always `nan_to_num` at forward-pass boundaries** when training in bfloat16 with a diffusion objective. SNR blow-ups at `t≈0` are a known failure mode; the cost of defensive sanitization is < 0.1% of step time.
+4. **Never jam two new regimes at once**. Launching `System1→System2` AND full-strength DF loss simultaneously at E10 caused a double-shock. Use warm-up ramps for any auxiliary loss that can reach >10% of the primary loss magnitude.
+5. **Log whatever you will want to investigate**. `df_lam`, `ans_coverage`, and grad_norm must all be in per-step logs; otherwise the post-mortem needs guesses instead of evidence.
+6. **`safe_normalize` is a public API** — both the model and the training script must use the SAME implementation. Duplicate helpers drift; consolidate.
+
+---
+
 ## 2026-04-13 - Diffusion Forcing audit: Min-SNR weight formula inversion and grad_norm logging gap
 
 ### Pattern
@@ -2084,3 +2464,28 @@ Fixing only `df_eval_noise_level` is not enough for stable validation metrics. I
 2. System1 (`target_steps=1`) must train directly on `chains[answer_pos]`, not on the first reasoning step or the final repeat pad.
 3. System2 should use prefix-aligned targets, but activate answer-specific losses and metrics as soon as `answer_pos < target_steps`.
 4. Rank diagnostics and answer metrics should compare rollout at `answer_pos` to the first answer vector, not to an arbitrary last valid repeat.
+
+## 2026-04-15 - Adam state reset is not neutral
+- Do not treat Adam/AdamW moment zeroing as a harmless recovery action. After `exp_avg` and `exp_avg_sq` are cleared, the next finite micro-gradient can produce an almost sign-like full-LR update because Adam normalizes by the freshly tiny second moment (with bias correction, `g / (|g| + eps)`). This can create NaN -> dead -> wake -> NaN oscillations.
+- Always verify recovery conclusions against JSONL metrics, not only terminal logs. Terminal logs may omit `zombie_reset`, `grad_sanitized`, or cumulative recovery counters.
+- If answer coverage recovers only when horizon reaches a minimum length, do not start System2 below that horizon; too-short prefixes can make QA answer supervision mathematically absent.
+
+## 2026-04-16 - Adam-zombie root cause: momentum zeroing, not NaN itself
+### Context
+NaN in gradients is a transient numerical event (bf16 overflow, bad batch).
+The real damage comes from the RESPONSE to NaN, not NaN itself.
+### Problem
+Zeroing Adam exp_avg/exp_avg_sq on NaN grad creates a catastrophic state:
+- Next non-zero gradient produces update ≈ lr · g / √(ε) ≈ lr · g · 1e4
+- This 10000× amplified step destabilizes the model
+- val metrics freeze at exact values because EMA shadow stops receiving updates
+- Model enters "zombie" state: finite loss, finite params, but grad_norm=0
+### Rule
+1. On NaN grad: scrub grad to zero, but NEVER touch Adam momentum buffers.
+   Zero grad → Adam decays momentum by β₁/β₂ → natural "no signal" handling.
+2. Only zero Adam buffers that are themselves non-finite (defense-in-depth).
+3. Zombie reset (restore from EMA shadow) should preserve healthy momentum.
+4. For fixed-horizon curriculum: use `horizon_schedule` config key with
+   `[[steps, epochs], ...]` to train at each horizon for a fixed duration,
+   instead of continuously incrementing (which doesn't let the model converge
+   at any single horizon before moving to a harder one).

@@ -50,6 +50,27 @@ class ChainGeneratorConfig:
     # "layernorm" = original LayerNorm (backward compatible).
     norm_type: str = "ada_rmsnorm"
 
+    # ── ResNet / DiT stabilization practices ──
+    # Zero-init the final projector of every residual sublayer (self-attn
+    # out_proj, cross-attn out_proj, FFN down-projection).  At init each
+    # block is a perfect identity, which creates a clean gradient highway
+    # from the loss down to layer 0 (FixUp / DeepNet / DiT).
+    zero_init_residual: bool = True
+    # Per-residual learnable gate γ_l (CaiT LayerScale).  Each sublayer
+    # output is multiplied by a [D]-shaped parameter initialized to
+    # ``layerscale_init`` before the residual add.  With a small init the
+    # block starts near-identity and "opens up" as training progresses,
+    # dampening the early-training chaos that Diffusion Forcing is
+    # particularly prone to.
+    use_layerscale: bool = True
+    layerscale_init: float = 1e-4
+
+    # Deep supervision / auxiliary heads. Layer numbers are 1-based to match
+    # human-facing configs ("layer 2", "layer 4"). Empty disables the feature.
+    aux_head_layers: tuple[int, ...] = ()
+    aux_head_hidden_dim: int = 1024
+    aux_head_dropout: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Normalization & FFN building blocks
@@ -59,12 +80,32 @@ class AdaRMSNorm(nn.Module):
     """RMSNorm with optional Adaptive Layer Normalization (AdaLN) conditioning.
 
     Base: ``RMSNorm(x) = x / RMS(x) * γ``  (Zhang & Sennrich 2019)
-    AdaLN: ``AdaRMSN(x, s, b) = RMSNorm(x) * (1 + s) + b``
-    where *s* (scale) and *b* (shift) are produced by a timestep MLP.
+    AdaLN: ``AdaRMSN(x, s, b) = RMSNorm(x) * gate + b``
+    where *gate = (1 + s)* and *s, b* are produced by a timestep MLP.
+
+    Two numerical-stability mechanisms (lessons.md 2026-04-20 evening):
+
+    1. **Full FP32 modulation chain.**  bf16 has only ~7 bits of mantissa,
+       which becomes catastrophically coarse when the modulation gate
+       ``(1 + scale)`` drifts close to zero (a known AdaLN failure mode).
+       We keep the entire normalize → gain → modulate → shift pipeline
+       in FP32 and only down-cast at the final return.
+
+    2. **Soft floor on the AdaLN gate.**  ``(1 + scale)`` is unbounded
+       below in vanilla AdaLN, and the user's GB10 runs showed catastrophic
+       gradient suppression when it dipped near 0 (signal annihilation).
+       We clamp the gate to a strictly-positive floor so the residual
+       branch can be strongly suppressed but never inverted or zeroed out.
 
     When *scale* and *shift* are ``None`` the layer is a standard RMSNorm,
     so teacher-forcing (no timestep) works unchanged.
     """
+
+    # Gate floor: (1 + scale) is clamped to >= GATE_MIN.  At GATE_MIN=1e-3
+    # the model can still attenuate the signal by 1000x — plenty for any
+    # real "suppress this position" use case — without ever hitting the
+    # NaN-prone 0 region or flipping sign.
+    GATE_MIN: float = 1e-3
 
     def __init__(self, d: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -77,14 +118,18 @@ class AdaRMSNorm(nn.Module):
             scale: Tensor | None = None,
             shift: Tensor | None = None,
     ) -> Tensor:
+        in_dtype = x.dtype
         x_f = x.float()
         rms = x_f.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        out = (x_f * rms).to(x.dtype) * self.weight
+        # Stay in FP32 through γ-multiplication; bf16 here loses precision
+        # whenever the post-norm signal's per-channel scale is small.
+        out = x_f * rms * self.weight.float()
         if scale is not None:
-            out = out * (1.0 + scale)
+            gate = (1.0 + scale.float()).clamp(min=self.GATE_MIN)
+            out = out * gate
         if shift is not None:
-            out = out + shift
-        return out
+            out = out + shift.float()
+        return out.to(in_dtype)
 
 
 class SwiGLUFFN(nn.Module):
@@ -93,6 +138,22 @@ class SwiGLUFFN(nn.Module):
     ``SwiGLU(x) = W_down( SiLU(W_gate(x)) ⊙ W_up(x) )``
 
     Three projections instead of two; no biases (standard practice).
+
+    Two anti-collapse mechanisms (lessons.md 2026-04-20 evening):
+
+    1. **Orthogonal init for W_gate / W_up.**  Xavier-uniform tends to
+       cluster gate inputs around zero, so ``SiLU(gate)`` lives in the
+       near-linear regime — exactly the "dead zone" the third-party
+       analysis warned about, where the gradient through the gate path
+       is ~0.5 and any drift toward the saturating tail kills training.
+       Orthogonal init spreads the gate inputs across the SiLU non-linear
+       region, preserving signal entropy and gradient flow at start.
+
+    2. **In-band activation telemetry.**  We record gate-input mean/std
+       and post-down output norm as non-persistent buffers, so the
+       training loop can poll them every ``probe_every_steps`` and
+       detect dead-zone drift before it kills training.  No per-step
+       cost beyond a single ``.detach().mean()`` when tracking is on.
     """
 
     def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1) -> None:
@@ -101,9 +162,77 @@ class SwiGLUFFN(nn.Module):
         self.w_up = nn.Linear(d_model, d_hidden, bias=False)
         self.w_down = nn.Linear(d_hidden, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
+        # Activation telemetry — populated when ``track_stats`` is True.
+        self.track_stats: bool = False
+        self.register_buffer("_gate_in_abs_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_gate_in_std", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_silu_kurtosis", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_out_norm_mean", torch.tensor(0.0), persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+        gate_in = self.w_gate(x)
+        silu_gate = F.silu(gate_in)
+        out = self.dropout(self.w_down(silu_gate * self.w_up(x)))
+        if self.track_stats and self.training:
+            # Stay on-device: copy_ keeps the values as tensors so we do
+            # NOT trigger a GPU→CPU sync on every forward.  The training
+            # loop pays the .item() cost only when polling at probe time.
+            with torch.no_grad():
+                gi = gate_in.detach().float()
+                self._gate_in_abs_mean.copy_(gi.abs().mean())
+                self._gate_in_std.copy_(gi.std())
+                # Excess kurtosis of post-SiLU values: high → spiky/dead,
+                # ~0 → Gaussian-like (healthy).  Detects the "лес из нулей
+                # и редких пиков" failure mode the analysis warned about.
+                sg = silu_gate.detach().float()
+                centered = sg - sg.mean()
+                var = centered.pow(2).mean().clamp(min=1e-12)
+                self._silu_kurtosis.copy_(centered.pow(4).mean() / var.pow(2) - 3.0)
+                self._out_norm_mean.copy_(out.detach().float().norm(dim=-1).mean())
+        return out
+
+
+class AuxiliaryPredictionHead(nn.Module):
+    """Small per-layer prediction head for deep supervision.
+
+    The head maps an intermediate residual-stream state back to SONAR-vector
+    space. It is intentionally independent from the main output projection:
+    auxiliary losses should diagnose and regularize intermediate layers, not
+    silently couple them to the final decoder head.
+    """
+
+    def __init__(
+            self,
+            d_model: int,
+            hidden_dim: int = 1024,
+            dropout: float = 0.0,
+            norm_type: str = "ada_rmsnorm",
+    ) -> None:
+        super().__init__()
+        self.norm = AdaRMSNorm(d_model) if norm_type == "ada_rmsnorm" else nn.LayerNorm(d_model)
+        hidden = int(hidden_dim)
+        if hidden > 0:
+            self.net = nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.SiLU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(hidden, d_model),
+            )
+        else:
+            self.net = nn.Linear(d_model, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(self.norm(x))
+
+    def init_output(self, gain: float = 0.01) -> None:
+        """Initialize the final projection small, matching the main head."""
+        modules = list(self.net.modules()) if isinstance(self.net, nn.Module) else []
+        for module in reversed(modules):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=gain)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                return
 
 
 class CrossAttention(nn.Module):
@@ -144,10 +273,31 @@ class CrossAttention(nn.Module):
                 raise ValueError(
                     f"context_mask shape {tuple(cm.shape)} does not match context shape {(bsz, ctx_len)}"
                 )
-            # SDPA additive mask: 0 for valid, -inf for invalid.
+            # SDPA additive mask.  CRITICAL: using ``float("-inf")`` in
+            # bfloat16 triggers NaN in SDPA on CUDA (flash / mem-efficient
+            # backends) — softmax over a row of all ``-inf`` produces
+            # ``0/0 = NaN`` and ``-inf + -inf = -inf`` poisons gradients.
+            # The standard safe pattern (HuggingFace transformers) is to
+            # use ``finfo(dtype).min``: ~-3.4e38 in fp32, ~-3.4e38 cast to
+            # bf16 clips to ~-3.3e38 — large enough that ``exp(logit + min)``
+            # underflows to 0, but never produces ``inf - inf = NaN``.
             invalid = cm <= 0
-            attn_mask = torch.zeros((bsz, self.n_heads, seq_len, ctx_len), device=x.device, dtype=q.dtype)
-            attn_mask = attn_mask.masked_fill(invalid[:, None, None, :], float("-inf"))
+            # Additionally, if an ENTIRE row is masked out (rare but not
+            # impossible with context_bank_size=4), SDPA still NaNs.  Force
+            # such rows to be fully visible: they'll attend uniformly to
+            # whatever is there, which is strictly better than NaN and the
+            # downstream loss will correctly mask the position anyway.
+            all_invalid = invalid.all(dim=-1, keepdim=True)  # [B, 1]
+            invalid = invalid & ~all_invalid
+            mask_min = torch.finfo(q.dtype).min
+            attn_mask = torch.zeros(
+                (bsz, self.n_heads, seq_len, ctx_len),
+                device=x.device,
+                dtype=q.dtype,
+            )
+            attn_mask = attn_mask.masked_fill(
+                invalid[:, None, None, :], mask_min
+            )
 
         dropout_p = self.dropout_p if self.training else 0.0
         out = F.scaled_dot_product_attention(
@@ -237,6 +387,20 @@ class DecoderBlock(nn.Module):
     FFN type:
     - ``"silu"``: ``Linear → SiLU → Linear`` (original)
     - ``"swiglu"``: ``SwiGLUFFN`` with gated activation (LLaMA-style)
+
+    Stabilization (enabled by default):
+    - **Zero-init residual projectors**: the final projection of every
+      sublayer (``self_attn.out_proj``, ``cross_attn.out_proj``, the FFN
+      down-projection) is zeroed at init so each block starts as an exact
+      identity — the "gradient highway" trick from FixUp / DeepNet / DiT.
+    - **LayerScale** (CaiT, Touvron et al. 2021): each sublayer's output is
+      scaled by a learnable per-channel gate γ_l initialized to ``1e-4``
+      before the residual add, preventing early-training blow-ups in
+      Diffusion Forcing.
+
+    The actual zeroing of residual projectors is applied by the parent
+    ``ChainGenerator._init_weights`` *after* its xavier sweep; doing it
+    here in ``__init__`` would be silently overwritten.
     """
 
     def __init__(
@@ -248,10 +412,13 @@ class DecoderBlock(nn.Module):
         max_seq_len: int = 32,
         norm_type: str = "ada_rmsnorm",
         ffn_type: str = "swiglu",
+        use_layerscale: bool = True,
+        layerscale_init: float = 1e-4,
     ):
         super().__init__()
         self._norm_type = norm_type
         self._ffn_type = ffn_type
+        self._use_layerscale = bool(use_layerscale)
 
         # ── Normalization ──
         if norm_type == "ada_rmsnorm":
@@ -259,12 +426,18 @@ class DecoderBlock(nn.Module):
             self.norm_cross = AdaRMSNorm(d_model)
             self.norm_ffn = AdaRMSNorm(d_model)
             # AdaLN modulation: 6 vectors (scale+shift for each of 3 norms).
+            # NOTE on init: we ask for zero-weight + zero-bias here so the
+            # block is identity-through-norm (scale=0→γ=1, shift=0→β=0) at
+            # start.  But ``ChainGenerator._init_weights`` runs a xavier
+            # sweep over every ``nn.Linear`` *after* construction, which
+            # silently overwrites this.  The parent's ``_init_weights``
+            # explicitly re-zeros ``adaln_modulation[-1]`` after the sweep;
+            # do NOT remove that call — otherwise we train with xavier
+            # adaLN and lose the AdaLN-Zero property entirely.
             self.adaln_modulation = nn.Sequential(
                 nn.SiLU(),
                 nn.Linear(d_model, 6 * d_model, bias=True),
             )
-            # Zero-init so that at start the block is identity-through-norm
-            # (γ=0→multiply by 1, β=0→add 0), preserving backward compat.
             nn.init.zeros_(self.adaln_modulation[-1].weight)
             nn.init.zeros_(self.adaln_modulation[-1].bias)
         else:
@@ -298,6 +471,48 @@ class DecoderBlock(nn.Module):
                 nn.Dropout(dropout),
             )
 
+        # ── LayerScale (CaiT) ──
+        # One per-channel gate γ_l per sublayer, initialized to a small
+        # constant so each residual branch contributes ~0 at start and the
+        # identity path from zero-init residual dominates.
+        if self._use_layerscale:
+            init_val = float(layerscale_init)
+            self.ls_self = nn.Parameter(torch.full((d_model,), init_val))
+            self.ls_cross = nn.Parameter(torch.full((d_model,), init_val))
+            self.ls_ffn = nn.Parameter(torch.full((d_model,), init_val))
+        else:
+            self.register_parameter("ls_self", None)
+            self.register_parameter("ls_cross", None)
+            self.register_parameter("ls_ffn", None)
+
+    def _scale(self, y: Tensor, gamma: Tensor | None) -> Tensor:
+        """Apply LayerScale gate if enabled."""
+        return y * gamma if gamma is not None else y
+
+    def _zero_init_residual_projectors(self) -> None:
+        """Zero the final projector weight of every residual sublayer.
+
+        After this call the block is an **exact identity** at initialization:
+        ``self_attn(norm(x)) = 0``, ``cross_attn(norm(x)) = 0``, ``ffn(norm(x)) = 0``,
+        so ``x → x + 0 + 0 + 0 = x`` through every layer.  This is the
+        "zero-init residual" trick from FixUp / DeepNet / DiT and is what
+        allows deep residual networks to receive a clean, full-magnitude
+        gradient on every parameter from the very first step.
+        """
+        nn.init.zeros_(self.self_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        if self._ffn_type == "swiglu":
+            nn.init.zeros_(self.ffn.w_down.weight)
+        else:
+            # nn.Sequential: [Linear, SiLU, Dropout, Linear, Dropout].
+            # Zero the last Linear (the down-projection).
+            for m in reversed(list(self.ffn)):
+                if isinstance(m, nn.Linear):
+                    nn.init.zeros_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                    break
+
     def forward(
         self,
         x: Tensor,
@@ -318,18 +533,30 @@ class DecoderBlock(nn.Module):
             # AdaLN-Zero: produce per-position scale/shift for each norm.
             mod = self.adaln_modulation(t_emb)  # [B, L, 6D]
             s_sa, sh_sa, s_ca, sh_ca, s_ff, sh_ff = mod.chunk(6, dim=-1)
-            x = x + self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa))
-            x = x + self.cross_attn(
-                self.norm_cross(x, scale=s_ca, shift=sh_ca),
-                context,
-                context_mask=context_mask,
+            x = x + self._scale(
+                self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa)),
+                self.ls_self,
             )
-            x = x + self.ffn(self.norm_ffn(x, scale=s_ff, shift=sh_ff))
+            x = x + self._scale(
+                self.cross_attn(
+                    self.norm_cross(x, scale=s_ca, shift=sh_ca),
+                    context,
+                    context_mask=context_mask,
+                ),
+                self.ls_cross,
+            )
+            x = x + self._scale(
+                self.ffn(self.norm_ffn(x, scale=s_ff, shift=sh_ff)),
+                self.ls_ffn,
+            )
         else:
             # Standard pre-norm (no conditioning).
-            x = x + self.self_attn(self.norm_self(x))
-            x = x + self.cross_attn(self.norm_cross(x), context, context_mask=context_mask)
-            x = x + self.ffn(self.norm_ffn(x))
+            x = x + self._scale(self.self_attn(self.norm_self(x)), self.ls_self)
+            x = x + self._scale(
+                self.cross_attn(self.norm_cross(x), context, context_mask=context_mask),
+                self.ls_cross,
+            )
+            x = x + self._scale(self.ffn(self.norm_ffn(x)), self.ls_ffn)
         return x
 
 
@@ -360,6 +587,8 @@ class ChainGenerator(nn.Module):
                     max_seq_len=max_seq,
                     norm_type=self.cfg.norm_type,
                     ffn_type=self.cfg.ffn_type,
+                    use_layerscale=self.cfg.use_layerscale,
+                    layerscale_init=self.cfg.layerscale_init,
                 )
                 for _ in range(self.cfg.n_layers)
             ]
@@ -371,20 +600,119 @@ class ChainGenerator(nn.Module):
         else:
             self.final_norm = nn.LayerNorm(self.cfg.d_model)
 
+        self.output_proj = nn.Linear(self.cfg.d_model, self.cfg.d_model)
+
+        self._aux_layer_numbers = self._normalize_aux_layers(self.cfg.aux_head_layers)
+        self.aux_heads = nn.ModuleDict(
+            {
+                str(layer_num): AuxiliaryPredictionHead(
+                    d_model=self.cfg.d_model,
+                    hidden_dim=self.cfg.aux_head_hidden_dim,
+                    dropout=self.cfg.aux_head_dropout,
+                    norm_type=self.cfg.norm_type,
+                )
+                for layer_num in self._aux_layer_numbers
+            }
+        )
+
+        # Timestep MLP for diffusion noise-level conditioning.
+        self.diffusion_time_mlp = nn.Sequential(
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+            nn.SiLU(),
+            nn.Linear(self.cfg.d_model, self.cfg.d_model),
+        )
+
         self._build_diffusion_schedule()
 
         self._init_weights()
 
     def _init_weights(self) -> None:
+        """Initialize parameters for a deep, diffusion-stable transformer.
+
+        Order matters — we first do a global xavier sweep over every
+        ``nn.Linear``, then selectively re-initialize a handful of projectors
+        to enforce the three "ResNet for diffusion" stabilization tricks:
+
+        1. **Zero-init residual projectors** (FixUp / DeepNet / DiT): the
+           final projection of every residual sublayer is zeroed, making
+           each ``DecoderBlock`` start as an exact identity.  Combined with
+           LayerScale (initialized tiny), this guarantees a clean gradient
+           highway from the loss straight to layer 0 at step 0.
+        2. **AdaLN-Zero**: the final Linear of every block's timestep
+           modulation MLP is zeroed so the AdaRMSNorm layers start as plain
+           RMSNorm (scale=0 → γ=1, shift=0 → β=0).  Without the re-zeroing
+           below, the xavier sweep overwrites the zeros set inside
+           ``DecoderBlock.__init__``, silently breaking AdaLN-Zero.
+        3. **Small output head**: ``output_proj`` uses xavier with gain
+           0.01 so initial predictions are small in SONAR space (compatible
+           with the 0.2051 target norm).
+        """
+        # ── 1. Global xavier sweep ──
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
+        # ── 2. Re-enforce AdaLN-Zero on every block ──
+        for block in self.layers:
+            if getattr(block, "adaln_modulation", None) is not None:
+                final = block.adaln_modulation[-1]
+                nn.init.zeros_(final.weight)
+                if final.bias is not None:
+                    nn.init.zeros_(final.bias)
+
+        # ── 3. Zero-init residual projectors (FixUp / DeepNet / DiT) ──
+        if self.cfg.zero_init_residual:
+            for block in self.layers:
+                block._zero_init_residual_projectors()
+
+        # ── 4. Small output head ──
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.01)
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
+        for head in self.aux_heads.values():
+            head.init_output(gain=0.01)
+
+        # ── 5. Orthogonal init for SwiGLU gate / up projections ──
+        # Xavier-uniform clusters gate inputs near zero (where SiLU is
+        # near-linear, gradient ~0.5), creating a "dead zone" that the
+        # third-party scale-collapse analysis flagged.  Orthogonal
+        # weights spread the gate inputs across SiLU's non-linear
+        # region, preserving signal entropy and gradient flow at start.
+        # Skip ``w_down`` — it's zero-initialized just above by
+        # _zero_init_residual_projectors() and we must NOT overwrite it.
+        for block in self.layers:
+            ffn = getattr(block, "ffn", None)
+            if isinstance(ffn, SwiGLUFFN):
+                nn.init.orthogonal_(ffn.w_gate.weight, gain=1.0)
+                nn.init.orthogonal_(ffn.w_up.weight, gain=1.0)
+
+    def _normalize_aux_layers(self, layers: tuple[int, ...] | list[int] | int | None) -> tuple[int, ...]:
+        """Return sorted unique 1-based layer numbers that are valid."""
+        if layers is None:
+            return ()
+        if isinstance(layers, int):
+            raw = [layers]
+        else:
+            raw = list(layers)
+        out: list[int] = []
+        for value in raw:
+            layer_num = int(value)
+            if layer_num < 1 or layer_num > int(self.cfg.n_layers):
+                raise ValueError(
+                    f"aux_head layer {layer_num} is outside valid range 1..{self.cfg.n_layers}"
+                )
+            if layer_num not in out:
+                out.append(layer_num)
+        return tuple(sorted(out))
+
+    def _maybe_aux_predict(self, layer_num: int, x: Tensor, aux: dict[str, Tensor] | None) -> None:
+        if aux is None:
+            return
+        key = str(layer_num)
+        if key in self.aux_heads:
+            aux[key] = self.aux_heads[key](x)
 
     def _build_diffusion_schedule(self) -> None:
         """Register DDPM schedule buffers used by Diffusion Forcing.
@@ -416,9 +744,9 @@ class ChainGenerator(nn.Module):
         self.register_buffer(
             "_df_sqrt_one_minus_alphas_cumprod",
             (1.0 - alphas_cumprod).clamp(min=0.0).sqrt(),
-            self.register_buffer("_df_alphas_cumprod", alphas_cumprod.float(), persistent=True),
             persistent=True,
         )
+        self.register_buffer("_df_alphas_cumprod", alphas_cumprod.float(), persistent=True)
         self.register_buffer("_df_snr", snr.float(), persistent=True)
 
     def _diffusion_noise_scale(self) -> float:
@@ -570,14 +898,39 @@ class ChainGenerator(nn.Module):
 
         F.normalize with default eps=1e-12 can produce exploding gradients
         when input norm approaches zero (especially in bfloat16). We use a
-        larger eps and clamp the norm to prevent this.
+        larger eps and clamp the norm to prevent this.  We also scrub any
+        non-finite values from the input so a poisoned row cannot leak NaN
+        through the downstream division (see tasks/lessons.md 2026-04-11
+        rule #3 for the NaN*0 propagation trap).
         """
         v_float = v.float()
+        v_float = torch.nan_to_num(v_float, nan=0.0, posinf=0.0, neginf=0.0)
         norms = v_float.norm(dim=dim, keepdim=True).clamp(min=eps)
         return (v_float / norms).to(dtype=v.dtype)
 
     def _sphere_project(self, v: Tensor) -> Tensor:
-        return self._safe_normalize(v, dim=-1) * self.cfg.target_norm
+        """Project ``v`` onto the SONAR hypersphere of radius ``target_norm``.
+
+        Critically, the output is **guaranteed** to lie on the sphere — even
+        when the input is non-finite or zero-norm.  Without this guarantee,
+        ``_safe_normalize`` would produce a zero vector for a degenerate row
+        (NaN → nan_to_num(0) → norm clamped to eps → 0/eps = 0), and that
+        off-manifold zero would feed back as the next step's history,
+        skewing attention statistics and triggering a NaN cascade across
+        the chain.  We detect collapsed rows and substitute the canonical
+        e₀ basis vector scaled to ``target_norm``.
+        """
+        v_safe = self._safe_normalize(v, dim=-1)  # unit-norm or ~0 for degenerate rows
+        # Detect rows that collapsed to ~0 (norm < 0.5 means we lost the unit
+        # constraint — under normal conditions safe_normalize returns norm=1).
+        with torch.no_grad():
+            row_norm = v_safe.float().norm(dim=-1, keepdim=True)
+            collapsed = row_norm < 0.5  # broadcast over last dim
+        if collapsed.any():
+            fallback = torch.zeros_like(v_safe)
+            fallback[..., 0] = 1.0  # canonical e₀ direction, on the unit sphere
+            v_safe = torch.where(collapsed, fallback, v_safe)
+        return v_safe * self.cfg.target_norm
 
     def _to_residual_space(self, sonar_vectors: Tensor) -> Tensor:
         """
@@ -634,7 +987,8 @@ class ChainGenerator(nn.Module):
         context_mask: Tensor | None = None,
         scheduled_sampling_prob: float = 0.0,
         tf_noise_std: float = 0.0,
-    ) -> Tensor:
+        return_aux: bool = False,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """Teacher-forced forward pass with optional scheduled sampling.
 
         When scheduled_sampling_prob > 0 and training, each position (except
@@ -679,25 +1033,74 @@ class ChainGenerator(nn.Module):
                 decoder_input = torch.cat([start, scaled_target[:, :-1, :]], dim=1)
 
             x = decoder_input
-            for layer in self.layers:
+            aux: dict[str, Tensor] | None = {} if return_aux and len(self.aux_heads) > 0 else None
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask)
+                self._maybe_aux_predict(layer_idx, x, aux)
 
             x = self.final_norm(x)
             v_pred = self.output_proj(x)
+
+            # ── NaN gate for teacher-forcing path ─────────────────
+            # Mirror the scheduled-sampling NaN gate (line ~975).
+            # Replace non-finite predictions with ground truth so
+            # the loss sees 0 (pred == target) instead of the
+            # nan_to_num(0) artifact that gives cos_loss=1.0 with
+            # zero gradient — the root cause of the NaN cascade
+            # where the unstable parameter region silently expands
+            # until every output is NaN (lesson 2026-04-16).
+            if self.training:
+                bad = ~torch.isfinite(v_pred)
+                if bad.any():
+                    # Count samples (not elements) with any NaN.
+                    n_bad = int(bad.any(dim=-1).any(dim=-1).sum().item())
+                    self._nan_gate_count = n_bad
+                    v_pred = torch.where(bad, v_target_chain, v_pred)
+                else:
+                    self._nan_gate_count = 0
+            else:
+                self._nan_gate_count = 0
+
+            if aux is not None:
+                return v_pred, aux
             return v_pred
 
         # ── Scheduled sampling: step-by-step with token mixing ──
+        self._nan_gate_count = 0  # reset before rollout
         seq = self.start_token.expand(bsz, -1, -1)  # [B, 1, D]
         preds: list[Tensor] = []
         use_tf_noise = self.training and tf_noise_std > 0.0
 
+        aux_steps: dict[str, list[Tensor]] | None = (
+            {str(layer_num): [] for layer_num in self._aux_layer_numbers}
+            if return_aux and len(self.aux_heads) > 0
+            else None
+        )
+
         for t in range(num_steps):
             x = seq
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask)
+                if aux_steps is not None and str(layer_idx) in aux_steps:
+                    aux_steps[str(layer_idx)].append(self.aux_heads[str(layer_idx)](x[:, -1:, :]))
 
             x = self.final_norm(x)
             raw = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+
+            # ── Per-sample NaN gate ──────────────────────────────────
+            # If any dimension is non-finite for a sample, replace that
+            # sample's raw output with ground truth.  This prevents a
+            # corrupted prediction from being fed back as context in
+            # subsequent rollout steps.  The loss sees GT for that
+            # sample (≈ zero loss, correct: no training signal from a
+            # broken forward pass).  Detach-free: GT has no grad path.
+            has_bad = ~torch.isfinite(raw).all(dim=-1, keepdim=True)  # [B, 1, 1]
+            if has_bad.any():
+                n_bad = int(has_bad.sum().item())
+                self._nan_gate_count = getattr(self, "_nan_gate_count", 0) + n_bad
+                gt_t = v_target_chain[:, t : t + 1, :]
+                raw = torch.where(has_bad.expand_as(raw), gt_t, raw)
+
             pred_t = self._sphere_project(raw)
             preds.append(raw)
 
@@ -718,8 +1121,11 @@ class ChainGenerator(nn.Module):
                 next_vec = torch.where(use_pred, scaled_noisy_pred, scaled_gt)
 
                 seq = torch.cat([seq, next_vec], dim=1)
-
-        return torch.cat(preds, dim=1)
+        v_pred = torch.cat(preds, dim=1)
+        if aux_steps is not None:
+            aux = {k: torch.cat(v, dim=1) for k, v in aux_steps.items() if v}
+            return v_pred, aux
+        return v_pred
 
     def diffusion_snr(self, noise_levels: Tensor) -> Tensor:
         """Return schedule SNR for each noise level."""
@@ -762,7 +1168,8 @@ class ChainGenerator(nn.Module):
             context_mask: Tensor | None = None,
             noise: Tensor | None = None,
             return_noisy: bool = False,
-    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
+            return_aux: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, dict[str, Tensor]] | tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         """Diffusion Forcing denoising pass over the whole chain.
 
         Each valid position receives its own diffusion noise level.  Unlike
@@ -792,23 +1199,28 @@ class ChainGenerator(nn.Module):
         x = self._to_residual_space(v_noisy)
         t_emb = self._diffusion_timestep_embedding(noise_levels).to(device=x.device, dtype=x.dtype)
 
+        aux: dict[str, Tensor] | None = {} if return_aux and len(self.aux_heads) > 0 else None
+
         if self.cfg.norm_type == "ada_rmsnorm":
-            # AdaLN path: pass t_emb through each layer for per-norm modulation.
-            # The input still gets a residual addition for backward compat and
-            # to provide a strong initial signal before the first norm.
-            x = x + t_emb
-            for layer in self.layers:
+            # AdaLN path: per-layer modulation only (DiT design).
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
+                self._maybe_aux_predict(layer_idx, x, aux)
         else:
             # Legacy: simple additive conditioning.
             x = x + t_emb
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers, start=1):
                 x = layer(x, context, context_mask=ctx_mask)
+                self._maybe_aux_predict(layer_idx, x, aux)
 
         x = self.final_norm(x)
         v_pred = self.output_proj(x)
+        if return_noisy and aux is not None:
+            return v_pred, v_noisy, eps, aux
         if return_noisy:
             return v_pred, v_noisy, eps
+        if aux is not None:
+            return v_pred, aux
         return v_pred
 
     def generate(
@@ -919,9 +1331,6 @@ class ChainGenerator(nn.Module):
                     cfg_scale=cfg_scale,
                 )
                 # ddim_result is [B, 1, D] in SONAR space, already sphere-projected.
-                # Convert to residual-space "raw" for the rest of the loop.
-                raw_next = ddim_result / self.cfg.target_norm * self.output_proj.weight.data.norm()
-                # But for consistency, just use the SONAR prediction directly:
                 raw_next = ddim_result
             else:
                 x = chain
@@ -1043,33 +1452,31 @@ class ChainGenerator(nn.Module):
                     next_vec_for_chain = torch.where(mask3, candidate, next_vec_for_chain)
                     repeat_resamples += int(repeat_mask.sum().item())
 
-            # Mathematical Fix: The model's TRUE prediction is the clean vector.
-            # We must evaluate the loss (and report metrics) on the clean vector.
-            # In contrast, the context chain gets the NOISY / RE-ROLLED vector.
-            # If we evaluated the noisy vector during training, we'd penalize random
-            # noise it couldn't predict.
+            # NaN guard: check raw_next BEFORE storing.  _sphere_project
+            # silently cleans NaN via nan_to_num(0) inside _safe_normalize,
+            # so checking next_vec_for_chain (post-projection) never fires.
+            # We must check raw_next (pre-projection) to catch the actual NaN.
+            raw_has_nan = not torch.isfinite(raw_next).all()
+
             if self.training:
-                # Training: track the raw unprojected logit to compute MSE gradients.
-                generated.append(raw_next)
+                if raw_has_nan:
+                    # Store clean sphere-projected vec instead of NaN-contaminated raw.
+                    # Downstream loss sees clean_pred ≈ GT direction → loss ≈ 0.
+                    generated.append(clean_next_vec)
+                else:
+                    generated.append(raw_next)
             else:
-                # Inference: track the ACTUAL vector chosen by the Critic/Repeat-Ban!
                 generated.append(next_vec_for_chain)
 
-            # NaN guard: if generated vector contains NaN, replace with the
-            # previous valid vector (or start_token projection). This prevents
-            # a single NaN from cascading through the entire chain.
-            if torch.isnan(next_vec_for_chain).any():
+            if raw_has_nan:
                 if len(generated) >= 2:
-                    next_vec_for_chain = generated[-2].detach().clone()
-                    next_vec_for_chain = self._sphere_project(next_vec_for_chain)
+                    fallback = generated[-2].detach().clone()
+                    next_vec_for_chain = self._sphere_project(fallback)
                 else:
                     next_vec_for_chain = self._sphere_project(
                         torch.randn(bsz, 1, self.cfg.d_model, device=v_query.device)
                     )
-                # Also fix the recorded generated vector
-                if self.training:
-                    generated[-1] = next_vec_for_chain / self.cfg.target_norm  # undo sphere project for raw logit scale
-                else:
+                if not self.training:
                     generated[-1] = next_vec_for_chain
 
             # Fix #3: Detach before appending so backward() through L_roll
@@ -1162,115 +1569,118 @@ class ChainGenerator(nn.Module):
 
         return chain_out, info
 
-        # ------------------------------------------------------------------
-        # DDIM iterative refinement at each autoregressive position
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # DDIM iterative refinement at each autoregressive position
+    # ------------------------------------------------------------------
 
-        def _ddim_denoise_position(
-                self,
-                chain_residual: Tensor,
-                context: Tensor,
-                ctx_mask: Tensor | None,
-                ddim_steps: int = 3,
-                cfg_scale: float = 1.0,
-        ) -> Tensor:
-            """Refine the next chain position via DDIM multi-step denoising.
+    def _ddim_denoise_position(
+            self,
+            chain_residual: Tensor,
+            context: Tensor,
+            ctx_mask: Tensor | None,
+            ddim_steps: int = 3,
+            cfg_scale: float = 1.0,
+    ) -> Tensor:
+        """Refine the next chain position via DDIM multi-step denoising.
 
-            Instead of one-shot prediction, this starts from pure noise and
-            iteratively denoises through ``ddim_steps`` diffusion steps, using
-            the model's DF pathway.  The chain prefix is treated as clean (t=0).
+        Instead of one-shot prediction, this starts from pure noise and
+        iteratively denoises through ``ddim_steps`` diffusion steps, using
+        the model's DF pathway.  The chain prefix is treated as clean (t=0).
 
-            Args:
-                chain_residual: [B, L, D] existing chain in residual space
-                                (start_token + generated so far).
-                context: [B, K, D] cross-attention context (residual space).
-                ctx_mask: [B, K] context mask.
-                ddim_steps: number of DDIM denoising steps.
-                cfg_scale: classifier-free guidance scale (1.0 = no guidance).
+        Args:
+            chain_residual: [B, L, D] existing chain in residual space
+                            (start_token + generated so far).
+            context: [B, K, D] cross-attention context (residual space).
+            ctx_mask: [B, K] context mask.
+            ddim_steps: number of DDIM denoising steps.
+            cfg_scale: classifier-free guidance scale (1.0 = no guidance).
 
-            Returns:
-                x0_pred: [B, 1, D] predicted clean vector in **SONAR** space.
-            """
-            bsz = chain_residual.shape[0]
-            K = max(2, int(self.cfg.diffusion_timesteps))
+        Returns:
+            x0_pred: [B, 1, D] predicted clean vector in **SONAR** space.
+        """
+        bsz = chain_residual.shape[0]
+        K = max(2, int(self.cfg.diffusion_timesteps))
 
-            # Build step schedule: evenly spaced from t_max down to 0.
-            # E.g. ddim_steps=3, K=64 → [63, 42, 21, 0]
-            schedule = torch.linspace(K - 1, 0, ddim_steps + 1).long().tolist()
+        # Build step schedule: evenly spaced from t_max down to 0.
+        # E.g. ddim_steps=3, K=64 → [63, 42, 21, 0]
+        schedule = torch.linspace(K - 1, 0, ddim_steps + 1).long().tolist()
 
-            # Start from pure SONAR-scaled noise for the new position.
-            noise_scale = self._diffusion_noise_scale()
-            x_t = noise_scale * torch.randn(
-                bsz, 1, self.cfg.d_model,
-                device=chain_residual.device,
-                dtype=chain_residual.dtype,
+        # Start from pure SONAR-scaled noise for the new position.
+        noise_scale = self._diffusion_noise_scale()
+        x_t = noise_scale * torch.randn(
+            bsz, 1, self.cfg.d_model,
+            device=chain_residual.device,
+            dtype=chain_residual.dtype,
+        )
+
+        for i in range(ddim_steps):
+            t_cur = schedule[i]
+            t_next = schedule[i + 1]
+
+            # Build levels: 0 for clean prefix, t_cur for the new position.
+            prefix_len = chain_residual.shape[1]
+            levels_prefix = torch.zeros(bsz, prefix_len, device=chain_residual.device, dtype=torch.long)
+            levels_new = torch.full((bsz, 1), t_cur, device=chain_residual.device, dtype=torch.long)
+            levels = torch.cat([levels_prefix, levels_new], dim=1)  # [B, L+1]
+
+            # Concatenate prefix + noisy new position.
+            x_new_res = self._to_residual_space(x_t)
+            full_seq = torch.cat([chain_residual, x_new_res], dim=1)  # [B, L+1, D]
+
+            # Timestep embedding for the full sequence.
+            t_emb = self._diffusion_timestep_embedding(levels).to(
+                device=full_seq.device, dtype=full_seq.dtype,
             )
 
-            for i in range(ddim_steps):
-                t_cur = schedule[i]
-                t_next = schedule[i + 1]
-
-                # Build levels: 0 for clean prefix, t_cur for the new position.
-                prefix_len = chain_residual.shape[1]
-                levels_prefix = torch.zeros(bsz, prefix_len, device=chain_residual.device, dtype=torch.long)
-                levels_new = torch.full((bsz, 1), t_cur, device=chain_residual.device, dtype=torch.long)
-                levels = torch.cat([levels_prefix, levels_new], dim=1)  # [B, L+1]
-
-                # Concatenate prefix + noisy new position.
-                x_new_res = self._to_residual_space(x_t)
-                full_seq = torch.cat([chain_residual, x_new_res], dim=1)  # [B, L+1, D]
-
-                # Timestep embedding for the full sequence.
-                t_emb = self._diffusion_timestep_embedding(levels).to(
-                    device=full_seq.device, dtype=full_seq.dtype,
-                )
-
-                # Forward through transformer with timestep conditioning.
+            # Forward through transformer with timestep conditioning.
+            if self.cfg.norm_type == "ada_rmsnorm":
                 x = full_seq + t_emb
+                for layer in self.layers:
+                    x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
+            else:
+                x = full_seq + t_emb
+                for layer in self.layers:
+                    x = layer(x, context, context_mask=ctx_mask)
+
+            x = self.final_norm(x)
+            model_out = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+
+            # CFG: conditional + unconditional interpolation (at the prediction,
+            # not x0 — mathematically equivalent for linear prediction types).
+            if cfg_scale > 1.0 and hasattr(self, "null_context_token"):
+                null_ctx = self.null_context_token.expand(bsz, context.shape[1], -1)
+                null_ctx = self._to_residual_space(null_ctx)
                 if self.cfg.norm_type == "ada_rmsnorm":
-                    for layer in self.layers:
-                        x = layer(x, context, context_mask=ctx_mask, t_emb=t_emb)
-                else:
-                    for layer in self.layers:
-                        x = layer(x, context, context_mask=ctx_mask)
-
-                x = self.final_norm(x)
-                model_out = self.output_proj(x[:, -1:, :])  # [B, 1, D]
-
-                # CFG: conditional + unconditional interpolation.
-                if cfg_scale > 1.0 and hasattr(self, "null_context_token"):
-                    null_ctx = self.null_context_token.expand(bsz, context.shape[1], -1)
-                    null_ctx = self._to_residual_space(null_ctx)
                     x_uc = full_seq + t_emb
-                    if self.cfg.norm_type == "ada_rmsnorm":
-                        for layer in self.layers:
-                            x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask, t_emb=t_emb)
-                    else:
-                        for layer in self.layers:
-                            x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask)
-                    x_uc = self.final_norm(x_uc)
-                    model_out_uc = self.output_proj(x_uc[:, -1:, :])
-                    model_out = model_out_uc + cfg_scale * (model_out - model_out_uc)
-
-                # Recover x₀ and ε from model output.
-                level_new = levels_new  # [B, 1]
-                x0_pred = self.predict_x0(x_t, model_out, level_new)
-                eps_pred = self.predict_eps(x_t, model_out, level_new)
-
-                # DDIM deterministic step: x_{t'} = √α̅_{t'} · x₀ + √(1-α̅_{t'}) · ε
-                if t_next > 0:
-                    sa_next = self._df_sqrt_alphas_cumprod[t_next].to(
-                        device=x_t.device, dtype=x_t.dtype,
-                    )
-                    som_next = self._df_sqrt_one_minus_alphas_cumprod[t_next].to(
-                        device=x_t.device, dtype=x_t.dtype,
-                    )
-                    x_t = sa_next * x0_pred + som_next * eps_pred
+                    for layer in self.layers:
+                        x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask, t_emb=t_emb)
                 else:
-                    x_t = x0_pred
+                    x_uc = full_seq + t_emb
+                    for layer in self.layers:
+                        x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask)
+                x_uc = self.final_norm(x_uc)
+                model_out_uc = self.output_proj(x_uc[:, -1:, :])
+                model_out = model_out_uc + cfg_scale * (model_out - model_out_uc)
 
-            # Project to SONAR sphere.
-            return self._sphere_project(x_t)
+            # Recover x₀ and ε from model output.
+            level_new = levels_new  # [B, 1]
+            x0_pred = self.predict_x0(x_t, model_out, level_new)
+            eps_pred = self.predict_eps(x_t, model_out, level_new)
+
+            # DDIM deterministic step: x_{t'} = √α̅_{t'} · x₀ + √(1-α̅_{t'}) · ε
+            if t_next > 0:
+                sa_next = self._df_sqrt_alphas_cumprod[t_next].to(
+                    device=x_t.device, dtype=x_t.dtype,
+                )
+                som_next = self._df_sqrt_one_minus_alphas_cumprod[t_next].to(
+                    device=x_t.device, dtype=x_t.dtype,
+                )
+                x_t = sa_next * x0_pred + som_next * eps_pred
+            else:
+                x_t = x0_pred
+
+        # Project to SONAR sphere.
+        return self._sphere_project(x_t)
 
     def beam_generate(
         self,
@@ -1323,33 +1733,39 @@ class ChainGenerator(nn.Module):
 
             new_W = W * K
             raw_k = raw_next.reshape(bsz, W, 1, self.cfg.d_model).unsqueeze(2).expand(-1, -1, K, -1, -1).clone()
-            
+
             if n_std > 0.0:
                 raw_k_noisy = raw_k + n_std * torch.randn_like(raw_k)
             else:
                 raw_k_noisy = raw_k
-                
-            cand_vecs = self._sphere_project(raw_k_noisy)  # [B, W, K, 1, D]
+
+            # Sphere-project to SONAR space for energy scoring and output.
+            cand_vecs = self._sphere_project(raw_k_noisy)  # [B, W, K, 1, D] — SONAR scale
 
             flat_cands = cand_vecs.reshape(bsz * new_W, self.cfg.d_model)
             flat_qs = v_query.repeat_interleave(new_W, dim=0)
-            
+
             with torch.no_grad():
                 step_energies = energy_fn(flat_qs, flat_cands)  # [B*W*K]
-            
+
             step_energies = step_energies.reshape(bsz, W, K)
-            
+
             # Cumulative energy over the chain path
             cum_energies = active_energies.unsqueeze(2) + step_energies  # [B, W, K]
             cum_energies_flat = cum_energies.reshape(bsz, new_W)
-            
+
             next_W = min(int(beam_width), new_W)
             top_energies, top_indices = torch.topk(cum_energies_flat, next_W, dim=1, largest=False)  # [B, next_W]
-            
-            reconstructed_cands = cand_vecs.reshape(bsz, new_W, 1, self.cfg.d_model)
+
+            # Scale candidates to residual space BEFORE appending to the chain.
+            # The chain is built in residual space (norm~32). SONAR-scale vectors
+            # (norm~0.2051) would be 156x smaller than the start_token and produce
+            # degenerate attention weights across beam steps.
+            cand_vecs_res = self._to_residual_space(cand_vecs)  # [B, W, K, 1, D] — residual scale
+            reconstructed_cands = cand_vecs_res.reshape(bsz, new_W, 1, self.cfg.d_model)
             t = active_chains.shape[2]
             history = active_chains.unsqueeze(2).expand(-1, -1, K, -1, -1).reshape(bsz, new_W, t, self.cfg.d_model)
-            
+
             next_chains = []
             for b in range(bsz):
                 idx = top_indices[b]
