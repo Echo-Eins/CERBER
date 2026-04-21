@@ -1,70 +1,34 @@
 # Lessons
 
-## 2026-04-20 (night) — Answer-triggered NaN cascade: 3 bugs at the horizon transition
+## 2026-04-21 — Corrected root-cause: soft Adam reset + missing LayerScale decay, NOT "answer double supervision"
 
-### Achievements (Session Cumulative)
-- **System1 val_roll_cos_last = 0.7481** (best ever, from scratch)
-- **System2(2) tf_cos = 0.85, roll_cos = 0.83** (best ever, no NaN cascade!)
-- Broke through the 0.73 ceiling that blocked all prior runs
-- AdaRMSNorm FP32 + SwiGLU orthogonal init + soft Adam reset = stable 2-step chains
-- First time the model survived the System1→System2 transition cleanly
+### Context
+Previous analysis (2026-04-20 night) identified 3 "bugs" at the horizon transition. After applying all 3 fixes, training REGRESSED (System2(2) 0.8144→0.8127) and the NaN cascade at E5 S350 persisted. Post-mortem revealed the analysis was partially wrong.
 
-### Symptom
-With ALL previous fixes applied (AdaRMSNorm FP32, SwiGLU ortho init, soft Adam reset), the model produces best-ever results through E0–E4. At E5, when `target_steps` increases from 2→3 and the answer embedding enters the training window for the first time (`ans_cov` 0.00→0.70):
-- `ffn_out` norms explode: 2819→3492→3822→4105 (vs ~1500–2000 at E4)
-- `raw_norm` = NaN at step 350
-- Gradients → 0 by step 550. Model dead.
+### What was wrong in the 2026-04-20 night analysis
 
-### Root Cause Analysis
+**"Bug 2" was incorrect.** The claim that `l_roll` using `chain_mask` creates "3.4× double supervision" on the answer was a reasoning error. `l_ans` operates on `v_tf` (teacher-forced prediction) while `l_roll` operates on `v_roll` (free-run rollout). They supervise DIFFERENT forward passes. The answer position in rollout NEEDS supervision — removing it (changing to `step_mask`) loses 50% of answer learning signal, explaining the 0.8144→0.8127 regression.
 
-**Why does the answer entering the window crash the model?**
+**Reverted**: `l_roll` back to `chain_mask`. The answer position receives gradient from `l_roll` (rollout quality) and `l_ans` (TF quality) — these are complementary signals on different predictions, not redundant.
 
-For 99% of the dataset, chains are 4 steps: `[step0, step1, answer, answer_pad]`. At `target_steps=2`, `answer_pos=2` is OUTSIDE the 2-step window → `has_answer=False` → `l_ans=0`. At `target_steps=3`, `answer_pos=2` is INSIDE → `has_answer=True` → `l_ans` activates.
+### Actual root causes found
 
-Three bugs combined to create a gradient shock that the 200-step LR warmup couldn't absorb:
+**Root cause 1: Soft Adam reset amplifies transition instability.**
+`horizon_adam_sq_scale=0.1` multiplies `exp_avg_sq` by 0.1 at horizon transitions. This makes Adam's effective step size sqrt(1/0.1)=3.16× larger immediately after the transition, UNDERMINING the 200-step LR warmup (which starts at 0.1× base). Net effect at transition: effective LR = 0.1 × 3.16 = 0.316× base, vs 0.1× without the reset. The previous working run (0.8144) had NO Adam reset. **Fix**: `horizon_adam_sq_scale=1.0` (disabled).
 
-**Bug 1: Inline answer loss lacked NaN guards.**
-`compute_composite_objective` lines 1235–1241 computed the answer loss inline instead of using `_answer_loss()`. The dedicated function has `nan_to_num(cos_sim.clamp(-1, 1), nan=0.0)` — the inline code had none. Any fp-rounding or poisoned row would propagate NaN unchecked through `l_ans` into the final loss.
+**Root cause 2: LayerScale params had zero weight decay.**
+`_build_wd_param_groups` used `p.ndim <= 1` to identify biases/norms for the no-decay group. LayerScale gates (`ls_self`, `ls_cross`, `ls_ffn`) are 1D `nn.Parameter` tensors, so they got zero weight decay. Without any regularization pressure, they can grow unboundedly, amplifying FFN output norms. Combined with the inflated effective step size from root cause 1, this drives a positive feedback loop: large FFN output → large gradient → LayerScale grows → even larger output. **Fix**: exclude `".ls_"` params from the 1D no-decay heuristic.
 
-**Bug 2: Rollout step loss double-supervised the answer position.**
-`l_roll` used `chain_mask` (includes answer position) while `l_step` used `step_mask` (excludes answer). The answer position received gradient from both `l_ans` (averaged over ~40% of batch → 2.5/bsz coefficient) and `l_roll` (0.33/bsz coefficient). Total: **3.4× more gradient than a reasoning position** (0.83/bsz). This imbalance drove FFN output norms into a positive feedback loop: large gradient → larger weights → larger FFN outputs → even larger gradient.
+### Fixes that were CORRECT from 2026-04-20 night (kept)
+1. **_answer_loss() wrapper** (Bug 1 fix): Inline → function call with NaN guards. Strictly safer.
+2. **Answer warmup** (Bug 3 fix): Ramps lambda_ans from 0→base at horizon transitions. Soft curriculum.
 
-**Bug 3: No answer loss warmup.**
-When `has_answer` transitioned from False→True at the horizon change, `l_ans` jumped from 0 to full strength in one step. The 200-step LR warmup (0.1×→1.0×) was insufficient because: (a) the gradient shock peaked at the answer position specifically, not uniformly, and (b) the warmup completed at step 200 but NaN hit at step 350 — the accumulated damage from 200 steps of imbalanced gradients was already fatal.
-
-### Fixes Applied
-
-1. **Replaced inline answer loss with `_answer_loss()` call** (`train_chain_generator.py` ~line 1235):
-   ```python
-   # Before: inline code without NaN guards
-   # After:
-   l_ans, _ans_stats = _answer_loss(tf_answer_all, tgt_answer_all, has_answer, w_cos, w_mse)
-   ```
-   Adds `nan_to_num(cos_sim.clamp(-1, 1), nan=0.0)` and consistent error handling.
-
-2. **Changed `l_roll` to use `step_mask`** (`train_chain_generator.py` ~line 1262):
-   ```python
-   # Before: l_roll = _masked_step_losses(v_roll, chains, chain_mask, ...)
-   # After:
-   l_roll = _masked_step_losses(v_roll, chains, step_mask, ...)
-   ```
-   Answer position now excluded from rollout step loss, same as TF step loss. Eliminates the 3.4× gradient imbalance. The answer is supervised solely through `l_ans` (TF), while the rollout learns to reach the answer through step-by-step chain quality.
-
-3. **Answer loss warmup at horizon transitions** (`train_chain_generator.py` ~line 2430):
-   ```python
-   # At horizon change: ramp lambda_ans from 0→base over answer_warmup_steps
-   answer_warmup_remaining = aw_steps
-   train_cfg["loss_lambda_answer"] = 0.0
-   # Per-step: linear ramp
-   train_cfg["loss_lambda_answer"] = base_ans_lambda * progress
-   ```
-   Runs in parallel with the existing LR warmup. Config key: `answer_warmup_steps` (defaults to `horizon_warmup_steps`).
-
-### Rules
-1. **Never compute loss inline when a guarded helper exists.** Code duplication in loss paths is a NaN vector. The `_answer_loss` function exists precisely for this — use it.
-2. **The answer position must have the same total gradient weight as reasoning positions.** If the TF step loss excludes the answer (via `step_mask`), the rollout step loss must too. Otherwise the answer gets `l_ans + l_roll` while reasoning positions get only `l_step + l_roll` — an imbalance that compounds into FFN norm explosion.
-3. **Any new loss term entering the training objective needs its own warmup.** LR warmup is necessary but not sufficient — it scales ALL gradients equally, while the shock is concentrated at specific positions. A per-lambda warmup targets the actual source of instability.
-4. **The 99th-percentile dataset property determines the failure mode.** 99% of chains are 4-step, so `answer_pos=2`. This means the answer enters the window at exactly `target_steps=3` for nearly all samples simultaneously — a synchronized gradient shock that no per-sample guard can smooth.
+### Rules (corrected)
+1. **Never compute loss inline when a guarded helper exists.** (Unchanged — still valid.)
+2. ~~Answer position must have same gradient weight~~ **WRONG. Rollout loss MUST include the answer position.** `l_ans` supervises v_tf, `l_roll` supervises v_roll — they are complementary. Removing either loses signal.
+3. **Do not reduce Adam's second-moment accumulator at transitions.** Reducing `exp_avg_sq` inflates effective step size, which AMPLIFIES gradient shocks rather than dampening them. The existing LR warmup is the correct mechanism.
+4. **LayerScale parameters need weight decay.** They are learnable gates, not biases or norm gains. The `ndim <= 1` heuristic misclassifies them. Check every 1D param by name to distinguish gate/scale params from biases/norms.
+5. **Verify fixes by comparing with the previous working run's config.** If the working run lacked a feature (e.g., Adam reset), adding that feature and seeing regression means the feature is the problem, not the solution.
 
 ---
 
@@ -98,7 +62,7 @@ Third-party scale-collapse / gradient-starvation analysis flagged four concrete 
 1. **Never let the AdaLN gate cross zero.** `(1 + scale).clamp(min=ε)` should be the default in any DiT-style modulation.  The smooth lower bound costs nothing and removes a known annihilation vector.
 2. **Modulation math stays in FP32, period.**  bf16's mantissa is too coarse for the regime where modulation factors are small — exactly the regime where stability matters most.
 3. **Orthogonal init for any gated-linear FFN** (SwiGLU, GeGLU, etc.).  Xavier-uniform is fine for plain Linear, but multiplicative gates need spread inputs to escape the near-linear regime.
-4. **Adam at distribution shift: scale `exp_avg_sq` down, never zero it, never touch `exp_avg`.** The hard reset cure is worse than the disease.
+4. ~~**Adam at distribution shift: scale `exp_avg_sq` down.**~~ **RETRACTED (2026-04-21).** Scaling `exp_avg_sq` DOWN by 0.1 inflates effective step size by sqrt(10)=3.16×, which UNDERMINES the LR warmup (net protection drops from 0.1× to 0.316×). The previous working run had NO Adam reset and survived transitions fine. Set `horizon_adam_sq_scale=1.0` (disabled). Do NOT reduce `exp_avg_sq` at transitions.
 5. **Telemetry as on-device tensors** (`copy_`, not `fill_(.item())`).  Triggering a sync per forward turns a "free" diagnostic into a 5–10% perf tax.
 
 ---

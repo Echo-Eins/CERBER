@@ -114,7 +114,7 @@
 
         "horizon_warmup_steps": 200,
         "horizon_warmup_factor": 0.1,
-        "horizon_adam_sq_scale": 0.1,
+        "horizon_adam_sq_scale": 1.0,
         "answer_warmup_steps": 200,
         "enable_ffn_stats": true,
 

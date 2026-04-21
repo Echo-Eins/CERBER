@@ -593,9 +593,13 @@ def _build_wd_param_groups(
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # 1-D parameters → biases or norm weights → no WD.
-        is_bias_or_norm = p.ndim <= 1
         is_special_token = name.endswith("start_token") or name.endswith("null_context_token")
+        # LayerScale gates (ls_self, ls_cross, ls_ffn) are 1-D but are NOT
+        # biases or norm gains — they are learnable residual-branch gates
+        # that can grow unboundedly without weight decay, amplifying FFN
+        # output norms toward NaN at horizon transitions.
+        is_layerscale = ".ls_" in name
+        is_bias_or_norm = p.ndim <= 1 and not is_layerscale
         if is_bias_or_norm or is_special_token:
             no_decay.append(p)
             no_decay_names.add(name)
@@ -1259,13 +1263,7 @@ def compute_composite_objective(
     _bad_roll = ~torch.isfinite(v_roll)
     if _bad_roll.any():
         v_roll = torch.where(_bad_roll, chains, v_roll)
-    # Use step_mask (not chain_mask) so the answer position is excluded from
-    # the rollout step loss — same as the TF step loss.  Without this, the
-    # answer position gets gradient from BOTH l_ans and l_roll, creating a
-    # ~3.4× gradient imbalance vs reasoning positions that destabilises FFN
-    # output norms at the horizon transition where answers first enter the
-    # training window (lessons 2026-04-20 night).
-    l_roll, roll_stats = _masked_step_losses(v_roll, chains, step_mask, d_model, w_cos, w_mse)
+    l_roll, roll_stats = _masked_step_losses(v_roll, chains, chain_mask, d_model, w_cos, w_mse)
 
     # 4) In-batch contrastive ranking on final rollout answer.
     roll_final = _gather_last_valid(v_roll, valid_lens)
