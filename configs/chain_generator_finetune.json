@@ -17,7 +17,8 @@
         "prediction_type": "v",
         "cfg_dropout_prob": 0.1,
         "ffn_type": "swiglu",
-        "norm_type": "ada_rmsnorm"
+        "norm_type": "ada_rmsnorm",
+        "residual_norm_clamp": 256.0
     },
 
     "critic": {
