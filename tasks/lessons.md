@@ -1,5 +1,41 @@
 # Lessons
 
+## 2026-04-22 — FF pipeline: separate backward per layer, single optimizer step
+
+### Context
+Building full FF training pipeline for CERBER. Key question: how to structure
+the backward passes when each layer has its own local loss.
+
+### Solution
+Accumulate gradients from all layers + head into the same .grad tensors, then
+do a single `optimizer.step()`:
+```python
+for i in range(n_layers):
+    loss_dict[f"ff_layer_{i}"].backward(retain_graph=True)
+loss_dict["head_total"].backward()
+optimizer.step()
+```
+This works because `.detach()` at block boundaries ensures each layer's loss
+only produces gradients for that layer's parameters — no cross-contamination.
+The `retain_graph=True` is needed because the positive/negative forward passes
+share the same context preparation graph.
+
+### Verified behavior (smoke test)
+- Layer 0: SymBa loss = 360 (actively learning, pos/neg have different norms)
+- Layer 1: SymBa loss = 0.693 = ln(2) (neutral — waiting for layer 0 to diverge)
+- 9/47 params get nonzero gradient (expected with zero-init residual)
+- Head loss backward only touches final_norm + output_proj
+
+### Rules
+1. **Always use `retain_graph=True` for all but the last backward** when doing
+   per-layer FF backwards. The graph is shared across layers.
+2. **One optimizer step after all backwards** — simpler and cheaper than
+   per-layer optimizers. AdamW handles the sparse gradient pattern naturally.
+3. **Gradient sanitation + EMA restore still works** — applied after all
+   backwards accumulate, before optimizer.step().
+
+---
+
 ## 2026-04-22 — Forward-Forward algorithm: zero-init residual kills delta-goodness
 
 ### Context
