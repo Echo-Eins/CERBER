@@ -1,5 +1,73 @@
 # Lessons
 
+## 2026-04-22 — Forward-Forward algorithm: zero-init residual kills delta-goodness
+
+### Context
+Implementing FF (Hinton 2022) layer-local training for CERBER's chain generator.
+First attempt used goodness = ||block_delta||² (x_out − x_in) per Ororbia & Mali 2023
+recommendation for residual networks.
+
+### Bug
+Zero-init residual projectors (our FixUp/DiT trick) make every sublayer output exactly
+0 at init: `sa_out = out_proj(attn@V) = 0` because `out_proj.weight = 0`. Therefore
+`block_delta = x_out − x_in = 0` → goodness = 0 → ∂||δ||²/∂δ = 2δ = 0.
+**Vanishing gradient at initialization — FF training cannot start.**
+
+### Fix
+Use **full-state goodness** (Hinton's original): `g = mean(x_out²)` instead of delta.
+At init x_out ≈ x_in (which is non-zero data), so gradient ∂g/∂x_out = 2·x_out ≠ 0.
+The activity normalization between layers (L2-norm rescale to √D) strips the magnitude
+cue for the next block, so the "norm kills signal" failure mode is avoided — goodness
+is measured on pre-next-layer-norm state (Brenig & Timofte 2023).
+
+### Dynamics at init (zero-init residual + activity norm + full-state goodness)
+- Layer 0: g_pos ≈ ||scaled_chain_pos||², g_neg ≈ ||scaled_chain_neg||². Different input
+  norms → different goodness → SymBa gradient non-zero. Only out_proj / cross_out_proj /
+  w_down get gradient (~1e-4 scale via LayerScale gate). q/k/v/gate/up projections get
+  zero gradient because the zero out_proj blocks the chain.
+- Layers 1+: after activity norm both pos and neg have ||x|| = √D → g_pos ≈ g_neg ≈ D →
+  SymBa = log(2) → gradient ≈ 0. These layers only start learning once layer 0 diverges
+  pos/neg representations. **This is expected FF cascading dynamics (Hinton §3.3).**
+
+### Rules
+1. **Never use delta-goodness (x_out − x_in) with zero-init residual.** It creates exact
+   zero with exact zero gradient. Use full-state goodness.
+2. **In FF, learnable gates (LayerScale, norm weights) are the first to get gradient from
+   zero-init layers.** Their initial signal is tiny (~1e-4). Use a higher learning rate
+   for per-layer optimizers (1e-3 vs 1e-4) to compensate.
+3. **Activity normalization is mandatory between FF blocks** — without it, layer 0's
+   magnitude cue leaks to layer 1, and layer 1 trivially matches g_pos/g_neg by echoing
+   the magnitude instead of learning features.
+
+---
+
+## 2026-04-22 — Residual-branch norm clamp: bf16 overflow safety valve
+
+### Context
+Training log E5 S700 showed FFN output norm growing unboundedly (120→1889→4300) until
+per-element values exceeded ~76 → QK logits overflow bf16 max (65504) → NaN cascade at
+horizon transition (target_steps=3).
+
+### Fix
+`_soft_clamp_residual_norm(y, max_norm)`: differentiable `y · min(1, max_norm/||y||₂)`.
+Applied to all 3 sublayer outputs in DecoderBlock.forward *before* LayerScale × residual
+add. FP32 norm computation to avoid the norm itself overflowing in bf16. Config field
+`residual_norm_clamp` (default None = disabled; 256 = 8·√d_model for d_model=1024).
+
+### Verified
+- Clamp=5 caps residual growth at 5.00 vs 234.55 unclamped (47× reduction).
+- bf16 huge-input path finite. Gradient flows through active clamp.
+- Full DF+CFG+DDIM+AdaLN-Zero path finite end-to-end.
+
+### Rules
+1. **LayerScale + weight decay slow unbounded FFN growth but don't prevent it.** A direct
+   norm clamp is the only mathematical bound. OpenMythos gets it for free via LTI spectral
+   radius ρ(A)<1, but feedforward stacks need the clamp.
+2. **Always compute activation norms in FP32 under bf16 autocast.** The thing you're
+   bounding is already near the bf16 ceiling; computing `.norm()` in bf16 overflows to inf.
+
+---
+
 ## 2026-04-21 — Corrected root-cause: soft Adam reset + missing LayerScale decay, NOT "answer double supervision"
 
 ### Context
