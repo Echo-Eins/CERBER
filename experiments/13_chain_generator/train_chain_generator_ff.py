@@ -530,20 +530,40 @@ def ff_train_step(
     # (due to .detach() at block boundaries in ff_forward).
     # head_total only has gradients for final_norm + output_proj.
     # We accumulate all grads, then do one optimizer step.
+    #
+    # Only backward non-zero, finite losses. Keep retain_graph=True on every
+    # backward EXCEPT the last one that will actually fire, so PyTorch can
+    # release the computation graph (autograd otherwise errors on the 2nd
+    # backward through a freed graph).
     n_layers = len(model.layers)
     grad_had_nan = False
     sanitized_count = 0
+    backward_count = 0
 
+    candidate_losses: list[tuple[str, torch.Tensor]] = []
     for i in range(n_layers):
-        layer_loss = loss_dict[f"ff_layer_{i}"]
-        layer_loss = torch.nan_to_num(layer_loss, nan=0.0, posinf=0.0, neginf=0.0)
-        if torch.isfinite(layer_loss) and float(layer_loss.detach()) > 0.0:
-            scaler.scale(layer_loss).backward(retain_graph=True)
+        ll = torch.nan_to_num(loss_dict[f"ff_layer_{i}"], nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.isfinite(ll) and float(ll.detach()) > 0.0:
+            candidate_losses.append((f"ff_layer_{i}", ll))
+    hl = torch.nan_to_num(loss_dict["head_total"], nan=0.0, posinf=0.0, neginf=0.0)
+    if torch.isfinite(hl) and float(hl.detach()) > 0.0:
+        candidate_losses.append(("head_total", hl))
 
-    head_loss = loss_dict["head_total"]
-    head_loss = torch.nan_to_num(head_loss, nan=0.0, posinf=0.0, neginf=0.0)
-    if torch.isfinite(head_loss) and float(head_loss.detach()) > 0.0:
-        scaler.scale(head_loss).backward()
+    for idx, (_, lss) in enumerate(candidate_losses):
+        is_last = (idx == len(candidate_losses) - 1)
+        scaler.scale(lss).backward(retain_graph=not is_last)
+        backward_count += 1
+
+    # If no backward was fired at all, skip optimizer/scheduler entirely —
+    # there is nothing to step on and we must not tick the LR scheduler.
+    if backward_count == 0:
+        optimizer.zero_grad(set_to_none=True)
+        return _ff_skip_metrics(
+            loss_dict, target_steps,
+            reason="no_nonzero_loss",
+            neg_strategy=neg_strategy,
+            n_layers=n_layers,
+        )
 
     scaler.unscale_(optimizer)
 
@@ -571,7 +591,12 @@ def ff_train_step(
         if not torch.isfinite(total_norm):
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
-            return _ff_skip_metrics(loss_dict, target_steps, "grad_clip_nan")
+            return _ff_skip_metrics(
+                loss_dict, target_steps,
+                reason="grad_clip_nan",
+                neg_strategy=neg_strategy,
+                n_layers=n_layers,
+            )
     else:
         total_norm = torch.tensor(0.0, device=device)
 
@@ -610,6 +635,9 @@ def ff_train_step(
         ema.update(model)
 
     # ── Metrics ──
+    # CRITICAL: MetricTracker calls ``float(v)`` on every value.  String
+    # metrics (like ``neg_strategy``) would crash it.  We keep this dict
+    # strictly numeric and log the string context separately from main().
     metrics: dict[str, float] = {
         "loss_total": float(loss_dict["loss_total"].detach().item()),
         "ff_total": float(loss_dict["ff_total"].detach().item()),
@@ -622,7 +650,7 @@ def ff_train_step(
         "nan_skipped": 1.0 if (grad_had_nan or params_restored > 0) else 0.0,
         "optimizer_stepped": 1.0,
         "target_steps": float(target_steps),
-        "neg_strategy": neg_strategy,
+        "backward_count": float(backward_count),
     }
     for i in range(n_layers):
         metrics[f"ff_layer_{i}"] = float(loss_dict[f"ff_layer_{i}"].detach().item())
@@ -633,23 +661,47 @@ def ff_train_step(
 
 
 def _ff_skip_metrics(
-    loss_dict: dict, target_steps: int, reason: str,
+    loss_dict: dict,
+    target_steps: int,
+    reason: str,
+    *,
+    neg_strategy: str | None = None,
+    n_layers: int = 0,
 ) -> dict[str, float]:
-    """Return metrics dict for a skipped FF step."""
-    return {
-        "loss_total": float(loss_dict.get("loss_total", torch.tensor(0.0)).detach().item()),
-        "ff_total": 0.0,
-        "head_cosine": 0.0,
-        "head_mse": 0.0,
-        "head_total": 0.0,
+    """Return metrics dict for a skipped FF step.
+
+    CRITICAL: ALL values must be numeric — MetricTracker.update() calls
+    ``float(v)``.  The textual ``reason`` / ``neg_strategy`` are dropped
+    here; the main loop logs them separately in JSONL.
+    """
+    metrics: dict[str, float] = {
+        "loss_total": float(loss_dict.get("loss_total", torch.tensor(0.0)).detach().item())
+            if "loss_total" in loss_dict else 0.0,
+        "ff_total": float(loss_dict.get("ff_total", torch.tensor(0.0)).detach().item())
+            if "ff_total" in loss_dict else 0.0,
+        "head_cosine": float(loss_dict.get("head_cosine", torch.tensor(0.0)).detach().item())
+            if "head_cosine" in loss_dict else 0.0,
+        "head_mse": float(loss_dict.get("head_mse", torch.tensor(0.0)).detach().item())
+            if "head_mse" in loss_dict else 0.0,
+        "head_total": float(loss_dict.get("head_total", torch.tensor(0.0)).detach().item())
+            if "head_total" in loss_dict else 0.0,
         "grad_norm": 0.0,
         "grad_sanitized": 0.0,
         "param_restored": 0.0,
         "nan_skipped": 1.0,
         "optimizer_stepped": 0.0,
         "target_steps": float(target_steps),
-        "skip_reason": reason,
+        "backward_count": 0.0,
     }
+    # Preserve per-layer metrics if present so tracker averages don't break.
+    for i in range(n_layers):
+        metrics[f"ff_layer_{i}"] = float(loss_dict.get(f"ff_layer_{i}", torch.tensor(0.0)).detach().item()) \
+            if f"ff_layer_{i}" in loss_dict else 0.0
+        gp = loss_dict.get("goodness_pos", [])
+        gn = loss_dict.get("goodness_neg", [])
+        metrics[f"goodness_pos_{i}"] = float(gp[i]) if i < len(gp) else 0.0
+        metrics[f"goodness_neg_{i}"] = float(gn[i]) if i < len(gn) else 0.0
+    return metrics
 
 
 # ═══════════════════════════════════════════════════════════════════════
