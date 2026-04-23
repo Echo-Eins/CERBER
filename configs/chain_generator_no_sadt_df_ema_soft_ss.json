@@ -21,6 +21,8 @@
         "zero_init_residual": true,
         "use_layerscale": true,
         "layerscale_init": 1e-4,
+        "residual_norm_clamp": 256.0,
+        "adaln_scale_clamp": 1.0,
         "aux_head_layers": [],
         "aux_head_hidden_dim": 1024,
         "aux_head_dropout": 0.0
@@ -52,7 +54,7 @@
     },
 
     "training": {
-        "batch_size": 16,
+        "batch_size": 32,
         "num_epochs": 50,
         "lr": 1e-4,
         "weight_decay": 5e-4,
@@ -69,8 +71,8 @@
         "max_chain_steps": 20,
         "horizon_schedule": [[2, 2], [3, 2], [4, 10], [5, 10]],
 
-        "scheduled_sampling_max": 0.15,
-        "scheduled_sampling_ramp_epochs": 5,
+        "scheduled_sampling_max": 0.30,
+        "scheduled_sampling_ramp_epochs": 8,
 
         "loss_lambda_step": 1.0,
         "loss_lambda_answer": 1.0,
@@ -79,12 +81,12 @@
         "loss_lambda_aux": 0.0,
         "loss_lambda_aux_df": 0.0,
         "aux_loss_answer_weight": 0.0,
-        "enable_diffusion_forcing": false,
-        "loss_lambda_diffusion": 0.0,
-        "df_warmup_epochs": 0,
+        "enable_diffusion_forcing": true,
+        "loss_lambda_diffusion": 0.15,
+        "df_warmup_epochs": 3,
         "df_noise_sampling": "logsnr",
         "df_noise_level_min": 2,
-        "df_noise_level_max": 63,
+        "df_noise_level_max": 50,
         "df_eval_noise_level": 32,
         "df_eval_deterministic_noise": true,
         "df_eval_noise_seed": 12345,
@@ -126,8 +128,8 @@
         "free_run_noise_std_max": 0.0,
         "eval_free_run_noise_std": 0.0,
 
-        "tf_noise_std_max": 0.0,
-        "tf_noise_ramp_epochs": 0,
+        "tf_noise_std_max": 0.002,
+        "tf_noise_ramp_epochs": 5,
         "free_run_repeat_penalty": 0.15,
         "free_run_repeat_cos_threshold": 0.98,
         "free_run_repeat_ban_threshold": 0.995,

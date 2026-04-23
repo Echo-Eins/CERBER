@@ -65,6 +65,30 @@ class ChainGeneratorConfig:
     use_layerscale: bool = True
     layerscale_init: float = 1e-4
 
+    # ── Residual-branch norm clamp (bf16-overflow safety valve) ──
+    # Soft-clamp the per-token L2 norm of every residual sublayer output
+    # (self-attn, cross-attn, FFN) to this bound *before* the residual add.
+    # The FFN path is the main offender: gated ``W_down(SiLU(W_g x) ⊙ W_u x)``
+    # can grow multiplicatively without any built-in bound, and once any single
+    # residual contribution pushes per-element values past ~76 in bf16 the
+    # subsequent QK logits overflow (bf16 max = 65504).  LayerScale + weight
+    # decay slow this but do not prevent it.  A direct, differentiable
+    # ``min(1, C/||y||)`` rescaling is the SOTA safety valve — it is a no-op
+    # in the healthy regime and only activates when a branch tries to emit
+    # an out-of-manifold spike.  Recommended default: ``8 * sqrt(d_model)``.
+    # ``None`` or ``<= 0`` disables (backward compatible).
+    residual_norm_clamp: float | None = None
+
+    # ── AdaLN scale clamp (FFN explosion safety valve) ──
+    # Soft-bound the AdaLN modulation scale output via tanh so the gate
+    # (1 + scale) stays in [GATE_MIN, 1 + adaln_scale_clamp].  Without
+    # this, the modulation MLP can produce arbitrarily large positive
+    # scales, which SwiGLU amplifies quadratically (output ∝ input²),
+    # causing bf16 overflow at horizon transitions where cold positions
+    # see extreme residual-stream statistics.  Default 1.0 caps the gate
+    # at 2.0× (ample for noise-level conditioning).  None disables.
+    adaln_scale_clamp: float | None = 1.0
+
     # Deep supervision / auxiliary heads. Layer numbers are 1-based to match
     # human-facing configs ("layer 2", "layer 4"). Empty disables the feature.
     aux_head_layers: tuple[int, ...] = ()
@@ -190,6 +214,40 @@ class SwiGLUFFN(nn.Module):
                 self._silu_kurtosis.copy_(centered.pow(4).mean() / var.pow(2) - 3.0)
                 self._out_norm_mean.copy_(out.detach().float().norm(dim=-1).mean())
         return out
+
+
+def _soft_clamp_residual_norm(
+    y: Tensor, max_norm: float | None, eps: float = 1e-6
+) -> Tensor:
+    """Soft-clamp the L2 norm of ``y`` along the last (feature) dim.
+
+    For each token (position in the sequence), if ``||y||_2 <= max_norm`` the
+    vector passes through unchanged; if ``||y||_2 > max_norm`` it is uniformly
+    rescaled to have norm exactly ``max_norm``.  This is the standard
+    gradient-clipping construction applied to forward activations and is
+    differentiable everywhere (in the sub-gradient sense at the boundary).
+
+    The norm is computed in FP32 — crucial under bf16 autocast because the
+    very thing we are trying to bound can already be near bf16's 65504 ceiling,
+    and computing ``.norm()`` in bf16 would itself overflow to inf.
+
+    Args:
+        y: [..., D] residual sublayer output (any leading dims allowed).
+        max_norm: positive scalar bound.  ``None`` or non-positive is a no-op.
+        eps: floor on the denominator to avoid division by zero on exactly-
+             zero tokens (the rescale factor becomes ``max_norm / eps`` but
+             is then clamped to <= 1, so the result is still ``y``).
+
+    Returns:
+        Tensor with the same shape/dtype as ``y`` and per-token L2 norm
+        bounded above by ``max_norm``.
+    """
+    if max_norm is None or float(max_norm) <= 0.0:
+        return y
+    y32 = y.float()
+    norm = y32.norm(dim=-1, keepdim=True).clamp_min(eps)
+    scale = (float(max_norm) / norm).clamp_max(1.0)
+    return (y32 * scale).to(y.dtype)
 
 
 class AuxiliaryPredictionHead(nn.Module):
@@ -414,11 +472,23 @@ class DecoderBlock(nn.Module):
         ffn_type: str = "swiglu",
         use_layerscale: bool = True,
         layerscale_init: float = 1e-4,
+        residual_norm_clamp: float | None = None,
+        adaln_scale_clamp: float | None = 1.0,
     ):
         super().__init__()
         self._norm_type = norm_type
         self._ffn_type = ffn_type
         self._use_layerscale = bool(use_layerscale)
+        # Store as Python float (or None) — read on every forward, so keep it
+        # as a plain scalar to avoid tensor-creation overhead in the hot path.
+        if residual_norm_clamp is None or float(residual_norm_clamp) <= 0.0:
+            self._residual_norm_clamp: float | None = None
+        else:
+            self._residual_norm_clamp = float(residual_norm_clamp)
+        if adaln_scale_clamp is not None and float(adaln_scale_clamp) > 0.0:
+            self._adaln_scale_clamp: float | None = float(adaln_scale_clamp)
+        else:
+            self._adaln_scale_clamp = None
 
         # ── Normalization ──
         if norm_type == "ada_rmsnorm":
@@ -529,34 +599,46 @@ class DecoderBlock(nn.Module):
             t_emb: [B, L, D] per-position timestep embedding (DF mode).
                    ``None`` for teacher-forcing / generation without diffusion.
         """
+        clamp = self._residual_norm_clamp  # Python float or None — hot-path read.
         if self.adaln_modulation is not None and t_emb is not None:
             # AdaLN-Zero: produce per-position scale/shift for each norm.
             mod = self.adaln_modulation(t_emb)  # [B, L, 6D]
             s_sa, sh_sa, s_ca, sh_ca, s_ff, sh_ff = mod.chunk(6, dim=-1)
-            x = x + self._scale(
-                self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa)),
-                self.ls_self,
+            sc = self._adaln_scale_clamp
+            if sc is not None:
+                s_sa = torch.tanh(s_sa) * sc
+                s_ca = torch.tanh(s_ca) * sc
+                s_ff = torch.tanh(s_ff) * sc
+            sa_out = self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa))
+            sa_out = _soft_clamp_residual_norm(sa_out, clamp)
+            x = x + self._scale(sa_out, self.ls_self)
+
+            ca_out = self.cross_attn(
+                self.norm_cross(x, scale=s_ca, shift=sh_ca),
+                context,
+                context_mask=context_mask,
             )
-            x = x + self._scale(
-                self.cross_attn(
-                    self.norm_cross(x, scale=s_ca, shift=sh_ca),
-                    context,
-                    context_mask=context_mask,
-                ),
-                self.ls_cross,
-            )
-            x = x + self._scale(
-                self.ffn(self.norm_ffn(x, scale=s_ff, shift=sh_ff)),
-                self.ls_ffn,
-            )
+            ca_out = _soft_clamp_residual_norm(ca_out, clamp)
+            x = x + self._scale(ca_out, self.ls_cross)
+
+            ffn_out = self.ffn(self.norm_ffn(x, scale=s_ff, shift=sh_ff))
+            ffn_out = _soft_clamp_residual_norm(ffn_out, clamp)
+            x = x + self._scale(ffn_out, self.ls_ffn)
         else:
             # Standard pre-norm (no conditioning).
-            x = x + self._scale(self.self_attn(self.norm_self(x)), self.ls_self)
-            x = x + self._scale(
-                self.cross_attn(self.norm_cross(x), context, context_mask=context_mask),
-                self.ls_cross,
+            sa_out = self.self_attn(self.norm_self(x))
+            sa_out = _soft_clamp_residual_norm(sa_out, clamp)
+            x = x + self._scale(sa_out, self.ls_self)
+
+            ca_out = self.cross_attn(
+                self.norm_cross(x), context, context_mask=context_mask
             )
-            x = x + self._scale(self.ffn(self.norm_ffn(x)), self.ls_ffn)
+            ca_out = _soft_clamp_residual_norm(ca_out, clamp)
+            x = x + self._scale(ca_out, self.ls_cross)
+
+            ffn_out = self.ffn(self.norm_ffn(x))
+            ffn_out = _soft_clamp_residual_norm(ffn_out, clamp)
+            x = x + self._scale(ffn_out, self.ls_ffn)
         return x
 
 
@@ -589,6 +671,8 @@ class ChainGenerator(nn.Module):
                     ffn_type=self.cfg.ffn_type,
                     use_layerscale=self.cfg.use_layerscale,
                     layerscale_init=self.cfg.layerscale_init,
+                    residual_norm_clamp=self.cfg.residual_norm_clamp,
+                    adaln_scale_clamp=self.cfg.adaln_scale_clamp,
                 )
                 for _ in range(self.cfg.n_layers)
             ]

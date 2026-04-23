@@ -18,7 +18,13 @@
         "cfg_dropout_prob": 0.1,
         "ffn_type": "swiglu",
         "norm_type": "ada_rmsnorm",
-        "residual_norm_clamp": 256.0
+        "zero_init_residual": true,
+        "use_layerscale": true,
+        "layerscale_init": 1e-4,
+        "residual_norm_clamp": 256.0,
+        "aux_head_layers": [],
+        "aux_head_hidden_dim": 1024,
+        "aux_head_dropout": 0.0
     },
 
     "critic": {
@@ -47,46 +53,47 @@
     },
 
     "training": {
-        "batch_size": 16,
-        "num_epochs": 30,
-        "lr": 5e-5,
-        "weight_decay": 1e-4,
+        "batch_size": 32,
+        "num_epochs": 50,
+        "lr": 1e-4,
+        "weight_decay": 5e-4,
         "warmup_epochs": 2,
         "lr_min_factor": 0.01,
         "clip_grad_norm": 1.0,
 
-        "system1_epochs": 0,
-        "system2_start_steps": 20,
+        "system1_epochs": 3,
+        "system2_start_steps": 4,
         "max_chain_steps": 20,
+        "horizon_schedule": [[2, 2], [3, 2], [4, 10], [5, 10]],
 
-        "scheduled_sampling_max": 0.65,
-        "scheduled_sampling_ramp_epochs": 5,
+        "ff_symba_alpha": 2.0,
+        "ff_head_cosine_weight": 1.0,
+        "ff_head_mse_weight": 0.1,
+        "ff_neg_sigma": 0.3,
+        "ff_neg_schedule": {
+            "shuffle_start": 5,
+            "hard_start": 15
+        },
 
-        "loss_lambda_step": 1.0,
-        "loss_lambda_answer": 1.0,
-        "loss_lambda_roll": 1.5,
-        "loss_lambda_rank": 0.1,
-        "contrastive_temperature": 0.07,
+        "model_ema_decay": 0.0,
 
-        "free_run_temperature": 1.05,
-        "free_run_noise_std": 0.07,
+        "free_run_temperature": 1.0,
+        "free_run_noise_std": 0.0,
+        "eval_free_run_noise_std": 0.0,
         "free_run_repeat_penalty": 0.15,
         "free_run_repeat_cos_threshold": 0.98,
         "free_run_repeat_ban_threshold": 0.995,
-        "free_run_repeat_ban_retries": 2,
+        "free_run_repeat_ban_retries": 3,
 
         "context_bank_size": 4,
         "answer_repeat_pad": 2,
 
-        "log_every": 50,
-        "checkpoint_every": 5,
-        "early_stop_patience": 15
-    },
+        "enable_ffn_stats": true,
 
-    "reranking": {
-        "enabled": false,
-        "critic_checkpoint": null,
-        "num_candidates": 4
+        "log_every": 50,
+        "metrics_log_name": "chain_generator_ff_training.jsonl",
+        "checkpoint_every": 3,
+        "early_stop_patience": 20
     },
 
     "amp": {
@@ -95,8 +102,8 @@
     },
 
     "output": {
-        "output_dir": "experiments/13_chain_generator/output_finetune",
-        "checkpoint_dir": "experiments/13_chain_generator/output_finetune/checkpoints",
-        "logs_dir": "experiments/13_chain_generator/output_finetune/logs"
+        "output_dir": "experiments/13_chain_generator/output_ff",
+        "checkpoint_dir": "experiments/13_chain_generator/output_ff/checkpoints",
+        "logs_dir": "experiments/13_chain_generator/output_ff/logs"
     }
 }
