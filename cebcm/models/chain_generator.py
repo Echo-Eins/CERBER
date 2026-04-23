@@ -1016,6 +1016,29 @@ class ChainGenerator(nn.Module):
             v_safe = torch.where(collapsed, fallback, v_safe)
         return v_safe * self.cfg.target_norm
 
+    def _soft_sphere_project(self, v: Tensor) -> Tensor:
+        """BPTT-safe pass-through that preserves gradient flow.
+
+        Unlike :meth:`_sphere_project` which rescales to ``target_norm``
+        (Jacobian gain = target_norm / ||v||, causing exponential gradient
+        vanishing when ||v|| > target_norm), this passes the vector through
+        unchanged.  A separate norm-penalty loss trains the model to produce
+        ||v|| ≈ target_norm, making the hard projection a near-identity at
+        convergence.
+
+        NaN/Inf rows are scrubbed and collapsed rows are replaced with the
+        canonical e₀ fallback (same safety contract as :meth:`_sphere_project`).
+        """
+        v_safe = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        with torch.no_grad():
+            row_norm = v_safe.float().norm(dim=-1, keepdim=True)
+            collapsed = row_norm < 1e-5
+        if collapsed.any():
+            fallback = torch.zeros_like(v_safe)
+            fallback[..., 0] = self.cfg.target_norm
+            v_safe = torch.where(collapsed, fallback, v_safe)
+        return v_safe
+
     def _to_residual_space(self, sonar_vectors: Tensor) -> Tensor:
         """
         SONAR embeddings have norm ~0.2 (variance ~4e-5). If fed directly into 
@@ -1652,6 +1675,112 @@ class ChainGenerator(nn.Module):
             info["cos_final"] = float(cos_hist[-1])
 
         return chain_out, info
+
+    # ------------------------------------------------------------------
+    # Truncated BPTT chain generation
+    # ------------------------------------------------------------------
+
+    def generate_with_bptt(
+        self,
+        v_query: Tensor,
+        num_steps: int,
+        bptt_steps: int = 2,
+        v_context_bank: Tensor | None = None,
+        context_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Generate chain with truncated BPTT through the last positions.
+
+        The first ``num_steps - bptt_steps`` positions are generated with
+        detached context (same as :meth:`generate`).  The last ``bptt_steps``
+        positions use :meth:`_soft_sphere_project` (no rescaling, Jacobian
+        gain = 1.0) and do NOT detach, allowing gradient to flow through
+        consecutive generation steps.
+
+        This is a stripped-down generation loop for training only: no noise,
+        repeat penalty, candidate selection, or early stopping.
+
+        Args:
+            v_query: ``[B, D]`` query embeddings.
+            num_steps: total number of chain steps to generate.
+            bptt_steps: number of trailing steps with gradient flow.
+            v_context_bank: ``[B, K, D]`` optional cross-attention context.
+            context_mask: ``[B, K]`` mask for context_bank.
+
+        Returns:
+            all_preds: ``[B, T, D]`` predictions at every position (SONAR
+                space).  Prefix positions carry per-step gradient; BPTT
+                positions carry through-chain gradient.
+            bptt_preds: ``[B, K, D]`` BPTT-window predictions with
+                through-chain gradient for the BPTT loss.
+            bptt_norms: ``[B, K]`` per-position output norms in the BPTT
+                window (with gradient) for the norm penalty.
+        """
+        bsz, _ = v_query.shape
+        context, ctx_mask = self._prepare_context(
+            v_query, v_context_bank, context_mask,
+        )
+
+        steps = max(1, int(num_steps))
+        bptt_k = max(0, min(int(bptt_steps), steps))
+        prefix_steps = steps - bptt_k
+
+        chain = self.start_token.expand(bsz, -1, -1)
+        all_preds: list[Tensor] = []
+        bptt_nan_count = 0
+
+        # Phase 1: Prefix — detached, mirrors the training path of generate().
+        for _ in range(prefix_steps):
+            x = chain
+            for layer in self.layers:
+                x = layer(x, context, context_mask=ctx_mask)
+            x = self.final_norm(x)
+            raw = self.output_proj(x[:, -1:, :])
+
+            all_preds.append(self._soft_sphere_project(raw))
+            proj = self._sphere_project(raw)
+            chain = torch.cat(
+                [chain, self._to_residual_space(proj).detach()], dim=1,
+            )
+
+        # Phase 2: BPTT window — gradient flows through the chain.
+        bptt_pred_list: list[Tensor] = []
+        for _ in range(bptt_k):
+            x = chain
+            for layer in self.layers:
+                x = layer(x, context, context_mask=ctx_mask)
+            x = self.final_norm(x)
+            raw = self.output_proj(x[:, -1:, :])
+
+            nan_detected = not torch.isfinite(raw).all()
+            if nan_detected:
+                bptt_nan_count += 1
+
+            soft = self._soft_sphere_project(raw)
+            all_preds.append(soft)
+            bptt_pred_list.append(soft)
+
+            scaled = self._to_residual_space(soft)
+            if nan_detected:
+                chain = torch.cat([chain, scaled.detach()], dim=1)
+            else:
+                chain = torch.cat([chain, scaled], dim=1)
+
+        self._bptt_nan_gate_count = bptt_nan_count
+
+        if not bptt_pred_list:
+            empty_preds = v_query.new_zeros(bsz, 0, self.cfg.d_model)
+            empty_norms = v_query.new_zeros(bsz, 0)
+            all_predictions = (
+                torch.cat(all_preds, dim=1) if all_preds
+                else v_query.new_zeros(bsz, 0, self.cfg.d_model)
+            )
+            return all_predictions, empty_preds, empty_norms
+
+        all_predictions = torch.cat(all_preds, dim=1)
+        bptt_predictions = torch.cat(bptt_pred_list, dim=1)
+        bptt_norms = bptt_predictions.norm(dim=-1)
+
+        return all_predictions, bptt_predictions, bptt_norms
 
     # ------------------------------------------------------------------
     # DDIM iterative refinement at each autoregressive position

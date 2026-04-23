@@ -1171,8 +1171,12 @@ def compute_composite_objective(
     lambda_aux = float(cfg.get("loss_lambda_aux", 0.0))
     lambda_aux_df = float(cfg.get("loss_lambda_aux_df", 0.0))
     aux_answer_weight = float(cfg.get("aux_loss_answer_weight", 1.0))
+    lambda_bptt = float(cfg.get("loss_lambda_bptt", 0.0))
+    lambda_norm = float(cfg.get("loss_lambda_norm_penalty", 0.0))
+    bptt_k = int(cfg.get("bptt_steps", 2))
     rank_enabled = lambda_rank > 0.0
     df_enabled = bool(cfg.get("enable_diffusion_forcing", False)) and lambda_df > 0.0
+    bptt_enabled = bool(cfg.get("bptt_enabled", False)) and lambda_bptt > 0.0 and steps >= 2
     aux_enabled = len(getattr(model, "aux_heads", {})) > 0 and lambda_aux > 0.0
     oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
     effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
@@ -1331,6 +1335,53 @@ def compute_composite_objective(
             "aux_df_cos_answer": 0.0,
         }
 
+    # 5) Truncated BPTT through the generation chain.
+    if bptt_enabled:
+        effective_bptt_k = min(bptt_k, steps)
+        all_bptt, bptt_preds, bptt_norms = model.generate_with_bptt(
+            v_q,
+            num_steps=steps,
+            bptt_steps=effective_bptt_k,
+            v_context_bank=context_banks,
+            context_mask=context_mask,
+        )
+
+        bptt_targets = chains[:, -effective_bptt_k:, :]
+        bptt_mask = chain_mask[:, -effective_bptt_k:]
+        l_bptt, bptt_stats = _masked_step_losses(
+            bptt_preds, bptt_targets, bptt_mask, d_model, w_cos, w_mse,
+        )
+        l_bptt = torch.nan_to_num(l_bptt, nan=0.0, posinf=0.0, neginf=0.0)
+
+        target_norm_val = float(model.cfg.target_norm)
+        l_norm_penalty = ((bptt_norms - target_norm_val) ** 2).mean()
+        l_norm_penalty = torch.nan_to_num(l_norm_penalty, nan=0.0, posinf=0.0, neginf=0.0)
+
+        loss = loss + lambda_bptt * l_bptt + lambda_norm * l_norm_penalty
+
+        bptt_maskf = bptt_mask.to(dtype=chains.dtype)
+        bptt_valid = bptt_maskf.sum().clamp(min=1.0)
+        bptt_cos_masked = (bptt_stats["cos_sim"] * bptt_maskf).sum() / bptt_valid
+        bptt_metrics = {
+            "loss_bptt": float(l_bptt.item()),
+            "loss_norm_penalty": float(l_norm_penalty.item()),
+            "bptt_cos_mean": float(bptt_cos_masked.item()),
+            "bptt_norm_mean": float(bptt_norms.detach().mean().item()),
+            "bptt_norm_std": float(bptt_norms.detach().std().item()) if bptt_norms.numel() > 1 else 0.0,
+            "bptt_nan_count": float(getattr(model, "_bptt_nan_gate_count", 0)),
+        }
+    else:
+        l_bptt = chains.new_zeros(())
+        l_norm_penalty = chains.new_zeros(())
+        bptt_metrics = {
+            "loss_bptt": 0.0,
+            "loss_norm_penalty": 0.0,
+            "bptt_cos_mean": 0.0,
+            "bptt_norm_mean": 0.0,
+            "bptt_norm_std": 0.0,
+            "bptt_nan_count": 0.0,
+        }
+
     with torch.no_grad():
         # Use FULL mask (incl. answer) for reporting metrics.
         tf_cos = (_safe_normalize(v_tf.float(), dim=-1) * _safe_normalize(chains.float(), dim=-1)).sum(dim=-1)
@@ -1417,6 +1468,10 @@ def compute_composite_objective(
         metrics["roll_mse_loss_raw"] = float(roll_stats["mse_loss"].item())
         metrics.update(aux_metrics)
         metrics.update(df_metrics)
+        metrics.update(bptt_metrics)
+        metrics["lambda_bptt"] = lambda_bptt
+        metrics["lambda_norm_penalty"] = lambda_norm
+        metrics["bptt_enabled"] = 1.0 if bptt_enabled else 0.0
 
     return loss, metrics
 
@@ -2299,6 +2354,8 @@ def main() -> None:
     base_df_lambda = float(train_cfg.get("loss_lambda_diffusion", 0.0))
     df_warmup_epochs = int(train_cfg.get("df_warmup_epochs", 0))
     base_ans_lambda = float(train_cfg.get("loss_lambda_answer", 1.0))
+    base_bptt_lambda = float(train_cfg.get("loss_lambda_bptt", 0.0))
+    bptt_warmup_epochs = int(train_cfg.get("bptt_warmup_epochs", 0))
 
     # Rolling ans_coverage history for collapse-warning heuristic.
     ans_cov_history: list[float] = []
@@ -2406,6 +2463,12 @@ def main() -> None:
             effective_df_lambda = base_df_lambda
         train_cfg["loss_lambda_diffusion"] = effective_df_lambda
 
+        # BPTT warm-up: disable until bptt_warmup_epochs have elapsed.
+        if bptt_warmup_epochs > 0 and epoch < bptt_warmup_epochs:
+            train_cfg["loss_lambda_bptt"] = 0.0
+        else:
+            train_cfg["loss_lambda_bptt"] = base_bptt_lambda
+
         epoch_start = time.time()
 
         # Reset SADT EMA at System2 transition to prevent false throttling.
@@ -2480,9 +2543,15 @@ def main() -> None:
 
         phase = "System1" if target_steps == 1 else f"System2({target_steps})"
         tf_noise_info = f" tf_noise={tf_noise:.4f}" if tf_noise > 0 else ""
+        bptt_info = (
+            f" bptt=ON(K={int(train_cfg.get('bptt_steps', 2))}, "
+            f"λ={float(train_cfg.get('loss_lambda_bptt', 0.0)):.3f})"
+            if float(train_cfg.get("loss_lambda_bptt", 0.0)) > 0.0
+            else ""
+        )
         print(f"\n[E{epoch}] target_steps={target_steps} [{phase}] "
               f"ss_prob={ss_prob:.3f} noise_std={noise_std:.4f} oracle_prob={oracle_prob:.3f}"
-              f"{tf_noise_info}")
+              f"{tf_noise_info}{bptt_info}")
 
         nan_count = 0
         for step, batch in enumerate(train_loader):
