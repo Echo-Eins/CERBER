@@ -1,5 +1,140 @@
 # Lessons
 
+## 2026-04-23 — DF collapse: unbounded AdaLN scale → SwiGLU quadratic explosion → bf16 NaN
+
+### Context
+Diffusion Forcing (DF) ON experiment showed catastrophic collapse at the System1→System2 transition (E3). Model was healthy during E0-E2 (target_steps=1), then died within 350 steps of E3 (target_steps=2). NaN count: 1→3→39→89→139... (every sample NaN), grad=0.0000 from step 400 onward.
+
+### Root Cause Chain
+1. **Unbounded AdaLN scale**: `adaln_modulation` (SiLU→Linear→6D) produces per-position scale/shift for each norm layer. The scale output is **unconstrained** — it can grow arbitrarily large as training progresses. By E0 step 1600, the scale had grown to ~+1.4 (gate=2.4×).
+2. **SwiGLU quadratic amplification**: SwiGLU output ∝ input² because both gate and up paths are linear in input. AdaLN scale 2.4× → FFN output 5.8× (quadratic). Observed: ffn_out jumped 0.23→1593 in 200 steps (E0 step 1400→1600) with gate_std 0.504→3.812.
+3. **residual_norm_clamp=256 contained Phase 1** but created a gradient-starved regime. FFN weights learned to produce huge outputs that were always clamped, so corrective gradients never flowed back.
+4. **Cold position trigger**: System2 introduces chain position 1 (never seen during System1). At this position, attention patterns are untrained, residual-stream statistics are extreme, AdaLN modulation produces even larger scales. gate_std: 5.25→10.23→13.87 in 400 steps. ffn_out: 861→3893→inf.
+5. **bf16 overflow → NaN cascade**: FFN output exceeds bf16 range at cold positions. NaN poisons gradients on all shared weights. NaN gate replaces output with GT (keeps loss finite), but gradient is zeroed → learning stops permanently.
+
+### Two Phase Transitions (Same Signature)
+- **Phase 1** (E0 step ~1500): gate_std 0.5→3.8, ffn_out 0.2→1593. Survived because residual_norm_clamp contains damage.
+- **Phase 2** (E3 step ~300): gate_std 5.3→13.9, ffn_out 861→inf. Fatal — cold positions amplify the already-unstable regime past bf16 limits.
+
+### Fix: `adaln_scale_clamp` via tanh
+Added `adaln_scale_clamp` config parameter (default=1.0). Applies `torch.tanh(scale) * clamp` to all three AdaLN scale outputs (self-attn, cross-attn, FFN) in `DecoderBlock.forward()`. This bounds the gate to [GATE_MIN, 1+clamp] = [0.001, 2.0], preventing the unbounded growth that triggers the quadratic SwiGLU explosion.
+
+### Additional Config Changes
+- `df_warmup_epochs`: 5→3 (match system1_epochs so DF warmup completes BEFORE System2 transition)
+- `df_noise_level_max`: 63→50 (avoid near-pure-noise timesteps that produce extreme conditioning patterns with negligible Min-SNR weight)
+
+### Rules
+1. AdaLN modulation outputs (scale) MUST be bounded. Unbounded scale + SwiGLU = quadratic explosion.
+2. Never let a warmup schedule straddle a horizon transition — complete all warmups BEFORE the next phase starts.
+3. When ffn_gate_std > 2× its init value, treat it as an early warning of FFN explosion. Add this as a training-time alarm.
+4. The residual_norm_clamp is defense-in-depth, not a fix — it masks the symptom while allowing the underlying instability to grow.
+
+---
+
+## 2026-04-22 — FF pipeline: separate backward per layer, single optimizer step
+
+### Context
+Building full FF training pipeline for CERBER. Key question: how to structure
+the backward passes when each layer has its own local loss.
+
+### Solution
+Accumulate gradients from all layers + head into the same .grad tensors, then
+do a single `optimizer.step()`:
+```python
+for i in range(n_layers):
+    loss_dict[f"ff_layer_{i}"].backward(retain_graph=True)
+loss_dict["head_total"].backward()
+optimizer.step()
+```
+This works because `.detach()` at block boundaries ensures each layer's loss
+only produces gradients for that layer's parameters — no cross-contamination.
+The `retain_graph=True` is needed because the positive/negative forward passes
+share the same context preparation graph.
+
+### Verified behavior (smoke test)
+- Layer 0: SymBa loss = 360 (actively learning, pos/neg have different norms)
+- Layer 1: SymBa loss = 0.693 = ln(2) (neutral — waiting for layer 0 to diverge)
+- 9/47 params get nonzero gradient (expected with zero-init residual)
+- Head loss backward only touches final_norm + output_proj
+
+### Rules
+1. **Always use `retain_graph=True` for all but the last backward** when doing
+   per-layer FF backwards. The graph is shared across layers.
+2. **One optimizer step after all backwards** — simpler and cheaper than
+   per-layer optimizers. AdamW handles the sparse gradient pattern naturally.
+3. **Gradient sanitation + EMA restore still works** — applied after all
+   backwards accumulate, before optimizer.step().
+
+---
+
+## 2026-04-22 — Forward-Forward algorithm: zero-init residual kills delta-goodness
+
+### Context
+Implementing FF (Hinton 2022) layer-local training for CERBER's chain generator.
+First attempt used goodness = ||block_delta||² (x_out − x_in) per Ororbia & Mali 2023
+recommendation for residual networks.
+
+### Bug
+Zero-init residual projectors (our FixUp/DiT trick) make every sublayer output exactly
+0 at init: `sa_out = out_proj(attn@V) = 0` because `out_proj.weight = 0`. Therefore
+`block_delta = x_out − x_in = 0` → goodness = 0 → ∂||δ||²/∂δ = 2δ = 0.
+**Vanishing gradient at initialization — FF training cannot start.**
+
+### Fix
+Use **full-state goodness** (Hinton's original): `g = mean(x_out²)` instead of delta.
+At init x_out ≈ x_in (which is non-zero data), so gradient ∂g/∂x_out = 2·x_out ≠ 0.
+The activity normalization between layers (L2-norm rescale to √D) strips the magnitude
+cue for the next block, so the "norm kills signal" failure mode is avoided — goodness
+is measured on pre-next-layer-norm state (Brenig & Timofte 2023).
+
+### Dynamics at init (zero-init residual + activity norm + full-state goodness)
+- Layer 0: g_pos ≈ ||scaled_chain_pos||², g_neg ≈ ||scaled_chain_neg||². Different input
+  norms → different goodness → SymBa gradient non-zero. Only out_proj / cross_out_proj /
+  w_down get gradient (~1e-4 scale via LayerScale gate). q/k/v/gate/up projections get
+  zero gradient because the zero out_proj blocks the chain.
+- Layers 1+: after activity norm both pos and neg have ||x|| = √D → g_pos ≈ g_neg ≈ D →
+  SymBa = log(2) → gradient ≈ 0. These layers only start learning once layer 0 diverges
+  pos/neg representations. **This is expected FF cascading dynamics (Hinton §3.3).**
+
+### Rules
+1. **Never use delta-goodness (x_out − x_in) with zero-init residual.** It creates exact
+   zero with exact zero gradient. Use full-state goodness.
+2. **In FF, learnable gates (LayerScale, norm weights) are the first to get gradient from
+   zero-init layers.** Their initial signal is tiny (~1e-4). Use a higher learning rate
+   for per-layer optimizers (1e-3 vs 1e-4) to compensate.
+3. **Activity normalization is mandatory between FF blocks** — without it, layer 0's
+   magnitude cue leaks to layer 1, and layer 1 trivially matches g_pos/g_neg by echoing
+   the magnitude instead of learning features.
+
+---
+
+## 2026-04-22 — Residual-branch norm clamp: bf16 overflow safety valve
+
+### Context
+Training log E5 S700 showed FFN output norm growing unboundedly (120→1889→4300) until
+per-element values exceeded ~76 → QK logits overflow bf16 max (65504) → NaN cascade at
+horizon transition (target_steps=3).
+
+### Fix
+`_soft_clamp_residual_norm(y, max_norm)`: differentiable `y · min(1, max_norm/||y||₂)`.
+Applied to all 3 sublayer outputs in DecoderBlock.forward *before* LayerScale × residual
+add. FP32 norm computation to avoid the norm itself overflowing in bf16. Config field
+`residual_norm_clamp` (default None = disabled; 256 = 8·√d_model for d_model=1024).
+
+### Verified
+- Clamp=5 caps residual growth at 5.00 vs 234.55 unclamped (47× reduction).
+- bf16 huge-input path finite. Gradient flows through active clamp.
+- Full DF+CFG+DDIM+AdaLN-Zero path finite end-to-end.
+
+### Rules
+1. **LayerScale + weight decay slow unbounded FFN growth but don't prevent it.** A direct
+   norm clamp is the only mathematical bound. OpenMythos gets it for free via LTI spectral
+   radius ρ(A)<1, but feedforward stacks need the clamp.
+2. **Always compute activation norms in FP32 under bf16 autocast.** The thing you're
+   bounding is already near the bf16 ceiling; computing `.norm()` in bf16 overflows to inf.
+
+---
+
 ## 2026-04-21 — Corrected root-cause: soft Adam reset + missing LayerScale decay, NOT "answer double supervision"
 
 ### Context

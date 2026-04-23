@@ -21,6 +21,7 @@
         "zero_init_residual": true,
         "use_layerscale": true,
         "layerscale_init": 1e-4,
+        "residual_norm_clamp": 256.0,
         "aux_head_layers": [],
         "aux_head_hidden_dim": 1024,
         "aux_head_dropout": 0.0
@@ -117,6 +118,12 @@
         "horizon_adam_sq_scale": 1.0,
         "answer_warmup_steps": 200,
         "enable_ffn_stats": true,
+
+        "bptt_enabled": false,
+        "bptt_steps": 2,
+        "bptt_warmup_epochs": 5,
+        "loss_lambda_bptt": 0.0,
+        "loss_lambda_norm_penalty": 0.0,
 
         "nan_gate_window_size": 50,
         "nan_gate_max_rate": 10,
