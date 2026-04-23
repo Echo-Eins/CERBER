@@ -68,7 +68,7 @@
         "system1_epochs": 3,
         "system2_start_steps": 4,
         "max_chain_steps": 20,
-        "horizon_schedule": [[2, 2], [3, 2], [4, 10], [5, 10]],
+        "horizon_schedule": [[2, 2], [3, 3], [4, 20], [5, 20]],
 
         "scheduled_sampling_max": 0.30,
         "scheduled_sampling_ramp_epochs": 8,
@@ -127,8 +127,8 @@
         "free_run_noise_std_max": 0.0,
         "eval_free_run_noise_std": 0.0,
 
-        "tf_noise_std_max": 0.0,
-        "tf_noise_ramp_epochs": 0,
+        "tf_noise_std_max": 0.002,
+        "tf_noise_ramp_epochs": 5,
         "free_run_repeat_penalty": 0.15,
         "free_run_repeat_cos_threshold": 0.98,
         "free_run_repeat_ban_threshold": 0.995,
