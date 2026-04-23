@@ -79,6 +79,16 @@ class ChainGeneratorConfig:
     # ``None`` or ``<= 0`` disables (backward compatible).
     residual_norm_clamp: float | None = None
 
+    # ── AdaLN scale clamp (FFN explosion safety valve) ──
+    # Soft-bound the AdaLN modulation scale output via tanh so the gate
+    # (1 + scale) stays in [GATE_MIN, 1 + adaln_scale_clamp].  Without
+    # this, the modulation MLP can produce arbitrarily large positive
+    # scales, which SwiGLU amplifies quadratically (output ∝ input²),
+    # causing bf16 overflow at horizon transitions where cold positions
+    # see extreme residual-stream statistics.  Default 1.0 caps the gate
+    # at 2.0× (ample for noise-level conditioning).  None disables.
+    adaln_scale_clamp: float | None = 1.0
+
     # Deep supervision / auxiliary heads. Layer numbers are 1-based to match
     # human-facing configs ("layer 2", "layer 4"). Empty disables the feature.
     aux_head_layers: tuple[int, ...] = ()
@@ -463,6 +473,7 @@ class DecoderBlock(nn.Module):
         use_layerscale: bool = True,
         layerscale_init: float = 1e-4,
         residual_norm_clamp: float | None = None,
+        adaln_scale_clamp: float | None = 1.0,
     ):
         super().__init__()
         self._norm_type = norm_type
@@ -474,6 +485,10 @@ class DecoderBlock(nn.Module):
             self._residual_norm_clamp: float | None = None
         else:
             self._residual_norm_clamp = float(residual_norm_clamp)
+        if adaln_scale_clamp is not None and float(adaln_scale_clamp) > 0.0:
+            self._adaln_scale_clamp: float | None = float(adaln_scale_clamp)
+        else:
+            self._adaln_scale_clamp = None
 
         # ── Normalization ──
         if norm_type == "ada_rmsnorm":
@@ -589,6 +604,11 @@ class DecoderBlock(nn.Module):
             # AdaLN-Zero: produce per-position scale/shift for each norm.
             mod = self.adaln_modulation(t_emb)  # [B, L, 6D]
             s_sa, sh_sa, s_ca, sh_ca, s_ff, sh_ff = mod.chunk(6, dim=-1)
+            sc = self._adaln_scale_clamp
+            if sc is not None:
+                s_sa = torch.tanh(s_sa) * sc
+                s_ca = torch.tanh(s_ca) * sc
+                s_ff = torch.tanh(s_ff) * sc
             sa_out = self.self_attn(self.norm_self(x, scale=s_sa, shift=sh_sa))
             sa_out = _soft_clamp_residual_norm(sa_out, clamp)
             x = x + self._scale(sa_out, self.ls_self)
@@ -652,6 +672,7 @@ class ChainGenerator(nn.Module):
                     use_layerscale=self.cfg.use_layerscale,
                     layerscale_init=self.cfg.layerscale_init,
                     residual_norm_clamp=self.cfg.residual_norm_clamp,
+                    adaln_scale_clamp=self.cfg.adaln_scale_clamp,
                 )
                 for _ in range(self.cfg.n_layers)
             ]

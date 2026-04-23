@@ -1,5 +1,36 @@
 # Lessons
 
+## 2026-04-23 — DF collapse: unbounded AdaLN scale → SwiGLU quadratic explosion → bf16 NaN
+
+### Context
+Diffusion Forcing (DF) ON experiment showed catastrophic collapse at the System1→System2 transition (E3). Model was healthy during E0-E2 (target_steps=1), then died within 350 steps of E3 (target_steps=2). NaN count: 1→3→39→89→139... (every sample NaN), grad=0.0000 from step 400 onward.
+
+### Root Cause Chain
+1. **Unbounded AdaLN scale**: `adaln_modulation` (SiLU→Linear→6D) produces per-position scale/shift for each norm layer. The scale output is **unconstrained** — it can grow arbitrarily large as training progresses. By E0 step 1600, the scale had grown to ~+1.4 (gate=2.4×).
+2. **SwiGLU quadratic amplification**: SwiGLU output ∝ input² because both gate and up paths are linear in input. AdaLN scale 2.4× → FFN output 5.8× (quadratic). Observed: ffn_out jumped 0.23→1593 in 200 steps (E0 step 1400→1600) with gate_std 0.504→3.812.
+3. **residual_norm_clamp=256 contained Phase 1** but created a gradient-starved regime. FFN weights learned to produce huge outputs that were always clamped, so corrective gradients never flowed back.
+4. **Cold position trigger**: System2 introduces chain position 1 (never seen during System1). At this position, attention patterns are untrained, residual-stream statistics are extreme, AdaLN modulation produces even larger scales. gate_std: 5.25→10.23→13.87 in 400 steps. ffn_out: 861→3893→inf.
+5. **bf16 overflow → NaN cascade**: FFN output exceeds bf16 range at cold positions. NaN poisons gradients on all shared weights. NaN gate replaces output with GT (keeps loss finite), but gradient is zeroed → learning stops permanently.
+
+### Two Phase Transitions (Same Signature)
+- **Phase 1** (E0 step ~1500): gate_std 0.5→3.8, ffn_out 0.2→1593. Survived because residual_norm_clamp contains damage.
+- **Phase 2** (E3 step ~300): gate_std 5.3→13.9, ffn_out 861→inf. Fatal — cold positions amplify the already-unstable regime past bf16 limits.
+
+### Fix: `adaln_scale_clamp` via tanh
+Added `adaln_scale_clamp` config parameter (default=1.0). Applies `torch.tanh(scale) * clamp` to all three AdaLN scale outputs (self-attn, cross-attn, FFN) in `DecoderBlock.forward()`. This bounds the gate to [GATE_MIN, 1+clamp] = [0.001, 2.0], preventing the unbounded growth that triggers the quadratic SwiGLU explosion.
+
+### Additional Config Changes
+- `df_warmup_epochs`: 5→3 (match system1_epochs so DF warmup completes BEFORE System2 transition)
+- `df_noise_level_max`: 63→50 (avoid near-pure-noise timesteps that produce extreme conditioning patterns with negligible Min-SNR weight)
+
+### Rules
+1. AdaLN modulation outputs (scale) MUST be bounded. Unbounded scale + SwiGLU = quadratic explosion.
+2. Never let a warmup schedule straddle a horizon transition — complete all warmups BEFORE the next phase starts.
+3. When ffn_gate_std > 2× its init value, treat it as an early warning of FFN explosion. Add this as a training-time alarm.
+4. The residual_norm_clamp is defense-in-depth, not a fix — it masks the symptom while allowing the underlying instability to grow.
+
+---
+
 ## 2026-04-22 — FF pipeline: separate backward per layer, single optimizer step
 
 ### Context
