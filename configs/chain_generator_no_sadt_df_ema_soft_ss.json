@@ -70,8 +70,8 @@
         "max_chain_steps": 20,
         "horizon_schedule": [[2, 2], [3, 2], [4, 10], [5, 10]],
 
-        "scheduled_sampling_max": 0.15,
-        "scheduled_sampling_ramp_epochs": 5,
+        "scheduled_sampling_max": 0.30,
+        "scheduled_sampling_ramp_epochs": 8,
 
         "loss_lambda_step": 1.0,
         "loss_lambda_answer": 1.0,
