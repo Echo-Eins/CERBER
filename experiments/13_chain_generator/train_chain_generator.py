@@ -1173,10 +1173,10 @@ def compute_composite_objective(
     aux_answer_weight = float(cfg.get("aux_loss_answer_weight", 1.0))
     lambda_bptt = float(cfg.get("loss_lambda_bptt", 0.0))
     lambda_norm = float(cfg.get("loss_lambda_norm_penalty", 0.0))
-    bptt_k = int(cfg.get("bptt_steps", 2))
+    bptt_k = int(cfg.get("bptt_steps", -1))
     rank_enabled = lambda_rank > 0.0
     df_enabled = bool(cfg.get("enable_diffusion_forcing", False)) and lambda_df > 0.0
-    bptt_enabled = bool(cfg.get("bptt_enabled", False)) and lambda_bptt > 0.0 and steps >= 2
+    bptt_enabled = bool(cfg.get("bptt_enabled", False)) and lambda_bptt > 0.0 and steps >= 1
     aux_enabled = len(getattr(model, "aux_heads", {})) > 0 and lambda_aux > 0.0
     oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
     effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
@@ -1335,10 +1335,10 @@ def compute_composite_objective(
             "aux_df_cos_answer": 0.0,
         }
 
-    # 5) Truncated BPTT through the generation chain.
+    # 5) Truncated BPTT through the generation chain (STE projection).
     if bptt_enabled:
-        effective_bptt_k = min(bptt_k, steps)
-        all_bptt, bptt_preds, bptt_norms = model.generate_with_bptt(
+        effective_bptt_k = steps if bptt_k < 0 else min(bptt_k, steps)
+        all_bptt, bptt_preds, bptt_raw_norms = model.generate_with_bptt(
             v_q,
             num_steps=steps,
             bptt_steps=effective_bptt_k,
@@ -1353,15 +1353,13 @@ def compute_composite_objective(
         )
         l_bptt = torch.nan_to_num(l_bptt, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Relative-deviation norm penalty: ((||v|| - target) / target)^2.
-        # The additive form ((||v|| - target)^2) scales with target_norm^2 ≈ 0.04
-        # which makes typical deviations (~0.1) produce loss ~0.01 — too weak to
-        # counteract other gradients.  The relative form is dimensionless and
-        # produces loss ~0.25 for the same ~50% deviation, so λ_norm in [0.1, 1.0]
-        # gives a gradient signal comparable to the cosine/MSE losses.
+        # Norm penalty on RAW output norms (pre-projection).
+        # STE forward gives exact target_norm, but we penalize raw output
+        # deviation to keep the STE approximation accurate (small gap between
+        # forward sphere_project and backward identity).
         target_norm_val = float(model.cfg.target_norm)
         target_norm_safe = max(target_norm_val, 1e-6)
-        rel_dev = (bptt_norms - target_norm_val) / target_norm_safe
+        rel_dev = (bptt_raw_norms - target_norm_val) / target_norm_safe
         l_norm_penalty = rel_dev.pow(2).mean()
         l_norm_penalty = torch.nan_to_num(l_norm_penalty, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -1374,8 +1372,8 @@ def compute_composite_objective(
             "loss_bptt": float(l_bptt.item()),
             "loss_norm_penalty": float(l_norm_penalty.item()),
             "bptt_cos_mean": float(bptt_cos_masked.item()),
-            "bptt_norm_mean": float(bptt_norms.detach().mean().item()),
-            "bptt_norm_std": float(bptt_norms.detach().std().item()) if bptt_norms.numel() > 1 else 0.0,
+            "bptt_norm_mean": float(bptt_raw_norms.detach().mean().item()),
+            "bptt_norm_std": float(bptt_raw_norms.detach().std().item()) if bptt_raw_norms.numel() > 1 else 0.0,
             "bptt_nan_count": float(getattr(model, "_bptt_nan_gate_count", 0)),
         }
     else:

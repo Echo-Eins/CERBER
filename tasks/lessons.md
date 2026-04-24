@@ -1,5 +1,38 @@
 # Lessons
 
+## 2026-04-24 — BPTT projection mismatch: _soft_sphere_project creates second distribution gap
+
+### Context
+Truncated BPTT (K=2) was implemented to close the exposure bias gap (roll_cos_last=0.616 at target_steps=5). After 24 epochs, BPTT showed zero effect — roll_cos_last=0.5898, WORSE than baseline. BPTT mechanics worked fine (bptt_cos=0.858, bptt_norm=0.206) but the cascade crash persisted unchanged.
+
+### Root Cause
+`generate_with_bptt` used `_soft_sphere_project` (pass-through, norm ~0.22) for the BPTT window while eval `generate()` uses `_sphere_project` (hard normalization, norm = exactly 0.2051). This created a SECOND distribution mismatch on top of the original exposure bias: the model learned to handle inputs at norm ~0.22 during BPTT training, but at eval time inputs are at norm 0.2051. The BPTT gradient signal didn't transfer to the eval distribution.
+
+Additional factors:
+1. K=2 only covered last 2 of 5 steps — steps 1-3 error invisible to gradient
+2. `_sphere_project` Jacobian gain = target_norm/||v|| ≈ 0.82/step → 0.37 over 5 steps, causing 63% gradient vanishing even if the projection were used in BPTT
+
+### Fix: Straight-Through Estimator (STE)
+Replaced `_soft_sphere_project` with `_ste_sphere_project`:
+- Forward: identical to `_sphere_project` (output on SONAR hypersphere at exactly target_norm)
+- Backward: identity Jacobian (gradient bypasses normalization entirely)
+- Implementation: `v_clean + (sphere_project(v_clean) - v_clean).detach()`
+
+Combined with full-chain BPTT (`bptt_steps=-1` = K covers all steps), the BPTT chain now:
+1. Has IDENTICAL forward distribution to eval (same projection, same norms)
+2. Has full gradient flow (no attenuation from normalization)
+3. Covers ALL chain steps (no blind prefix)
+
+Norm penalty retained on raw output norms to keep STE approximation accurate (small gap between forward sphere_project and backward identity).
+
+### Rules
+1. **Never use a different projection in training vs eval for autoregressive chains.** Any distribution mismatch between the training chain and eval chain negates the gradient signal. The whole point of BPTT is to match eval conditions.
+2. **Use STE when you need gradient through a non-differentiable or poorly-conditioned operation.** Standard technique from VQ-VAE, binary nets, Gumbel-Softmax.
+3. **Set BPTT K = total steps unless memory is a constraint.** Partial coverage (K < total) leaves early-step errors invisible to gradient. For chain lengths ≤ 20, full-chain BPTT is affordable.
+4. **Norm penalty on raw (pre-projection) output, not on projected output.** STE/sphere-projected output has exact target_norm by construction — penalizing it is a no-op.
+
+---
+
 ## 2026-04-23 — DF collapse: unbounded AdaLN scale → SwiGLU quadratic explosion → bf16 NaN
 
 ### Context
