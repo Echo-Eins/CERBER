@@ -1016,28 +1016,22 @@ class ChainGenerator(nn.Module):
             v_safe = torch.where(collapsed, fallback, v_safe)
         return v_safe * self.cfg.target_norm
 
-    def _soft_sphere_project(self, v: Tensor) -> Tensor:
-        """BPTT-safe pass-through that preserves gradient flow.
+    def _ste_sphere_project(self, v: Tensor) -> Tensor:
+        """Straight-Through Estimator sphere projection for BPTT.
 
-        Unlike :meth:`_sphere_project` which rescales to ``target_norm``
-        (Jacobian gain = target_norm / ||v||, causing exponential gradient
-        vanishing when ||v|| > target_norm), this passes the vector through
-        unchanged.  A separate norm-penalty loss trains the model to produce
-        ||v|| ≈ target_norm, making the hard projection a near-identity at
-        convergence.
+        Forward: identical to :meth:`_sphere_project` (output on the SONAR
+        hypersphere at exactly ``target_norm``).
+        Backward: identity Jacobian — gradient flows through ``v`` directly,
+        bypassing the normalization Jacobian (gain = target_norm/||v||) that
+        causes exponential gradient vanishing over multi-step chains.
 
-        NaN/Inf rows are scrubbed and collapsed rows are replaced with the
-        canonical e₀ fallback (same safety contract as :meth:`_sphere_project`).
+        This ensures the BPTT chain sees the SAME input distribution as eval
+        (hard sphere projection), eliminating the train/eval distribution
+        mismatch that made the previous soft-projection BPTT ineffective.
         """
-        v_safe = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-        with torch.no_grad():
-            row_norm = v_safe.float().norm(dim=-1, keepdim=True)
-            collapsed = row_norm < 1e-5
-        if collapsed.any():
-            fallback = torch.zeros_like(v_safe)
-            fallback[..., 0] = self.cfg.target_norm
-            v_safe = torch.where(collapsed, fallback, v_safe)
-        return v_safe
+        v_clean = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        hard = self._sphere_project(v_clean)
+        return v_clean + (hard - v_clean).detach()
 
     def _to_residual_space(self, sonar_vectors: Tensor) -> Tensor:
         """
@@ -1688,32 +1682,32 @@ class ChainGenerator(nn.Module):
         v_context_bank: Tensor | None = None,
         context_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Generate chain with truncated BPTT through the last positions.
+        """Generate chain with truncated BPTT via Straight-Through Estimator.
 
         The first ``num_steps - bptt_steps`` positions are generated with
-        detached context (same as :meth:`generate`).  The last ``bptt_steps``
-        positions use :meth:`_soft_sphere_project` (no rescaling, Jacobian
-        gain = 1.0) and do NOT detach, allowing gradient to flow through
-        consecutive generation steps.
+        :meth:`_sphere_project` + detach (identical to eval :meth:`generate`).
+        The last ``bptt_steps`` positions use :meth:`_ste_sphere_project`:
+        forward = exact sphere projection (norm = target_norm), backward =
+        identity Jacobian (full gradient flow).  This eliminates the
+        train/eval distribution mismatch that made soft-projection BPTT
+        ineffective.
 
-        This is a stripped-down generation loop for training only: no noise,
-        repeat penalty, candidate selection, or early stopping.
+        Use ``bptt_steps=-1`` to cover all steps (full-chain BPTT).
 
         Args:
             v_query: ``[B, D]`` query embeddings.
             num_steps: total number of chain steps to generate.
-            bptt_steps: number of trailing steps with gradient flow.
+            bptt_steps: trailing steps with gradient flow (-1 = all).
             v_context_bank: ``[B, K, D]`` optional cross-attention context.
             context_mask: ``[B, K]`` mask for context_bank.
 
         Returns:
-            all_preds: ``[B, T, D]`` predictions at every position (SONAR
-                space).  Prefix positions carry per-step gradient; BPTT
-                positions carry through-chain gradient.
+            all_preds: ``[B, T, D]`` STE-projected predictions at every
+                position (SONAR space, norm = target_norm).
             bptt_preds: ``[B, K, D]`` BPTT-window predictions with
-                through-chain gradient for the BPTT loss.
-            bptt_norms: ``[B, K]`` per-position output norms in the BPTT
-                window (with gradient) for the norm penalty.
+                through-chain gradient (STE-projected).
+            bptt_raw_norms: ``[B, K]`` raw output norms (pre-projection)
+                for the norm penalty that keeps STE accurate.
         """
         bsz, _ = v_query.shape
         context, ctx_mask = self._prepare_context(
@@ -1721,14 +1715,14 @@ class ChainGenerator(nn.Module):
         )
 
         steps = max(1, int(num_steps))
-        bptt_k = max(0, min(int(bptt_steps), steps))
+        bptt_k = steps if int(bptt_steps) < 0 else max(0, min(int(bptt_steps), steps))
         prefix_steps = steps - bptt_k
 
         chain = self.start_token.expand(bsz, -1, -1)
         all_preds: list[Tensor] = []
         bptt_nan_count = 0
 
-        # Phase 1: Prefix — detached, mirrors the training path of generate().
+        # Phase 1: Prefix — detached, identical to eval generate().
         for _ in range(prefix_steps):
             x = chain
             for layer in self.layers:
@@ -1736,14 +1730,15 @@ class ChainGenerator(nn.Module):
             x = self.final_norm(x)
             raw = self.output_proj(x[:, -1:, :])
 
-            all_preds.append(self._soft_sphere_project(raw))
             proj = self._sphere_project(raw)
+            all_preds.append(proj)
             chain = torch.cat(
                 [chain, self._to_residual_space(proj).detach()], dim=1,
             )
 
-        # Phase 2: BPTT window — gradient flows through the chain.
+        # Phase 2: BPTT window — STE projection, gradient flows.
         bptt_pred_list: list[Tensor] = []
+        bptt_raw_norm_list: list[Tensor] = []
         for _ in range(bptt_k):
             x = chain
             for layer in self.layers:
@@ -1755,11 +1750,14 @@ class ChainGenerator(nn.Module):
             if nan_detected:
                 bptt_nan_count += 1
 
-            soft = self._soft_sphere_project(raw)
-            all_preds.append(soft)
-            bptt_pred_list.append(soft)
+            ste = self._ste_sphere_project(raw)
+            all_preds.append(ste)
+            bptt_pred_list.append(ste)
 
-            scaled = self._to_residual_space(soft)
+            raw_clean = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+            bptt_raw_norm_list.append(raw_clean.squeeze(1).norm(dim=-1))
+
+            scaled = self._to_residual_space(ste)
             if nan_detected:
                 chain = torch.cat([chain, scaled.detach()], dim=1)
             else:
@@ -1778,9 +1776,9 @@ class ChainGenerator(nn.Module):
 
         all_predictions = torch.cat(all_preds, dim=1)
         bptt_predictions = torch.cat(bptt_pred_list, dim=1)
-        bptt_norms = bptt_predictions.norm(dim=-1)
+        bptt_raw_norms = torch.stack(bptt_raw_norm_list, dim=1)
 
-        return all_predictions, bptt_predictions, bptt_norms
+        return all_predictions, bptt_predictions, bptt_raw_norms
 
     # ------------------------------------------------------------------
     # DDIM iterative refinement at each autoregressive position

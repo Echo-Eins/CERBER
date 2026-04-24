@@ -120,8 +120,8 @@
         "answer_warmup_steps": 200,
         "enable_ffn_stats": true,
 
-        "bptt_enabled": true,
-        "bptt_steps": 2,
+        "bptt_enabled": false,
+        "bptt_steps": -1,
         "bptt_warmup_epochs": 5,
         "loss_lambda_bptt": 0.5,
         "loss_lambda_norm_penalty": 0.2,
