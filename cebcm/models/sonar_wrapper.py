@@ -13,9 +13,64 @@ Installation:
     pip install sonar-space
 """
 
+import os
+import re
+import shutil
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+
+# fairseq2 raises a message of the form
+#   "Model checkpoint of the <asset> asset card is erroneous.  Make sure
+#    that it is downloaded correctly and, if not, delete your cached
+#    version at <path>."
+# when an interrupted download leaves a partial "tmpXXXX" file in the
+# asset cache.  The loader refuses to reuse that file on the next run.
+# We detect this exact message, scrub the offending cache entry, and
+# retry once so that fairseq2 re-downloads the checkpoint cleanly.
+_FAIRSEQ2_CORRUPT_CACHE_RE = re.compile(
+    r"delete your cached version at\s+(\S+)",
+    flags=re.IGNORECASE,
+)
+
+
+def _cleanup_fairseq2_cache(error_message: str) -> str | None:
+    """Remove a corrupt fairseq2 cache entry referenced by ``error_message``.
+
+    Returns the path that was removed, or ``None`` if the message did not
+    reference a cache path or the path could not be removed.
+    """
+    match = _FAIRSEQ2_CORRUPT_CACHE_RE.search(error_message)
+    if not match:
+        return None
+
+    raw_path = match.group(1).rstrip(".,;:")
+    if not raw_path:
+        return None
+
+    # The message points at the temp file inside the asset directory.
+    # Remove the entire asset directory so every sibling (partial manifests,
+    # lock files, etc.) is purged and fairseq2 re-downloads from scratch.
+    if os.path.isfile(raw_path):
+        target = os.path.dirname(raw_path) or raw_path
+    else:
+        target = raw_path
+
+    if not target or not os.path.exists(target):
+        # Path no longer exists — maybe a concurrent process already cleaned
+        # it; treat as "best effort succeeded" so the caller retries.
+        return target if target else None
+
+    try:
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        else:
+            os.remove(target)
+    except OSError:
+        return None
+    return target
 
 
 class SONARWrapper:
@@ -45,27 +100,55 @@ class SONARWrapper:
         self._decoder = None
 
     def _load_encoder(self):
-        """Lazy-load encoder on first use."""
+        """Lazy-load encoder on first use with cache-corruption recovery."""
         if self._encoder is None:
             from sonar.inference_pipelines.text import TextToEmbeddingModelPipeline
 
-            self._encoder = TextToEmbeddingModelPipeline(
-                encoder=self.encoder_name,
-                tokenizer=self.tokenizer_name,
-                device=self.device,
-            )
+            try:
+                self._encoder = TextToEmbeddingModelPipeline(
+                    encoder=self.encoder_name,
+                    tokenizer=self.tokenizer_name,
+                    device=self.device,
+                )
+            except Exception as exc:
+                cleaned = _cleanup_fairseq2_cache(str(exc))
+                if cleaned is None:
+                    raise
+                print(
+                    f"[SONARWrapper] Corrupt fairseq2 cache detected; "
+                    f"removed {cleaned} and retrying encoder download."
+                )
+                self._encoder = TextToEmbeddingModelPipeline(
+                    encoder=self.encoder_name,
+                    tokenizer=self.tokenizer_name,
+                    device=self.device,
+                )
         return self._encoder
 
     def _load_decoder(self):
-        """Lazy-load decoder on first use."""
+        """Lazy-load decoder on first use with cache-corruption recovery."""
         if self._decoder is None:
             from sonar.inference_pipelines.text import EmbeddingToTextModelPipeline
 
-            self._decoder = EmbeddingToTextModelPipeline(
-                decoder=self.decoder_name,
-                tokenizer=self.tokenizer_name,
-                device=self.device,
-            )
+            try:
+                self._decoder = EmbeddingToTextModelPipeline(
+                    decoder=self.decoder_name,
+                    tokenizer=self.tokenizer_name,
+                    device=self.device,
+                )
+            except Exception as exc:
+                cleaned = _cleanup_fairseq2_cache(str(exc))
+                if cleaned is None:
+                    raise
+                print(
+                    f"[SONARWrapper] Corrupt fairseq2 cache detected; "
+                    f"removed {cleaned} and retrying decoder download."
+                )
+                self._decoder = EmbeddingToTextModelPipeline(
+                    decoder=self.decoder_name,
+                    tokenizer=self.tokenizer_name,
+                    device=self.device,
+                )
         return self._decoder
 
     def encode(
