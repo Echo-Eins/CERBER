@@ -1353,8 +1353,16 @@ def compute_composite_objective(
         )
         l_bptt = torch.nan_to_num(l_bptt, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Relative-deviation norm penalty: ((||v|| - target) / target)^2.
+        # The additive form ((||v|| - target)^2) scales with target_norm^2 ≈ 0.04
+        # which makes typical deviations (~0.1) produce loss ~0.01 — too weak to
+        # counteract other gradients.  The relative form is dimensionless and
+        # produces loss ~0.25 for the same ~50% deviation, so λ_norm in [0.1, 1.0]
+        # gives a gradient signal comparable to the cosine/MSE losses.
         target_norm_val = float(model.cfg.target_norm)
-        l_norm_penalty = ((bptt_norms - target_norm_val) ** 2).mean()
+        target_norm_safe = max(target_norm_val, 1e-6)
+        rel_dev = (bptt_norms - target_norm_val) / target_norm_safe
+        l_norm_penalty = rel_dev.pow(2).mean()
         l_norm_penalty = torch.nan_to_num(l_norm_penalty, nan=0.0, posinf=0.0, neginf=0.0)
 
         loss = loss + lambda_bptt * l_bptt + lambda_norm * l_norm_penalty
@@ -2799,6 +2807,15 @@ def main() -> None:
                 nan_gate_total = sum(nan_gate_window)
                 nan_info = f" [NaN:{nan_count}]" if nan_count > 0 else ""
                 nan_info += f" [gate:{nan_gate_total}]" if nan_gate_total > 0 else ""
+                bptt_active = avg.get("bptt_enabled", 0.0) > 0.0
+                bptt_info = (
+                    f" bptt={avg.get('loss_bptt', 0.0):.4f}"
+                    f" bptt_cos={avg.get('bptt_cos_mean', 0.0):.4f}"
+                    f" bptt_norm={avg.get('bptt_norm_mean', 0.0):.3f}"
+                    f" norm_pen={avg.get('loss_norm_penalty', 0.0):.4f}"
+                    if bptt_active
+                    else ""
+                )
                 print(
                     f"  [E{epoch} S{step+1}] "
                     f"loss={avg.get('loss', 0.0):.4f} "
@@ -2819,7 +2836,7 @@ def main() -> None:
                     f"ans_cov={avg.get('answer_coverage', 0.0):.2f} "
                     f"raw_norm={avg.get('raw_norm_mean', 0.0):.2f} "
                     f"grad={avg.get('grad_norm', 0.0):.4f} "
-                    f"lr={lr_now:.2e}{sadt_info}{nan_info}"
+                    f"lr={lr_now:.2e}{bptt_info}{sadt_info}{nan_info}"
                 )
                 _append_jsonl(
                     metrics_log_path,
