@@ -120,7 +120,7 @@
         "answer_warmup_steps": 200,
         "enable_ffn_stats": true,
 
-        "bptt_enabled": false,
+        "bptt_enabled": true,
         "bptt_steps": -1,
         "bptt_warmup_epochs": 5,
         "bptt_horizon_warmup_steps": 200,
