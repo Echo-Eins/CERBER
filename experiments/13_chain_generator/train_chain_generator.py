@@ -1348,15 +1348,20 @@ def compute_composite_objective(
 
         bptt_targets = chains[:, -effective_bptt_k:, :]
         bptt_mask = chain_mask[:, -effective_bptt_k:]
-        l_bptt, bptt_stats = _masked_step_losses(
+        l_bptt_raw, bptt_stats = _masked_step_losses(
             bptt_preds, bptt_targets, bptt_mask, d_model, w_cos, w_mse,
         )
-        l_bptt = torch.nan_to_num(l_bptt, nan=0.0, posinf=0.0, neginf=0.0)
+        l_bptt_raw = torch.nan_to_num(l_bptt_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        # Normalize by K so the per-step gradient magnitude is comparable
+        # to teacher-forced loss regardless of chain length.  Without this,
+        # full-chain BPTT (K=5) produces ~5× the gradient of K=1, causing
+        # gradient shock at horizon transitions.
+        l_bptt = l_bptt_raw / max(effective_bptt_k, 1)
 
         # Norm penalty on RAW output norms (pre-projection).
-        # STE forward gives exact target_norm, but we penalize raw output
-        # deviation to keep the STE approximation accurate (small gap between
-        # forward sphere_project and backward identity).
+        # Optional: keeps STE approximation accurate but can cause
+        # gradient shock at horizon transitions (lessons 2026-04-25).
+        # Default lambda_norm=0.0 (disabled).
         target_norm_val = float(model.cfg.target_norm)
         target_norm_safe = max(target_norm_val, 1e-6)
         rel_dev = (bptt_raw_norms - target_norm_val) / target_norm_safe
@@ -1375,6 +1380,7 @@ def compute_composite_objective(
             "bptt_norm_mean": float(bptt_raw_norms.detach().mean().item()),
             "bptt_norm_std": float(bptt_raw_norms.detach().std().item()) if bptt_raw_norms.numel() > 1 else 0.0,
             "bptt_nan_count": float(getattr(model, "_bptt_nan_gate_count", 0)),
+            "bptt_k": float(effective_bptt_k),
         }
     else:
         l_bptt = chains.new_zeros(())
@@ -2446,6 +2452,9 @@ def main() -> None:
     # Answer loss warmup state (ramps lambda_ans 0→base at horizon transitions).
     answer_warmup_remaining = 0
     answer_warmup_total = 0
+    # BPTT loss warmup state (ramps lambda_bptt 0→base at horizon transitions).
+    bptt_warmup_remaining = 0
+    bptt_warmup_total = 0
     # NaN cascade detector state.
     nan_gate_window_size = int(train_cfg.get("nan_gate_window_size", 50))
     nan_gate_window: list[int] = []
@@ -2505,6 +2514,20 @@ def main() -> None:
             else:
                 train_cfg["loss_lambda_answer"] = base_ans_lambda
 
+            # ── BPTT horizon warmup ───────────────────────────
+            # BPTT through cold positions at a horizon transition
+            # produces gradient 10-20× larger than normal (lessons
+            # 2026-04-25).  Ramp lambda_bptt from 0→base over
+            # bptt_horizon_warmup_steps to prevent gradient shock.
+            bw_steps = int(train_cfg.get("bptt_horizon_warmup_steps", hw_steps))
+            if bw_steps > 0 and target_steps > prev_target_steps:
+                bptt_warmup_remaining = bw_steps
+                bptt_warmup_total = bw_steps
+                train_cfg["loss_lambda_bptt"] = 0.0
+            else:
+                bptt_warmup_remaining = 0
+                bptt_warmup_total = 0
+
             if hw_steps > 0 and prev_target_steps > 0:
                 horizon_warmup_remaining = hw_steps
                 horizon_warmup_total = hw_steps
@@ -2512,7 +2535,8 @@ def main() -> None:
                 print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
                       f"EMA reset, cooldown={sadt_cooldown} steps, "
                       f"LR warmup={hw_steps} steps (factor={hw_factor}), "
-                      f"answer warmup={aw_steps} steps")
+                      f"answer warmup={aw_steps} steps, "
+                      f"BPTT warmup={bw_steps} steps")
             else:
                 print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
                       f"EMA reset, cooldown={sadt_cooldown} steps")
@@ -2598,6 +2622,13 @@ def main() -> None:
                 answer_warmup_remaining -= 1
                 if answer_warmup_remaining == 0:
                     train_cfg["loss_lambda_answer"] = base_ans_lambda
+            # ── BPTT loss warmup (parallel to LR warmup) ─────────
+            if bptt_warmup_remaining > 0:
+                bw_progress = 1.0 - (bptt_warmup_remaining / bptt_warmup_total)
+                train_cfg["loss_lambda_bptt"] = base_bptt_lambda * bw_progress
+                bptt_warmup_remaining -= 1
+                if bptt_warmup_remaining == 0:
+                    train_cfg["loss_lambda_bptt"] = base_bptt_lambda
             global_step += 1
             tracker.update(metrics)
 

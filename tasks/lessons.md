@@ -33,6 +33,31 @@ Norm penalty retained on raw output norms to keep STE approximation accurate (sm
 
 ---
 
+## 2026-04-25 — STE BPTT NaN cascade: norm penalty gradient shock kills training at horizon transition
+
+### Context
+STE-based BPTT (full-chain K=-1, λ=0.5) with norm penalty (λ_norm=0.2) causes complete training death at System1→System2 transition (E3). Model healthy during E0-E2 (target_steps=1, BPTT off due to warmup). At E3 S50: grad=377 (17× normal), NaN:8. By E3 S600: grad=0.0 permanently, NaN count ≈ step count. Model brain-dead through E3+E4.
+
+### Root Cause Chain
+1. **Norm penalty spike**: At E3 S50, raw output norms (~0.4) diverge from target (0.2051). norm_pen=12.15, contributing λ_norm*12.15=2.43 to loss — 60% of total loss 4.12. The gradient direction is dominated by the norm penalty rather than the task.
+2. **STE gradient amplification**: `_to_residual_space` scales by ×156 in forward; backward multiplies gradient by ×156 at each step boundary. With K=2 (full chain at target_steps=2), gradient is amplified ×156 through the chain boundary.
+3. **Cold position instability**: Position 2 is never seen during System1. Attention patterns are untrained → extreme outputs → large BPTT loss.
+4. **Gradient shock**: Combined gradient 377× vs normal 22× overwhelms clip_grad_norm=1.0 (clipping preserves the wrong direction dominated by norm penalty).
+5. **NaN cascade**: Initial gradient shock pushes weights into bf16-fragile zones. NaN count: 8→14→59→108... → grad=0.0 permanently.
+
+### Fix (Three-Part)
+1. **Remove norm penalty** (`loss_lambda_norm_penalty=0.0`): Not needed with STE — forward already gives exact target_norm. The norm penalty was a stability hazard, not a benefit.
+2. **BPTT horizon warmup** (`bptt_horizon_warmup_steps=200`): Ramp lambda_bptt from 0→base over 200 steps at each horizon transition. Mirrors the LR warmup and answer warmup mechanisms.
+3. **BPTT loss normalization by 1/K**: Divide l_bptt by effective_bptt_k so per-step gradient magnitude stays comparable to teacher-forced loss regardless of chain length.
+
+### Rules
+1. **Never enable BPTT at a horizon transition without warmup.** The cold-position gradient is 10-20× larger than normal. Add `bptt_horizon_warmup_steps` alongside LR/answer warmup.
+2. **Norm penalty + STE is unnecessary and dangerous.** STE forward gives exact target_norm by construction. The penalty only improves gradient accuracy but can dominate the loss at transition points.
+3. **Always normalize multi-step losses by step count.** K-step BPTT accumulates K steps of loss; without 1/K normalization, the gradient scales with K and overwhelms teacher-forced gradient.
+4. **The `_to_residual_space` ×156 scaling amplifies backward gradient by ×156 per step boundary.** Any multi-step gradient path through `_to_residual_space` requires careful scaling.
+
+---
+
 ## 2026-04-23 — DF collapse: unbounded AdaLN scale → SwiGLU quadratic explosion → bf16 NaN
 
 ### Context
