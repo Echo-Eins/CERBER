@@ -122,8 +122,9 @@
         "bptt_enabled": false,
         "bptt_steps": -1,
         "bptt_warmup_epochs": 5,
+        "bptt_horizon_warmup_steps": 200,
         "loss_lambda_bptt": 0.5,
-        "loss_lambda_norm_penalty": 0.2,
+        "loss_lambda_norm_penalty": 0.0,
 
         "nan_gate_window_size": 50,
         "nan_gate_max_rate": 10,
