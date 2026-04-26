@@ -1162,9 +1162,18 @@ class ChainGenerator(nn.Module):
             else:
                 self._nan_gate_count = 0
 
+            # Keep teacher-forced supervision on the same SONAR sphere as
+            # autoregressive generation.  The raw output remains available to
+            # gradients through STE in training, but the forward loss no longer
+            # explodes when raw norms drift during horizon changes.
+            if self.training:
+                v_pred_for_loss = self._ste_sphere_project(v_pred)
+            else:
+                v_pred_for_loss = self._sphere_project(v_pred)
+
             if aux is not None:
-                return v_pred, aux
-            return v_pred
+                return v_pred_for_loss, aux
+            return v_pred_for_loss
 
         # ── Scheduled sampling: step-by-step with token mixing ──
         self._nan_gate_count = 0  # reset before rollout
@@ -1203,7 +1212,8 @@ class ChainGenerator(nn.Module):
                 raw = torch.where(has_bad.expand_as(raw), gt_t, raw)
 
             pred_t = self._sphere_project(raw)
-            preds.append(raw)
+            pred_for_loss = self._ste_sphere_project(raw) if self.training else pred_t
+            preds.append(pred_for_loss)
 
             if t < num_steps - 1:
                 # Decide per-sample: use own prediction or ground truth.

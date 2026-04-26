@@ -315,13 +315,15 @@ def select_training_targets(
     chain_lens: torch.Tensor,
     answer_pos: torch.Tensor,
     target_steps: int,
+    system1_target_mode: str = "answer",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Select training targets aligned to the generation process.
 
     Two regimes:
-      - System1 (target_steps=1): answer-aligned; take the first answer token,
-        not the first reasoning token and not an answer-repeat pad.
+      - System1 (target_steps=1): answer-aligned by default. For chain-only
+        experiments, system1_target_mode="prefix" keeps the target compatible
+        with System2 by using the first chain token instead.
       - System2 (target_steps>1): prefix-aligned; take chains[0:target_steps],
         matching what generate() produces autoregressively from position 0.
     """
@@ -337,7 +339,8 @@ def select_training_targets(
         ti = min(steps, li)
         ai = max(0, min(int(answer_pos[i].item()), li - 1))
 
-        if steps == 1:
+        mode = str(system1_target_mode or "answer").lower()
+        if steps == 1 and mode != "prefix":
             # System1: direct answer.  Use the first answer vector, not an
             # arbitrary repeated answer pad at the end of the chain.
             targets[i, 0] = chains[i, ai]
@@ -1526,7 +1529,11 @@ def train_step(
     context_mask = batch["context_mask"].to(device)
 
     chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
-        chains, chain_lens, answer_pos, target_steps
+        chains,
+        chain_lens,
+        answer_pos,
+        target_steps,
+        system1_target_mode=str(cfg.get("system1_target_mode", "answer")),
     )
 
     optimizer.zero_grad(set_to_none=True)
@@ -1779,7 +1786,11 @@ def eval_step(
     context_mask = batch["context_mask"].to(device)
 
     chains_trunc, chain_mask, target_answer_pos, target_has_answer = select_training_targets(
-        chains, chain_lens, answer_pos, gen_steps
+        chains,
+        chain_lens,
+        answer_pos,
+        gen_steps,
+        system1_target_mode=str(cfg.get("system1_target_mode", "answer")),
     )
 
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
@@ -2015,6 +2026,7 @@ def write_training_probe_snapshot(
             chain_lens,
             answer_pos,
             steps,
+            system1_target_mode=str(cfg.get("system1_target_mode", "answer")),
         )
         context_mask = context_mask[:, : context_banks.shape[1]]
 
