@@ -1177,6 +1177,14 @@ def compute_composite_objective(
     rank_enabled = lambda_rank > 0.0
     df_enabled = bool(cfg.get("enable_diffusion_forcing", False)) and lambda_df > 0.0
     bptt_enabled = bool(cfg.get("bptt_enabled", False)) and lambda_bptt > 0.0 and steps >= 1
+    # When BPTT is the main rollout loss path, L_roll becomes redundant
+    # (both train the same generate() output, but BPTT has full-chain
+    # gradient flow vs. L_roll's 1-step). Setting bptt_replaces_roll=true
+    # zeroes L_roll while BPTT is active, freeing optimization budget for
+    # the stronger signal.
+    bptt_replaces_roll = bool(cfg.get("bptt_replaces_roll", False))
+    if bptt_enabled and bptt_replaces_roll:
+        lambda_roll = 0.0
     aux_enabled = len(getattr(model, "aux_heads", {})) > 0 and lambda_aux > 0.0
     oracle_enabled = bool(cfg.get("enable_oracle_dagger", False))
     effective_oracle_prob = float(oracle_prob) if oracle_enabled else 0.0
@@ -1336,6 +1344,10 @@ def compute_composite_objective(
         }
 
     # 5) Truncated BPTT through the generation chain (STE projection).
+    # When bptt is enabled, this is the MAIN rollout loss path (not auxiliary):
+    # full-chain gradient flow through cascading multi-step drift, exactly
+    # what L_roll cannot provide (L_roll detaches at every step → 1-step
+    # gradient only, useless for fixing exposure bias at horizon ≥ 4).
     if bptt_enabled:
         effective_bptt_k = steps if bptt_k < 0 else min(bptt_k, steps)
         all_bptt, bptt_preds, bptt_raw_norms = model.generate_with_bptt(
@@ -1348,15 +1360,17 @@ def compute_composite_objective(
 
         bptt_targets = chains[:, -effective_bptt_k:, :]
         bptt_mask = chain_mask[:, -effective_bptt_k:]
-        l_bptt_raw, bptt_stats = _masked_step_losses(
+        l_bptt, bptt_stats = _masked_step_losses(
             bptt_preds, bptt_targets, bptt_mask, d_model, w_cos, w_mse,
         )
-        l_bptt_raw = torch.nan_to_num(l_bptt_raw, nan=0.0, posinf=0.0, neginf=0.0)
-        # Normalize by K so the per-step gradient magnitude is comparable
-        # to teacher-forced loss regardless of chain length.  Without this,
-        # full-chain BPTT (K=5) produces ~5× the gradient of K=1, causing
-        # gradient shock at horizon transitions.
-        l_bptt = l_bptt_raw / max(effective_bptt_k, 1)
+        l_bptt = torch.nan_to_num(l_bptt, nan=0.0, posinf=0.0, neginf=0.0)
+        # NOTE: do NOT divide by K here. _masked_step_losses already
+        # averages over valid tokens, which gives a per-token signal
+        # comparable to L_step regardless of chain length. The previous
+        # /K normalization was a double-average that suppressed the
+        # gradient by another factor of K — at K=5, λ=0.5, the effective
+        # contribution shrank to ~0.10 (vs. nominal 0.5), making BPTT
+        # too weak to overcome exposure bias.
 
         # Norm penalty on RAW output norms (pre-projection).
         # Optional: keeps STE approximation accurate but can cause
@@ -2479,6 +2493,14 @@ def main() -> None:
         train_cfg["loss_lambda_diffusion"] = effective_df_lambda
 
         # BPTT warm-up: disable until bptt_warmup_epochs have elapsed.
+        # bptt_warmup_epochs=0 (default for clean configs) activates BPTT
+        # from the first System2 epoch — exposure bias is the critical
+        # problem starting there, so we want full BPTT signal as soon as
+        # target_steps > 1.  The horizon-transition bptt_horizon_warmup_steps
+        # ramp (per-step) handles the gradient-shock concern at each
+        # transition.  Keeping bptt_warmup_epochs > 0 only delays BPTT
+        # past the first few System2 epochs, leaving them under-trained
+        # for multi-step rollout.
         if bptt_warmup_epochs > 0 and epoch < bptt_warmup_epochs:
             train_cfg["loss_lambda_bptt"] = 0.0
         else:
@@ -2532,6 +2554,10 @@ def main() -> None:
                 horizon_warmup_remaining = hw_steps
                 horizon_warmup_total = hw_steps
                 horizon_warmup_factor = hw_factor
+                # Apply initial LR warmup factor IMMEDIATELY so the first
+                # batch of the new horizon is also protected (not just step 1+).
+                for pg in optimizer.param_groups:
+                    pg["lr"] = pg["lr"] * hw_factor
                 print(f"  [SADT] Horizon changed {prev_target_steps}→{target_steps}, "
                       f"EMA reset, cooldown={sadt_cooldown} steps, "
                       f"LR warmup={hw_steps} steps (factor={hw_factor}), "
@@ -2585,6 +2611,20 @@ def main() -> None:
 
         nan_count = 0
         for step, batch in enumerate(train_loader):
+            # ── Apply warmup ramps BEFORE train_step ──────────────
+            # Previously the ramps were applied AFTER train_step, so the
+            # first batch of each horizon transition saw the un-ramped
+            # value (lambda=0 at epoch init for answer/bptt; full LR for
+            # the optimizer). Moving the ramp here ensures every batch —
+            # including the first one after a transition — sees the
+            # correctly-ramped warmup value.
+            if answer_warmup_remaining > 0:
+                aw_progress = 1.0 - (answer_warmup_remaining / answer_warmup_total)
+                train_cfg["loss_lambda_answer"] = base_ans_lambda * aw_progress
+            if bptt_warmup_remaining > 0:
+                bw_progress = 1.0 - (bptt_warmup_remaining / bptt_warmup_total)
+                train_cfg["loss_lambda_bptt"] = base_bptt_lambda * bw_progress
+
             metrics = train_step(
                 model,
                 batch,
@@ -2609,23 +2649,21 @@ def main() -> None:
             # to 1.0 over horizon_warmup_total steps.  This prevents
             # the ~50x gradient norm spike at System1→System2 transition
             # from pushing parameters into bfloat16-fragile zones.
+            # Note: the very first batch is also protected because we
+            # applied the initial factor (= horizon_warmup_factor) to the
+            # optimizer at horizon transition setup, before this loop.
             if horizon_warmup_remaining > 0:
                 progress = 1.0 - (horizon_warmup_remaining / horizon_warmup_total)
                 factor = horizon_warmup_factor + (1.0 - horizon_warmup_factor) * progress
                 for pg in optimizer.param_groups:
                     pg["lr"] = pg["lr"] * factor
                 horizon_warmup_remaining -= 1
-            # ── Answer loss warmup (parallel to LR warmup) ────────
+            # ── Decrement answer/bptt warmup counters AFTER step ──
             if answer_warmup_remaining > 0:
-                aw_progress = 1.0 - (answer_warmup_remaining / answer_warmup_total)
-                train_cfg["loss_lambda_answer"] = base_ans_lambda * aw_progress
                 answer_warmup_remaining -= 1
                 if answer_warmup_remaining == 0:
                     train_cfg["loss_lambda_answer"] = base_ans_lambda
-            # ── BPTT loss warmup (parallel to LR warmup) ─────────
             if bptt_warmup_remaining > 0:
-                bw_progress = 1.0 - (bptt_warmup_remaining / bptt_warmup_total)
-                train_cfg["loss_lambda_bptt"] = base_bptt_lambda * bw_progress
                 bptt_warmup_remaining -= 1
                 if bptt_warmup_remaining == 0:
                     train_cfg["loss_lambda_bptt"] = base_bptt_lambda
@@ -2914,8 +2952,16 @@ def main() -> None:
         val = val_tracker.get()
         epoch_time = time.time() - epoch_start
 
-        # Main selection metric: rollout final cosine.
-        val_metric = float(val.get("val_roll_cos_last", val.get("val_roll_cos", 0.0)))
+        # Main selection metric: rollout answer cosine, gated on ans_cov.
+        # val_roll_cos_last is meaningless when ans_cov=0 (model never reaches
+        # answer position). Require ans_cov >= 0.9 to use val_roll_cos_answer;
+        # fall back to val_roll_cos_last if the gate is not met yet.
+        val_ans_cov = float(val.get("val_answer_coverage", 0.0))
+        ans_cov_gate = float(train_cfg.get("best_metric_ans_cov_gate", 0.9))
+        if val_ans_cov >= ans_cov_gate:
+            val_metric = float(val.get("val_roll_cos_answer", 0.0))
+        else:
+            val_metric = float(val.get("val_roll_cos_last", val.get("val_roll_cos", 0.0)))
 
         print(
             f"  [E{epoch} VAL] "
@@ -2981,7 +3027,8 @@ def main() -> None:
                     "ema": ema.state_dict() if ema is not None else None,
                 },
             )
-            print(f"  ** New best: val_roll_cos_last={best_metric:.4f}")
+            metric_name = "val_roll_cos_answer" if val_ans_cov >= ans_cov_gate else "val_roll_cos_last"
+            print(f"  ** New best: {metric_name}={best_metric:.4f} (ans_cov={val_ans_cov:.2f})")
         else:
             no_improve += 1
 
@@ -3005,7 +3052,7 @@ def main() -> None:
             break
 
     print("\nTraining complete")
-    print(f"Best val_roll_cos_last={best_metric:.4f}")
+    print(f"Best val_metric={best_metric:.4f}")
     print(f"Checkpoints: {out_cfg['checkpoint_dir']}")
     _append_jsonl(
         metrics_log_path,

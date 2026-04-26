@@ -1,0 +1,189 @@
+{
+    "_comment": "Clean ablation config: NO Diffusion Forcing, NO EMA, NO SADT, NO scheduled sampling ramp. Horizon [4,10]→[5,10] only (skip h2/h3 where answer is outside training window). Zombie guard ON. BPTT is the main rollout loss path. Use this to measure pure BPTT/STE effect on cascade drift.",
+
+    "seed": 42,
+
+    "generator": {
+        "d_model": 1024,
+        "n_heads": 8,
+        "n_layers": 6,
+        "dim_feedforward": 4096,
+        "max_chain_len": 20,
+        "dropout": 0.1,
+        "target_norm": 0.2051,
+        "loss_cosine_weight": 1.0,
+        "loss_mse_weight": 0.1,
+        "diffusion_timesteps": 64,
+        "diffusion_beta_schedule": "cosine",
+        "diffusion_noise_scale": 0.0,
+        "prediction_type": "v",
+        "cfg_dropout_prob": 0.1,
+        "ffn_type": "swiglu",
+        "norm_type": "ada_rmsnorm",
+        "zero_init_residual": true,
+        "use_layerscale": true,
+        "layerscale_init": 1e-4,
+        "residual_norm_clamp": 256.0,
+        "adaln_scale_clamp": 1.0,
+        "aux_head_layers": [],
+        "aux_head_hidden_dim": 1024,
+        "aux_head_dropout": 0.0
+    },
+
+    "critic": {
+        "angular": {
+            "dim": 1024,
+            "hidden_dims": [2048, 1024, 512],
+            "activation": "silu",
+            "dropout": 0.1,
+            "use_layer_norm": true,
+            "energy_output_clamp": 50.0,
+            "include_context": true,
+            "temperature": 0.07,
+            "focal_gamma": 2.0,
+            "num_negatives": 7
+        },
+        "radial": {
+            "target_norm": 0.2051,
+            "scale": 1.0
+        },
+        "lambda_radial": 5.0
+    },
+
+    "data": {
+        "path": "data/hotpotqa_sonar.pt",
+        "num_workers": 4
+    },
+
+    "training": {
+        "batch_size": 32,
+        "num_epochs": 30,
+        "lr": 1e-4,
+        "weight_decay": 5e-4,
+        "warmup_epochs": 2,
+        "lr_min_factor": 0.01,
+        "clip_grad_norm": 1.0,
+        "hard_fail_bad_step_streak": 25,
+        "hard_fail_zero_grad_streak": 25,
+        "zero_grad_threshold": 1e-8,
+        "enable_zombie_guard": true,
+
+        "system1_epochs": 3,
+        "system2_start_steps": 4,
+        "max_chain_steps": 20,
+        "horizon_schedule": [[4, 10], [5, 10]],
+
+        "scheduled_sampling_max": 0.15,
+        "scheduled_sampling_ramp_epochs": 4,
+
+        "loss_lambda_step": 1.0,
+        "loss_lambda_answer": 1.0,
+        "loss_lambda_roll": 1.0,
+        "loss_lambda_rank": 0.0,
+        "loss_lambda_aux": 0.0,
+        "loss_lambda_aux_df": 0.0,
+        "aux_loss_answer_weight": 0.0,
+
+        "_comment_df": "Diffusion Forcing fully OFF for clean ablation",
+        "enable_diffusion_forcing": false,
+        "loss_lambda_diffusion": 0.0,
+        "df_warmup_epochs": 0,
+        "df_noise_sampling": "logsnr",
+        "df_noise_level_min": 2,
+        "df_noise_level_max": 50,
+        "df_eval_noise_level": 32,
+        "df_eval_deterministic_noise": true,
+        "df_eval_noise_seed": 12345,
+        "df_min_snr_gamma": 5.0,
+
+        "positional_weight_type": "exponential",
+        "positional_weight_base": 1.15,
+        "positional_weight_alpha": 1.0,
+
+        "_comment_ema": "Model EMA OFF",
+        "model_ema_decay": 0.0,
+
+        "ddim_steps": 3,
+        "cfg_scale": 1.5,
+        "contrastive_temperature": 0.07,
+        "enable_oracle_dagger": false,
+        "oracle_max_retries": 0,
+        "oracle_prob_max": 0.0,
+        "oracle_prob_min": 0.0,
+        "oracle_decay_epochs": 20,
+
+        "_comment_sadt": "SADT OFF",
+        "dynamic_step_lr": false,
+        "sadt_ema_alpha": 0.1,
+        "sadt_throttle_factor": 0.5,
+        "sadt_turbo_factor": 1.02,
+        "sadt_min_lr": 1e-6,
+        "sadt_max_lr": 5e-4,
+        "sadt_tolerance": 0.10,
+        "sadt_cooldown_steps": 200,
+
+        "horizon_warmup_steps": 200,
+        "horizon_warmup_factor": 0.1,
+        "horizon_adam_sq_scale": 1.0,
+        "answer_warmup_steps": 200,
+        "enable_ffn_stats": true,
+
+        "_comment_bptt": "BPTT is the main rollout loss path. K=-1 = full chain. lambda_bptt=0.5 dominates the rollout signal. bptt_replaces_roll=true zeroes redundant L_roll. bptt_warmup_epochs=0 activates BPTT from the first System2 epoch.",
+        "bptt_enabled": true,
+        "bptt_steps": -1,
+        "bptt_warmup_epochs": 0,
+        "bptt_horizon_warmup_steps": 200,
+        "loss_lambda_bptt": 0.5,
+        "loss_lambda_norm_penalty": 0.0,
+        "bptt_replaces_roll": true,
+
+        "nan_gate_window_size": 50,
+        "nan_gate_max_rate": 10,
+
+        "free_run_temperature": 1.0,
+        "free_run_noise_std": 0.0,
+        "free_run_noise_std_max": 0.0,
+        "eval_free_run_noise_std": 0.0,
+
+        "tf_noise_std_max": 0.0,
+        "tf_noise_ramp_epochs": 0,
+        "free_run_repeat_penalty": 0.15,
+        "free_run_repeat_cos_threshold": 0.98,
+        "free_run_repeat_ban_threshold": 0.995,
+        "free_run_repeat_ban_retries": 3,
+
+        "context_bank_size": 4,
+        "answer_repeat_pad": 2,
+
+        "log_every": 50,
+        "metrics_log_name": "chain_generator_training.jsonl",
+        "enable_training_geometry_probe": true,
+        "probe_every_steps": 200,
+        "probe_num_samples": 4,
+        "probe_steps": 0,
+        "probe_dir_name": "geometry_probes",
+        "probe_save_raw_vectors": false,
+        "checkpoint_every": 3,
+        "early_stop_patience": 20,
+
+        "_comment_best": "Gate best-checkpoint on ans_cov >= 0.9 — without this, val_roll_cos_last with ans_cov=0 (model never reaches answer position) wins over later honest scores.",
+        "best_metric_ans_cov_gate": 0.9
+    },
+
+    "reranking": {
+        "enabled": false,
+        "critic_checkpoint": null,
+        "num_candidates": 4
+    },
+
+    "amp": {
+        "enabled": true,
+        "dtype": "bfloat16"
+    },
+
+    "output": {
+        "output_dir": "experiments/13_chain_generator/output_clean",
+        "checkpoint_dir": "experiments/13_chain_generator/output_clean/checkpoints",
+        "logs_dir": "experiments/13_chain_generator/output_clean/logs"
+    }
+}

@@ -1,5 +1,40 @@
 # Lessons
 
+## 2026-04-26 — Eight systemic defects creating "false progress" in the training pipeline
+
+### Context
+After STE BPTT survived horizon transitions (no NaN cascade), training looked stable through 24 epochs but `Best val_roll_cos_last=0.8091` was set at E4 — the first System2(2) epoch with `ans_cov=0.00`. From E5 onward, the model honestly reached answer position (`ans_cov≈0.99`) but the saved best was never beaten because ans_cov=0 had inflated the metric. At target_steps=5, val_roll_cos_last collapsed to 0.61 while train roll_cos held 0.91 — the cascade drift remained unresolved. The "BPTT didn't help" verdict was a measurement artifact stacked on top of multiple architectural defects.
+
+### Eight Defects
+1. **Train/eval rollout mismatch in `generate()`**: training stored `raw_next` (pre-projection, drifting norm 0.25–0.36) for loss; eval stored `next_vec_for_chain` (post-projection at exact target_norm). Different distributions, incomparable metrics.
+2. **Best checkpoint selection broken**: `val_roll_cos_last` with no ans_cov gate. At horizon=2/3 the answer is outside the training window, so ans_cov=0 and the metric measures rollout cosine on irrelevant tokens. The metric fires highest exactly when the model is least useful.
+3. **Curriculum starts at h=2/h=3** where most chains never include the answer (`ans_cov=0` for entire E4). The `[[2,2],[3,2],[4,10],[5,10]]` schedule wastes the first four epochs on a degenerate task and contaminates the best-checkpoint metric.
+4. **Config name mismatch**: `chain_generator_no_sadt_df_ema_soft_ss.json` actually had DF enabled (λ=0.15), partial SS ramp (max=0.30), no EMA but DF was present. Name said "no DF/EMA/SADT" but DF was on. Easy to forget what's actually being tested.
+5. **BPTT loss double-normalized (/K)**: `_masked_step_losses` already averages over valid tokens, then `/max(K,1)` divided again. At K=5, λ=0.5, effective contribution shrank to ~0.10 — too weak to overcome exposure bias.
+6. **BPTT as auxiliary, not main rollout**: L_roll uses `generate()` with detach-per-step (1-step gradient, useless against cascade drift); BPTT used `generate_with_bptt` with full-chain gradient. They train the same path but BPTT is strictly stronger. Running both at λ_roll=1.0 + λ_bptt=0.5 dilutes BPTT's signal under L_roll's redundant noise.
+7. **Warmup timing off-by-one**: per-step LR/answer/BPTT ramps were applied AFTER `train_step()`. The first batch of each new horizon ran with un-ramped values (full LR, λ_answer=base, λ_bptt=base or 0). The whole point of warmup was to protect the cold-position transition — and the cold positions saw the un-protected first batch.
+8. **Context bank GT leakage**: `context_bank` includes `[question, evidence_step_1, ..., evidence_step_N]` from ground-truth reasoning. The model is trained to attend to the GT chain it's supposed to generate. At eval time the bank still contains GT (because we're using the dataset), but in any real deployment the bank would only have the question — train/eval gap by design.
+
+### Fix
+1. **STE in `generate()` for training**: store `_ste_sphere_project(raw_next)` instead of `raw_next`. Forward = same hard projection as eval; backward = identity (no Jacobian attenuation). Train and eval now sample the same distribution.
+2. **Gate best-checkpoint on ans_cov ≥ 0.9** (configurable via `best_metric_ans_cov_gate`); use `val_roll_cos_answer` when gated, fall back to `val_roll_cos_last` only until ans_cov is reached.
+3. **Clean curriculum** `[[4,10],[5,10]]` skips degenerate horizons. Use `chain_generator_clean.json`.
+4. **Honest config naming**: `chain_generator_clean.json` truly has DF=false, EMA=0, SADT=false, zombie guard on.
+5. **Remove the /K**: `l_bptt = l_bptt_raw` (no extra division). The masked-loss averaging already gives a per-token signal comparable to L_step.
+6. **`bptt_replaces_roll: true`** zeroes `lambda_roll` while BPTT is active. BPTT becomes the sole rollout loss path.
+7. **Warmup ramps applied BEFORE `train_step()`** for answer/BPTT (the values train_step sees are the correctly-ramped ones). For LR, the initial factor is also applied at horizon-transition setup so step 0 of the new horizon sees the reduced LR.
+8. **Context bank GT leakage** is a longer-term redesign (out of scope for this commit). Note it explicitly so future work doesn't read clean numbers as evidence the model generalises — they reflect a leakage gap that must be removed before any deployment claim.
+
+### Rules
+1. **Always sanity-check best-checkpoint metric against ans_cov.** If ans_cov ≪ 1, the rollout metric is measuring something else.
+2. **Train and eval must sample the same output distribution.** STE is the right tool when you want eval-quality forward without giving up gradient.
+3. **Don't double-normalize loss components.** If `_masked_step_losses` already averages, do not divide by K again. Track total contribution to `loss` not the raw component value.
+4. **Warmup ramps must be applied BEFORE the optimizer step, not after.** The step you're protecting is the one that runs next, not the one that just finished.
+5. **Curriculum must include the answer position from the start of System2** — otherwise early horizons train a degenerate task and pollute every metric that depends on `ans_cov`.
+6. **Config filenames are documentation.** A config named `no_DF` must actually disable DF; otherwise lessons get attributed to the wrong run.
+
+---
+
 ## 2026-04-24 — BPTT projection mismatch: _soft_sphere_project creates second distribution gap
 
 ### Context

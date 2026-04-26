@@ -1559,13 +1559,27 @@ class ChainGenerator(nn.Module):
             # We must check raw_next (pre-projection) to catch the actual NaN.
             raw_has_nan = not torch.isfinite(raw_next).all()
 
+            # ── Train/eval rollout alignment (lessons 2026-04-26) ──
+            # During training we previously stored raw_next (pre-projection)
+            # for loss/metrics, while eval stored next_vec_for_chain (post-
+            # projection at exact target_norm). This made train roll_cos
+            # incomparable to eval roll_cos — the two paths sampled
+            # different distributions.
+            #
+            # Fix: in training, store the STE-projected vector. Forward gives
+            # the same distribution as eval (sphere-projected at target_norm),
+            # backward flows the gradient through the identity (no Jacobian
+            # attenuation from normalization). This unifies train and eval
+            # without sacrificing gradient signal.
             if self.training:
                 if raw_has_nan:
                     # Store clean sphere-projected vec instead of NaN-contaminated raw.
                     # Downstream loss sees clean_pred ≈ GT direction → loss ≈ 0.
                     generated.append(clean_next_vec)
                 else:
-                    generated.append(raw_next)
+                    # STE projection: forward = sphere_project(raw_next),
+                    # backward = identity through raw_next.
+                    generated.append(self._ste_sphere_project(raw_next))
             else:
                 generated.append(next_vec_for_chain)
 
