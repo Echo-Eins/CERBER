@@ -79,6 +79,12 @@ class ChainGeneratorConfig:
     # ``None`` or ``<= 0`` disables (backward compatible).
     residual_norm_clamp: float | None = None
 
+    # Bound pre-projection output logits in SONAR space. The downstream target
+    # is directional and fixed-norm, so raw radius is a nuisance parameter; if
+    # left unconstrained it can grow without improving cosine quality and push
+    # bf16 training into NaN-prone regimes.
+    raw_output_norm_clamp: float | None = None
+
     # ── AdaLN scale clamp (FFN explosion safety valve) ──
     # Soft-bound the AdaLN modulation scale output via tanh so the gate
     # (1 + scale) stays in [GATE_MIN, 1 + adaln_scale_clamp].  Without
@@ -1016,6 +1022,24 @@ class ChainGenerator(nn.Module):
             v_safe = torch.where(collapsed, fallback, v_safe)
         return v_safe * self.cfg.target_norm
 
+    def _guard_raw_output(self, v: Tensor) -> Tensor:
+        """Clamp finite raw output norms before sphere projection.
+
+        Projection removes radius from the forward signal, and STE removes the
+        projection Jacobian in backward, so raw radius is otherwise weakly
+        identified and can drift to huge values. This clamp preserves direction
+        and non-finite sentinels while preventing finite raw logits from
+        becoming the next numerical failure mode.
+        """
+        clamp = self.cfg.raw_output_norm_clamp
+        if clamp is None or float(clamp) <= 0.0:
+            return v
+        max_norm = float(clamp)
+        v_finite = torch.nan_to_num(v.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        norm = v_finite.norm(dim=-1, keepdim=True)
+        scale = (max_norm / norm.clamp(min=max_norm)).to(dtype=v.dtype)
+        return v * scale
+
     def _ste_sphere_project(self, v: Tensor) -> Tensor:
         """Straight-Through Estimator sphere projection for BPTT.
 
@@ -1140,7 +1164,7 @@ class ChainGenerator(nn.Module):
                 self._maybe_aux_predict(layer_idx, x, aux)
 
             x = self.final_norm(x)
-            v_pred = self.output_proj(x)
+            v_pred = self._guard_raw_output(self.output_proj(x))
 
             # ── NaN gate for teacher-forcing path ─────────────────
             # Mirror the scheduled-sampling NaN gate (line ~975).
@@ -1195,7 +1219,7 @@ class ChainGenerator(nn.Module):
                     aux_steps[str(layer_idx)].append(self.aux_heads[str(layer_idx)](x[:, -1:, :]))
 
             x = self.final_norm(x)
-            raw = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+            raw = self._guard_raw_output(self.output_proj(x[:, -1:, :]))  # [B, 1, D]
 
             # ── Per-sample NaN gate ──────────────────────────────────
             # If any dimension is non-finite for a sample, replace that
@@ -1325,7 +1349,7 @@ class ChainGenerator(nn.Module):
                 self._maybe_aux_predict(layer_idx, x, aux)
 
         x = self.final_norm(x)
-        v_pred = self.output_proj(x)
+        v_pred = self._guard_raw_output(self.output_proj(x))
         if return_noisy and aux is not None:
             return v_pred, v_noisy, eps, aux
         if return_noisy:
@@ -1449,7 +1473,7 @@ class ChainGenerator(nn.Module):
                     x = layer(x, context, context_mask=ctx_mask)
 
                 x = self.final_norm(x)
-                raw_next = self.output_proj(x[:, -1:, :])
+                raw_next = self._guard_raw_output(self.output_proj(x[:, -1:, :]))
 
             raw_norms.append(float(raw_next.detach().norm(dim=-1).mean().item()))
 
@@ -1752,7 +1776,7 @@ class ChainGenerator(nn.Module):
             for layer in self.layers:
                 x = layer(x, context, context_mask=ctx_mask)
             x = self.final_norm(x)
-            raw = self.output_proj(x[:, -1:, :])
+            raw = self._guard_raw_output(self.output_proj(x[:, -1:, :]))
 
             proj = self._sphere_project(raw)
             all_preds.append(proj)
@@ -1768,7 +1792,7 @@ class ChainGenerator(nn.Module):
             for layer in self.layers:
                 x = layer(x, context, context_mask=ctx_mask)
             x = self.final_norm(x)
-            raw = self.output_proj(x[:, -1:, :])
+            raw = self._guard_raw_output(self.output_proj(x[:, -1:, :]))
 
             nan_detected = not torch.isfinite(raw).all()
             if nan_detected:
@@ -1878,7 +1902,7 @@ class ChainGenerator(nn.Module):
                     x = layer(x, context, context_mask=ctx_mask)
 
             x = self.final_norm(x)
-            model_out = self.output_proj(x[:, -1:, :])  # [B, 1, D]
+            model_out = self._guard_raw_output(self.output_proj(x[:, -1:, :]))  # [B, 1, D]
 
             # CFG: conditional + unconditional interpolation (at the prediction,
             # not x0 — mathematically equivalent for linear prediction types).
@@ -1894,7 +1918,7 @@ class ChainGenerator(nn.Module):
                     for layer in self.layers:
                         x_uc = layer(x_uc, null_ctx, context_mask=ctx_mask)
                 x_uc = self.final_norm(x_uc)
-                model_out_uc = self.output_proj(x_uc[:, -1:, :])
+                model_out_uc = self._guard_raw_output(self.output_proj(x_uc[:, -1:, :]))
                 model_out = model_out_uc + cfg_scale * (model_out - model_out_uc)
 
             # Recover x₀ and ε from model output.
@@ -1964,7 +1988,7 @@ class ChainGenerator(nn.Module):
                 x = layer(x, flat_context, context_mask=flat_ctx_mask)
 
             x = self.final_norm(x)
-            raw_next = self.output_proj(x[:, -1:, :])  # [B*W, 1, D]
+            raw_next = self._guard_raw_output(self.output_proj(x[:, -1:, :]))  # [B*W, 1, D]
 
             new_W = W * K
             raw_k = raw_next.reshape(bsz, W, 1, self.cfg.d_model).unsqueeze(2).expand(-1, -1, K, -1, -1).clone()

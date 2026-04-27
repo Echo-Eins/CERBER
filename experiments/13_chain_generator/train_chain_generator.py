@@ -1706,8 +1706,13 @@ def train_step(
     else:
         total_norm = torch.tensor(0.0, device=device)
 
+    scale_before = float(scaler.get_scale()) if hasattr(scaler, "is_enabled") and scaler.is_enabled() else None
     scaler.step(optimizer)
     scaler.update()
+    optimizer_did_step = True
+    if scale_before is not None:
+        scale_after = float(scaler.get_scale())
+        optimizer_did_step = scale_after >= scale_before
 
     # --- Post-step parameter sanity check (EMA break-glass) --------
     # If the optimizer step somehow produced NaN/Inf or HUGE-but-finite
@@ -1750,10 +1755,10 @@ def train_step(
     # NO param restore.  Otherwise subtle drift (that passed isfinite
     # but is already polluted) leaks into the shadow, and the very
     # rescue source becomes the source of future corruption.
-    if ema is not None and not grad_had_nan and params_restored == 0:
+    if ema is not None and optimizer_did_step and not grad_had_nan and params_restored == 0:
         ema.update(model)
 
-    metrics["nan_skipped"] = 1.0 if (grad_had_nan or params_restored > 0) else 0.0
+    metrics["nan_skipped"] = 1.0 if (grad_had_nan or params_restored > 0 or not optimizer_did_step) else 0.0
     metrics["nan_loss_skipped"] = 0.0
     metrics["nan_grad_skipped"] = 0.0
     metrics["grad_sanitized"] = float(sanitized_count)
@@ -1761,7 +1766,7 @@ def train_step(
     metrics["zombie_reset"] = 0.0
     metrics["zombie_resets_total"] = float(zombie_resets_total)
     metrics["zombie_streak"] = float(zombie_streak_now)
-    metrics["optimizer_stepped"] = 1.0
+    metrics["optimizer_stepped"] = 1.0 if optimizer_did_step else 0.0
     metrics["grad_norm"] = float(total_norm.item()) if clip_grad > 0 else 0.0
     metrics["target_steps"] = float(target_steps)
     metrics["target_is_answer"] = 1.0 if target_steps == 1 else 0.0
